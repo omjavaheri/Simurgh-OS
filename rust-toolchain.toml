@@ -1,0 +1,55 @@
+# ============================================================================
+# rust-toolchain.toml
+#
+# Pins the exact Rust toolchain for the whole workspace. Every `cargo`
+# invocation inside this directory tree (or any subdirectory) will
+# automatically use this toolchain via rustup, without requiring manual
+# `rustup override set` on each developer machine or CI runner.
+#
+# Nightly is required because this workspace depends on unstable features
+# that are mandatory for a `no_std` kernel/HAL target:
+#   - `-Z build-std=core,alloc`  (building core/alloc from source for custom
+#                                  JSON targets that have no prebuilt std)
+#   - `#![feature(...)]` attributes used in hal-core / hal-x86_64 / etc.
+#     for low-level intrinsics not yet stabilized (e.g. some asm/cfg items)
+# ============================================================================
+
+[toolchain]
+# Pinned to a specific dated nightly (not just "nightly") so that:
+#   1. All contributors and CI build with the exact same compiler.
+#   2. An unrelated nightly regression upstream cannot silently break
+#      the build on a random day.
+# Bump this date deliberately (and re-test all three architectures) when
+# a newer nightly is needed for a specific feature.
+channel = "nightly-2025-01-15"
+
+# Components needed on top of the base toolchain:
+#   - rust-src: required by `-Z build-std=core,alloc` so Cargo can
+#     recompile core/alloc from source for our custom no_std targets
+#     (targets/x86_64-hal.json, aarch64-hal.json, riscv64gc-hal.json)
+#     which have no prebuilt std/core shipped by rustup.
+#   - llvm-tools-preview: provides llvm-objcopy / llvm-objdump, used to
+#     produce raw kernel binaries from ELF output and to inspect the
+#     generated boot images during QEMU debugging.
+#   - rustfmt / clippy: standard code-quality tooling, kept in sync with
+#     the pinned channel so formatting/lint results are reproducible.
+components = [
+    "rust-src",
+    "llvm-tools-preview",
+    "rustfmt",
+    "clippy",
+]
+
+# Host-side targets installed by default (for hal-core / hal-manifest /
+# hal-direct unit tests, which run on the developer's own machine — see
+# WORKSPACE.md, "default-members"). The three no_std architecture targets
+# (x86_64-unknown-none, aarch64-unknown-none, riscv64gc-unknown-none-elf)
+# are intentionally NOT listed here: they are custom JSON targets built
+# via `-Z build-std`, not prebuilt rustup targets, so there is nothing
+# for rustup to install for them.
+targets = []
+
+# Use the "minimal" profile as the baseline (rustup default set of
+# components is trimmed down) since we explicitly list every component
+# we actually need above; keeps CI toolchain install fast and small.
+profile = "minimal"

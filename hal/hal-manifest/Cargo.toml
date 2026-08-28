@@ -1,0 +1,58 @@
+# ============================================================================
+# hal-manifest
+#
+# Defines the Hardware Manifest data structures — the single artifact that
+# flows from HAL (layer 1) up to the microkernel / Root Task (layer 2/3).
+#
+# Per 01-HAL-Layer.md, section 9 ("Final decision: Hardware Manifest
+# format"), this crate is intentionally split into two representations:
+#   - raw.rs : `#[repr(C)]`, fixed-size arrays, NO heap allocation.
+#              Used for the boot-time handoff (HAL -> Root Task), which
+#              happens BEFORE any real allocator exists.
+#   - lib.rs : a `Vec`-based dynamic representation, used from layer 3
+#              onward once a heap is available.
+#
+# This is why hal-manifest depends on `alloc` but explicitly does NOT
+# depend on `std`: it must stay usable both from the no_std boot path
+# (hal-core, hal-x86_64/arm64/riscv64) and from later, heap-enabled
+# layers, without ever pulling in the standard library.
+# ============================================================================
+
+[package]
+name        = "hal-manifest"
+description = "Hardware Manifest data structures shared between HAL (layer 1) and upper layers"
+edition.workspace   = true
+version.workspace   = true
+authors.workspace   = true
+license.workspace   = true
+repository.workspace = true
+
+[lib]
+# No harness override needed here: unit tests for this crate run on the
+# host target (see workspace default-members), not on the no_std
+# architecture targets.
+
+[dependencies]
+# `default-features = false` is required: bitflags' default features pull
+# in `std`, which is unavailable in the no_std boot path that consumes
+# this crate (hal-core, hal-x86_64, hal-arm64, hal-riscv64).
+bitflags = { workspace = true }
+
+[features]
+# Default: no_std, no heap. This is what hal-core and every hal-<arch>
+# crate depend on, since they run before any allocator is initialized
+# (see 01-HAL-Layer.md, section 9).
+default = []
+
+# Enables the alloc-based dynamic Vec representation (HardwareManifest,
+# as opposed to HardwareManifestRaw). Enabled by layer 3 (Root Task and
+# above) once a real heap allocator is available. Kept as an explicit
+# opt-in feature — rather than always-on — so that hal-core and the
+# hal-<arch> crates never accidentally pull in `alloc` during the boot
+# path where no allocator exists yet.
+alloc = []
+
+[dev-dependencies]
+# Intentionally empty for now. Unit tests for raw <-> dynamic conversion
+# (section 4 / section 9 of 01-HAL-Layer.md) will run on the host target
+# and need no extra crates beyond std, which is available there.

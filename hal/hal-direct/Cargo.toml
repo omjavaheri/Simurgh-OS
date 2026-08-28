@@ -1,0 +1,54 @@
+# ============================================================================
+# hal-direct
+#
+# The optional, capability-gated half of the HAL, per 01-HAL-Layer.md
+# section 1:
+#
+#   HAL
+#    ├── hal-core      -> always active, safe, auto-detect, no config needed
+#    └── hal-direct    -> optional, capability-gated
+#
+# Per section 1's explicit requirement, hal-core and hal-direct "باید از
+# هم جدا (در کد و در باینری نهایی) باشند" — must be separate both in
+# code AND in the final binary. Keeping this as its own crate (rather
+# than a feature flag on hal-core) is what makes that separation real:
+# a build that never links hal-direct at all is possible simply by not
+# listing it as a dependency, with no `#[cfg]` gymnastics needed.
+#
+# Per section 5, every function in this crate requires a valid
+# `CapabilityToken` minted by the Security/Permission Broker (layer 4):
+# "هیچ تابعی در hal-direct بدون CapabilityToken معتبر اجرا نمی‌شود...
+# صدور این token مسئولیت Security/Permission Broker در لایه ۴ است، نه
+# HAL. HAL فقط توکن را verify می‌کند."
+# ============================================================================
+
+[package]
+name        = "hal-direct"
+description = "Capability-gated direct hardware access for professional users and driver authors"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+# Like hal-core, this crate's own unit tests (mock CapabilityToken
+# verification logic) run on the host target by default. Real
+# architecture-specific implementations of `HalDirectAccess` live in
+# hal-x86_64 / hal-arm64 / hal-riscv64, each gated behind a --target
+# build, exactly mirroring hal-core's structure.
+
+[dependencies]
+# hal-direct's trait signatures (map_mmio_region, etc.) are expressed
+# in terms of hal-core's PhysAddr/VirtAddr and HalError, so the two
+# crates must speak the exact same address/error types — see
+# 01-HAL-Layer.md section 5's pre-draft trait, which reuses HalError
+# directly rather than defining a parallel error type.
+hal-core = { path = "../hal-core" }
+
+[dev-dependencies]
+# No extra crates needed for the same reason as hal-core: host-target
+# unit tests use std implicitly, the crate under test stays no_std.
+
+[features]
+default = []

@@ -1,0 +1,71 @@
+# ============================================================================
+# kernel-stub
+#
+# The minimal microkernel stand-in required by 01-HAL-Layer.md section 8,
+# MVP acceptance criterion 3, now extended to build against all three
+# target architectures (x86_64, ARM64, RISC-V) rather than x86_64 only.
+#
+# Per-architecture HAL dependencies are selected via Cargo's
+# `[target.'cfg(...)'.dependencies]` tables, keyed on `target_arch` —
+# this works correctly even though our targets are custom JSON files
+# (not built-in rustc triples), because `target_arch` is still derived
+# from the target spec's own "arch" field (see targets/*.json's "arch"
+# key: "x86_64", "aarch64", "riscv64" respectively) regardless of
+# whether the target itself is built-in or custom.
+#
+# This means a single `cargo build -p kernel-stub --target
+# targets/aarch64-hal.json -Z build-std=core,alloc` pulls in
+# hal-arm64 automatically, without any Cargo feature flags needed.
+# ============================================================================
+
+[package]
+name        = "kernel-stub"
+description = "Minimal microkernel stand-in for Phase 1 HAL boot testing (01-HAL-Layer.md section 8.3), all three architectures"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "kernel-stub"
+path = "src/main.rs"
+
+[dependencies]
+hal-core     = { path = "../hal/hal-core" }
+hal-manifest = { path = "../hal/hal-manifest", default-features = false }
+
+# ----------------------------------------------------------------------
+# Per-architecture HAL implementation, selected by target_arch.
+# Exactly one of these three is ever compiled in for a given
+# --target invocation, since targets/x86_64-hal.json sets
+# arch="x86_64", targets/aarch64-hal.json sets arch="aarch64", and
+# targets/riscv64gc-hal.json sets arch="riscv64" (see each file's
+# own "arch" field) — Cargo/rustc resolve target_arch from that
+# field before dependency resolution happens, so this table
+# behaves exactly like selecting among three mutually exclusive
+# built-in triples would.
+# ----------------------------------------------------------------------
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+hal-x86_64 = { path = "../hal/hal-x86_64" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+hal-arm64 = { path = "../hal/hal-arm64" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+hal-riscv64 = { path = "../hal/hal-riscv64" }
+
+[package.metadata.hal]
+# Unlike hal-<arch> crates (which each declare exactly one target),
+# kernel-stub is meant to be built against any of the three — this
+# field lists all three for documentation purposes; the actual
+# --target flag is chosen at build-invocation time (see the
+# convenience aliases this file's sibling .cargo/config.toml would
+# need extending with, e.g. `xbuild-kernel-x86_64`).
+targets = [
+    "targets/x86_64-hal.json",
+    "targets/aarch64-hal.json",
+    "targets/riscv64gc-hal.json",
+]

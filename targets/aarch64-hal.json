@@ -1,0 +1,33 @@
+{
+    "llvm-target": "aarch64-unknown-none",
+    "arch": "aarch64",
+    "target-endian": "little",
+    "target-pointer-width": "64",
+    "target-c-int-width": "32",
+    "data-layout": "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+
+
+    "os": "none",
+    "executable": true,
+    "linker-flavor": "ld.lld",
+    "linker": "rust-lld",
+
+    "panic-strategy": "abort",
+    "disable-redzone": true,
+
+    "features": "+strict-align,+neon,+fp-armv8",
+
+    "relocation-model": "static",
+    "code-model": "large",
+
+    "position-independent-executables": false,
+
+    "max-atomic-width": 128,
+
+    "abi-blacklist": [
+        "stdcall", "fastcall", "vectorcall", "thiscall",
+        "win64", "sysv64", "ptx-kernel", "msp430-interrupt",
+        "x86-interrupt", "amdgpu-kernel", "avr-interrupt",
+        "avr-non-blocking-interrupt"
+    ]
+}

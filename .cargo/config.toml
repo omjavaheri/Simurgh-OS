@@ -1,0 +1,117 @@
+# ============================================================================
+# .cargo/config.toml
+#
+# Workspace-wide Cargo configuration. Applies to every crate built from
+# within os-project/ (and subdirectories), on top of rust-toolchain.toml.
+#
+# Responsibilities of this file:
+#   1. Provide per-target linker/runner configuration so building and
+#      running (via QEMU) the custom JSON targets (targets/*.json) works
+#      without extra flags typed by hand every time.
+#   2. Keep the *default* host build (no --target passed) completely
+#      unaffected, so `cargo test` on hal-core/hal-manifest/hal-direct
+#      keeps working normally on the developer's own machine (see
+#      WORKSPACE.md, "default-members").
+#
+# `-Z build-std` is DELIBERATELY NOT set here. `[unstable]` in a config
+# file applies to EVERY cargo invocation in this tree, host builds
+# included — and a global `build-std` makes a plain `cargo test`/`cargo
+# build` rebuild `core` from source while also linking the prebuilt
+# `core`, which fails with "duplicate lang item in crate `core`". The
+# custom no_std targets DO need `core`/`alloc` rebuilt from source (rustup
+# ships no prebuilt copy for them), so that flag lives on the `xbuild-*` /
+# `xbuild-kernel-* ` / `xrun-kernel-*` aliases below instead, scoping it
+# to exactly the cross-compiles that need it. A raw `cargo build --target
+# targets/<arch>.json` therefore also needs `-Z build-std=core,alloc
+# -Z build-std-features=compiler-builtins-mem` added by hand; prefer the
+# aliases.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Per-architecture bare-metal target configuration
+#
+# NOTE: these sections key on the *custom target name* (the file stem of
+# targets/x86_64-hal.json, i.e. "x86_64-hal"), NOT on a `cfg(target_arch
+# = "...")` predicate. This is deliberate: `cfg(target_arch = "x86_64")`
+# ALSO matches the developer's host triple (x86_64-pc-windows-msvc,
+# x86_64-unknown-linux-gnu, …), so putting the QEMU `runner` there makes
+# a plain `cargo test` at the workspace root try to launch the host test
+# binaries under `qemu-system-x86_64 -kernel` and fail. Cargo matches
+# custom JSON targets by their file stem when passed via
+# `--target targets/x86_64-hal.json`, so keying on the stem scopes both
+# the runner and the linker rustflags to exactly the cross-compiles that
+# want them, and leaves host builds untouched (see the "Host build
+# behavior" note at the bottom).
+# ----------------------------------------------------------------------------
+[target.x86_64-hal]
+runner = "qemu-system-x86_64 -serial stdio -display none -kernel"
+rustflags = [
+    "-C", "relocation-model=static",
+    # Disable red zone: interrupt/exception handlers run without a safe
+    # 128-byte scratch area below RSP: with red zone enabled, an
+    # interrupt firing mid-function could corrupt caller data below RSP.
+    "-C", "target-feature=-red-zone",
+    # NOTE: the linker script itself is NOT passed here anymore — each
+    # hal-<arch> crate's own build.rs emits
+    # `cargo:rustc-link-arg=-T<absolute-path-to-linker.ld>` using its
+    # own CARGO_MANIFEST_DIR, which is always correct regardless of
+    # which directory `cargo` was invoked from. A relative path here
+    # broke as soon as the project's own directory name/location
+    # changed (see git history around the "cannot find linker script"
+    # build failure).
+]
+
+[target.aarch64-hal]
+runner = "qemu-system-aarch64 -M virt -cpu cortex-a72 -serial stdio -display none -kernel"
+rustflags = [
+    "-C", "relocation-model=static",
+]
+
+[target.riscv64gc-hal]
+runner = "qemu-system-riscv64 -M virt -serial stdio -display none -kernel"
+rustflags = [
+    "-C", "relocation-model=static",
+]
+
+# ----------------------------------------------------------------------------
+# Convenience aliases
+#
+# These let contributors type `cargo xbuild-x86_64` instead of the full
+# `cargo build -p hal-x86_64 --target targets/x86_64-hal.json -Z build-std=…`
+# incantation. Each one carries the `-Z build-std` flags (see the header
+# comment on why they are not in `[unstable]`): `core,alloc` rebuilt from
+# source because the custom JSON targets have no prebuilt copy, and
+# `compiler-builtins-mem` so the bare-metal image needs no external libc
+# for `memcpy`/`memset`/…
+# ----------------------------------------------------------------------------
+[alias]
+xbuild-x86_64  = "build -p hal-x86_64  --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-aarch64 = "build -p hal-arm64   --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-riscv64 = "build -p hal-riscv64 --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# ----------------------------------------------------------------------------
+# kernel-stub build/run aliases
+#
+# `xbuild-kernel-*` builds the FULL bootable image for each architecture:
+# kernel-stub links in the matching hal-<arch> crate (selected
+# automatically via kernel-stub/Cargo.toml's target_arch-keyed dependency
+# tables), which in turn links in the boot assembly + linker.ld for that
+# architecture. `xrun-kernel-*` does the same and then launches it under
+# QEMU via the per-target `runner` configured above.
+# ----------------------------------------------------------------------------
+xbuild-kernel-x86_64  = "build -p kernel-stub --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-kernel-aarch64 = "build -p kernel-stub --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-kernel-riscv64 = "build -p kernel-stub --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+xrun-kernel-x86_64  = "run -p kernel-stub --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xrun-kernel-aarch64 = "run -p kernel-stub --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xrun-kernel-riscv64 = "run -p kernel-stub --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+# ----------------------------------------------------------------------------
+# Host build behavior (no --target passed)
+#
+# Intentionally left with no [build] table / no default target override:
+# a plain `cargo build` or `cargo test` at the workspace root must keep
+# targeting the developer's native host triple, so that hal-core /
+# hal-manifest / hal-direct unit tests (mock hardware, per WORKSPACE.md)
+# run normally without cross-compilation.
+# ----------------------------------------------------------------------------

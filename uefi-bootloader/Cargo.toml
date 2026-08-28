@@ -1,0 +1,45 @@
+# ============================================================================
+# uefi-bootloader
+#
+# A UEFI application that:
+#   1. Locates and loads the kernel-stub ELF image into memory.
+#   2. Obtains the UEFI memory map and the ACPI RSDP address.
+#   3. Calls ExitBootServices().
+#   4. Jumps to the kernel's entry point with RDI pointing at a memory
+#      block in the exact format hal-x86_64/src/memory.rs expects
+#      (see 01-HAL-Layer.md section 3.5 / 9, and the handoff document
+#      produced for this work).
+#
+# Built for the standard `x86_64-unknown-uefi` triple (a built-in
+# rustup target, NOT the custom targets/x86_64-hal.json used by the
+# HAL crates) — this is a plain, ordinary UEFI application, not a
+# no_std bare-metal kernel image itself, even though it never touches
+# an OS after ExitBootServices().
+# ============================================================================
+
+[package]
+name        = "uefi-bootloader"
+description = "UEFI application that loads kernel-stub and hands off control per hal-x86_64's boot protocol"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "uefi-bootloader"
+path = "src/main.rs"
+
+[dependencies]
+# The `uefi` crate provides safe, typed wrappers around UEFI protocols
+# (GetMemoryMap, LoadImage/exec, file system access, configuration
+# table lookup for ACPI RSDP) — see the handoff document's rationale
+# for choosing this over hand-rolling the UEFI spec's raw structures.
+uefi = { version = "0.31", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

@@ -1,0 +1,100 @@
+# ============================================================================
+# hal-x86_64
+#
+# The x86_64 architecture implementation of every hal-core trait, per
+# 01-HAL-Layer.md section 6's proposed folder structure:
+#
+#   hal/
+#    ├── hal-core/
+#    ├── hal-direct/
+#    ├── hal-x86_64/          <- this crate
+#    ├── hal-arm64/
+#    ├── hal-riscv64/
+#    └── hal-manifest/
+#
+# This is the first crate in the workspace that actually produces a
+# bootable artifact: it links hal-core's traits against real x86_64
+# hardware access (CPUID, MSRs, APIC/x2APIC MMIO, TSC/HPET, UEFI Memory
+# Map parsing), plus the minimal `boot.S` assembly stub and linker
+# script needed to go from UEFI handoff to a valid Rust execution
+# environment.
+#
+# Per section 7's build requirements:
+#   - `#![no_std]` in every hal-* crate (enforced in lib.rs, not here)
+#   - built via a custom target (`targets/x86_64-hal.json`) rather than
+#     a prebuilt rustup target, using `-Z build-std=core,alloc` (wired
+#     up already in .cargo/config.toml)
+#   - the earliest bootstrap code (before a valid stack exists) lives in
+#     a separate `boot.S`, kept apart from the 100% Rust remainder
+#
+# NOTE: this crate is intentionally NOT in the workspace's
+# `default-members` (see os-project/Cargo.toml, WORKSPACE.md) — it only
+# builds with `cargo xbuild-x86_64` (the alias defined in
+# .cargo/config.toml), which supplies the custom target and build-std
+# flags. A plain `cargo build` at the workspace root never touches this
+# crate.
+# ============================================================================
+
+[package]
+name        = "hal-x86_64"
+description = "x86_64 architecture implementation of the hal-core trait contracts"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+# Required so `build.rs` below can locate and assemble boot.S / apply
+# linker.ld relative to this crate's own manifest directory rather than
+# the workspace root, regardless of where `cargo` was invoked from.
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+# Only `rlib` is needed: kernel-stub depends on this crate through the
+# ordinary Cargo dependency graph (not by linking a standalone .a file
+# by hand), so Cargo/rustc already knows how to fold this crate's code
+# into kernel-stub's final binary. `staticlib` was removed because it
+# makes rustc treat this crate as a standalone, complete link target
+# requiring its OWN #[panic_handler] — which is wrong here, since the
+# panic handler correctly lives in kernel-stub (the actual final
+# binary), not in this library crate. `rlib` also keeps this crate
+# usable as an ordinary Rust dependency for host-target unit tests of
+# its pure-Rust logic (e.g. CPUID feature bit parsing tested
+# independently of real hardware, per section 8.4's "mock hardware"
+# philosophy applied at the architecture-crate level).
+
+[dependencies]
+hal-core     = { path = "../hal-core" }
+hal-manifest = { path = "../hal-manifest", default-features = false }
+
+# `default-features = false`: this crate runs entirely in the no_std,
+# no-heap boot path (section 9) — the same reasoning as hal-core's own
+# bitflags dependency.
+bitflags = { workspace = true }
+
+[dependencies.hal-direct]
+path = "../hal-direct"
+# hal-direct is an OPTIONAL dependency at the workspace level (section
+# 1: "باید از هم جدا... در باینری نهایی باشند" — must be separate in the
+# final binary too). Gated behind a feature so a minimal/locked-down
+# x86_64 build can be produced without it ever being linked in at all —
+# see the `features` table below.
+optional = true
+
+[features]
+default = []
+# Enables hal-direct support in this architecture's build. Off by
+# default so the "always active, safe" hal-core-only configuration
+# (section 1) is what a plain `cargo xbuild-x86_64` produces; a
+# professional/driver-author build opts in explicitly with
+# `--features hal-direct-support`.
+hal-direct-support = ["dep:hal-direct"]
+
+[package.metadata.hal]
+# Not read by Cargo itself — documentation-as-data for this crate's own
+# build.rs and for developers, recording which custom target this
+# architecture crate is meant to be built against (see
+# targets/x86_64-hal.json and the [target.x86_64-hal] section of
+# .cargo/config.toml). Keeping this explicit here catches a mismatch
+# early if someone renames the target file without updating this crate.
+target = "targets/x86_64-hal.json"

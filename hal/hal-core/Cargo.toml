@@ -1,0 +1,60 @@
+# ============================================================================
+# hal-core
+#
+# The always-active, no_std, no-heap trait layer of the HAL, per
+# 01-HAL-Layer.md section 1:
+#
+#   HAL
+#    ├── hal-core      -> always active, safe, auto-detect, no config needed
+#    └── hal-direct    -> optional, capability-gated
+#
+# This crate defines ONLY the trait/type contracts (section 4's Rust
+# pre-draft: CpuAbstraction, MemoryBootstrap, TimerAbstraction,
+# InterruptController, ComputeDeviceDiscovery, plus the Boot/Power
+# abstractions from sections 3.5/3.7). It contains NO architecture-
+# specific code — that lives in hal-x86_64 / hal-arm64 / hal-riscv64,
+# each of which depends on this crate and implements its traits.
+#
+# Per section 4's closing line: "کد بالادست (میکروکرنل) فقط با traitها
+# کار می‌کند و هیچ #[cfg(target_arch)] در لایه ۲ به بالا نباید دیده شود"
+# — this crate is exactly what makes that possible: it is the single
+# architecture-independent contract every hal-<arch> crate must satisfy.
+# ============================================================================
+
+[package]
+name        = "hal-core"
+description = "Architecture-independent HAL trait contracts (no_std, no heap)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+# Built and unit-tested on the host target by default (mock hardware
+# implementations of these traits, per 01-HAL-Layer.md section 8.4:
+# "تست واحد برای هر trait روی معماری میزبان (mock hardware)"). The real,
+# architecture-specific implementations live in hal-x86_64/arm64/riscv64
+# and are only built with a --target pointing at the relevant custom
+# JSON target.
+
+[dependencies]
+# Fixed-size manifest types (MemoryRegionRaw's runtime counterparts,
+# ComputeKind, etc.) are re-used here rather than redefined, so hal-core
+# and hal-manifest never drift out of sync on what a "compute device" or
+# "memory region" looks like.
+hal-manifest = { path = "../hal-manifest", default-features = false }
+
+# `default-features = false`: bitflags' std-dependent default features
+# are not available in this no_std crate. Used for CpuFeatureFlags
+# (section 3.1: "بیت‌فیلد استاندارد مستقل از معماری") and for the
+# InterruptController's IRQ handling result flags.
+bitflags = { workspace = true }
+
+[dev-dependencies]
+# No extra crates needed: unit tests for trait-level logic (e.g. mock
+# CpuAbstraction implementations) run on the host target with std
+# available there, but the crate under test itself stays no_std.
+
+[features]
+default = []

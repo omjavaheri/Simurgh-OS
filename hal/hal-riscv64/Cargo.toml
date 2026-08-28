@@ -1,0 +1,67 @@
+# ============================================================================
+# hal-riscv64
+#
+# The RISC-V (RV64GC) architecture implementation of every hal-core
+# trait, per 01-HAL-Layer.md section 6. Mirrors hal-x86_64/hal-arm64's
+# structure (see hal-x86_64/Cargo.toml for the general rationale shared
+# by every hal-<arch> crate); this file only documents what differs.
+#
+# Key architectural differences from both x86_64 and ARM64, reflected
+# throughout this crate:
+#   - Boot protocol: SBI (Supervisor Binary Interface) + Device Tree —
+#     NOT UEFI, per 01-HAL-Layer.md section 3.5's explicit RISC-V row
+#     ("SBI + Device Tree"). This is the one hal-<arch> crate in this
+#     project that does NOT share hal-x86_64/hal-arm64's UEFI boot
+#     path at all.
+#   - Privilege levels: M-mode (machine, boot-time only) / S-mode
+#     (supervisor, this project's kernel) / U-mode (user) — mapped onto
+#     hal-core's Kernel/User/Monitor the same way ARM64 maps EL1/EL0/EL2.
+#   - Interrupt controller: PLIC (external interrupts) + CLIC (fast
+#     local/vectored interrupts), per section 3.4.
+#   - Timer: SBI TIME extension (mtime/mtimecmp), per section 3.3.
+#   - IOMMU: IOPMP, per section 3.2.
+#   - Device Tree is MANDATORY (not "preferred, ACPI as alternative"
+#     like ARM64) per the SBI specification itself — this crate has no
+#     ACPI code path at all, unlike hal-arm64/memory.rs.
+# ============================================================================
+
+[package]
+name        = "hal-riscv64"
+description = "RISC-V (RV64GC) architecture implementation of the hal-core trait contracts"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+# Only `rlib` is needed: kernel-stub depends on this crate through the
+# ordinary Cargo dependency graph (not by linking a standalone .a file
+# by hand), so Cargo/rustc already knows how to fold this crate's code
+# into kernel-stub's final binary. `staticlib` was removed because it
+# makes rustc treat this crate as a standalone, complete link target
+# requiring its OWN #[panic_handler] — which is wrong here, since the
+# panic handler correctly lives in kernel-stub (the actual final
+# binary), not in this library crate. `rlib` also keeps this crate
+# usable as an ordinary Rust dependency for host-target unit tests of
+# its pure-Rust logic (e.g. CPUID feature bit parsing tested
+# independently of real hardware, per section 8.4's "mock hardware"
+# philosophy applied at the architecture-crate level).
+
+[dependencies]
+hal-core     = { path = "../hal-core" }
+hal-manifest = { path = "../hal-manifest", default-features = false }
+bitflags     = { workspace = true }
+
+[dependencies.hal-direct]
+path = "../hal-direct"
+optional = true
+
+[features]
+default = []
+hal-direct-support = ["dep:hal-direct"]
+
+[package.metadata.hal]
+target = "targets/riscv64gc-hal.json"

@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "hal/hal-manifest",
+    "hal/hal-core",
+    "hal/hal-direct",
+    "hal/hal-x86_64",
+    "hal/hal-arm64",
+    "hal/hal-riscv64",
+    "kernel-stub",
+    "uefi-bootloader",
+]
+
+# فقط کریت‌های معماری-مستقل در build پیش‌فرض (بدون --target) کامپایل می‌شوند.
+# hal-x86_64 / hal-arm64 / hal-riscv64 نیاز به target سفارشی no_std دارند
+# و اگر در default-members باشند، `cargo build` ساده روی هاست fail می‌شود.
+default-members = [
+    "hal/hal-manifest",
+    "hal/hal-core",
+    "hal/hal-direct",
+]
+
+[workspace.package]
+edition      = "2021"
+version      = "0.1.0"
+authors      = ["Simurgh OS Project Contributors"]
+license      = "MPL-2.0"
+repository   = "https://github.com/omjavaheri/Simurgh-OS-Layer01-HAL"
+
+# نسخه‌ی مشترک وابستگی‌ها بین همه‌ی کریت‌های no_std لایه ۱
+[workspace.dependencies]
+bitflags = { version = "2", default-features = false }
+
+# panic=abort اجباری است: کد no_std این پروژه به unwinding runtime متکی نیست
+# (طبق سند لایه ۲، بخش ۱.۱ — این قاعده به لایه ۱ هم سرایت می‌کند چون هر دو
+# در همان باینری Privileged لینک می‌شوند)
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic         = "abort"
+lto           = true
+codegen-units = 1
+opt-level     = "z"      # اولویت با اندازه‌ی باینری بوت، نه سرعت کامپایل
+strip         = false    # دیباگ‌پذیری روی QEMU حفظ شود؛ برای ریلیز نهایی بعداً strip می‌کنیم
