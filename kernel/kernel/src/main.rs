@@ -729,6 +729,19 @@ fn simurgh_syscall(
             kernel_arch_glue::log(format_args!(
                 "device-manager (U-mode, isolated subsystem process): state={name} restarts_in_window={a1}\r\n"
             ));
+            if a0 == 3 {
+                // `Failed`: device-manager has given up and drops into
+                // its own "spin forever" idle (matches every other demo
+                // process's convention) — it will never again call
+                // `DM_WAIT_CRASH`/`DM_RESPAWN_DRIVER`, so it must stop
+                // being exempt from ordinary preemption (`p2_tick`'s
+                // `DM_TID` check), or it would monopolize the CPU forever
+                // and starve A/B/C's own fairness demo. A real bug hit
+                // via QEMU: `s_timer` fired ~12500 times in a tight
+                // re-arm loop with zero forward progress once
+                // device-manager's exemption outlived its purpose.
+                kernel_arch_glue::p2_dm_supervision_done();
+            }
             return TrapOutcome::Resume(0);
         }
         sys::DM_WAIT_CRASH => {

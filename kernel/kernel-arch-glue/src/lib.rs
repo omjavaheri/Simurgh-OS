@@ -993,6 +993,29 @@ pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
     // SAFETY: single-core; `G_HAL` set by `enter`; `P2_TICKS` / `P2_*`
     // touched only from this path and the one-time setup.
     let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+
+    // Device-manager's own scheduling is governed ENTIRELY by the
+    // deterministic crash/respawn hand-off (`p2_fault`'s hand-off to
+    // `DM_TID` / `p2_dm_handoff_to_driver`), not this ordinary
+    // round-robin timer — it is not a participant in the A/B/C fairness
+    // demo this tick counts toward. Letting an ordinary tick preempt it
+    // here would race with that protocol: if device-manager loses the
+    // ordinary scheduler's fairness comparison at the WRONG moment
+    // (between finishing a crash-notify resume and making its own next
+    // respawn call), NOTHING would ever give it the CPU back — the
+    // driver it would respawn is not even running yet to crash and
+    // trigger the OTHER hand-off. A real bug hit via QEMU: the
+    // crash/restart cycle would silently stop one step short of ever
+    // reporting `Failed`, despite every crash having genuinely happened.
+    // Simply never counting this tick, or switching away, while
+    // device-manager holds the CPU closes it.
+    // SAFETY: single-core.
+    let dm_tid = unsafe { core::ptr::addr_of!(DM_TID).read() };
+    if dm_tid.is_some() && dm_tid == kstate().sched.running() {
+        hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+        return None;
+    }
+
     let ticks = unsafe { core::ptr::addr_of!(P2_TICKS).read() } + 1;
     unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(ticks) };
 
@@ -1133,6 +1156,18 @@ pub fn p2_watch_driver(tid: ThreadId) {
 pub fn p2_register_device_manager(tid: ThreadId) {
     // SAFETY: single-core; only written here, read by `p2_fault`.
     unsafe { core::ptr::addr_of_mut!(DM_TID).write(Some(tid)) };
+}
+
+/// Called once device-manager reports `Failed` (`sys::DM_REPORT` with
+/// `a0 == 3`): it has given up and drops into its own "spin forever"
+/// idle, so it must stop being exempt from ordinary preemption
+/// (`p2_tick`'s `DM_TID` check) — it will never again call
+/// `DM_WAIT_CRASH`/`DM_RESPAWN_DRIVER`, and staying exempt would let it
+/// monopolize the CPU forever, starving A/B/C's own fairness demo. See
+/// `p2_tick`'s doc comment for the exemption this undoes.
+pub fn p2_dm_supervision_done() {
+    // SAFETY: single-core; only written here and by `p2_register_device_manager`.
+    unsafe { core::ptr::addr_of_mut!(DM_TID).write(None) };
 }
 
 /// `DM_WAIT_CRASH` from device-manager: block until the watched driver
