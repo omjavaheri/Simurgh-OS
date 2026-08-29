@@ -575,6 +575,29 @@ extern "C" fn umode_a_loop() -> ! {
     }
 }
 
+/// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
+/// Layer.md §5.2 acceptance-test demo: "inject a panic in a driver,
+/// prove the rest of the system is unaffected". Executes an illegal
+/// instruction the instant it is scheduled, taking a synchronous U-mode
+/// exception (scause=2) that `hal_riscv64`'s trap vector routes to the
+/// registered `FaultHandler` (`simurgh_fault` -> `kernel_arch_glue::
+/// p2_fault` -> `KernelState::terminate_thread`) instead of halting the
+/// system — proving per-thread fault isolation end-to-end, not just at
+/// the unit-test level (`kernel-core`'s `terminate_thread` tests already
+/// cover the state-machine in isolation).
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_faulty_driver() -> ! {
+    // SAFETY: `.word 0` is not a valid RV64GC instruction encoding —
+    // deliberately triggers an illegal-instruction exception, which is
+    // the entire point of this process. `options(noreturn)` is honest:
+    // control never falls through this instruction (the thread is
+    // terminated by the fault handler and never resumed).
+    unsafe {
+        core::arch::asm!(".word 0", options(noreturn));
+    }
+}
+
 /// Placeholder U-mode entry for the architectures whose real-kernel boot
 /// is not yet wired (x86_64 / aarch64 still boot `kernel-stub`).
 #[cfg(not(target_arch = "riscv64"))]
@@ -667,6 +690,7 @@ fn simurgh_syscall(
         }
         sys::P2_PREEMPT_START => {
             spawn_device_manager(kernel_arch_glue::khal());
+            spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
@@ -842,6 +866,23 @@ fn simurgh_tick() -> hal_riscv64::cpu::TrapOutcome {
     }
 }
 
+/// The per-process fault-isolation handler the HAL trap vector calls for
+/// a synchronous exception taken from a running U-mode thread that is
+/// not an `ecall` (registered via `hal_riscv64::cpu::set_fault_handler`)
+/// — 03-Kernel-Subsystems-Layer.md §2.1/§5.2. Delegates to
+/// `kernel-arch-glue`, which terminates the faulting thread and picks
+/// whatever else is runnable; `Some(into)` resumes it, `None` means
+/// nothing else was runnable (fatal — the trap vector falls through to
+/// the system-halt dump in that case).
+#[cfg(target_arch = "riscv64")]
+fn simurgh_fault(cause_code: usize, sepc: usize, stval: usize) -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_fault(cause_code, sepc, stval) {
+        Some(into) => TrapOutcome::Terminate { into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
 // Linker symbols for the user (layer-3) Root Task image — see
 // hal-riscv64/src/linker.ld's `.user_text` / `.user_stack` sections.
 #[cfg(target_arch = "riscv64")]
@@ -951,6 +992,39 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
     }
 }
 
+/// Spawns `umode_faulty_driver` (see its doc comment) via the SAME
+/// generic `kernel_arch_glue::spawn_process` path as device-manager, so
+/// it joins the same preemption loop and its crash can be observed
+/// happening concurrently with the rest of the demo — the real §5.2
+/// proof point is that A/B/C and device-manager are unaffected by it.
+#[cfg(target_arch = "riscv64")]
+fn spawn_faulty_driver(hal: &hal_core::HalInterface) {
+    let k = kernel_arch_glue::kstate();
+    let user = user_image();
+    const FAULTY_STACK_VMA: usize = 0xC050_0000;
+    const FAULTY_STACK_LEN: usize = 4096 * 4;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        FAULTY_STACK_VMA,
+        FAULTY_STACK_LEN,
+        umode_faulty_driver as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned faulty-driver (tid {}) - it will fault on its first instruction (fault-isolation demo, 03 5.2)\r\n",
+                tid.as_u32()
+            ));
+        }
+        None => kernel_arch_glue::log(format_args!(
+            "root task: faulty-driver spawn skipped (out of resources)\r\n"
+        )),
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel_main — architecture-independent body
 // ----------------------------------------------------------------------------
@@ -981,12 +1055,17 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             let _ = writeln!(s, "----------------------------------------------------------------------");
             let _ = writeln!(s, "handing control to the Root Task...");
             // Register the S-mode syscall handler the HAL trap vector
-            // invokes for an `ecall` from U-mode, and the tick handler it
-            // invokes for a supervisor timer interrupt on a U-mode thread.
+            // invokes for an `ecall` from U-mode, the tick handler it
+            // invokes for a supervisor timer interrupt on a U-mode thread,
+            // and the fault handler it invokes for any other synchronous
+            // exception taken from U-mode (03-Kernel-Subsystems-Layer.md
+            // §2.1/§5.2 per-process fault isolation).
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_syscall_handler(simurgh_syscall);
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_tick_handler(simurgh_tick);
+            #[cfg(target_arch = "riscv64")]
+            hal_riscv64::cpu::set_fault_handler(simurgh_fault);
             // Never returns: runs the in-kernel demo, then (riscv64) maps
             // the user image U=1, activates Sv39 paging, and drops the
             // Root Task to U-mode isolated.

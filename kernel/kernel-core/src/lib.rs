@@ -45,7 +45,7 @@ pub mod preempt;
 mod fuzz;
 
 pub use config::CONTEXT_BYTES;
-pub use preempt::PreemptStep;
+pub use preempt::{PreemptStep, TerminationOutcome};
 pub use run::ScheduleOutcome;
 pub use state::{KernelInitError, KernelState};
 pub use syscall::{SyscallError, SyscallOp, SyscallReturn};
