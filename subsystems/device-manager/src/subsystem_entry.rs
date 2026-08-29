@@ -1,5 +1,18 @@
 //! ============================================================================
-//! subsystem_entry.rs — riscv64
+//! subsystem_entry.rs — riscv64 / x86_64
+//!
+//! Note on this file's ONE architecture-conditional piece: the crate-
+//! level invariant is "no `#[cfg(target_arch)]` in `kernel/` or
+//! `subsystems/`" (everything architecture-specific belongs in the
+//! `hal-<arch>` crates or the final binary), and `raw_syscall` below
+//! is a pre-existing, narrow exception to it — this function's ONLY
+//! job is to issue the raw syscall INSTRUCTION itself (`ecall`/
+//! `int 0x80`/a future `svc`), which is unavoidably an ISA detail no
+//! `hal-core` abstraction covers (it runs entirely in U-mode, on the
+//! OTHER side of the kernel/user boundary those crates model). Kept
+//! to this one function, gated per architecture, with every other
+//! line in this file (the `Supervised` state-machine driving logic)
+//! staying genuinely architecture-generic.
 //!
 //! Purpose: Device Manager's real process entry point. Runs `Supervised`
 //! against REAL crashes of a REAL driver process — blocking on the
@@ -71,6 +84,7 @@ const DM_RESPAWN_DRIVER: usize = 33;
 ///
 /// Returns whatever the kernel wrote back into `a0` (`0` for opcodes that
 /// carry no return value, e.g. `DM_REPORT`).
+#[cfg(target_arch = "riscv64")]
 #[inline(always)]
 unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     let ret;
@@ -81,6 +95,29 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
             in("a7") a7,
             inlateout("a0") a0 => ret,
             in("a1") a1,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// # Safety
+/// `int 0x80` from Ring 3 traps to `hal_x86_64::cpu`'s dedicated DPL-3
+/// gate, which preserves every register except `rax` — this project's
+/// own convention (see `hal_x86_64::cpu::SyscallHandler`'s doc comment):
+/// `rax` = opcode (`a7`), `rdi` = `a0`, `rsi` = `a1`. Same register-only
+/// contract as the riscv64 variant above.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") a7 => ret,
+            in("rdi") a0,
+            in("rsi") a1,
             options(nostack),
         );
     }

@@ -196,11 +196,24 @@ static mut GDT: [u64; 7] = [
 // matters here.
 // ============================================================================
 
-/// 16 KiB, matching the boot stack's own sizing rationale (`cpu.rs`
-/// module docs) — this is the stack the CPU switches to for the
-/// duration of servicing a U-mode trap; the syscall trampoline below
-/// only ever pushes a small, fixed number of registers on it.
-const TSS_RSP0_STACK_SIZE: usize = 16 * 1024;
+/// 64 KiB — this is the stack the CPU switches to for the duration of
+/// servicing a U-mode trap. The trampolines themselves (syscall/fault)
+/// only ever push a small, fixed number of registers, but the SYSCALL
+/// HANDLERS they call into can recurse arbitrarily deep in an
+/// unoptimized (`dev`-profile) build: **bug found via QEMU** — the P2/
+/// device-manager demo's `P2_REPORT_A` handler calls
+/// `spawn_device_manager_x86`/`spawn_faulty_driver_x86`
+/// (`root_task::plan_boot` + `kernel_arch_glue::spawn_process`, several
+/// unoptimized stack frames deep each) directly from THIS stack — with
+/// the original 16 KiB, this overflowed below `TSS_RSP0_STACK`,
+/// corrupting whatever sat below it and producing an unrecoverable
+/// `#GP`/`#DF` storm (QEMU `-d int`: ~4500 `v=0d` at the SAME `RIP`,
+/// `RSP` stuck near the bottom of the 16 KiB region, escalating to one
+/// `v=08` double fault) with zero further serial output — silent from
+/// the boot log's perspective, diagnosed only via `-d int` tracing.
+/// 64 KiB (matching hal-riscv64's own identical fix for an analogous
+/// deep-recursion-into-`spawn_process` stack-overflow bug) resolved it.
+const TSS_RSP0_STACK_SIZE: usize = 64 * 1024;
 /// `.bss`, zeroed by the loader — never read before `bootstrap_current_core`
 /// points `TSS.rsp0` at its top.
 static mut TSS_RSP0_STACK: [u8; TSS_RSP0_STACK_SIZE] = [0; TSS_RSP0_STACK_SIZE];
@@ -1033,6 +1046,33 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
             }
             let addr = &isr_syscall_trampoline as *const u8 as u64;
             IDT[SYSCALL_VECTOR as usize] = IdtEntry::gate_dpl3(addr);
+        }
+
+        // The fault gate: `#UD` (vector 6), same override pattern as the
+        // syscall gate just above — points at the DEDICATED
+        // `isr_fault_trampoline` instead of the generic `isr_stub_6` the
+        // loop installed, since only the dedicated one has TrapOutcome-
+        // style switch semantics. Stays DPL 0 (the default `gate()`
+        // already installed): `#UD` is CPU-generated, not raised via a
+        // software `int`, so the IDT's own DPL check (which only applies
+        // to `int nn`) never blocks it regardless.
+        //
+        // SAFETY: `IDT` is written here, on the bootstrap core, before
+        // `load_idt` is called and before interrupts are enabled — no
+        // concurrent access is possible.
+        unsafe {
+            unsafe extern "C" {
+                static isr_fault_trampoline: u8;
+            }
+            let addr = &isr_fault_trampoline as *const u8 as u64;
+            IDT[FAULT_VECTOR_UD as usize] = IdtEntry::gate(addr);
+        }
+
+        // SAFETY: `IDT`/`TSS`/`GDT` are fully populated at this point
+        // (generic loop + both dedicated overrides above); this is the
+        // bootstrap core, before interrupts are enabled — no concurrent
+        // access is possible.
+        unsafe {
             load_idt();
             load_tss();
         }
@@ -1306,8 +1346,32 @@ extern "C" fn common_syscall_entry(frame: *mut SyscallFrame) {
     match h(f.rax as usize, f.rdi as usize, f.rsi as usize) {
         TrapOutcome::Resume(ret) => {
             f.rax = ret as u64;
-            // Resume at the instruction after the 2-byte `int 0x80`.
-            f.rip += 2;
+            // `rip` needs NO adjustment here: unlike a hardware exception
+            // (which points AT the faulting instruction, "int $0x80"'s
+            // COMPLETE, HARDWARE-SAVED return address already points at
+            // the instruction FOLLOWING the 2-byte `int 0x80` — Intel SDM
+            // Vol. 3 §6.3.1, "software interrupt": the saved CS:RIP is the
+            // address of the instruction after INT n, exactly like a CALL
+            // instruction's own return address. **Real bug found via
+            // QEMU** (this session's P2/device-manager demo, not the
+            // original U-mode+syscall milestone that introduced this
+            // line): an earlier draft of this function added a manual
+            // `f.rip += 2` here on top of that already-correct hardware
+            // value, DOUBLE-advancing past the next instruction's own
+            // first 2 bytes. This went unnoticed in the original
+            // milestone's narrow ALIVE/REPORT/spin-forever test (and
+            // even survived this session's OWN two-process cooperative
+            // round-trip) purely by luck — the skipped 2 bytes happened
+            // to still decode into something harmless for BOTH of those
+            // specific code layouts — but device-manager's
+            // `subsystem_main` hit a genuinely bad byte boundary: landing
+            // 2 bytes into a 6-byte `movl $1, %r8d`, decoding garbage for
+            // its remaining bytes, which then read from a bogus address
+            // and took a Ring-3 `#PF` (confirmed via a temporary raw-
+            // serial dump of `rip` on entry, which was ALREADY correct
+            // pre-adjustment: `0x4000017e`, matching the disassembled
+            // next instruction exactly — proving the hardware advance
+            // alone is correct and any further `+=` is the bug).
         }
         TrapOutcome::SwitchTo { save, into } => {
             // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
@@ -1316,10 +1380,14 @@ extern "C" fn common_syscall_entry(frame: *mut SyscallFrame) {
             // thread — resuming AFTER its `int 0x80` — then never
             // return: `restore_user_and_iretq` abandons this trap
             // frame's stack and `iretq`s into the incoming thread.
+            //
+            // `f.rip` (NOT `f.rip + 2`): same bug/fix as the `Resume`
+            // arm just above — the hardware-saved return address ALREADY
+            // points past the 2-byte `int 0x80`.
             unsafe {
                 save_syscall_frame_as_user_context(
                     f,
-                    f.rip + 2,
+                    f.rip,
                     save as *mut X8664UserContext,
                 );
                 restore_user_and_iretq(into as *const X8664UserContext);
@@ -1337,10 +1405,13 @@ extern "C" fn common_syscall_entry(frame: *mut SyscallFrame) {
 
 /// Serialises an interrupted U-mode `SyscallFrame` into an
 /// `X8664UserContext` so it can be `restore_user_and_iretq`'d later.
-/// `resume_rip` is where the thread should continue (the caller passes
-/// `rip + 2` so a suspended `int 0x80` does not re-execute). Captures
-/// the *live* CR3, which for a trap taken from U-mode already describes
-/// the thread's own address space.
+/// `resume_rip` is where the thread should continue — for a suspended
+/// `int 0x80`, the caller passes `f.rip` UNCHANGED: the hardware-saved
+/// return address for a software interrupt already points past the
+/// 2-byte `int 0x80` (see `common_syscall_entry`'s `Resume` arm doc
+/// comment for the bug this fixes). Captures the *live* CR3, which for
+/// a trap taken from U-mode already describes the thread's own address
+/// space.
 ///
 /// # Safety
 /// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
@@ -1424,6 +1495,174 @@ unsafe fn restore_user_and_iretq(blob: *const X8664UserContext) -> ! {
             in("r15") blob,
             options(noreturn),
         );
+    }
+}
+
+// ============================================================================
+// Per-process fault isolation (`#UD`, Ring 3 -> Ring 0) — analogous to
+// hal-riscv64's `FaultHandler`/`common_trap_entry`'s exception branch
+// (03-Kernel-Subsystems-Layer.md §2.1/§5.2: a driver crash must kill only
+// that ONE process). Routed through a SECOND dedicated trampoline
+// (`isr_fault_trampoline`), separate from both the generic 256-vector ISR
+// path (no TrapOutcome semantics) and the syscall boundary above (a
+// different vector, a different calling convention) — reusing
+// `SyscallFrame`'s exact layout, since `#UD` (unlike e.g. `#PF`/`#GP`)
+// pushes NO error code, so the hardware-pushed IRETQ frame sits at the
+// same offset the syscall trampoline already expects.
+// ============================================================================
+
+/// `#UD` (Invalid Opcode) — this project's fault-injection demo choice on
+/// x86_64, analogous to hal-riscv64's `.word 0`: `ud2` is the ISA-
+/// guaranteed-invalid encoding, so a deliberately crashing process can
+/// trigger it with a single, unambiguous instruction. The ONLY vector
+/// this mechanism currently handles — a real kernel would extend this to
+/// every exception vector that can legitimately occur from Ring 3 (e.g.
+/// `#PF`/`#GP`), a tracked follow-up once a concrete need arises.
+const FAULT_VECTOR_UD: u8 = 6;
+
+/// Signature of the handler `common_fault_entry` calls for a Ring-3
+/// `#UD`: `(vector, rip, _reserved)` — mirrors hal-riscv64's
+/// `FaultHandler`'s `(cause_code, sepc, stval)` shape; `_reserved` stays
+/// 0 today (there is no AArch64/RISC-V-style single fault-info register
+/// value for `#UD` the way `stval`/`FAR_EL1` carry one for a memory
+/// fault) but keeps the signature stable if a future vector needs it.
+pub type FaultHandler = fn(usize, usize, usize) -> TrapOutcome;
+
+#[cfg(target_os = "none")]
+static mut FAULT_HANDLER: Option<FaultHandler> = None;
+
+/// Registers the handler `common_fault_entry` calls for a Ring-3 `#UD`.
+/// Same "no handler, no behavior change" contract as `set_syscall_handler`
+/// — a binary that never registers one (e.g. `kernel-stub`) is unaffected;
+/// an unhandled `#UD` (no registered handler, or one taken from Ring 0)
+/// halts, same as any other unexpected fault.
+#[cfg(target_os = "none")]
+pub fn set_fault_handler(handler: FaultHandler) {
+    // SAFETY: single-core boot; set exactly once before any drop to
+    // Ring 3.
+    unsafe {
+        core::ptr::addr_of_mut!(FAULT_HANDLER).write(Some(handler));
+    }
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .global isr_fault_trampoline
+    isr_fault_trampoline:
+        push r15
+        push r14
+        push r13
+        push r12
+        push r11
+        push r10
+        push r9
+        push r8
+        push rbp
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push rbx
+        push rax
+
+        mov rdi, rsp
+        call common_fault_entry
+
+        mov rbx, [rsp + 8]
+        mov rcx, [rsp + 16]
+        mov rdx, [rsp + 24]
+        mov rsi, [rsp + 32]
+        mov rdi, [rsp + 40]
+        mov rbp, [rsp + 48]
+        mov r8,  [rsp + 56]
+        mov r9,  [rsp + 64]
+        mov r10, [rsp + 72]
+        mov r11, [rsp + 80]
+        mov r12, [rsp + 88]
+        mov r13, [rsp + 96]
+        mov r14, [rsp + 104]
+        mov r15, [rsp + 112]
+        mov rax, [rsp + 0]
+        add rsp, 120
+        iretq
+    "#
+);
+
+/// Host (`cargo test`) stub — same reason `common_syscall_entry` needs
+/// one (the `global_asm!` trampoline's `call` is never cfg-gated).
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_fault_entry(_frame: *mut SyscallFrame) {}
+
+/// Called from `isr_fault_trampoline` with a pointer to the pushed
+/// `SyscallFrame`. A CPU exception (unlike a syscall) can be taken from
+/// EITHER privilege level, so this checks `frame.cs & 3` first: a Ring-0
+/// `#UD` is the kernel's own bug and stays genuinely fatal (falls
+/// through to `halt_on_unexpected_fault`, mirroring hal-riscv64's own
+/// "S-mode fault stays unconditionally fatal" choice), never reaching
+/// the registered handler at all.
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_fault_entry(frame: *mut SyscallFrame) {
+    // SAFETY: `frame` points at the 160-byte block `isr_fault_trampoline`
+    // just pushed, this function's only caller.
+    let f = unsafe { &mut *frame };
+    let from_ring3 = (f.cs & 3) == 3;
+    if from_ring3 {
+        // SAFETY: single-core; `FAULT_HANDLER` is only written by
+        // `set_fault_handler` during boot, before any drop to Ring 3.
+        let handler = unsafe { core::ptr::addr_of!(FAULT_HANDLER).read() };
+        if let Some(h) = handler {
+            match h(FAULT_VECTOR_UD as usize, f.rip as usize, 0) {
+                TrapOutcome::Resume(ret) => {
+                    // Not the expected outcome for a fatal exception (the
+                    // faulting instruction is still `ud2`, so resuming
+                    // at the SAME `rip` would just re-fault forever),
+                    // but the type is shared with the syscall path, so
+                    // this arm must exist — same as hal-riscv64's own
+                    // fault-handler `Resume` arm.
+                    f.rax = ret as u64;
+                    return;
+                }
+                TrapOutcome::SwitchTo { save, into } => {
+                    // SAFETY: `save`/`into` are kernel-owned, 8-byte-
+                    // aligned `HAL_USER_CONTEXT_BYTES` blobs. Resume
+                    // point is `f.rip` unchanged (the faulting
+                    // instruction never legitimately completes).
+                    unsafe {
+                        save_syscall_frame_as_user_context(
+                            f,
+                            f.rip,
+                            save as *mut X8664UserContext,
+                        );
+                        restore_user_and_iretq(into as *const X8664UserContext);
+                    }
+                }
+                TrapOutcome::Terminate { into } => {
+                    // The expected outcome: the faulting thread is dead,
+                    // its trap frame abandoned, no save.
+                    // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+                    // `HAL_USER_CONTEXT_BYTES` blob.
+                    unsafe { restore_user_and_iretq(into as *const X8664UserContext) };
+                }
+            }
+            return;
+        }
+    }
+    halt_on_unexpected_fault();
+}
+
+#[cfg(target_os = "none")]
+fn halt_on_unexpected_fault() -> ! {
+    loop {
+        // SAFETY: `hlt` is the standard, side-effect-free halt — same
+        // terminal-state justification as every other architecture's
+        // unhandled-fault path.
+        unsafe {
+            core::arch::asm!("cli");
+            core::arch::asm!("hlt");
+        }
     }
 }
 
