@@ -239,6 +239,7 @@ impl KernelState {
             None => TerminationOutcome::Idle,
         }
     }
+<<<<<<< HEAD
 
     /// `tid` voluntarily blocks waiting on an external event (this
     /// session's real crash-notification wait — `kernel-arch-glue::
@@ -338,6 +339,8 @@ impl KernelState {
             incoming: to,
         }
     }
+=======
+>>>>>>> c823464 (feat(kernel): real per-thread fault isolation — a crashing process dies alone (riscv64))
 }
 
 /// What `terminate_thread` resolved to. Unlike `PreemptStep`, there is no
@@ -364,7 +367,10 @@ pub enum TerminationOutcome {
 mod tests {
     use super::*;
     use hal_core::{BootInfo, BootProtocol};
+<<<<<<< HEAD
     use kernel_sched::RunState;
+=======
+>>>>>>> c823464 (feat(kernel): real per-thread fault isolation — a crashing process dies alone (riscv64))
     use hal_manifest::raw::{
         HardwareManifestRaw, MemoryRegionKindRaw, MemoryRegionRaw, TimerInfoRaw, TimerKindRaw,
     };
@@ -422,6 +428,7 @@ mod tests {
         assert!(k.sched.entity(root).is_none());
         assert_eq!(k.sched.running(), Some(other));
     }
+<<<<<<< HEAD
 
     #[test]
     fn block_thread_switches_to_another_ready_thread() {
@@ -547,4 +554,6 @@ mod tests {
         assert_eq!(k.sched.running(), Some(target));
         assert_eq!(k.sched.entity(root).unwrap().state, RunState::Blocked);
     }
+=======
+>>>>>>> c823464 (feat(kernel): real per-thread fault isolation — a crashing process dies alone (riscv64))
 }
