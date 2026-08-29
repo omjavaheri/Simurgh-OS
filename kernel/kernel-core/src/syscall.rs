@@ -24,7 +24,7 @@
 
 use crate::state::KernelState;
 use crate::tcb::ThreadState;
-use hal_core::{MapPermissions, VirtAddr};
+use hal_core::{HalInterface, MapPermissions, VirtAddr};
 use kernel_cap::{
     CapId, CapTableError, Capability, CapabilityRights, KernelObjectKind, ObjectId, ObjectRef,
     PageTableId, ThreadId, UntypedId,
@@ -248,12 +248,17 @@ impl KernelState {
 
     /// The one syscall entry point. `now_ns` is the current monotonic
     /// time from `hal_core::TimerAbstraction::now_ns`, threaded in so the
-    /// scheduler can charge run time without this crate touching the HAL.
+    /// scheduler can charge run time without this crate touching the HAL
+    /// otherwise. `hal` itself is threaded through only for `Map`'s real
+    /// hardware page-table walk (`do_map`) — every other arm ignores it;
+    /// this crate still never touches raw physical memory itself (see
+    /// `KernelState`'s map-pool fields' doc comment).
     pub fn dispatch(
         &mut self,
         caller: ThreadId,
         now_ns: u64,
         op: SyscallOp,
+        hal: &HalInterface,
     ) -> Result<SyscallReturn, SyscallError> {
         match op {
             SyscallOp::Yield => {
@@ -296,7 +301,7 @@ impl KernelState {
                 frame,
                 vaddr,
                 perms,
-            } => self.do_map(caller, page_table, frame, vaddr, perms),
+            } => self.do_map(caller, page_table, frame, vaddr, perms, hal),
 
             SyscallOp::Send { endpoint, msg } => self.do_send(caller, endpoint, msg, false, now_ns),
             SyscallOp::Call { endpoint, msg } => self.do_send(caller, endpoint, msg, true, now_ns),
@@ -440,6 +445,16 @@ impl KernelState {
         Ok(SyscallReturn::Granted { dst: dst_slot })
     }
 
+    /// `Map` (02-Microkernel-Layer.md §6): resolve the `page_table` /
+    /// `frame` capabilities (rights-checked — the caller must hold
+    /// `WRITE` on the page table and `READ`/`WRITE`/`EXECUTE` on the
+    /// frame matching `perms`), record the mapping in the software
+    /// `AddressSpace` model, then — if this architecture has a working
+    /// `map_range` (`install_map_pool` was called at boot) — walk it into
+    /// REAL hardware page-table entries too, rolling the software model
+    /// back if that hardware walk fails so the two never drift (see
+    /// `kernel_mm::address_space`'s module doc and `MmError::
+    /// HardwareMapFailed`).
     fn do_map(
         &mut self,
         caller: ThreadId,
@@ -447,6 +462,7 @@ impl KernelState {
         frame: CapId,
         vaddr: VirtAddr,
         perms: MapPermissions,
+        hal: &HalInterface,
     ) -> Result<SyscallReturn, SyscallError> {
         let pt = self.resolve(
             caller,
@@ -471,8 +487,43 @@ impl KernelState {
             .base();
 
         let as_id = PageTableId::new(pt.object.id.as_u32());
-        let space = self.addr_space_mut(as_id).ok_or(SyscallError::BadCap)?;
-        space.map(vaddr, frame_phys, PAGE_SIZE, perms)?;
+        let root_phys = {
+            let space = self.addr_space_mut(as_id).ok_or(SyscallError::BadCap)?;
+            space.map(vaddr, frame_phys, PAGE_SIZE, perms)?;
+            space.root_phys().as_usize()
+        };
+
+        if self.map_pool_base() != 0 {
+            // R=1 | W=2 | X=4 | U=8 (`hal_core::CpuAbstraction::map_range`'s
+            // portable bitfield). U is set unconditionally: `Map` is
+            // always a user-space-facing syscall in this MVP — there is
+            // no kernel-only variant of it.
+            let perm_bits = (perms.readable as usize)
+                | ((perms.writable as usize) << 1)
+                | ((perms.executable as usize) << 2)
+                | (1 << 3);
+            let (pool_base, pool_len) = self.map_pool_remaining();
+            let consumed = hal.map_range(
+                root_phys,
+                vaddr.as_usize(),
+                frame_phys.as_usize(),
+                PAGE_SIZE,
+                perm_bits,
+                pool_base,
+                pool_len,
+            );
+            if consumed == u32::MAX {
+                // Roll back: the hardware never saw this mapping, so the
+                // software model must not claim it either.
+                if let Some(space) = self.addr_space_mut(as_id) {
+                    let _ = space.unmap(vaddr);
+                }
+                return Err(SyscallError::Mm(MmError::HardwareMapFailed));
+            }
+            self.map_pool_advance(consumed);
+            hal.flush_tlb();
+        }
+
         Ok(SyscallReturn::Mapped)
     }
 
@@ -576,10 +627,73 @@ impl KernelState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hal_core::{BootInfo, BootProtocol};
+    use hal_core::cpu::{CpuAbstraction, CpuContext, CpuFeatureFlags, PrivilegeLevel};
+    use hal_core::timer::{TimerAbstraction, TimerCallback, TimerMode};
+    use hal_core::{BootInfo, BootProtocol, HalError, HAL_CONTEXT_BYTES};
     use hal_manifest::raw::{
         HardwareManifestRaw, MemoryRegionKindRaw, MemoryRegionRaw, TimerInfoRaw, TimerKindRaw,
     };
+
+    // Minimal mock `HalInterface` for `dispatch`'s new `hal` parameter.
+    // `map_range`/`flush_tlb` are left at their default (no-op /
+    // `u32::MAX`-returning) trait implementations: no test here installs
+    // a map pool, so `do_map`'s hardware path is never exercised —
+    // exactly the "no pool on this architecture" MVP fallback these
+    // tests stand in for.
+    struct MockCpu;
+    impl CpuAbstraction<HAL_CONTEXT_BYTES> for MockCpu {
+        fn core_count(&self) -> usize {
+            1
+        }
+        fn current_core_id(&self) -> usize {
+            0
+        }
+        fn feature_flags(&self) -> CpuFeatureFlags {
+            CpuFeatureFlags::empty()
+        }
+        unsafe fn context_switch(
+            &self,
+            _from: &mut CpuContext<HAL_CONTEXT_BYTES>,
+            _to: &CpuContext<HAL_CONTEXT_BYTES>,
+        ) {
+        }
+        fn set_privilege_level(&self, _level: PrivilegeLevel) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn bootstrap_current_core(&self) -> Result<(), HalError> {
+            Ok(())
+        }
+    }
+
+    struct MockTimer;
+    impl TimerAbstraction for MockTimer {
+        fn now_ns(&self) -> u64 {
+            0
+        }
+        fn set_oneshot(&self, _deadline_ns: u64, _mode: TimerMode) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn cancel_oneshot(&self) {}
+        fn set_tickless(&self, _enabled: bool) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn set_timer_callback(&self, _callback: TimerCallback) {}
+        fn supports_tickless(&self) -> bool {
+            false
+        }
+        fn frequency_hz(&self) -> u64 {
+            1_000_000_000
+        }
+    }
+
+    // `build_interface`'s `cpu`/`timer` refs must outlive the
+    // `HalInterface` it returns, so this returns owned values for each
+    // test to bind as locals before building its own `hal` — kernel-core
+    // is `#![no_std]` with no `alloc`, so no `Box::leak` shortcut (same
+    // pattern `run.rs`'s tests already use).
+    fn mock_hal_pair() -> (MockCpu, MockTimer) {
+        (MockCpu, MockTimer)
+    }
 
     fn kernel() -> KernelState {
         let mut m = HardwareManifestRaw::zeroed();
@@ -607,6 +721,8 @@ mod tests {
     fn retype_untyped_into_endpoint_gives_new_cap() {
         let mut k = kernel();
         let caller = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
         // The Root Task's first capability (slot 0) is an UntypedMemory cap.
         let r = k
             .dispatch(
@@ -617,6 +733,7 @@ mod tests {
                     target_type: KernelObjectType::Endpoint,
                     count: 1,
                 },
+                &hal,
             )
             .unwrap();
         match r {
@@ -639,6 +756,8 @@ mod tests {
     fn revoke_requires_revoke_right_and_frees_slots() {
         let mut k = kernel();
         let caller = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
         // Make an endpoint, then revoke the untyped it came from — the
         // untyped root cap has full rights (incl. REVOKE).
         k.dispatch(
@@ -649,10 +768,11 @@ mod tests {
                 target_type: KernelObjectType::Endpoint,
                 count: 1,
             },
+            &hal,
         )
         .unwrap();
         let r = k
-            .dispatch(caller, 0, SyscallOp::CapRevoke { cap: CapId::new(0) })
+            .dispatch(caller, 0, SyscallOp::CapRevoke { cap: CapId::new(0) }, &hal)
             .unwrap();
         assert!(matches!(r, SyscallReturn::Revoked { freed } if freed >= 1));
     }
@@ -661,7 +781,9 @@ mod tests {
     fn bad_cap_is_rejected() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let e = k.dispatch(caller, 0, SyscallOp::CapRevoke { cap: CapId::new(99) });
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
+        let e = k.dispatch(caller, 0, SyscallOp::CapRevoke { cap: CapId::new(99) }, &hal);
         assert_eq!(e, Err(SyscallError::BadCap));
     }
 
@@ -669,9 +791,100 @@ mod tests {
     fn yield_reports_reschedule() {
         let mut k = kernel();
         let caller = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
         // Root task must be dispatched first for account() to have work.
         k.sched.dispatch(caller, 0).unwrap();
-        let r = k.dispatch(caller, 1_000_000, SyscallOp::Yield).unwrap();
+        let r = k.dispatch(caller, 1_000_000, SyscallOp::Yield, &hal).unwrap();
         assert!(matches!(r, SyscallReturn::Reschedule { .. }));
+    }
+
+    #[test]
+    fn map_installs_hardware_ptes_when_a_pool_is_present() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
+
+        // Retype a PageTable and a frame from the Root Task's first untyped.
+        let pt_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::PageTable,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+        let frame_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Untyped,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // No pool installed yet: `Map` succeeds, software-model-only
+        // (`MockCpu`'s default `map_range` is never even consulted since
+        // `do_map` skips the hardware path entirely when `map_pool_base`
+        // is `0`).
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Map {
+                page_table: pt_cap,
+                frame: frame_cap,
+                vaddr: VirtAddr::new(0x4000_0000),
+                perms: MapPermissions::KERNEL_DATA,
+            },
+            &hal,
+        );
+        assert_eq!(r, Ok(SyscallReturn::Mapped));
+
+        // With a pool installed, `MockCpu`'s DEFAULT `map_range` (which
+        // returns `u32::MAX`, i.e. "unsupported") makes the hardware walk
+        // fail — `do_map` must roll the software model back rather than
+        // leave it claiming a mapping the hardware never saw.
+        k.install_map_pool(0x1000, 8);
+        let r2 = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Map {
+                page_table: pt_cap,
+                frame: frame_cap,
+                vaddr: VirtAddr::new(0x5000_0000),
+                perms: MapPermissions::KERNEL_DATA,
+            },
+            &hal,
+        );
+        assert_eq!(r2, Err(SyscallError::Mm(MmError::HardwareMapFailed)));
+        // Rolled back: this VA must NOT resolve in the software model.
+        let as_id = kernel_cap::PageTableId::new(
+            k.cap_space(k.root_cap_space)
+                .and_then(|t| t.lookup(pt_cap))
+                .map(|c| c.object.id.as_u32())
+                .unwrap(),
+        );
+        assert!(k
+            .addr_space_mut(as_id)
+            .unwrap()
+            .translate(VirtAddr::new(0x5000_0000))
+            .is_none());
     }
 }

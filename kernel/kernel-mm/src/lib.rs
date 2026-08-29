@@ -77,4 +77,15 @@ pub enum MmError {
     NotMapped,
     /// An `AddressSpace`'s fixed mapping capacity is exhausted.
     AddressSpaceFull,
+    /// The software model accepted a `map`, but installing the real
+    /// hardware page-table entries (`hal_core::HalInterface::map_range`)
+    /// failed — the page-table scratch-frame pool is exhausted, or the
+    /// architecture rejected the request (e.g. a superpage leaf already
+    /// covers the range). Not raised when NO pool is installed at all
+    /// (x86_64 / aarch64, MVP): that case is a silent software-model-only
+    /// `Map`, since those architectures never claimed to enforce it in
+    /// hardware yet. The caller (`kernel-core`'s `do_map`) rolls the
+    /// software-model mapping back before returning this, so the two
+    /// never drift.
+    HardwareMapFailed,
 }

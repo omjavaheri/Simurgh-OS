@@ -509,19 +509,28 @@ extern "C" fn umode_root() -> ! {
 }
 
 /// Physical address of the frame the most recent `MAP_PAGE` handed the
-/// Root Task. `MAP_ALIAS` maps a second VA onto exactly this frame, so a
-/// caller can never smuggle in an arbitrary physical address to alias.
+/// Root Task (for `XCHECK`'s kernel-side cross-check read).
 #[cfg(target_arch = "riscv64")]
 static mut LAST_MAPPED_FRAME: usize = 0;
+/// The Frame capability (an `UntypedMemory` cap) the most recent
+/// `MAP_PAGE` retyped. `MAP_ALIAS` maps this SAME capability at a second
+/// VA — real capability-gated aliasing (`do_map` resolves it exactly like
+/// the first `Map` did), not a kernel-side "trust the last physical
+/// address" shortcut: a caller can never smuggle in an arbitrary
+/// physical address, only a capability it actually holds.
+#[cfg(target_arch = "riscv64")]
+static mut LAST_MAPPED_FRAME_CAP: u32 = 0;
 
 /// Retypes one page-sized `Untyped` object from the Root Task's first
-/// `UntypedMemory` capability and returns its physical base, or `None` if
-/// the retype or the cap lookup fails.
+/// `UntypedMemory` capability, returning both the new Frame capability
+/// (for `SyscallOp::Map`'s `frame` argument) and its physical base (for
+/// `XCHECK`'s kernel-side read — `Map` itself does not hand this back).
+/// `None` if the retype or the cap lookup fails.
 #[cfg(target_arch = "riscv64")]
 fn alloc_root_frame(
     k: &mut kernel_core::KernelState,
     hal: &hal_core::HalInterface,
-) -> Option<usize> {
+) -> Option<(kernel_cap::CapId, usize)> {
     use kernel_core::{SyscallOp, SyscallReturn};
     use kernel_mm::KernelObjectType;
 
@@ -533,6 +542,7 @@ fn alloc_root_frame(
             target_type: KernelObjectType::Untyped,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         _ => return None,
@@ -542,7 +552,8 @@ fn alloc_root_frame(
             .and_then(|t| t.lookup(cap))
             .map(|c| c.object.id.as_u32())?,
     );
-    Some(k.untyped_mut(uid)?.base().as_usize())
+    let phys = k.untyped_mut(uid)?.base().as_usize();
+    Some((cap, phys))
 }
 
 /// The syscall handler the HAL trap vector calls for an `ecall` from
@@ -611,47 +622,72 @@ fn simurgh_syscall(
                     target_type: KernelObjectType::Endpoint,
                     count: 1,
                 },
+                hal,
             ) {
                 Ok(SyscallReturn::NewCaps { cap, .. }) => cap.as_u32() as usize,
                 _ => usize::MAX,
             }
         }
         sys::MAP_PAGE => {
-            // Allocate a real frame, walk a genuine Sv39 leaf for it into
-            // the LIVE page table (R|W|U = 1|2|8), then mirror it in the
-            // software model so TRANSLATE still answers.
-            let frame = match alloc_root_frame(k, hal) {
+            // Retype a real Frame (Untyped) capability, then the REAL,
+            // capability-gated `Map` syscall: `do_map` resolves
+            // `page_table` (WRITE) and `frame` (rights matching `perms`),
+            // records the software-model mapping, AND walks a genuine
+            // Sv39 leaf into the LIVE page table (the map pool `enter`
+            // installed makes this real, not just a model update).
+            let (frame_cap, frame_phys) = match alloc_root_frame(k, hal) {
                 Some(f) => f,
                 None => return TrapOutcome::Resume(usize::MAX),
             };
-            if !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
-                return TrapOutcome::Resume(usize::MAX);
-            }
-            if let Some(space) = k.addr_space_mut(k.root_addr_space) {
-                let _ = space.map(
-                    hal_core::VirtAddr::new(a0),
-                    hal_core::PhysAddr::new(frame),
-                    kernel_mm::PAGE_SIZE,
-                    hal_core::MapPermissions::KERNEL_DATA,
-                );
+            match k.dispatch(
+                root,
+                hal.now_ns(),
+                SyscallOp::Map {
+                    page_table: k.root_page_table_cap,
+                    frame: frame_cap,
+                    vaddr: hal_core::VirtAddr::new(a0),
+                    perms: hal_core::MapPermissions::KERNEL_DATA,
+                },
+                hal,
+            ) {
+                Ok(SyscallReturn::Mapped) => {}
+                _ => return TrapOutcome::Resume(usize::MAX),
             }
             // SAFETY: single-core syscall path; only written here.
-            unsafe { core::ptr::addr_of_mut!(LAST_MAPPED_FRAME).write(frame) };
-            frame
+            unsafe {
+                core::ptr::addr_of_mut!(LAST_MAPPED_FRAME).write(frame_phys);
+                core::ptr::addr_of_mut!(LAST_MAPPED_FRAME_CAP).write(frame_cap.as_u32());
+            }
+            frame_phys
         }
         sys::MAP_ALIAS => {
             // SAFETY: single-core; set by the last MAP_PAGE.
-            let frame = unsafe { core::ptr::addr_of!(LAST_MAPPED_FRAME).read() };
-            if frame == 0 || !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
+            let (frame_phys, frame_cap) = unsafe {
+                (
+                    core::ptr::addr_of!(LAST_MAPPED_FRAME).read(),
+                    kernel_cap::CapId::new(core::ptr::addr_of!(LAST_MAPPED_FRAME_CAP).read()),
+                )
+            };
+            if frame_phys == 0 {
                 return TrapOutcome::Resume(usize::MAX);
             }
-            if let Some(space) = k.addr_space_mut(k.root_addr_space) {
-                let _ = space.map(
-                    hal_core::VirtAddr::new(a0),
-                    hal_core::PhysAddr::new(frame),
-                    kernel_mm::PAGE_SIZE,
-                    hal_core::MapPermissions::KERNEL_DATA,
-                );
+            // Map the SAME Frame capability at a second VA — the
+            // capability-gated form of the alias: the kernel does not
+            // pick or trust a bare physical address, `do_map` resolves
+            // `frame_cap` exactly like the first `Map` did.
+            match k.dispatch(
+                root,
+                hal.now_ns(),
+                SyscallOp::Map {
+                    page_table: k.root_page_table_cap,
+                    frame: frame_cap,
+                    vaddr: hal_core::VirtAddr::new(a0),
+                    perms: hal_core::MapPermissions::KERNEL_DATA,
+                },
+                hal,
+            ) {
+                Ok(SyscallReturn::Mapped) => {}
+                _ => return TrapOutcome::Resume(usize::MAX),
             }
             0
         }
