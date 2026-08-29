@@ -543,11 +543,10 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
 
     klog!("root task: 8.2 milestone - 2nd thread + synchronous IPC round-trip complete\r\n");
 
-    // 6. Shared-memory groundwork (02-Microkernel-Layer.md §5.2 / §8.4):
+    // 6. Shared-memory model (02-Microkernel-Layer.md §5.2 / §8.4):
     //    alias ONE physical frame at two virtual addresses in the Root
     //    Task's address space and confirm both translate to it. This is
-    //    the aliasing structure zero-copy shared memory needs; hardware-
-    //    enforced cross-process zero-copy still awaits active page tables.
+    //    the software-model view; step 7 does the same thing in hardware.
     let frame_cap = match k.dispatch(
         root,
         hal.now_ns(),
@@ -589,6 +588,91 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             p1.is_some() && p1 == p2
         );
     }
+
+    // 7. The same aliasing, MMU-enforced across TWO separate Sv39 address
+    //    spaces (02-Microkernel-Layer.md §8.4). Build two independent root
+    //    page tables, each with its own low-3 GiB kernel identity map (so
+    //    S-mode keeps executing across the `satp` swaps) plus the shared
+    //    frame at a DIFFERENT virtual address in each. Then: write through
+    //    space A's VA, switch to space B, read it back through B's VA,
+    //    write a new value, switch back to A, read that. If both crossings
+    //    see the other space's write, the frame is genuinely shared with
+    //    no copy. Runs here with paging still off (`satp == 0`), so
+    //    `map_range`'s physical pointers are directly addressable; the
+    //    final `activate_address_space(0)` returns to Bare mode before
+    //    `enter` builds the real Root Task space.
+    //
+    //    This is the kernel-mechanism half of "two processes share memory
+    //    zero-copy"; running two U-mode threads concurrently in spaces A
+    //    and B additionally needs a context-switch primitive that can
+    //    resume a user context (tracked in IMPLEMENTATION-PLAN.md).
+    let two_space = (|| {
+        let uid = || kernel_cap::UntypedId::new(0);
+        let sp_a = k.untyped_mut(uid())?.alloc(4096, 4096).ok()?.as_usize();
+        let sp_b = k.untyped_mut(uid())?.alloc(4096, 4096).ok()?.as_usize();
+        let pool = k.untyped_mut(uid())?.alloc(4096, 4096 * 4).ok()?.as_usize();
+        Some((sp_a, sp_b, pool))
+    })();
+    let (sp_a, sp_b, pool) = match two_space {
+        Some(v) => v,
+        None => {
+            klog!("root task: two-address-space proof skipped (no untyped left)\r\n");
+            return;
+        }
+    };
+    // SAFETY: `pool` is fresh untyped RAM, identity-addressable with
+    // paging off; single-core; `map_range` requires it pre-zeroed.
+    unsafe {
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 4);
+    }
+    let phys = frame_phys.as_usize();
+    let (va_a, va_b) = (0xE000_0000usize, 0xF000_0000usize);
+    hal.map_ram_identity(sp_a, 3, false);
+    hal.map_ram_identity(sp_b, 3, false);
+    let n_a = hal.map_range(sp_a, va_a, phys, 4096, 1 | 2, pool, 4);
+    let n_b = if n_a == u32::MAX {
+        u32::MAX
+    } else {
+        hal.map_range(sp_b, va_b, phys, 4096, 1 | 2, pool + (n_a as usize) * 4096, 4 - n_a as usize)
+    };
+    if n_a == u32::MAX || n_b == u32::MAX {
+        klog!("root task: two-address-space proof skipped (map_range unsupported on this arch)\r\n");
+        return;
+    }
+    // SAFETY: after each `activate_address_space`, `va_a` (in space A) /
+    // `va_b` (in space B) map the shared frame `R+W`; the kernel's own
+    // code/stack stay valid via each table's identity map. Single-core,
+    // no other reference to the frame is live. `flush_tlb` after every
+    // write makes the next crossing observe it.
+    let (seen_in_b, seen_in_a) = unsafe {
+        hal.activate_address_space(sp_a);
+        core::ptr::write_volatile(va_a as *mut u32, 0xA1A1);
+        hal.flush_tlb();
+
+        hal.activate_address_space(sp_b);
+        let b = core::ptr::read_volatile(va_b as *const u32);
+        core::ptr::write_volatile(va_b as *mut u32, 0xB2B2);
+        hal.flush_tlb();
+
+        hal.activate_address_space(sp_a);
+        let a = core::ptr::read_volatile(va_a as *const u32);
+
+        hal.activate_address_space(0); // back to Bare mode for `enter`
+        (b, a)
+    };
+    klog!(
+        "root task: two Sv39 spaces - frame {:#x} at VA {:#x} (A) / {:#x} (B); A wrote 0xa1a1, B read {:#x}, B wrote 0xb2b2, A read {:#x} -> {}\r\n",
+        phys,
+        va_a,
+        va_b,
+        seen_in_b,
+        seen_in_a,
+        if seen_in_b == 0xA1A1 && seen_in_a == 0xB2B2 {
+            "ZERO-COPY ACROSS ISOLATED SPACES"
+        } else {
+            "MISMATCH"
+        }
+    );
 }
 
 /// The second thread's entry point (runs on `THREAD2_STACK`). Sends one

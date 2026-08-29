@@ -116,6 +116,10 @@ cargo xrun-microkernel-riscv64       # build + boot under QEMU
     table (not just the software model); mapping a second virtual address onto
     the same frame and reading a value written through the first is served by
     the MMU — the intra-address-space half of `§5.2` / `§8.4`.
+  - Zero-copy across isolation boundaries: the kernel builds two independent
+    Sv39 page tables that map one physical frame at different virtual
+    addresses, and a write through one table is visible through the other after
+    a `satp` switch — the kernel-mechanism half of `§8.4`.
 - **Layer 3:** `ipc-protocol` (message contract + FsRequest codec) and every
   `subsystems/*` crate build and unit-test their pure service logic (mount-table
   routing, an in-memory filesystem, ICMP echo build/parse, the driver-restart
@@ -127,9 +131,10 @@ cargo xrun-microkernel-riscv64       # build + boot under QEMU
   MVP path picks the frame in-kernel and acts on the Root Task's space
   directly), and `kernel-mm::AddressSpace::map` itself driving `map_range` so
   the software model and the hardware table cannot drift.
-- `02 §8.3` (`ipc_call` fast-path benchmark), `§8.4` as a *cross-process*
-  zero-copy proof (needs a second address space + thread; the single-space
-  aliasing is done), `§8.6` (syscall fuzzing).
+- `02 §8.3` (`ipc_call` fast-path benchmark); `§8.4` as a *cross-process*
+  proof — two U-mode threads running concurrently in separate address spaces
+  that share a frame (the kernel-side mechanism is done; this needs a HAL
+  primitive that can resume a user context); `§8.6` (syscall fuzzing).
 - Preemptive scheduling (no timer-tick / IRQ routing into the kernel yet).
 - All of `03-Kernel-Subsystems-Layer.md §5`: no subsystem runs as a real process
   yet (they are libraries pending the process-load path).
