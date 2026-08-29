@@ -1,0 +1,25 @@
+# ============================================================================
+# netstack  (03-Kernel-Subsystems-Layer.md §2.3)
+#
+# User-space TCP/IP. MVP target (§5.4): receive/send one ICMP echo (ping)
+# over virtio-net on QEMU. A parallel DPDK-style kernel-bypass path exists
+# from the MVP too (§2.3, §5.4.1) — clients with a special capability drive
+# the NIC rings directly via a SharedRegion + hal-direct, skipping this
+# stack entirely.
+#
+# `#![no_std] + alloc`. `rlib`.
+# ============================================================================
+[package]
+name        = "netstack"
+description = "Simurgh user-space network stack (03-Kernel-Subsystems-Layer.md §2.3) — MVP ICMP echo"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+ipc-protocol = { path = "../../ipc-protocol" }

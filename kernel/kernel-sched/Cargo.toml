@@ -1,0 +1,28 @@
+# ============================================================================
+# kernel-sched
+#
+# The dual-mode (Interactive / Throughput) scheduler for the Simurgh
+# microkernel, per 02-Microkernel-Layer.md §4. The Throughput mode
+# implements the custom NUMA/IPC-chain-aware algorithm of §4.1/§4.3 rather
+# than CFS/EEVDF, because the scheduling unit here is the IPC *chain group*
+# (app → VFS → driver), not a lone thread.
+#
+# `#![no_std]`, no `alloc`, and NO floating point: all weight/vruntime math
+# is fixed-point integer arithmetic (kernel code must not depend on FPU
+# state save/restore, and integer math is a cleaner verification target —
+# 02 §1.1). Run queues are fixed-capacity arrays (IMPLEMENTATION-PLAN.md D1).
+# ============================================================================
+[package]
+name        = "kernel-sched"
+description = "Dual-mode Interactive/Throughput scheduler for the Simurgh microkernel (02-Microkernel-Layer.md §4)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+kernel-cap = { path = "../kernel-cap" }

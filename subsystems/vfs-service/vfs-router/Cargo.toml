@@ -1,0 +1,24 @@
+# ============================================================================
+# vfs-router  (03-Kernel-Subsystems-Layer.md §2.2)
+#
+# The front of the VFS: clients send `FsRequest`s here, and the router
+# forwards each to the filesystem service that owns the matching mount
+# point. Filesystems are separate services (fs-native, fs-compat-ext4, …),
+# not kernel code (§2.2).
+#
+# `#![no_std] + alloc`. `rlib`.
+# ============================================================================
+[package]
+name        = "vfs-router"
+description = "Simurgh VFS Router: mount table + FsRequest routing (03-Kernel-Subsystems-Layer.md §2.2)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+ipc-protocol = { path = "../../../ipc-protocol" }

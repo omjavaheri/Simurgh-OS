@@ -8,6 +8,27 @@ members = [
     "hal/hal-x86_64",
     "hal/hal-arm64",
     "hal/hal-riscv64",
+    # لایه ۲ — میکروکرنل (02-Microkernel-Layer.md §7). این کریت‌ها با hal/*
+    # در یک باینری Privileged واحد لینک می‌شوند (REPO-Simurgh-OS.md §6).
+    "kernel/kernel-cap",
+    "kernel/kernel-mm",
+    "kernel/kernel-ipc",
+    "kernel/kernel-sched",
+    "kernel/kernel-core",
+    "kernel/kernel-arch-glue",
+    "kernel/kernel",
+    # قرارداد پیام مشترک لایه ۲↔۳ (03-Kernel-Subsystems-Layer.md §3).
+    "ipc-protocol",
+    # لایه ۳ — زیرسیستم‌های user-space (03-Kernel-Subsystems-Layer.md §4).
+    # هرکدام یک پروسه‌ی ایزوله است؛ فقط از طریق syscall/IPC صحبت می‌کند.
+    "subsystems/root-task",
+    "subsystems/device-manager",
+    "subsystems/drivers/driver-framework",
+    "subsystems/drivers/driver-virtio-blk",
+    "subsystems/vfs-service/vfs-router",
+    "subsystems/vfs-service/fs-native",
+    "subsystems/netstack",
+    "subsystems/mm-service",
     "kernel-stub",
     "uefi-bootloader",
 ]
@@ -15,10 +36,21 @@ members = [
 # فقط کریت‌های معماری-مستقل در build پیش‌فرض (بدون --target) کامپایل می‌شوند.
 # hal-x86_64 / hal-arm64 / hal-riscv64 نیاز به target سفارشی no_std دارند
 # و اگر در default-members باشند، `cargo build` ساده روی هاست fail می‌شود.
+#
+# کریت‌های لایه ۲/۳ که منطق معماری‌مستقل و تست میزبان دارند اینجا هستند تا
+# `cargo test` ساده در ریشه‌ی workspace اجرایشان کند (طبق CONTRIBUTING.md §2).
+# kernel-arch-glue / kernel / subsystems/* که به target سفارشی یا فقط لینک
+# نهایی نیاز دارند، عمداً بیرون‌اند.
 default-members = [
     "hal/hal-manifest",
     "hal/hal-core",
     "hal/hal-direct",
+    "kernel/kernel-cap",
+    "kernel/kernel-mm",
+    "kernel/kernel-ipc",
+    "kernel/kernel-sched",
+    "kernel/kernel-core",
+    "ipc-protocol",
 ]
 
 [workspace.package]

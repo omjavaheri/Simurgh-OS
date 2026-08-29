@@ -1,0 +1,54 @@
+# ============================================================================
+# kernel  (binary: `kernel`)
+#
+# The real bootable microkernel image — the Phase-2 successor to
+# `kernel-stub`. It is the single `[[bin]]` that links hal-core + the whole
+# `kernel/*` stack into one privileged binary (REPO-Simurgh-OS.md §6). Like
+# `kernel-stub` it selects its `hal-<arch>` crate (for `_start` + the panic
+# handler + boot assembly + linker script) via a `target_arch`-keyed
+# dependency table, so `cargo xbuild-kernel-*` style invocations build it
+# for each architecture with no feature flags.
+#
+# `kernel-stub` is kept as-is for the pure 01-HAL-Layer.md §8 smoke test;
+# this crate is what exercises the real HAL→microkernel handoff
+# (02-Microkernel-Layer.md §8.1/§8.2).
+# ============================================================================
+[package]
+name        = "kernel"
+description = "Bootable Simurgh microkernel image (02-Microkernel-Layer.md §8) — links hal-core + kernel/* into one privileged binary"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+# Bare-metal `#![no_std] #![no_main]` image with its own `#[panic_handler]`:
+# a host `cargo test` harness would pull in `std` and collide on `panic_impl`.
+# It has no `#[cfg(test)]` tests of its own (the logic lives in kernel-core /
+# kernel-arch-glue, which ARE host-tested), so skip it under `cargo test`.
+test = false
+
+[dependencies]
+hal-core        = { path = "../../hal/hal-core" }
+kernel-core     = { path = "../kernel-core" }
+kernel-arch-glue = { path = "../kernel-arch-glue" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+hal-x86_64 = { path = "../../hal/hal-x86_64" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+hal-arm64 = { path = "../../hal/hal-arm64" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+hal-riscv64 = { path = "../../hal/hal-riscv64" }
+
+[package.metadata.hal]
+targets = [
+    "targets/x86_64-hal.json",
+    "targets/aarch64-hal.json",
+    "targets/riscv64gc-hal.json",
+]

@@ -609,6 +609,43 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
         }
     }
 
+    fn init_context(
+        &self,
+        context: &mut CpuContext<{ crate::X86_64_CONTEXT_BYTES }>,
+        entry: usize,
+        stack_top: usize,
+    ) {
+        // SAFETY: a `[u8; X86_64_CONTEXT_BYTES]` buffer is layout-
+        // compatible with `X86_64Context` (`#[repr(C)]`, size asserted
+        // by the `const _` above). Zeroing then setting the fields the
+        // `context_switch` restore path consumes for a fresh thread:
+        // `rip` (`jmp`ed to), `rsp`, `rflags`, `cr3`. `cs`/`ss` are not
+        // reloaded by the restore path (same privilege), so 0 is fine.
+        let ctx = unsafe {
+            &mut *(context.as_bytes_mut().as_mut_ptr() as *mut X86_64Context)
+        };
+        *ctx = X86_64Context::default();
+        ctx.rsp = stack_top as u64;
+        ctx.rip = entry as u64;
+        // Bit 1 is the reserved-always-1 flag; IF (bit 9) left clear so
+        // the freshly started thread does not take interrupts until it
+        // (or the kernel) explicitly enables them.
+        ctx.rflags = 0x2;
+
+        #[cfg(target_os = "none")]
+        {
+            // SAFETY: reading CR3 is a privileged but side-effect-free
+            // MOV; the new thread runs in this same address space.
+            let cr3: u64;
+            unsafe { core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
+            ctx.cr3 = cr3;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ctx.cr3 = 0;
+        }
+    }
+
     fn set_privilege_level(&self, level: PrivilegeLevel) -> Result<(), HalError> {
         match level {
             // x86_64 has no direct equivalent of ARM64 EL2 / RISC-V

@@ -1,0 +1,31 @@
+# ============================================================================
+# kernel-arch-glue
+#
+# The bridge between kernel-core and hal-core (02-Microkernel-Layer.md §7,
+# §0; 01-HAL-Layer.md §0). It is written purely against hal-core's
+# architecture-ERASED surface — `hal_core::HalInterface` and
+# `hal_core::BootInfo` — so it contains no `#[cfg(target_arch)]` and no
+# architecture crate name (REPO-Simurgh-OS.md §8, principle 5 of
+# 00-Overview.md). The thin per-architecture binary (`kernel/kernel`) links
+# one `hal-<arch>` crate for its `_start`, then calls straight in here.
+#
+# `#![no_std]`, no `alloc`.
+# ============================================================================
+[package]
+name        = "kernel-arch-glue"
+description = "Architecture-erased bridge from hal-core to kernel-core for the Simurgh microkernel (02-Microkernel-Layer.md §7)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+kernel-core = { path = "../kernel-core" }
+kernel-cap  = { path = "../kernel-cap" }
+kernel-mm   = { path = "../kernel-mm" }
+kernel-ipc  = { path = "../kernel-ipc" }
+hal-core    = { path = "../../hal/hal-core" }

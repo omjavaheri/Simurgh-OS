@@ -1,0 +1,29 @@
+# ============================================================================
+# kernel-mm
+#
+# Microkernel memory management, per 02-Microkernel-Layer.md §3: the kernel
+# provides only the MECHANISM (UntypedMemory, retype, map/unmap), never the
+# POLICY (how RAM is split between services — that is the Root Task's job in
+# layer 3). Physical memory itself is a capability (`UntypedMemory`), exactly
+# the seL4 model referenced in §2.
+#
+# `#![no_std]`, no `alloc`. Links into the one privileged kernel binary with
+# hal/* (REPO-Simurgh-OS.md §6). Object storage is static tables in
+# kernel-core; this crate models the physical-memory budget and the
+# address-space mapping bookkeeping (IMPLEMENTATION-PLAN.md D2).
+# ============================================================================
+[package]
+name        = "kernel-mm"
+description = "UntypedMemory, retype, and address-space mapping for the Simurgh microkernel (02-Microkernel-Layer.md §3)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+kernel-cap = { path = "../kernel-cap" }
+hal-core   = { path = "../../hal/hal-core" }

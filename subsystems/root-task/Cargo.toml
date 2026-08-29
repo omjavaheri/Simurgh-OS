@@ -1,0 +1,30 @@
+# ============================================================================
+# root-task  (03-Kernel-Subsystems-Layer.md §1)
+#
+# The first process the microkernel runs. It receives the machine's RAM as
+# `UntypedMemory` capabilities and the Hardware Manifest, decides how to
+# split memory between services (POLICY — the kernel only provides the
+# mechanism, 02 §3), spawns Device Manager / VFS / a block driver, and hands
+# each a capability set scoped to exactly what it needs (§1, §5.1).
+#
+# `#![no_std] + alloc` (it has a heap once it retypes some untyped memory).
+# MVP: an `rlib` exposing the memory-split + spawn-plan logic; the process
+# entry shim is added once the layer-2 TCB-load path exists
+# (IMPLEMENTATION-PLAN.md — Phase C).
+# ============================================================================
+[package]
+name        = "root-task"
+description = "Simurgh Root Task: initial capability/memory distributor (03-Kernel-Subsystems-Layer.md §1)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+hal-manifest = { path = "../../hal/hal-manifest", default-features = false }
+kernel-core  = { path = "../../kernel/kernel-core" }
+ipc-protocol = { path = "../../ipc-protocol" }

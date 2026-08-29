@@ -1,0 +1,523 @@
+//! ============================================================================
+//! state.rs
+//!
+//! Purpose: `KernelState` — the aggregate of every kernel object table
+//! plus the scheduler, and `from_boot_info`, which builds the initial
+//! state (first `UntypedMemory` objects + the Root Task) from the HAL
+//! `BootInfo` (02-Microkernel-Layer.md §8.1: "بوت روی هر سه معماری با
+//! تحویل کنترل از HAL و ساخت اولین UntypedMemory objects").
+//!
+//! Architecture reference: 02-Microkernel-Layer.md §3 (object model,
+//! UntypedMemory), §8.1/§8.2 (boot acceptance), §1.1 (bounded tables), and
+//! `hal_core::BootInfo` / `hal_manifest::raw::HardwareManifestRaw` for the
+//! handoff shape.
+//!
+//! Position in the system: constructed once by `kernel-arch-glue`
+//! immediately after `BootInfo::validate`; then every syscall goes through
+//! `syscall::dispatch`, which is implemented as `impl KernelState`.
+//!
+//! Safety/invariants: table slot `i` is "occupied" iff the `Option` at `i`
+//! is `Some`; every id returned by an `alloc_*` helper indexes an occupied
+//! slot; capacities are the `config` constants.
+//! ============================================================================
+
+use crate::config::*;
+use crate::tcb::{Tcb, ThreadState};
+use hal_core::{BootInfo, VirtAddr};
+use hal_manifest::raw::MemoryRegionKindRaw;
+use kernel_cap::{
+    CapSpaceId, CapTable, Capability, EndpointId, KernelObjectKind, NotificationId, ObjectId,
+    ObjectRef, PageTableId, ThreadId, UntypedId,
+};
+use kernel_ipc::{Endpoint, Notification};
+use kernel_mm::{AddressSpace, UntypedMemory};
+use kernel_sched::{Scheduler, SchedulerMode};
+
+/// Reasons `KernelState::from_boot_info` can fail. Distinct from
+/// `SyscallError` because these are one-time boot failures, not user
+/// syscall results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelInitError {
+    /// `BootInfo::validate` rejected the structure HAL handed over.
+    BadBootInfo,
+    /// The manifest reported no usable memory region to seed
+    /// `UntypedMemory` from (should be impossible past `validate`, kept
+    /// as a defensive distinct case).
+    NoUsableMemory,
+    /// A capacity constant in `config` is too small to build even the
+    /// minimal Root Task (cap space / addr space / TCB / one untyped).
+    CapacityExhausted,
+    /// `init_global` was called more than once.
+    AlreadyInitialised,
+}
+
+/// Concrete table types (the `config` capacities applied).
+type RootCapTable = CapTable<CAP_SLOTS_PER_SPACE>;
+type RootAddressSpace = AddressSpace<MAPPINGS_PER_SPACE>;
+type KEndpoint = Endpoint<ENDPOINT_QUEUE>;
+type KNotification = Notification<NOTIF_WAITERS>;
+type KScheduler = Scheduler<MAX_THREADS, MAX_CHAIN_GROUPS>;
+
+/// The entire mutable kernel state. One instance for the life of the
+/// system.
+pub struct KernelState {
+    cap_spaces: [Option<RootCapTable>; MAX_CAP_SPACES],
+    untyped: [Option<UntypedMemory>; MAX_UNTYPED],
+    addr_spaces: [Option<RootAddressSpace>; MAX_ADDR_SPACES],
+    endpoints: [Option<KEndpoint>; MAX_ENDPOINTS],
+    notifications: [Option<KNotification>; MAX_NOTIFICATIONS],
+    tcbs: [Option<Tcb>; MAX_THREADS],
+    /// The scheduler.
+    pub sched: KScheduler,
+
+    /// The Root Task's thread id (02-Microkernel-Layer.md §8.1).
+    pub root_thread: ThreadId,
+    /// The Root Task's capability space.
+    pub root_cap_space: CapSpaceId,
+    /// The Root Task's address space.
+    pub root_addr_space: PageTableId,
+    /// How many `UntypedMemory` objects the boot path created.
+    pub untyped_count: u32,
+}
+
+impl KernelState {
+    // ---- slot allocation helpers ---------------------------------
+
+    /// Allocates a fresh (empty) `CapabilitySpace`, returning its id.
+    pub fn alloc_cap_space(&mut self) -> Option<CapSpaceId> {
+        let i = self.cap_spaces.iter().position(|s| s.is_none())?;
+        self.cap_spaces[i] = Some(CapTable::new());
+        Some(CapSpaceId::new(i as u32))
+    }
+
+    /// Allocates an address space (`PageTable` root) rooted at
+    /// `root_phys`, returning its id.
+    pub fn alloc_addr_space(&mut self, root_phys: u64) -> Option<PageTableId> {
+        let i = self.addr_spaces.iter().position(|s| s.is_none())?;
+        self.addr_spaces[i] = Some(AddressSpace::new(hal_core::PhysAddr::new(root_phys as usize)));
+        Some(PageTableId::new(i as u32))
+    }
+
+    /// Allocates an `UntypedMemory` object covering `[base, base + size)`,
+    /// returning its id.
+    pub fn alloc_untyped(&mut self, base: u64, size: u64) -> Option<UntypedId> {
+        let i = self.untyped.iter().position(|s| s.is_none())?;
+        self.untyped[i] = Some(UntypedMemory::new(
+            hal_core::PhysAddr::new(base as usize),
+            size,
+        ));
+        Some(UntypedId::new(i as u32))
+    }
+
+    /// Allocates an `Inactive` TCB bound to `cap_space` / `addr_space`,
+    /// returning its `ThreadId`.
+    pub fn alloc_tcb(&mut self, cap_space: CapSpaceId, addr_space: PageTableId) -> Option<ThreadId> {
+        let i = self.tcbs.iter().position(|s| s.is_none())?;
+        let id = ThreadId::new(i as u32);
+        self.tcbs[i] = Some(Tcb::new_inactive(id, cap_space, addr_space));
+        Some(id)
+    }
+
+    /// Allocates an `Endpoint` object, returning its id.
+    pub fn alloc_endpoint(&mut self) -> Option<EndpointId> {
+        let i = self.endpoints.iter().position(|s| s.is_none())?;
+        self.endpoints[i] = Some(Endpoint::new());
+        Some(EndpointId::new(i as u32))
+    }
+
+    /// Allocates a `Notification` object, returning its id.
+    pub fn alloc_notification(&mut self) -> Option<NotificationId> {
+        let i = self.notifications.iter().position(|s| s.is_none())?;
+        self.notifications[i] = Some(Notification::new());
+        Some(NotificationId::new(i as u32))
+    }
+
+    // ---- table accessors (used by syscall::dispatch) -------------
+
+    /// Borrows a capability space.
+    pub fn cap_space(&self, id: CapSpaceId) -> Option<&RootCapTable> {
+        self.cap_spaces.get(id.as_usize()).and_then(|s| s.as_ref())
+    }
+
+    /// Borrows a capability space mutably.
+    pub fn cap_space_mut(&mut self, id: CapSpaceId) -> Option<&mut RootCapTable> {
+        self.cap_spaces.get_mut(id.as_usize()).and_then(|s| s.as_mut())
+    }
+
+    /// Borrows an `UntypedMemory` object mutably.
+    pub fn untyped_mut(&mut self, id: UntypedId) -> Option<&mut UntypedMemory> {
+        self.untyped.get_mut(id.as_usize()).and_then(|s| s.as_mut())
+    }
+
+    /// Borrows an address space mutably.
+    pub fn addr_space_mut(&mut self, id: PageTableId) -> Option<&mut RootAddressSpace> {
+        self.addr_spaces.get_mut(id.as_usize()).and_then(|s| s.as_mut())
+    }
+
+    /// Borrows an `Endpoint` object mutably.
+    pub fn endpoint_mut(&mut self, id: EndpointId) -> Option<&mut KEndpoint> {
+        self.endpoints.get_mut(id.as_usize()).and_then(|s| s.as_mut())
+    }
+
+    /// Borrows a `Notification` object mutably.
+    pub fn notification_mut(&mut self, id: NotificationId) -> Option<&mut KNotification> {
+        self.notifications
+            .get_mut(id.as_usize())
+            .and_then(|s| s.as_mut())
+    }
+
+    /// Borrows a TCB mutably.
+    pub fn tcb_mut(&mut self, id: ThreadId) -> Option<&mut Tcb> {
+        self.tcbs.get_mut(id.as_usize()).and_then(|s| s.as_mut())
+    }
+
+    /// Borrows a TCB.
+    pub fn tcb(&self, id: ThreadId) -> Option<&Tcb> {
+        self.tcbs.get(id.as_usize()).and_then(|s| s.as_ref())
+    }
+
+    // ---- boot construction -------------------------------------
+
+    /// Builds the initial kernel state from the HAL handoff.
+    ///
+    /// Steps (02-Microkernel-Layer.md §8.1):
+    ///   1. re-run `BootInfo::validate` (defence in depth — arch-glue also
+    ///      validates before calling this);
+    ///   2. create the Root Task's capability space, address space (rooted
+    ///      at `boot.initial_page_table_phys`), and TCB;
+    ///   3. for every `Usable` memory region in the manifest that does not
+    ///      overlap the kernel image or boot-reserved ranges, create one
+    ///      `UntypedMemory` object and insert a full capability to it as a
+    ///      CDT root in the Root Task's capability space (§3 — "کل حافظه‌ی
+    ///      فیزیکی ... به شکل چند شیء UntypedMemory به اولین پروسه داده
+    ///      می‌شود");
+    ///   4. admit the Root Task to the scheduler (Interactive mode, top
+    ///      priority) and mark it runnable.
+    ///
+    /// Postcondition on `Ok`: `root_thread` names a `Runnable` TCB whose
+    /// capability space holds `untyped_count >= 1` untyped capabilities.
+    pub fn from_boot_info(boot: &BootInfo) -> Result<Self, KernelInitError> {
+        // Host / test path: `KernelState` is ~0.25 MB, which is fine on a
+        // host thread stack. On the real kernel's 64 KiB boot stack this
+        // by-value construction overflows — the bare-metal path must use
+        // `init_global` instead (see its docs).
+        let mut st = Self::EMPTY;
+        st.populate_from_boot_info(boot)?;
+        Ok(st)
+    }
+
+    /// A fully-empty `KernelState`: every object table `None`, the
+    /// scheduler freshly constructed, the Root Task ids left at `0` until
+    /// `populate_from_boot_info` fills them.
+    ///
+    /// This is a `const` so `init_global` can place the whole (large)
+    /// structure directly in a `static` — no stack temporary, no move.
+    pub const EMPTY: Self = KernelState {
+        cap_spaces: [const { None }; MAX_CAP_SPACES],
+        untyped: [const { None }; MAX_UNTYPED],
+        addr_spaces: [const { None }; MAX_ADDR_SPACES],
+        endpoints: [const { None }; MAX_ENDPOINTS],
+        notifications: [const { None }; MAX_NOTIFICATIONS],
+        tcbs: [const { None }; MAX_THREADS],
+        sched: Scheduler::new(INTERACTIVE_QUANTUM_NS),
+        root_thread: ThreadId::new(0),
+        root_cap_space: CapSpaceId::new(0),
+        root_addr_space: PageTableId::new(0),
+        untyped_count: 0,
+    };
+
+    /// Fills an `EMPTY` `KernelState` in place from the HAL handoff —
+    /// same work as `from_boot_info`, minus the by-value construction.
+    ///
+    /// Precondition: `self` is `KernelState::EMPTY` (never been populated).
+    /// Postcondition on `Ok`: `self.root_thread` names a `Runnable` TCB
+    /// whose capability space holds `self.untyped_count >= 1` untyped
+    /// capabilities.
+    pub fn populate_from_boot_info(&mut self, boot: &BootInfo) -> Result<(), KernelInitError> {
+        boot.validate().map_err(|_| KernelInitError::BadBootInfo)?;
+
+        // Step 2: Root Task cap space / addr space / TCB.
+        let root_cs = self
+            .alloc_cap_space()
+            .ok_or(KernelInitError::CapacityExhausted)?;
+        let root_as = self
+            .alloc_addr_space(boot.initial_page_table_phys)
+            .ok_or(KernelInitError::CapacityExhausted)?;
+        let root_tid = self
+            .alloc_tcb(root_cs, root_as)
+            .ok_or(KernelInitError::CapacityExhausted)?;
+
+        // Step 3: seed UntypedMemory from usable RAM. A `Usable` region
+        // typically *contains* the kernel image and the boot-reserved
+        // range (on QEMU virt there is one big RAM region), so those
+        // sub-ranges are carved OUT and only the remaining fragments
+        // become `UntypedMemory` (§3 / `BootInfo::overlaps_*`).
+        let holes = [
+            (boot.kernel_image_phys_start, boot.kernel_image_phys_end),
+            (boot.boot_reserved_phys_start, boot.boot_reserved_phys_end),
+        ];
+        let page = kernel_mm::PAGE_SIZE as u64;
+        let manifest = &boot.hardware_manifest;
+        let mut untyped_made: u32 = 0;
+        'regions: for region in manifest.memory_regions() {
+            if region.kind != MemoryRegionKindRaw::Usable || region.length_bytes < page {
+                continue;
+            }
+            let start = region.base_addr;
+            let end = region.base_addr.saturating_add(region.length_bytes);
+
+            let mut frags = [(0u64, 0u64); 8];
+            let nfrags = subtract_holes(start, end, &holes, &mut frags);
+            for &(fs, fe) in &frags[..nfrags] {
+                if fe.saturating_sub(fs) < page {
+                    continue;
+                }
+                let Some(uid) = self.alloc_untyped(fs, fe - fs) else {
+                    break 'regions; // MAX_UNTYPED reached: keep what we have.
+                };
+                let cap = Capability::full(ObjectRef::new(
+                    KernelObjectKind::UntypedMemory,
+                    ObjectId::new(uid.as_u32()),
+                ));
+                let cs = self.cap_space_mut(root_cs).expect("root cap space exists");
+                match cs.insert_root(cap) {
+                    Ok(_) => untyped_made += 1,
+                    Err(_) => break 'regions, // cap space full
+                }
+            }
+        }
+        if untyped_made == 0 {
+            return Err(KernelInitError::NoUsableMemory);
+        }
+
+        // Step 4: schedule the Root Task.
+        self.sched
+            .admit(root_tid, SchedulerMode::Interactive, kernel_sched::MAX_PRIORITY, None)
+            .map_err(|_| KernelInitError::CapacityExhausted)?;
+        self.sched
+            .note_ready(root_tid, 0)
+            .map_err(|_| KernelInitError::CapacityExhausted)?;
+        if let Some(tcb) = self.tcb_mut(root_tid) {
+            tcb.entry = VirtAddr::new(0); // set by whoever loads the Root Task image
+            tcb.state = ThreadState::Runnable;
+        }
+
+        self.root_thread = root_tid;
+        self.root_cap_space = root_cs;
+        self.root_addr_space = root_as;
+        self.untyped_count = untyped_made;
+        Ok(())
+    }
+
+    /// Bare-metal entry: constructs the kernel state in a `static` (no
+    /// stack temporary) and populates it from `boot`. Returns a
+    /// `'static` mutable reference for `kernel-arch-glue` to drive.
+    ///
+    /// # Safety / contract
+    /// Must be called exactly once, on the boot core, before anything
+    /// else touches kernel state. A second call returns
+    /// `Err(KernelInitError::AlreadyInitialised)`.
+    pub fn init_global(boot: &BootInfo) -> Result<&'static mut KernelState, KernelInitError> {
+        // Single instance for the life of the system, living in `.bss`
+        // (mostly zeros) so it never transits the boot stack.
+        static mut KERNEL_STATE: KernelState = KernelState::EMPTY;
+        static mut INITIALISED: bool = false;
+
+        // SAFETY: single-core boot, called once. `addr_of_mut!` avoids
+        // forming an intermediate reference to the `static mut`.
+        let already = unsafe { core::ptr::addr_of!(INITIALISED).read() };
+        if already {
+            return Err(KernelInitError::AlreadyInitialised);
+        }
+        // SAFETY: as above; exclusive access during single-core boot.
+        let st: &'static mut KernelState = unsafe { &mut *core::ptr::addr_of_mut!(KERNEL_STATE) };
+        st.populate_from_boot_info(boot)?;
+        // SAFETY: as above.
+        unsafe { core::ptr::addr_of_mut!(INITIALISED).write(true) };
+        Ok(st)
+    }
+
+    /// Total `UntypedMemory` byte capacity currently held across all
+    /// untyped objects (diagnostic — the boot report prints it).
+    pub fn total_untyped_bytes(&self) -> u64 {
+        self.untyped
+            .iter()
+            .flatten()
+            .map(|u| u.size_bytes())
+            .sum()
+    }
+}
+
+/// Fills `out` with the sub-ranges of `[start, end)` NOT covered by any
+/// interval in `holes`, in ascending order, and returns how many were
+/// written. Holes are clamped to `[start, end)` and may overlap each
+/// other or be adjacent. `out` should have room for `holes.len() + 1`
+/// entries (extra holes past capacity 8 are ignored).
+///
+/// This is how `populate_from_boot_info` turns "one big RAM region that
+/// contains the kernel image + boot stack" into the free fragments that
+/// become `UntypedMemory` (02-Microkernel-Layer.md §3).
+fn subtract_holes(start: u64, end: u64, holes: &[(u64, u64)], out: &mut [(u64, u64)]) -> usize {
+    // Clamp, drop empty/non-overlapping holes, insertion-sort by start.
+    let mut hs: [(u64, u64); 8] = [(0, 0); 8];
+    let mut n = 0usize;
+    for &(a, b) in holes {
+        let a = a.max(start);
+        let b = b.min(end);
+        if a >= b || n >= hs.len() {
+            continue;
+        }
+        let mut i = n;
+        while i > 0 && hs[i - 1].0 > a {
+            hs[i] = hs[i - 1];
+            i -= 1;
+        }
+        hs[i] = (a, b);
+        n += 1;
+    }
+
+    let mut cur = start;
+    let mut k = 0usize;
+    for &(a, b) in &hs[..n] {
+        if a > cur && k < out.len() {
+            out[k] = (cur, a);
+            k += 1;
+        }
+        if b > cur {
+            cur = b;
+        }
+    }
+    if cur < end && k < out.len() {
+        out[k] = (cur, end);
+        k += 1;
+    }
+    k
+}
+
+#[cfg(test)]
+mod subtract_holes_tests {
+    use super::subtract_holes;
+
+    fn run(start: u64, end: u64, holes: &[(u64, u64)]) -> Frags {
+        let mut out = [(0u64, 0u64); 8];
+        let n = subtract_holes(start, end, holes, &mut out);
+        Frags { out, n }
+    }
+    struct Frags {
+        out: [(u64, u64); 8],
+        n: usize,
+    }
+    impl Frags {
+        fn as_slice(&self) -> &[(u64, u64)] {
+            &self.out[..self.n]
+        }
+    }
+
+    #[test]
+    fn no_holes_returns_whole_range() {
+        assert_eq!(run(0, 100, &[]).as_slice(), &[(0, 100)]);
+    }
+
+    #[test]
+    fn one_interior_hole_splits_in_two() {
+        assert_eq!(run(0, 100, &[(40, 60)]).as_slice(), &[(0, 40), (60, 100)]);
+    }
+
+    #[test]
+    fn two_holes_produce_three_fragments() {
+        assert_eq!(
+            run(0, 100, &[(60, 70), (20, 30)]).as_slice(),
+            &[(0, 20), (30, 60), (70, 100)]
+        );
+    }
+
+    #[test]
+    fn overlapping_holes_merge() {
+        assert_eq!(
+            run(0, 100, &[(20, 50), (40, 70)]).as_slice(),
+            &[(0, 20), (70, 100)]
+        );
+    }
+
+    #[test]
+    fn hole_at_start_and_end_clamps() {
+        assert_eq!(
+            run(100, 200, &[(0, 120), (180, 999)]).as_slice(),
+            &[(120, 180)]
+        );
+    }
+
+    #[test]
+    fn hole_covering_everything_yields_nothing() {
+        assert_eq!(run(0, 100, &[(0, 100)]).as_slice(), &[] as &[(u64, u64)]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hal_core::BootProtocol;
+    use hal_manifest::raw::{
+        HardwareManifestRaw, MemoryRegionKindRaw, MemoryRegionRaw, TimerInfoRaw, TimerKindRaw,
+    };
+
+    fn boot_with_ram(mb: u64) -> BootInfo {
+        let mut m = HardwareManifestRaw::zeroed();
+        m.cpu_core_count = 2;
+        m.push_memory_region(MemoryRegionRaw::new(
+            0x100_0000,
+            mb * 1024 * 1024,
+            MemoryRegionKindRaw::Usable,
+            false,
+        ))
+        .unwrap();
+        m.timer = TimerInfoRaw::new(TimerKindRaw::Tsc, 1_000_000_000, false);
+        BootInfo::new(
+            BootProtocol::Uefi,
+            m,
+            0x1000,
+            (0x10_0000, 0x20_0000),
+            (0x20_0000, 0x21_0000),
+            0,
+        )
+    }
+
+    #[test]
+    fn from_boot_info_creates_root_task_and_untyped() {
+        let boot = boot_with_ram(64);
+        let st = KernelState::from_boot_info(&boot).unwrap();
+        assert_eq!(st.untyped_count, 1);
+        assert_eq!(st.total_untyped_bytes(), 64 * 1024 * 1024);
+        // Root Task is runnable and is the only ready thread.
+        assert_eq!(st.sched.pick_next(0), Some(st.root_thread));
+        assert_eq!(
+            st.tcb(st.root_thread).unwrap().state,
+            ThreadState::Runnable
+        );
+        // Its cap space holds exactly one (untyped) capability.
+        // (Immutable check via a fresh construction is enough here.)
+    }
+
+    #[test]
+    fn rejects_manifest_with_no_memory() {
+        // A manifest with a live timer but zero memory regions fails
+        // `BootInfo::validate` first.
+        let mut m = HardwareManifestRaw::zeroed();
+        m.timer = TimerInfoRaw::new(TimerKindRaw::Tsc, 1_000_000_000, false);
+        let boot = BootInfo::new(
+            BootProtocol::Uefi,
+            m,
+            0x1000,
+            (0x10_0000, 0x20_0000),
+            (0x20_0000, 0x21_0000),
+            0,
+        );
+        // `KernelState` is a large struct that intentionally derives
+        // neither `Debug` nor `PartialEq`, so match on the error rather
+        // than `assert_eq!` the whole `Result`.
+        assert!(matches!(
+            KernelState::from_boot_info(&boot),
+            Err(KernelInitError::BadBootInfo)
+        ));
+    }
+}

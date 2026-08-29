@@ -235,6 +235,34 @@ pub trait CpuAbstraction<const ARCH_CONTEXT_BYTES: usize> {
         to: &CpuContext<ARCH_CONTEXT_BYTES>,
     );
 
+    /// Initializes a *fresh* `CpuContext` so that the first
+    /// `context_switch` INTO it begins executing at `entry` with
+    /// `stack_top` as the initial stack pointer, in the CURRENT address
+    /// space and privilege level.
+    ///
+    /// This is the "architecture-specific 'new thread' setup code" the
+    /// `context_switch` docs above refer to: the microkernel's scheduler
+    /// (02-Microkernel-Layer.md §4) calls it once per newly created
+    /// thread, then treats the context as switchable.
+    ///
+    /// `entry` must point at a function that never returns (`-> !`);
+    /// there is no return address on the fresh stack for it to fall back
+    /// to. `stack_top` must be the (16-byte-aligned, per every target
+    /// ABI) HIGH end of the thread's stack region — the stack grows down
+    /// from there.
+    ///
+    /// The default implementation is a no-op: a mock/test `CpuAbstraction`
+    /// that never actually context-switches does not need it. Every real
+    /// `hal-<arch>` crate overrides it.
+    fn init_context(
+        &self,
+        context: &mut CpuContext<ARCH_CONTEXT_BYTES>,
+        entry: usize,
+        stack_top: usize,
+    ) {
+        let _ = (context, entry, stack_top);
+    }
+
     /// Requests a privilege level transition for the CURRENT core.
     ///
     /// Returns `Err(HalError::UnsupportedPrivilegeLevel)` if the

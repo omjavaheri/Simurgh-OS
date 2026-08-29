@@ -1,0 +1,30 @@
+# ============================================================================
+# kernel-ipc
+#
+# IPC is the heart of the microkernel design (02-Microkernel-Layer.md §5):
+# because every driver / filesystem / network service runs as a separate
+# layer-3 process, IPC throughput directly determines whole-system
+# performance. This crate provides the two IPC primitives — synchronous
+# small-message endpoints (register-passed, zero copy) and asynchronous
+# notifications — plus shared-memory regions for bulk zero-copy transfer and
+# the fast-path hook.
+#
+# `#![no_std]`, no `alloc`. Links into the one privileged kernel binary with
+# hal/* (REPO-Simurgh-OS.md §6). Wait queues are fixed-capacity arrays
+# (IMPLEMENTATION-PLAN.md D1).
+# ============================================================================
+[package]
+name        = "kernel-ipc"
+description = "Synchronous endpoints, async notifications, and shared regions for the Simurgh microkernel (02-Microkernel-Layer.md §5)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+kernel-cap = { path = "../kernel-cap" }
+hal-core   = { path = "../../hal/hal-core" }

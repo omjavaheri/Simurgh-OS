@@ -510,6 +510,38 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
         }
     }
 
+    fn init_context(
+        &self,
+        context: &mut CpuContext<{ crate::RISCV64_CONTEXT_BYTES }>,
+        entry: usize,
+        stack_top: usize,
+    ) {
+        // SAFETY: a `[u8; RISCV64_CONTEXT_BYTES]` buffer is layout-
+        // compatible with `Riscv64Context` (`#[repr(C)]`, size asserted
+        // by the `const _` above). Zeroing then setting the three fields
+        // the `context_switch` restore path actually consumes for a
+        // fresh thread: `ra` (jumped to via `jr`), `sp`, and `satp`.
+        let ctx = unsafe {
+            &mut *(context.as_bytes_mut().as_mut_ptr() as *mut Riscv64Context)
+        };
+        *ctx = Riscv64Context::default();
+        ctx.ra = entry as u64;
+        ctx.sp = stack_top as u64;
+
+        #[cfg(target_os = "none")]
+        {
+            // SAFETY: `csrr satp` is always valid to execute in S-mode;
+            // the new thread runs in this same address space for now.
+            let satp: u64;
+            unsafe { core::arch::asm!("csrr {0}, satp", out(reg) satp) };
+            ctx.satp = satp;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ctx.satp = 0;
+        }
+    }
+
     fn set_privilege_level(&self, level: PrivilegeLevel) -> Result<(), HalError> {
         match level {
             // RISC-V's M-mode (mapped to Monitor) is not reachable via

@@ -1,0 +1,31 @@
+# ============================================================================
+# ipc-protocol
+#
+# The message contract shared between the microkernel boundary (layer 2)
+# and the user-space subsystems (layer 3), per 03-Kernel-Subsystems-Layer.md
+# §3: "تمام پیام‌های بین‌سرویسی این لایه با IDL مشترک تعریف می‌شوند". It is
+# THE most synchronised point of the whole project (REPO-Simurgh-OS.md §4):
+# changes must respect semver because repos outside this one depend on it.
+#
+# MVP form (IMPLEMENTATION-PLAN.md D7): plain `#[repr(C)]` / enum message
+# types plus a hand-written codec that packs them into
+# `kernel_ipc::SmallMessage` words — no `serde`, no proc-macro IDL yet. The
+# message *types* are the stable surface; the codec is swappable.
+#
+# `#![no_std]`, no `alloc`.
+# ============================================================================
+[package]
+name        = "ipc-protocol"
+description = "Layer 2↔3 message contract for Simurgh-OS (03-Kernel-Subsystems-Layer.md §3)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+kernel-ipc = { path = "../kernel/kernel-ipc" }
+bitflags   = { workspace = true }

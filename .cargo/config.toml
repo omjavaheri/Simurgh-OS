@@ -107,6 +107,21 @@ xrun-kernel-aarch64 = "run -p kernel-stub --target targets/aarch64-hal.json -Z b
 xrun-kernel-riscv64 = "run -p kernel-stub --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
+# microkernel (`kernel` bin) build/run aliases — the Phase-2 successor to
+# kernel-stub. Same mechanics (target_arch-keyed hal-<arch> dep + build.rs
+# linker script), but this bin links the full kernel/* stack and runs
+# `kernel_arch_glue::run`. kernel-stub's aliases above are kept for the
+# pure 01-HAL-Layer.md §8 smoke test.
+# ----------------------------------------------------------------------------
+xbuild-microkernel-x86_64  = "build -p kernel --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-microkernel-aarch64 = "build -p kernel --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-microkernel-riscv64 = "build -p kernel --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+xrun-microkernel-x86_64  = "run -p kernel --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xrun-microkernel-aarch64 = "run -p kernel --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xrun-microkernel-riscv64 = "run -p kernel --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+# ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)
 #
 # Intentionally left with no [build] table / no default target override:
