@@ -21,7 +21,7 @@
 //! ============================================================================
 
 use crate::CpuContext;
-use hal_core::VirtAddr;
+use hal_core::{UserContext, VirtAddr};
 use kernel_cap::{CapSpaceId, PageTableId, ThreadId};
 use kernel_ipc::SmallMessage;
 
@@ -77,9 +77,18 @@ impl ThreadState {
 pub struct Tcb {
     /// This thread's id (index into the TCB table).
     pub id: ThreadId,
-    /// Saved hardware register context. Written by `context_switch` when
-    /// the thread is switched out; read when it is switched back in.
+    /// Saved hardware register context for the kernel-to-kernel
+    /// cooperative path (`hal_core::HalInterface::context_switch`).
+    /// Written when the thread is switched out at a call boundary; read
+    /// when switched back in.
     pub context: CpuContext,
+    /// Saved U-mode register context, for threads that run in user space.
+    /// Written from the trap frame when the thread is preempted or
+    /// `P2_YIELD`s; restored via `hal_core::HalInterface::resume_user`.
+    /// Distinct from `context` because a U-mode thread is snapshotted at
+    /// an arbitrary trap point, not a call boundary (02-Microkernel-Layer.md
+    /// §4 preemption).
+    pub user_context: UserContext,
     /// The capability space `CapId` arguments in this thread's syscalls
     /// are resolved against.
     pub cap_space: CapSpaceId,
@@ -110,6 +119,7 @@ impl Tcb {
         Self {
             id,
             context: CpuContext::zeroed(),
+            user_context: UserContext::zeroed(),
             cap_space,
             addr_space,
             entry: VirtAddr::new(0),

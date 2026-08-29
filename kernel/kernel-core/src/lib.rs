@@ -41,8 +41,10 @@ pub mod tcb;
 pub mod state;
 pub mod syscall;
 pub mod run;
+pub mod preempt;
 
 pub use config::CONTEXT_BYTES;
+pub use preempt::PreemptStep;
 pub use run::ScheduleOutcome;
 pub use state::{KernelInitError, KernelState};
 pub use syscall::{SyscallError, SyscallOp, SyscallReturn};

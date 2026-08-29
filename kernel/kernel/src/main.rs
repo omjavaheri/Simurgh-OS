@@ -508,8 +508,10 @@ fn simurgh_syscall(
     // outcome or run before the object-model borrow below.
     match a7 {
         sys::P2_YIELD => {
-            let (save, into) = kernel_arch_glue::p2_yield();
-            return TrapOutcome::SwitchTo { save, into };
+            return match kernel_arch_glue::p2_yield() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
         }
         sys::P2_REPORT_A => {
             kernel_arch_glue::p2_report_a(a0);

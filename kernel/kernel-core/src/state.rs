@@ -176,6 +176,14 @@ impl KernelState {
         self.tcbs.get(id.as_usize()).and_then(|s| s.as_ref())
     }
 
+    /// Element pointer of the TCB table, for `preempt.rs` to form
+    /// non-aliasing raw pointers into two distinct `Tcb::user_context`
+    /// buffers during a preemptive switch (the borrow checker cannot see
+    /// that two different indices don't overlap).
+    pub(crate) fn tcbs_mut_ptr(&mut self) -> *mut Option<Tcb> {
+        self.tcbs.as_mut_ptr()
+    }
+
     // ---- boot construction -------------------------------------
 
     /// Builds the initial kernel state from the HAL handoff.

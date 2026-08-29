@@ -40,9 +40,9 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use core::fmt::Arguments;
-use hal_core::{BootInfo, HalInterface, MapPermissions, VirtAddr, HAL_USER_CONTEXT_BYTES};
+use hal_core::{BootInfo, HalInterface, MapPermissions, VirtAddr};
 use kernel_cap::{CapId, CapabilityRights, ThreadId};
-use kernel_core::{KernelInitError, KernelState, SyscallOp, SyscallReturn, ThreadState};
+use kernel_core::{KernelInitError, KernelState, PreemptStep, SyscallOp, SyscallReturn, ThreadState};
 use kernel_ipc::SmallMessage;
 use kernel_mm::KernelObjectType;
 
@@ -79,28 +79,19 @@ static mut G_EP: u32 = 0;
 static mut G_ROOT: u32 = 0;
 
 // ---------------------------------------------------------------------------
-// Two-process zero-copy proof (02-Microkernel-Layer.md §8.4).
+// Two-process proof (02-Microkernel-Layer.md §8.4 zero-copy + §4 preemption).
 //
 // `enter` builds a SECOND, fully isolated Sv39 address space with its own
-// U-mode thread, and maps ONE physical frame into both spaces at
-// different virtual addresses. The two threads then hand the core back
-// and forth through the kernel (`P2_YIELD` ecall -> `TrapOutcome::
-// SwitchTo`), each writing/reading the shared frame through its own VA.
-// If each side sees the other's write, the frame is genuinely shared
-// with no copy — across the MMU-enforced isolation boundary, which is
-// what "two processes" means here (vs the earlier in-kernel `satp`-bounce
-// proof in `inkernel_demo` step 7).
+// U-mode thread (a real `kernel-core` TCB — its saved U-mode context lives
+// in `Tcb::user_context`, and `kernel-sched` round-robins the two), and
+// maps ONE physical frame into both spaces at different virtual addresses.
+// First a cooperative round-trip (`P2_YIELD` ecall) proves the frame is
+// genuinely shared with no copy across the MMU boundary; then
+// `P2_PREEMPT_START` arms the timer and the two threads run counting loops
+// switched by the timer interrupt alone (`p2_tick` -> `KernelState::
+// preempt_tick`).
 // ---------------------------------------------------------------------------
 
-/// 8-byte-aligned backing for one `hal_core::UserContext` (the arch crate
-/// reinterprets it as a struct of `u64` fields).
-#[repr(align(8))]
-struct UserCtxBuf([u8; HAL_USER_CONTEXT_BYTES]);
-
-static mut P2_CTX_A: UserCtxBuf = UserCtxBuf([0; HAL_USER_CONTEXT_BYTES]);
-static mut P2_CTX_B: UserCtxBuf = UserCtxBuf([0; HAL_USER_CONTEXT_BYTES]);
-/// 0 = process A is on the CPU, 1 = process B. Flipped by `p2_yield`.
-static mut P2_TURN: u8 = 0;
 /// Physical frame shared by both address spaces.
 static mut P2_SHARED_PHYS: usize = 0;
 /// Virtual address the shared frame is mapped at in space A / space B.
@@ -381,13 +372,15 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
             core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
             core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
         }
-        // SAFETY: `P2_CTX_A` was just filled by `init_user_context` in
-        // `setup_two_process`; it is a valid, resumable U-mode context and
-        // interrupts are masked (never enabled on this core). Never returns.
-        unsafe {
-            let ctx_a = &(*core::ptr::addr_of!(P2_CTX_A)).0;
-            hal.resume_user(ctx_a)
-        }
+        // The Root Task's `Tcb::user_context` was filled by
+        // `init_user_thread` in `setup_two_process` and it is the
+        // scheduler's `running` thread. Resume it in U-mode.
+        let ctx_a = state
+            .user_context_bytes(state.root_thread)
+            .expect("root TCB present");
+        // SAFETY: a valid, resumable U-mode context; interrupts are
+        // masked (never enabled in S-mode on this core). Never returns.
+        unsafe { hal.resume_user(ctx_a) }
     }
 
     // ---- Single-process fallback (unchanged behaviour) ----
@@ -421,11 +414,13 @@ const P2_STACK_B_LEN: usize = 4096 * 4;
 const P2_VA_A_CONST: usize = 0xC004_0000;
 const P2_VA_B_CONST: usize = 0xC020_0000;
 
-/// Builds address space B, maps the shared frame into both spaces, and
-/// initialises both `UserContext`s. Returns `false` (and logs) if untyped
-/// RAM or the page-table pool runs out — the caller then falls back to the
-/// single-process path. On `true`, `P2_CTX_A` / `P2_CTX_B` and the `P2_*`
-/// globals are ready and the caller may `resume_user(P2_CTX_A)`.
+/// Builds address space B, maps the shared frame into both spaces, gives
+/// the second process a real `kernel-core` TCB (its `user_context`
+/// seeded, admitted to `kernel-sched`), and seeds the Root Task's TCB the
+/// same way. Returns `false` (and logs) if untyped RAM, the page-table
+/// pool, or a kernel table runs out — the caller then falls back to the
+/// single-process path. On `true` the Root Task is the scheduler's
+/// `running` thread and the caller may `resume_user` its `user_context`.
 fn setup_two_process(
     hal: &HalInterface,
     state: &mut KernelState,
@@ -506,22 +501,49 @@ fn setup_two_process(
 
     let stack_b_top = (P2_STACK_B_VMA + P2_STACK_B_LEN) & !0xF;
 
-    // SAFETY: `P2_CTX_A` / `P2_CTX_B` are 8-byte-aligned
-    // `HAL_USER_CONTEXT_BYTES` buffers; single-core boot, written once.
-    unsafe {
-        let ctx_a = &mut (*core::ptr::addr_of_mut!(P2_CTX_A)).0;
-        hal.init_user_context(ctx_a, user.entry_vma, user_sp_a, root_pt);
-        let ctx_b = &mut (*core::ptr::addr_of_mut!(P2_CTX_B)).0;
-        hal.init_user_context(ctx_b, user.worker_entry_vma, stack_b_top, root_pt_b);
+    // Process A = the Root Task (already admitted at boot; `init_user_thread`
+    // just seeds its `user_context` and refreshes it `Ready`). Process B =
+    // a fresh TCB bound to space B.
+    let root = state.root_thread;
+    state.init_user_thread(root, user.entry_vma, user_sp_a, root_pt, hal);
 
+    let worker_as = match state.alloc_addr_space(root_pt_b as u64) {
+        Some(a) => a,
+        None => {
+            klog!("two-process proof: no address-space slot - single-process path\r\n");
+            return false;
+        }
+    };
+    let worker_tid = match state.alloc_tcb(state.root_cap_space, worker_as) {
+        Some(t) => t,
+        None => {
+            klog!("two-process proof: no TCB slot - single-process path\r\n");
+            return false;
+        }
+    };
+    state.init_user_thread(
+        worker_tid,
+        user.worker_entry_vma,
+        stack_b_top,
+        root_pt_b,
+        hal,
+    );
+
+    // Make the Root Task the scheduler's running thread, so the first
+    // `preempt_tick` (or cooperative `P2_YIELD`) has it as `outgoing`.
+    let _ = state.sched.dispatch(root, hal.now_ns());
+
+    // SAFETY: single-core boot; written once, before any syscall.
+    unsafe {
         core::ptr::addr_of_mut!(P2_SHARED_PHYS).write(shared);
         core::ptr::addr_of_mut!(P2_VA_A).write(P2_VA_A_CONST);
         core::ptr::addr_of_mut!(P2_VA_B).write(P2_VA_B_CONST);
-        core::ptr::addr_of_mut!(P2_TURN).write(0);
     }
 
     klog!(
-        "--- Sv39 paging active; two isolated U-mode processes; shared frame {:#x} at VA {:#x} (A) / {:#x} (B) ---\r\n",
+        "--- Sv39 paging active; two isolated U-mode processes (tids {} / {}); shared frame {:#x} at VA {:#x} (A) / {:#x} (B) ---\r\n",
+        root.as_u32(),
+        worker_tid.as_u32(),
         shared,
         P2_VA_A_CONST,
         P2_VA_B_CONST
@@ -529,24 +551,20 @@ fn setup_two_process(
     true
 }
 
-/// Called by the riscv64 syscall handler when either process makes a
-/// `P2_YIELD` `ecall`. Returns `(save, into)` for `TrapOutcome::SwitchTo`
-/// — the outgoing context to snapshot and the incoming one to resume —
-/// and flips whose turn it is.
-pub fn p2_yield() -> (*mut u8, *const u8) {
-    // SAFETY: single-core; `P2_TURN` and the two context buffers are only
-    // touched from this cooperative hand-off path (and the one-time
-    // `setup_two_process` before any thread runs).
-    unsafe {
-        let a = core::ptr::addr_of_mut!(P2_CTX_A) as *mut u8;
-        let b = core::ptr::addr_of_mut!(P2_CTX_B) as *mut u8;
-        let turn = core::ptr::addr_of!(P2_TURN).read();
-        core::ptr::addr_of_mut!(P2_TURN).write(turn ^ 1);
-        if turn == 0 {
-            (a, b as *const u8) // A yields -> save A, resume B
-        } else {
-            (b, a as *const u8) // B yields -> save B, resume A
-        }
+/// Called by the riscv64 syscall handler when a process makes a
+/// `P2_YIELD` `ecall` (the cooperative §8.4 phase, before the timer is
+/// armed). A voluntary yield is just a scheduler tick with no timer
+/// involved: `KernelState::preempt_tick` charges the caller and picks the
+/// other runnable thread. Returns `Some((save, into))` for
+/// `TrapOutcome::SwitchTo`, or `None` (→ `Resume`) if there is no other
+/// thread to run.
+pub fn p2_yield() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    match k.cooperative_yield(hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
     }
 }
 
@@ -609,9 +627,10 @@ pub fn p2_report_a(value: usize) {
 /// `P2_PREEMPT_START` from process A: the cooperative §8.4 round-trip is
 /// done; arm the supervisor timer so from here the two processes are
 /// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an explicit
-/// `P2_YIELD`. `P2_CTX_B` already holds process B suspended just after
-/// its own `P2_YIELD` (i.e. at the head of its counting loop), so the
-/// first tick can switch straight into it.
+/// `P2_YIELD`. The worker's `Tcb::user_context` already holds it
+/// suspended just after its own `P2_YIELD` (the head of its counting
+/// loop) and it is `Ready` in `kernel-sched`, so the first tick's
+/// `preempt_tick` switches straight into it.
 pub fn p2_preempt_start() {
     // SAFETY: single-core; `G_HAL` was set by `enter` before any syscall.
     let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
@@ -637,42 +656,41 @@ pub fn p2_preempt_start() {
 /// preempted thread into `save` and resumes `into`), or `None` to let it
 /// keep running.
 pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
-    // SAFETY: single-core; every static here is touched only from this
-    // cooperative/preemptive hand-off path and the one-time setup.
-    unsafe {
-        let hal = &*core::ptr::addr_of!(G_HAL).read();
-        let ticks = core::ptr::addr_of!(P2_TICKS).read() + 1;
-        core::ptr::addr_of_mut!(P2_TICKS).write(ticks);
+    // SAFETY: single-core; `G_HAL` set by `enter`; `P2_TICKS` / `P2_*`
+    // touched only from this path and the one-time setup.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let ticks = unsafe { core::ptr::addr_of!(P2_TICKS).read() } + 1;
+    unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(ticks) };
 
-        if ticks >= P2_TICK_BUDGET {
-            hal.cancel_timer();
-            let phys = core::ptr::addr_of!(P2_SHARED_PHYS).read();
-            let a = core::ptr::read_volatile((phys + P2_COUNTER_A_OFF) as *const u32);
-            let b = core::ptr::read_volatile((phys + P2_COUNTER_B_OFF) as *const u32);
-            klog!(
-                "preemption: {} timer ticks, NO P2_YIELD - process A's counter = {}, process B's counter = {} -> {}\r\n",
-                ticks,
-                a,
-                b,
-                if a > 0 && b > 0 {
-                    "PREEMPTIVE TWO-PROCESS SCHEDULING (02 4): both ran, timer-driven"
-                } else {
-                    "MISMATCH"
-                }
-            );
-            return None;
-        }
+    if ticks >= P2_TICK_BUDGET {
+        hal.cancel_timer();
+        let phys = unsafe { core::ptr::addr_of!(P2_SHARED_PHYS).read() };
+        // SAFETY: `phys` is identity-mapped U=0 in the live space.
+        let (a, b) = unsafe {
+            (
+                core::ptr::read_volatile((phys + P2_COUNTER_A_OFF) as *const u32),
+                core::ptr::read_volatile((phys + P2_COUNTER_B_OFF) as *const u32),
+            )
+        };
+        klog!(
+            "preemption: {} timer ticks, NO P2_YIELD - process A's counter = {}, process B's counter = {} -> {}\r\n",
+            ticks,
+            a,
+            b,
+            if a > 0 && b > 0 {
+                "PREEMPTIVE TWO-PROCESS SCHEDULING (02 4): both ran, timer-driven"
+            } else {
+                "MISMATCH"
+            }
+        );
+        return None;
+    }
 
-        hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
-        let turn = core::ptr::addr_of!(P2_TURN).read();
-        core::ptr::addr_of_mut!(P2_TURN).write(turn ^ 1);
-        let a = core::ptr::addr_of_mut!(P2_CTX_A) as *mut u8;
-        let b = core::ptr::addr_of_mut!(P2_CTX_B) as *mut u8;
-        if turn == 0 {
-            Some((a, b as *const u8))
-        } else {
-            Some((b, a as *const u8))
-        }
+    hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+    let k = kstate();
+    match k.preempt_tick(hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
     }
 }
 
