@@ -143,7 +143,7 @@ pub use power::{DomainsAboveThresholdIter, DvfsRequest, DvfsState, MilliCelsius,
 
 pub use boot::{BootInfo, BootProtocol};
 
-pub use interface::{build_interface, HalInterface};
+pub use interface::{build_interface, HalInterface, HAL_CONTEXT_BYTES};
 
 // ----------------------------------------------------------------------------
 // Aggregate trait

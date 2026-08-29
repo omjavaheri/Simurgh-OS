@@ -453,6 +453,38 @@ impl CpuAbstraction<{ crate::ARM64_CONTEXT_BYTES }> for Cpu {
         }
     }
 
+    fn init_context(
+        &self,
+        context: &mut CpuContext<{ crate::ARM64_CONTEXT_BYTES }>,
+        entry: usize,
+        stack_top: usize,
+    ) {
+        // SAFETY: a `[u8; ARM64_CONTEXT_BYTES]` buffer is layout-
+        // compatible with `Arm64Context` (`#[repr(C)]`, size asserted by
+        // the `const _` above). Zeroing then setting the fields the
+        // `context_switch` restore path consumes for a fresh thread:
+        // `x30` (branched to via `br x30`), `sp`, `ttbr0_el1`.
+        let ctx = unsafe {
+            &mut *(context.as_bytes_mut().as_mut_ptr() as *mut Arm64Context)
+        };
+        *ctx = Arm64Context::default();
+        ctx.x30 = entry as u64;
+        ctx.sp = stack_top as u64;
+
+        #[cfg(target_os = "none")]
+        {
+            // SAFETY: `mrs ttbr0_el1` is a side-effect-free read; the new
+            // thread runs in this same address space for now.
+            let ttbr0: u64;
+            unsafe { core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags)) };
+            ctx.ttbr0_el1 = ttbr0;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ctx.ttbr0_el1 = 0;
+        }
+    }
+
     fn set_privilege_level(&self, level: PrivilegeLevel) -> Result<(), HalError> {
         match level {
             // Unlike x86_64 (where Monitor is unsupported), ARM64

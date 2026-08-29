@@ -1,0 +1,28 @@
+# ============================================================================
+# fs-native  (03-Kernel-Subsystems-Layer.md §2.2)
+#
+# The project's own filesystem service — a new design with copy-on-write
+# and checksumming in spirit (ZFS/btrfs-like), written entirely in Rust
+# (§2.2). Runs as a separate service behind the VFS Router.
+#
+# MVP: a small in-memory filesystem that satisfies §5.3 (mount + basic
+# read/write over IPC). The on-disk format / endianness is defined from
+# scratch and documented separately before the block-backed version — see
+# IMPLEMENTATION-PLAN.md Q3.
+#
+# `#![no_std] + alloc`. `rlib`.
+# ============================================================================
+[package]
+name        = "fs-native"
+description = "Simurgh native filesystem service (03-Kernel-Subsystems-Layer.md §2.2) — MVP in-memory form"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+ipc-protocol = { path = "../../../ipc-protocol" }

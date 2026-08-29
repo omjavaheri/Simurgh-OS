@@ -1,0 +1,27 @@
+# ============================================================================
+# kernel-cap
+#
+# Capability model for the Simurgh microkernel: the security core of the whole
+# OS (02-Microkernel-Layer.md §2). Defines Capability, CapabilityRights, the
+# Kernel Object reference model, and the Capability Derivation Tree (CDT) with
+# revocation — following seL4's proven CDT pattern rather than a custom design
+# (§2, and §1.1's verification-readiness constraints).
+#
+# `#![no_std]` and NO `alloc`: this crate links into the single privileged
+# kernel binary alongside hal/* (REPO-Simurgh-OS.md §6). All storage is
+# fixed-capacity, array-backed (IMPLEMENTATION-PLAN.md D1/D3).
+# ============================================================================
+[package]
+name        = "kernel-cap"
+description = "Capability model + Capability Derivation Tree for the Simurgh microkernel (02-Microkernel-Layer.md §2)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+bitflags = { workspace = true }

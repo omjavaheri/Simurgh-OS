@@ -1,0 +1,32 @@
+# ============================================================================
+# kernel-core
+#
+# The syscall dispatcher and kernel object model of the Simurgh microkernel
+# (02-Microkernel-Layer.md §6, §1.1). Ties together kernel-cap (capabilities),
+# kernel-mm (untyped memory / address spaces), kernel-ipc (endpoints /
+# notifications), and kernel-sched (the scheduler) behind one `KernelState`
+# and one explicit `dispatch` state machine.
+#
+# The syscall surface is deliberately tiny (~8 ops, seL4-scale — §6),
+# nothing like Linux's ~350. `#![no_std]`, no `alloc`; all object tables are
+# fixed-capacity statics-shaped structures (IMPLEMENTATION-PLAN.md D2).
+# ============================================================================
+[package]
+name        = "kernel-core"
+description = "Syscall dispatcher + kernel object model for the Simurgh microkernel (02-Microkernel-Layer.md §6)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+kernel-cap   = { path = "../kernel-cap" }
+kernel-mm    = { path = "../kernel-mm" }
+kernel-ipc   = { path = "../kernel-ipc" }
+kernel-sched = { path = "../kernel-sched" }
+hal-core     = { path = "../../hal/hal-core" }
+hal-manifest = { path = "../../hal/hal-manifest", default-features = false }

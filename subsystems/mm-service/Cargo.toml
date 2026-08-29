@@ -1,0 +1,25 @@
+# ============================================================================
+# mm-service  (03-Kernel-Subsystems-Layer.md §2.5)
+#
+# The high-level memory POLICY service — distinct from the kernel's raw
+# UntypedMemory mechanism (layer 2). Decides swapping/paging, the OOM
+# victim policy (tunable by layer-4 Profile Policy), and coordinates
+# unified memory across CPU/GPU/NPU pools where CXL is reported in the
+# Hardware Manifest (§2.5).
+#
+# `#![no_std] + alloc`. `rlib`.
+# ============================================================================
+[package]
+name        = "mm-service"
+description = "Simurgh high-level memory policy service (03-Kernel-Subsystems-Layer.md §2.5)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+hal-manifest = { path = "../../hal/hal-manifest", default-features = false }

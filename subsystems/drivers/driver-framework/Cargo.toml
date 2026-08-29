@@ -1,0 +1,25 @@
+# ============================================================================
+# driver-framework  (03-Kernel-Subsystems-Layer.md §2.1)
+#
+# The shared `DeviceDriver` trait every driver crate implements, plus the
+# minimal sandbox-runtime shape (the message loop that turns incoming
+# `DriverRequest`s and IRQ notifications into trait calls). Each concrete
+# driver is a separate crate + separate process.
+#
+# `#![no_std]`. `rlib`.
+# ============================================================================
+[package]
+name        = "driver-framework"
+description = "Shared DeviceDriver trait + sandbox runtime for Simurgh drivers (03-Kernel-Subsystems-Layer.md §2.1)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+ipc-protocol = { path = "../../../ipc-protocol" }
+hal-manifest = { path = "../../../hal/hal-manifest", default-features = false }

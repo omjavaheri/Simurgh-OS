@@ -1,0 +1,26 @@
+# ============================================================================
+# device-manager  (03-Kernel-Subsystems-Layer.md §2.1)
+#
+# Spawns one isolated process per driver, grants each a capability set
+# scoped to exactly its device (its MMIO region + its IRQ, nothing more),
+# and — the key win over a monolithic kernel — restarts a crashed driver in
+# a fresh process without taking the system down (§2.1, §5.2).
+#
+# `#![no_std] + alloc`. MVP: an `rlib` exposing the restart-policy state
+# machine and the per-driver capability plan.
+# ============================================================================
+[package]
+name        = "device-manager"
+description = "Simurgh Device Manager: driver process isolation + restart policy (03-Kernel-Subsystems-Layer.md §2.1)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+hal-manifest = { path = "../../hal/hal-manifest", default-features = false }
+ipc-protocol = { path = "../../ipc-protocol" }
