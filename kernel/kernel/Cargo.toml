@@ -38,6 +38,14 @@ kernel-core      = { path = "../kernel-core" }
 kernel-cap       = { path = "../kernel-cap" }
 kernel-mm        = { path = "../kernel-mm" }
 kernel-arch-glue = { path = "../kernel-arch-glue" }
+# Layer-3 (subsystems as processes, IMPLEMENTATION-PLAN.md follow-up):
+# `root-task` decides WHAT to launch (`plan_boot`); `device-manager` is
+# the first real subsystem process launched. Both `#![no_std]`,
+# arch-agnostic — `device-manager`'s process entry point is itself
+# riscv64-gated internally, so this compiles cleanly (as a no-op
+# inclusion) on x86_64/aarch64 too, ahead of their own real-kernel boot.
+root-task        = { path = "../../subsystems/root-task" }
+device-manager   = { path = "../../subsystems/device-manager" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 hal-x86_64 = { path = "../../hal/hal-x86_64" }

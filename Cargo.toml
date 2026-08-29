@@ -70,6 +70,24 @@ bitflags = { version = "2", default-features = false }
 [profile.dev]
 panic = "abort"
 
+# `device-manager`'s `subsystem_entry` module compiles its process entry
+# point into `.user_text` (the U=1-mapped, isolated-process code range —
+# see `kernel-arch-glue::spawn_process`'s doc comment). Every function it
+# reaches must be inlined into that one compiled body: a call instruction
+# targeting anything outside `.user_text` (ordinary kernel `.text`, mapped
+# U=0) faults the instant U-mode tries to fetch from it. `#[inline(always)]`
+# is a strong hint, but at `opt-level = 0` (plain `[profile.dev]`) LLVM's
+# inliner is largely disabled and can still leave a real call in the
+# object code — verified via `llvm-objdump` when this was added: the
+# default dev profile emitted a genuine `auipc`+`jalr` "far call" into
+# kernel `.text` from `Supervised::on_crash`'s inlined-in-theory body,
+# which faulted on real hardware (QEMU); `-O2` on this ONE package (still
+# under an otherwise-unoptimized `cargo build`/`xbuild-*`, so the rest of
+# the dev workflow is unaffected) makes LLVM's real inliner run and fully
+# eliminates it.
+[profile.dev.package.device-manager]
+opt-level = 2
+
 [profile.release]
 panic         = "abort"
 lto           = true
