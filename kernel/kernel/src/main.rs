@@ -340,6 +340,7 @@ mod sys {
     /// above). `a0` = `DriverState` discriminant, `a1` =
     /// `restarts_in_window`.
     pub const DM_REPORT: usize = 30;
+<<<<<<< HEAD
 
     // Real IPC-driven driver supervision (03-Kernel-Subsystems-Layer.md
     // §5.2's actual acceptance test): device-manager reacts to a REAL
@@ -362,6 +363,8 @@ mod sys {
     /// `p2_watch_driver` on its new `ThreadId` (a respawned driver is a
     /// brand-new thread, not the dead one coming back).
     pub const DM_RESPAWN_DRIVER: usize = 33;
+=======
+>>>>>>> 6ad58b1 (feat(kernel): device-manager's real logic runs as a spawned process (riscv64))
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -712,7 +715,10 @@ fn simurgh_syscall(
         }
         sys::P2_PREEMPT_START => {
             spawn_device_manager(kernel_arch_glue::khal());
+<<<<<<< HEAD
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
+=======
+>>>>>>> 6ad58b1 (feat(kernel): device-manager's real logic runs as a spawned process (riscv64))
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
@@ -729,6 +735,7 @@ fn simurgh_syscall(
             kernel_arch_glue::log(format_args!(
                 "device-manager (U-mode, isolated subsystem process): state={name} restarts_in_window={a1}\r\n"
             ));
+<<<<<<< HEAD
             if a0 == 3 {
                 // `Failed`: device-manager has given up and drops into
                 // its own "spin forever" idle (matches every other demo
@@ -762,6 +769,10 @@ fn simurgh_syscall(
                 None => TrapOutcome::Resume(0),
             };
         }
+=======
+            return TrapOutcome::Resume(0);
+        }
+>>>>>>> 6ad58b1 (feat(kernel): device-manager's real logic runs as a spawned process (riscv64))
         _ => {}
     }
 
@@ -1022,6 +1033,7 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
     // comment) but on its OWN fresh stack/address space/capability space.
     let user = user_image();
     const DM_STACK_VMA: usize = 0xC040_0000;
+<<<<<<< HEAD
     // 64 KiB, not the 16 KiB every other spawned demo process uses:
     // device-manager's own ecall handlers (`DM_RESPAWN_DRIVER`) now call
     // BACK INTO `spawn_process` itself, on device-manager's OWN stack (an
@@ -1037,6 +1049,9 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
     // `trap_entry`'s first instruction, `tval` walking down from just
     // below `DM_STACK_VMA` in exact `sizeof(TrapFrame)`=248-byte steps).
     const DM_STACK_LEN: usize = 4096 * 16;
+=======
+    const DM_STACK_LEN: usize = 4096 * 4;
+>>>>>>> 6ad58b1 (feat(kernel): device-manager's real logic runs as a spawned process (riscv64))
     match kernel_arch_glue::spawn_process(
         hal,
         k,
@@ -1048,7 +1063,10 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
         device_manager::subsystem_entry::subsystem_main as usize,
     ) {
         Some((tid, _cap_space, _stack_phys)) => {
+<<<<<<< HEAD
             kernel_arch_glue::p2_register_device_manager(tid);
+=======
+>>>>>>> 6ad58b1 (feat(kernel): device-manager's real logic runs as a spawned process (riscv64))
             kernel_arch_glue::log(format_args!(
                 "root task: spawned device-manager (tid {}) via the generic path, joining the preemption loop\r\n",
                 tid.as_u32()
@@ -1060,6 +1078,7 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
     }
 }
 
+<<<<<<< HEAD
 /// Spawns `umode_faulty_driver` (see its doc comment) via the SAME
 /// generic `kernel_arch_glue::spawn_process` path as device-manager, so
 /// it joins the same preemption loop and its crash can be observed
@@ -1100,6 +1119,8 @@ fn spawn_faulty_driver(hal: &hal_core::HalInterface) -> Option<kernel_cap::Threa
     }
 }
 
+=======
+>>>>>>> 6ad58b1 (feat(kernel): device-manager's real logic runs as a spawned process (riscv64))
 // ----------------------------------------------------------------------------
 // kernel_main — architecture-independent body
 // ----------------------------------------------------------------------------
