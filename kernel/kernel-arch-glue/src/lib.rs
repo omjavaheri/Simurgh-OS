@@ -997,6 +997,49 @@ pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
     }
 }
 
+/// Per-process fault isolation (03-Kernel-Subsystems-Layer.md §2.1/§5.2):
+/// registered as the arch `FaultHandler` for a synchronous exception
+/// taken from U-mode that is not an `ecall`. `cause_code`/`sepc`/`stval`
+/// are the raw architecture trap values, logged for diagnosis; WHICH
+/// thread faulted is `kernel-sched`'s own `running()` bookkeeping — the
+/// arch trap vector has no other way to know, since the exception could
+/// be anything (illegal instruction, page fault, ...), not a syscall
+/// naming its own caller.
+///
+/// Terminates that thread (`KernelState::terminate_thread`) and returns
+/// the next runnable thread's context to resume, or `None` if nothing
+/// else is runnable (the caller then has no thread left to `sret` into
+/// — a real kernel would idle; logged as fatal here since every demo
+/// process in this MVP either counts forever or has already finished).
+pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u8> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    let Some(tid) = k.sched.running() else {
+        klog!(
+            "FAULT: no thread was running when exception (cause={:#x} sepc={:#x} stval={:#x}) landed - halting\r\n",
+            cause_code, sepc, stval
+        );
+        return None;
+    };
+    klog!(
+        "FAULT: thread {} took a fatal U-mode exception (cause={:#x} sepc={:#x} stval={:#x}) - terminating IT, rest of the system continues (03 5.2)\r\n",
+        tid.as_u32(), cause_code, sepc, stval
+    );
+    match k.terminate_thread(tid, hal.now_ns()) {
+        kernel_core::TerminationOutcome::Switched { incoming } => {
+            k.user_context_bytes(incoming).map(|c| c.as_ptr())
+        }
+        kernel_core::TerminationOutcome::Idle => {
+            klog!(
+                "FAULT: nothing else runnable after terminating thread {} - halting\r\n",
+                tid.as_u32()
+            );
+            None
+        }
+    }
+}
+
 /// Busy-park forever. The in-kernel demo threads have nothing to return
 /// to once their part is done; a real service would loop on `Recv`.
 fn park() -> ! {
