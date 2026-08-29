@@ -153,6 +153,10 @@ pub enum SegmentSelector {
     /// RPL field) — 0x18 | 3 and 0x20 | 3.
     UserCode = 0x1B,
     UserData = 0x23,
+    /// The TSS descriptor (slots 5-6 below — a 64-bit TSS descriptor is
+    /// 16 bytes, spanning two `u64` GDT slots, unlike every other entry
+    /// here). Loaded via `ltr`, never used as a segment register value.
+    Tss = 0x28,
 }
 
 /// One flat-model, long-mode GDT entry. Values below encode: present,
@@ -162,13 +166,131 @@ pub enum SegmentSelector {
 /// long-mode OS uses, since segmentation itself is not used for memory
 /// protection in long mode (paging does that); these entries exist
 /// purely to satisfy the CPU's mode-switching requirements.
-static GDT: [u64; 5] = [
+///
+/// Slots 5-6 (the TSS descriptor) cannot be a compile-time constant —
+/// its `base` field is `&TSS`'s runtime address — so unlike the other
+/// five entries they are written by `bootstrap_current_core` (via
+/// `encode_tss_descriptor`) before `load_gdt` runs. `static mut` for the
+/// same single-core, write-once-before-any-concurrent-access reason as
+/// `IDT` below.
+static mut GDT: [u64; 7] = [
     0x0000_0000_0000_0000, // 0x00: null descriptor (required by the architecture)
     0x00AF_9A00_0000_FFFF, // 0x08: kernel code, DPL0, long mode
     0x00AF_9200_0000_FFFF, // 0x10: kernel data, DPL0
     0x00AF_FA00_0000_FFFF, // 0x18: user code, DPL3 (selector 0x1B with RPL=3)
     0x00AF_F200_0000_FFFF, // 0x20: user data, DPL3 (selector 0x23 with RPL=3)
+    0,                     // 0x28: TSS descriptor, low 8 bytes — filled at boot
+    0,                     // 0x30 (not a real selector): TSS descriptor, high 8 bytes (base[63:32])
 ];
+
+// ============================================================================
+// TSS — Task State Segment (needed the moment ANY Ring 3 -> Ring 0
+// transition can happen, e.g. a U-mode `int 0x80` syscall below): on
+// x86_64 a privilege-raising interrupt/exception ALWAYS switches to the
+// stack in `TSS.rsp0` before pushing anything — unlike RISC-V, where
+// `sp` is never hardware-switched on a trap. Without a loaded TSS with a
+// valid `rsp0`, the CPU faults trying to find one (a double/triple
+// fault) the instant U-mode code takes ANY trap. This project uses none
+// of the TSS's other historical x86 features (hardware task-switching,
+// IST stacks, an I/O permission bitmap) — `rsp0` is the only field that
+// matters here.
+// ============================================================================
+
+/// 16 KiB, matching the boot stack's own sizing rationale (`cpu.rs`
+/// module docs) — this is the stack the CPU switches to for the
+/// duration of servicing a U-mode trap; the syscall trampoline below
+/// only ever pushes a small, fixed number of registers on it.
+const TSS_RSP0_STACK_SIZE: usize = 16 * 1024;
+/// `.bss`, zeroed by the loader — never read before `bootstrap_current_core`
+/// points `TSS.rsp0` at its top.
+static mut TSS_RSP0_STACK: [u8; TSS_RSP0_STACK_SIZE] = [0; TSS_RSP0_STACK_SIZE];
+
+/// x86_64 TSS layout (Intel SDM Vol. 3A, section 8.7). `#[repr(C, packed)]`
+/// to match the hardware-defined byte offsets exactly — this struct is
+/// never accessed through a Rust reference in a way that would trip
+/// packed-field alignment lints (every field is read/written by value).
+#[repr(C, packed)]
+struct Tss {
+    reserved0: u32,
+    /// Stack pointer loaded into RSP on a transition to Ring 0. The only
+    /// field this project's TSS actually uses.
+    rsp0: u64,
+    rsp1: u64,
+    rsp2: u64,
+    reserved1: u64,
+    /// Interrupt Stack Table — 7 optional dedicated stacks a specific
+    /// IDT gate can request instead of `rsp0` (e.g. for a double-fault
+    /// handler that must not trust the current stack). Unused (all
+    /// zero) — no IDT gate here sets an IST index.
+    ist: [u64; 7],
+    reserved2: u64,
+    reserved3: u16,
+    /// I/O permission bitmap base, as an offset from the TSS's own
+    /// start. Set past `size_of::<Tss>()` (no bitmap follows), which
+    /// the architecture defines as "no I/O bitmap present" — every
+    /// I/O port access from Ring 3 traps, which is fine: this project
+    /// has no port-I/O-capable U-mode code.
+    iomap_base: u16,
+}
+
+impl Tss {
+    const fn new() -> Self {
+        Self {
+            reserved0: 0,
+            rsp0: 0,
+            rsp1: 0,
+            rsp2: 0,
+            reserved1: 0,
+            ist: [0; 7],
+            reserved2: 0,
+            reserved3: 0,
+            iomap_base: size_of::<Tss>() as u16,
+        }
+    }
+}
+
+/// The system-wide TSS. `static mut` for the same reason as `IDT`/`GDT`:
+/// written once, on the bootstrap core, before any trap can be taken.
+static mut TSS: Tss = Tss::new();
+
+/// Encodes a 64-bit TSS descriptor (Intel SDM Vol. 3A, section 7.2.3)
+/// pointing at `tss_addr`, split into the GDT's two-slot representation
+/// (low 8 bytes, high 8 bytes = `base[63:32]`).
+///
+/// Access byte `0x89`: present, DPL 0, type `0b1001` (64-bit TSS,
+/// available — not busy). Limit is `size_of::<Tss>() - 1` (103), well
+/// under the 20-bit limit field's range, so the G (granularity) bit
+/// stays clear (byte-granular limit).
+fn encode_tss_descriptor(tss_addr: u64) -> (u64, u64) {
+    let limit = (size_of::<Tss>() - 1) as u64;
+    let base_low24 = tss_addr & 0xFF_FFFF;
+    let base_mid8 = (tss_addr >> 24) & 0xFF;
+    let base_high32 = (tss_addr >> 32) & 0xFFFF_FFFF;
+    let access: u64 = 0x89;
+    let low = limit
+        | (base_low24 << 16)
+        | (access << 40)
+        | (((limit >> 16) & 0xF) << 48)
+        | (base_mid8 << 56);
+    (low, base_high32)
+}
+
+/// Loads the TSS selector via `ltr`.
+///
+/// # Safety
+/// The GDT's TSS descriptor (slots 5-6) must already describe a valid,
+/// `'static` `Tss` — i.e. this must run after `encode_tss_descriptor`'s
+/// result has been written into `GDT` and after `load_gdt()`.
+unsafe fn load_tss() {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "ltr {sel:x}",
+            sel = in(reg) SegmentSelector::Tss as u16,
+            options(nostack, preserves_flags),
+        );
+    }
+}
 
 #[repr(C, packed)]
 struct DescriptorTablePointer {
@@ -187,8 +309,12 @@ struct DescriptorTablePointer {
 /// registers already pointing at a different (e.g. UEFI-provided) GDT.
 unsafe fn load_gdt() {
     let pointer = DescriptorTablePointer {
-        limit: (size_of::<[u64; 5]>() - 1) as u16,
-        base: GDT.as_ptr() as u64,
+        limit: (size_of::<[u64; 7]>() - 1) as u16,
+        // SAFETY: reading the address of `GDT` (not its contents) is
+        // sound regardless of `static mut` aliasing rules, since we
+        // only ever take `.as_ptr()` here — same reasoning as `IDT`'s
+        // own `load_idt` below.
+        base: unsafe { GDT.as_ptr() as u64 },
     };
 
     // SAFETY: `pointer` describes a `'static` table (GDT above) that
@@ -269,11 +395,31 @@ impl IdtEntry {
             offset_low: (handler & 0xFFFF) as u16,
             selector: SegmentSelector::KernelCode as u16,
             ist: 0, // TODO(layer 1 follow-up): use IST slot 1 for double-fault
-            // (vector 8) once the TSS is built — running the double-
-            // fault handler on a dedicated stack is standard practice
-            // to survive a kernel stack overflow, but requires a TSS
-            // this MVP phase does not yet build (see module docs).
+            // (vector 8) — a TSS exists now (see this file's TSS
+            // module docs), but wiring double-fault's own dedicated
+            // stack through it is still a tracked follow-up, not done
+            // speculatively here.
             type_attr: 0b1000_1110, // present, DPL0, 64-bit interrupt gate
+            offset_mid: ((handler >> 16) & 0xFFFF) as u16,
+            offset_high: ((handler >> 32) & 0xFFFF_FFFF) as u32,
+            reserved: 0,
+        }
+    }
+
+    /// Like `gate`, but DPL 3 — reachable via a software interrupt
+    /// (`int`) executed from Ring 3 without a #GP. Every OTHER vector
+    /// stays DPL 0 (`gate` above): a CPU exception or hardware IRQ is
+    /// never something U-mode code should be able to trigger directly
+    /// through the IDT's own privilege check, only through the actual
+    /// mechanism that raises it. Used for exactly one vector — the
+    /// syscall gate `bootstrap_current_core` installs after the generic
+    /// population loop.
+    fn gate_dpl3(handler: u64) -> Self {
+        Self {
+            offset_low: (handler & 0xFFFF) as u16,
+            selector: SegmentSelector::KernelCode as u16,
+            ist: 0,
+            type_attr: 0b1110_1110, // present, DPL3, 64-bit interrupt gate
             offset_mid: ((handler >> 16) & 0xFFFF) as u16,
             offset_high: ((handler >> 32) & 0xFFFF_FFFF) as u32,
             reserved: 0,
@@ -705,6 +851,88 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
         x86_64_paging::map_range(root_frame, vaddr, paddr, len, perm_bits, pool_base, pool_len)
     }
 
+    #[cfg(target_os = "none")]
+    fn enter_user(&self, entry: usize, stack_top: usize) -> ! {
+        // SAFETY: a one-way Ring 0 -> Ring 3 drop via a fabricated
+        // IRETQ frame: push SS (user data | RPL 3), RSP (`stack_top`),
+        // RFLAGS (IF=1, so the dropped thread can eventually take
+        // interrupts once one is routed to it — harmless today, nothing
+        // is), CS (user code | RPL 3), RIP (`entry`), then `iretq`
+        // pops all five and drops privilege. Never returns.
+        unsafe {
+            core::arch::asm!(
+                "push {ss}",
+                "push {sp}",
+                "push {flags}",
+                "push {cs}",
+                "push {entry}",
+                "iretq",
+                ss = in(reg) SegmentSelector::UserData as u64,
+                sp = in(reg) stack_top as u64,
+                flags = in(reg) 0x202u64,
+                cs = in(reg) SegmentSelector::UserCode as u64,
+                entry = in(reg) entry as u64,
+                options(noreturn),
+            );
+        }
+    }
+
+    fn init_user_context(
+        &self,
+        context: &mut hal_core::UserContext,
+        entry: usize,
+        stack_top: usize,
+        root_frame: usize,
+    ) {
+        // SAFETY: `hal_core::UserContext` is `#[repr(C, align(8))]` over
+        // exactly `[u8; HAL_USER_CONTEXT_BYTES]`, and `X8664UserContext`
+        // is `#[repr(C)]` of a size asserted `<=` that (the `const _`
+        // beside its definition) — so the buffer's leading bytes ARE a
+        // valid `X8664UserContext`.
+        let ctx = unsafe { &mut *(context.as_bytes_mut().as_mut_ptr() as *mut X8664UserContext) };
+        *ctx = X8664UserContext::default();
+        ctx.rip = entry as u64;
+        ctx.rsp = stack_top as u64;
+        ctx.cs = SegmentSelector::UserCode as u64;
+        ctx.ss = SegmentSelector::UserData as u64;
+        ctx.rflags = 0x202; // IF=1, reserved bit 1 = 1
+
+        // `root_frame == 0` means "keep whatever is active" — read CR3
+        // back so the first `resume_user` does not clobber the live
+        // translation (mirrors hal-riscv64's `satp` handling here
+        // exactly).
+        #[cfg(target_os = "none")]
+        {
+            let cr3: u64;
+            // SAFETY: reading CR3 has no preconditions in S-mode... err,
+            // Ring 0.
+            unsafe {
+                core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+            }
+            ctx.cr3 = if root_frame != 0 { root_frame as u64 } else { cr3 };
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ctx.cr3 = root_frame as u64;
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    unsafe fn resume_user(&self, context: &hal_core::UserContext) -> ! {
+        // SAFETY: the buffer is a valid `X8664UserContext` (see
+        // `init_user_context`); the resumable-context + interrupts-
+        // masked obligations are this method's documented caller
+        // contract.
+        let blob = context.as_bytes().as_ptr() as *const X8664UserContext;
+        unsafe { restore_user_and_iretq(blob) }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    unsafe fn resume_user(&self, context: &hal_core::UserContext) -> ! {
+        let _ = context;
+        unreachable!("resume_user is bare-metal only (host test build)");
+    }
+
     fn set_privilege_level(&self, level: PrivilegeLevel) -> Result<(), HalError> {
         match level {
             // x86_64 has no direct equivalent of ARM64 EL2 / RISC-V
@@ -734,6 +962,22 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
     }
 
     fn bootstrap_current_core(&self) -> Result<(), HalError> {
+        // SAFETY: single-core boot, before any trap can fire. `TSS.rsp0`
+        // must be valid before ANY Ring 3 -> Ring 0 transition can
+        // happen (see the TSS's own module doc comment) — set up before
+        // `load_gdt`/`load_tss` below reference it, and before any
+        // interrupt (which `bootstrap_current_core`'s own contract
+        // already guarantees, per the comment on `load_gdt` just below).
+        unsafe {
+            let rsp0 = core::ptr::addr_of_mut!(TSS_RSP0_STACK)
+                .cast::<u8>()
+                .add(TSS_RSP0_STACK_SIZE) as u64;
+            TSS.rsp0 = rsp0;
+            let (low, high) = encode_tss_descriptor(core::ptr::addr_of!(TSS) as u64);
+            GDT[5] = low;
+            GDT[6] = high;
+        }
+
         // SAFETY: called exactly once per core, before any interrupt
         // can fire on this core (interrupts remain hardware-masked
         // from UEFI handoff through this point — boot.S never issued
@@ -770,7 +1014,27 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
                 let handler_addr = isr_stub_address(vector as u8);
                 IDT[vector] = IdtEntry::gate(handler_addr);
             }
+        }
+
+        // The syscall gate: DPL 3 so U-mode's `int 0x80` doesn't take a
+        // #GP, pointing at the DEDICATED `isr_syscall_trampoline` (NOT
+        // the generic `isr_stub_<N>` the loop above just installed for
+        // this same vector) — the generic ISR path has no TrapOutcome-
+        // style switch semantics a syscall handler needs. Installed
+        // AFTER the loop specifically so it overrides that vector's
+        // generic gate; `load_idt`/`load_tss` run once, after both.
+        //
+        // SAFETY: `IDT`/`TSS`/`GDT` are written here, on the bootstrap
+        // core, before `load_idt`/`load_tss` are called and before
+        // interrupts are enabled — no concurrent access is possible.
+        unsafe {
+            unsafe extern "C" {
+                static isr_syscall_trampoline: u8;
+            }
+            let addr = &isr_syscall_trampoline as *const u8 as u64;
+            IDT[SYSCALL_VECTOR as usize] = IdtEntry::gate_dpl3(addr);
             load_idt();
+            load_tss();
         }
 
         Ok(())
@@ -815,6 +1079,352 @@ fn isr_stub_address(vector: u8) -> u64 {
     // above — indexing it with any `u8` value is in-bounds by
     // construction (256 entries for all 256 possible vector values).
     unsafe { isr_stub_table[vector as usize] }
+}
+
+// ============================================================================
+// U-mode syscall boundary (`int 0x80`, DPL 3) — analogous to
+// hal-riscv64's `ecall`/`SyscallHandler`/`TrapOutcome`/`common_trap_entry`,
+// but on a DEDICATED trampoline rather than reusing the generic 256-
+// vector ISR path above: that path has no TrapOutcome-style switch
+// semantics (it always resumes exactly where an interrupt landed,
+// correct for a hardware IRQ but not for a syscall that may need to
+// switch which thread is running), and only saves 15 GPRs in a layout
+// that doesn't cover a full resumable U-mode context.
+// ============================================================================
+
+/// This project's own raw software-interrupt convention for a syscall
+/// (there is no ISA-defined one on x86_64 the way `ecall` is on
+/// RISC-V) — deliberately the same vector Linux's classic 32-bit ABI
+/// used, for a convention any x86 developer recognizes.
+const SYSCALL_VECTOR: u8 = 0x80;
+
+/// The on-stack layout `isr_syscall_trampoline` pushes: 15 GPRs (every
+/// one except `rsp`, which is part of the hardware-pushed IRETQ frame
+/// below and never needs an explicit save/restore of its own), then
+/// whatever the CPU auto-pushed crossing from Ring 3 to Ring 0 on this
+/// `int 0x80` (`RIP`, `CS`, `RFLAGS`, `RSP`, `SS`, in that order —
+/// present because DPL 3 gates always carry a privilege change here).
+/// Field ORDER matches the trampoline's own push sequence exactly (`rax`
+/// pushed LAST = lowest address = offset 0).
+#[repr(C)]
+struct SyscallFrame {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+/// A suspended U-mode thread's full context — `SyscallFrame`'s exact
+/// same leading 160 bytes (so a save is one `copy_nonoverlapping`, not a
+/// field-by-field copy) plus `cr3` (the IRETQ frame carries no notion of
+/// address space — CR3 must be read/written separately, exactly like
+/// riscv64's `RiscvUserContext` carries `satp` alongside its own trap-
+/// frame-shaped prefix).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct X8664UserContext {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+    cr3: u64,
+}
+
+const _: () = {
+    assert!(size_of::<X8664UserContext>() <= hal_core::HAL_USER_CONTEXT_BYTES);
+};
+
+/// What the syscall handler decided should happen next — identical
+/// shape to hal-riscv64's own `TrapOutcome` (see that type's own doc
+/// comment for the rationale behind each variant); duplicated here
+/// rather than shared because every other piece of the trap-handling
+/// surface (the frame layout, the restore mechanism) is architecture-
+/// local too, and hal_core defines no such type.
+pub enum TrapOutcome {
+    /// Return to the trapping thread with `.0` in `rax`, `rip` advanced
+    /// past the 2-byte `int 0x80`. The ordinary syscall return.
+    Resume(usize),
+    /// Serialise the trapping thread's full context into the
+    /// `HAL_USER_CONTEXT_BYTES` blob at `save`, then restore `into` and
+    /// `iretq` into it. Both pointers are kernel-owned, 8-byte-aligned
+    /// `hal_core::UserContext` storage.
+    SwitchTo {
+        /// Where to write the outgoing thread's snapshot.
+        save: *mut u8,
+        /// The incoming thread's context to resume.
+        into: *const u8,
+    },
+    /// The trapping thread has been TERMINATED — no save (a terminated
+    /// thread never resumes); just restores `into` and `iretq`s into it.
+    Terminate {
+        /// The next thread's context to resume.
+        into: *const u8,
+    },
+}
+
+/// Signature of the handler the microkernel registers for an
+/// `int 0x80` from U-mode: raw `(rax, rdi, rsi)` — this project's own
+/// convention (`rax` = opcode, mirroring the real Linux `syscall`/`int
+/// 0x80` ABIs where `rax`/`eax` is always the syscall number) — returning
+/// a `TrapOutcome` telling the trampoline how to resume.
+pub type SyscallHandler = fn(usize, usize, usize) -> TrapOutcome;
+
+#[cfg(target_os = "none")]
+static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
+
+/// Registers the handler `common_syscall_entry` calls for an
+/// `int 0x80` from U-mode. The microkernel calls this once during boot,
+/// before it drops any process to user mode — same "no handler, no
+/// behavior change" contract as hal-riscv64's `set_syscall_handler`, so
+/// a binary that links `hal-x86_64` but never runs user code (e.g.
+/// `kernel-stub`) simply never registers one.
+#[cfg(target_os = "none")]
+pub fn set_syscall_handler(handler: SyscallHandler) {
+    // SAFETY: single-core boot; set exactly once before any U-mode
+    // `int 0x80` can be taken.
+    unsafe {
+        core::ptr::addr_of_mut!(SYSCALL_HANDLER).write(Some(handler));
+    }
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .global isr_syscall_trampoline
+    isr_syscall_trampoline:
+        push r15
+        push r14
+        push r13
+        push r12
+        push r11
+        push r10
+        push r9
+        push r8
+        push rbp
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push rbx
+        push rax
+
+        mov rdi, rsp
+        call common_syscall_entry
+
+        mov rbx, [rsp + 8]
+        mov rcx, [rsp + 16]
+        mov rdx, [rsp + 24]
+        mov rsi, [rsp + 32]
+        mov rdi, [rsp + 40]
+        mov rbp, [rsp + 48]
+        mov r8,  [rsp + 56]
+        mov r9,  [rsp + 64]
+        mov r10, [rsp + 72]
+        mov r11, [rsp + 80]
+        mov r12, [rsp + 88]
+        mov r13, [rsp + 96]
+        mov r14, [rsp + 104]
+        mov r15, [rsp + 112]
+        mov rax, [rsp + 0]
+        add rsp, 120
+        iretq
+    "#
+);
+
+/// Host (`cargo test`) stub — reached only from the bare-metal
+/// `isr_syscall_trampoline`'s `call common_syscall_entry` above, which
+/// (being a `global_asm!` block) is not itself `#[cfg(target_os =
+/// "none")]`-gated and so is present in every build; without this stub
+/// the host build fails to LINK (an unresolved `common_syscall_entry`
+/// symbol) rather than merely never executing this dead trampoline —
+/// same fix hal-riscv64's own `common_trap_entry` host stub applies for
+/// the identical reason.
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_syscall_entry(_frame: *mut SyscallFrame) {}
+
+/// Called from `isr_syscall_trampoline` with a pointer to the pushed
+/// `SyscallFrame`. Reads `rax`/`rdi`/`rsi` as `(opcode, a0, a1)`,
+/// dispatches to the registered `SyscallHandler`, and either returns
+/// normally (the `Resume` case — the trampoline above pops the
+/// (in-place modified) saved registers and `iretq`s back to the SAME
+/// trapping thread) or diverges into `restore_user_and_iretq` (the
+/// `SwitchTo`/`Terminate` cases — a DIFFERENT thread's context, never
+/// returning to this trampoline invocation at all).
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_syscall_entry(frame: *mut SyscallFrame) {
+    // SAFETY: `frame` points at the 160-byte block `isr_syscall_trampoline`
+    // just pushed (GPRs) followed by the CPU's own auto-pushed IRETQ
+    // frame — both valid for the lifetime of this call, this function's
+    // only caller.
+    let f = unsafe { &mut *frame };
+    // SAFETY: single-core; `SYSCALL_HANDLER` is only written by
+    // `set_syscall_handler` during boot, before any U-mode `int 0x80`.
+    let handler = unsafe { core::ptr::addr_of!(SYSCALL_HANDLER).read() };
+    let Some(h) = handler else {
+        // No handler registered (e.g. `kernel-stub`, which never enters
+        // U-mode): nothing meaningful to do with an unexpected syscall
+        // trap — halt rather than silently `iretq` back into whatever
+        // caused it.
+        loop {
+            core::hint::spin_loop();
+        }
+    };
+    match h(f.rax as usize, f.rdi as usize, f.rsi as usize) {
+        TrapOutcome::Resume(ret) => {
+            f.rax = ret as u64;
+            // Resume at the instruction after the 2-byte `int 0x80`.
+            f.rip += 2;
+        }
+        TrapOutcome::SwitchTo { save, into } => {
+            // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blobs (the trampoline/
+            // `hal_core::UserContext` contract). Snapshot the outgoing
+            // thread — resuming AFTER its `int 0x80` — then never
+            // return: `restore_user_and_iretq` abandons this trap
+            // frame's stack and `iretq`s into the incoming thread.
+            unsafe {
+                save_syscall_frame_as_user_context(
+                    f,
+                    f.rip + 2,
+                    save as *mut X8664UserContext,
+                );
+                restore_user_and_iretq(into as *const X8664UserContext);
+            }
+        }
+        TrapOutcome::Terminate { into } => {
+            // No save: this trap frame is simply abandoned, same as any
+            // other terminated thread.
+            // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blob.
+            unsafe { restore_user_and_iretq(into as *const X8664UserContext) };
+        }
+    }
+}
+
+/// Serialises an interrupted U-mode `SyscallFrame` into an
+/// `X8664UserContext` so it can be `restore_user_and_iretq`'d later.
+/// `resume_rip` is where the thread should continue (the caller passes
+/// `rip + 2` so a suspended `int 0x80` does not re-execute). Captures
+/// the *live* CR3, which for a trap taken from U-mode already describes
+/// the thread's own address space.
+///
+/// # Safety
+/// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
+/// 8-byte-aligned storage.
+#[cfg(target_os = "none")]
+unsafe fn save_syscall_frame_as_user_context(
+    frame: &SyscallFrame,
+    resume_rip: u64,
+    dst: *mut X8664UserContext,
+) {
+    let cr3: u64;
+    // SAFETY: reading CR3 has no preconditions in a trap handler.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: `dst` is valid writable storage of the matching size /
+    // alignment per this function's contract; `SyscallFrame` and
+    // `X8664UserContext` share their leading 160 bytes field-for-field
+    // (see `X8664UserContext`'s own doc comment).
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            frame as *const SyscallFrame as *const u8,
+            dst as *mut u8,
+            size_of::<SyscallFrame>(),
+        );
+        (*dst).rip = resume_rip;
+        (*dst).cr3 = cr3;
+    }
+}
+
+/// Restores a full `X8664UserContext` and `iretq`s into U-mode. Never
+/// returns. Shared by `resume_user` (first entry, from an
+/// `init_user_context` blob) and the syscall trampoline's process
+/// hand-off path (from a blob it just serialised out of a trap frame).
+///
+/// # Safety
+/// `blob` must point at a valid, resumable `X8664UserContext` whose
+/// `cr3` names an address space that maps this core's IDT/GDT/TSS
+/// targets and the identity-mapped low RAM `blob` itself lives in.
+/// Interrupts must be masked (true throughout — DPL 3 interrupt gates
+/// already clear IF on entry, same as every other vector here).
+#[cfg(target_os = "none")]
+unsafe fn restore_user_and_iretq(blob: *const X8664UserContext) -> ! {
+    // SAFETY: contract above. `r15` carries the blob base for the whole
+    // sequence (every other GPR this restores, `rax` last): x86_64 has
+    // no spare GPR beyond the 15 a full context restores, so — exactly
+    // like hal-riscv64's `restore_user_and_sret` uses `t6` — ONE of the
+    // restored registers must double as the pointer, loaded from its
+    // OWN saved slot dead last, once nothing after it needs `blob`
+    // anymore.
+    unsafe {
+        core::arch::asm!(
+            "mov rax, [r15 + 160]", // cr3
+            "mov cr3, rax",
+            "mov rax, [r15 + 152]", // ss
+            "push rax",
+            "mov rax, [r15 + 144]", // rsp
+            "push rax",
+            "mov rax, [r15 + 136]", // rflags
+            "push rax",
+            "mov rax, [r15 + 128]", // cs
+            "push rax",
+            "mov rax, [r15 + 120]", // rip
+            "push rax",
+            "mov rbx, [r15 + 8]",
+            "mov rcx, [r15 + 16]",
+            "mov rdx, [r15 + 24]",
+            "mov rsi, [r15 + 32]",
+            "mov rdi, [r15 + 40]",
+            "mov rbp, [r15 + 48]",
+            "mov r8,  [r15 + 56]",
+            "mov r9,  [r15 + 64]",
+            "mov r10, [r15 + 72]",
+            "mov r11, [r15 + 80]",
+            "mov r12, [r15 + 88]",
+            "mov r13, [r15 + 96]",
+            "mov r14, [r15 + 104]",
+            "mov rax, [r15 + 0]",
+            "mov r15, [r15 + 112]",
+            "iretq",
+            in("r15") blob,
+            options(noreturn),
+        );
+    }
 }
 
 #[cfg(test)]

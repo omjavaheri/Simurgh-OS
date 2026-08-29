@@ -130,11 +130,65 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* ------------------------------------------------------------------
+     * User (layer-3) Root Task image.
+     *
+     * `.user_text` / `.user_stack` are linked for a VMA in an otherwise
+     * empty PML4[0]-mapped GiB slot, but LOADED (LMA) contiguously
+     * inside the kernel image, right after `.bss` — same split
+     * hal-riscv64/linker.ld uses for the same purpose. The microkernel
+     * maps these pages `U=1` (kernel `.text` stays `U=0`) before
+     * activating this table and dropping to Ring 3, so the Root Task
+     * runs isolated. Kept in their own 4 KiB pages so no kernel
+     * code/data ever shares a `U=1` page.
+     *
+     * VMA is 0x40000000 (GiB 1), NOT hal-riscv64's 0xC0000000 (GiB 3):
+     * `kernel-arch-glue::enter` computes how many GiB to
+     * `map_ram_identity` generically from `BootInfo::
+     * kernel_image_phys_end` (`(end / 1_GiB) + 1`, no hardcoded
+     * per-architecture constant) and this crate's tiny, low
+     * (`KERNEL_LMA_BASE = 0x00200000`) image needs only 1 GiB of that —
+     * so GiB 1 is the first slot that identity map leaves free.
+     * Deliberately NOT GiB 3 (or anywhere >= 2 GiB / 0x80000000): this
+     * target's `code-model: "kernel"` setting requires every symbol
+     * address to be representable as a sign-extended 32-bit value
+     * (`R_X86_64_32S`) — true for GiB 0-1 (positive, < 2 GiB) and for
+     * the real higher-half kernel range near `0xFFFFFFFF80000000+`, but
+     * NOT for anything in between (a genuine link failure hit while
+     * building this: "relocation R_X86_64_32S out of range" against
+     * `__user_text_start` when it was linked at 0xC0000000).
+     * ------------------------------------------------------------------ */
+    . = ALIGN(4K);
+    __user_load = .;              /* LMA cursor (still identity here) */
+
+    . = 0x40000000;              /* jump VMA into the user GiB slot */
+
+    .user_text ALIGN(4K) : AT(__user_load)
+    {
+        __user_text_start = .;
+        KEEP(*(.user_text .user_text.*))
+        . = ALIGN(4K);
+        __user_text_end = .;
+    }
+
+    .user_stack ALIGN(4K) : AT(__user_load + SIZEOF(.user_text))
+    {
+        __user_stack_start = .;
+        . += 64K;
+        . = ALIGN(4K);
+        __user_stack_end = .;
+    }
+
+    __user_text_lma  = LOADADDR(.user_text);
+    __user_stack_lma = LOADADDR(.user_stack);
+
     /* Symbol upper layers use, alongside __kernel_image_phys_start
      * above, to bound the kernel image range reported in BootInfo
      * (hal-core/src/boot.rs: kernel_image_phys_start/end) — computed
-     * from the final VMA position translated back to LMA space. */
-    __kernel_image_phys_end = .;
+     * from the final VMA position translated back to LMA space.
+     * Everything the bootloader loaded (kernel + the user image's LMA
+     * copy) is off-limits as free memory. */
+    __kernel_image_phys_end = LOADADDR(.user_stack) + SIZEOF(.user_stack);
 
     /* ------------------------------------------------------------------
      * Discard sections we never want in the final bare-metal image:

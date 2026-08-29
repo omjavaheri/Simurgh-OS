@@ -63,6 +63,15 @@ static mut THREAD2_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut THREAD3_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut G_STATE: *mut KernelState = core::ptr::null_mut();
 static mut G_HAL: *const HalInterface = core::ptr::null();
+/// How many GiB `map_ram_identity` covers for the kernel's OWN image —
+/// computed once by `enter` (see that function's own doc comment) and
+/// read by every LATER `map_ram_identity` call (`setup_two_process`'s
+/// space B, `spawn_process`'s per-process spaces), so they all agree
+/// with space A's own identity map on where it's safe to place
+/// `.user_text`/`.user_stack`. `3` is a safe pre-`enter` default (matches
+/// every use before this session's x86_64 work, when the constant really
+/// was hardcoded to 3).
+static mut G_BYTES_GIB: usize = 3;
 static mut G_LOG: Option<fn(Arguments<'_>)> = None;
 // The runtime `Map` syscall's hardware page-table pool used to live here
 // (arch-glue-owned globals `map_user_page` drew from); it is now
@@ -359,15 +368,42 @@ impl UserImage {
 ///   1. stash the kernel-state / HAL pointers for later syscall handling;
 ///   2. run `inkernel_demo` (the in-kernel §8.1/§8.2/§8.5 milestones —
 ///      direct `dispatch` + `context_switch`, same privilege);
-///   3. if a `user` image is present: build an Sv39 page table (kernel
+///   3. if a `user` image is present: build a page table (kernel
 ///      identity `U=0`, the `.user_*` pages `U=1`), activate paging, and
 ///      drop the Root Task to U-mode. From there it is a real, MMU-
-///      isolated layer-3 process reaching the kernel only through `ecall`.
-pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImage) -> ! {
+///      isolated layer-3 process reaching the kernel only through a
+///      syscall trap.
+pub fn enter(
+    hal: &HalInterface,
+    state: &'static mut KernelState,
+    user: UserImage,
+    boot_info: &BootInfo,
+) -> ! {
     // SAFETY: single-core boot, called once, right after `build`.
     unsafe {
         core::ptr::addr_of_mut!(G_STATE).write(state as *mut KernelState);
         core::ptr::addr_of_mut!(G_HAL).write(hal as *const HalInterface);
+    }
+
+    // How many GiB `map_ram_identity` must cover to keep the KERNEL'S OWN
+    // currently-executing image mapped once this table activates —
+    // computed generically from `BootInfo` (never a hardcoded per-
+    // architecture constant): riscv64's image sits at ~0x8020_0000+
+    // (needs 3 GiB); x86_64's tiny, low (`KERNEL_LMA_BASE = 0x0020_0000`)
+    // image needs only 1. `.user_text`/`.user_stack` then land in the
+    // FIRST GiB slot this leaves free (GiB `bytes_gib` itself) — each
+    // architecture's own linker.ld picks its `.user_text` VMA to match
+    // (0xC000_0000 = GiB 3 for riscv64, 0x4000_0000 = GiB 1 for x86_64;
+    // see hal-x86_64/linker.ld's own doc comment on why x86_64 can't
+    // reuse riscv64's GiB 3 — its `code-model: "kernel"` target requires
+    // every symbol address to fit a sign-extended 32-bit value, true for
+    // GiB 0-1 but not GiB 2-3).
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let bytes_gib = ((boot_info.kernel_image_phys_end / GIB) + 1) as usize;
+    // SAFETY: single-core boot; only read by `setup_two_process`/
+    // `spawn_process`, both called later, after this write.
+    unsafe {
+        core::ptr::addr_of_mut!(G_BYTES_GIB).write(bytes_gib);
     }
 
     inkernel_demo(state, hal);
@@ -392,9 +428,16 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
     //   - `.user_stack`: `U=1 R+W`.
     // Then activate paging and drop to U-mode WITHOUT deactivating — the
     // Root Task runs isolated.
+    // 2 CONTIGUOUS pages, not 1: some architectures' `root_frame`
+    // convention needs more than a single page for their page-table
+    // root (x86_64: CR3 always points at a PML4, which needs a
+    // companion PDPT at `root_frame + 4096` — see `hal_x86_64::cpu`'s
+    // `x86_64_paging` module doc comment). Harmless on Sv39/AArch64,
+    // which only ever use the first page — carving uniformly here keeps
+    // this crate free of `#[cfg(target_arch)]`.
     let root_pt = state
         .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096).ok());
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok());
     let pool = state
         .untyped_mut(kernel_cap::UntypedId::new(0))
         .and_then(|u| u.alloc(4096, 4096 * POOL_FRAMES as u64).ok());
@@ -442,7 +485,7 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
     let user_sp = (user.stack_vma + user.stack_len) & !0xF;
 
     // ---- Space A (the Root Task): kernel identity U=0, user image U=1 ----
-    hal.map_ram_identity(root_pt, 3, false);
+    hal.map_ram_identity(root_pt, bytes_gib, false);
     // R=1 W=2 X=4 U=8.
     let n1 = hal.map_range(
         root_pt,
@@ -543,7 +586,8 @@ fn setup_two_process(
 
     let (shared, root_pt_b, pool_b, stack_b) = match (
         carve(state, 4096),
-        carve(state, 4096),
+        // 2 pages, not 1 — see `enter`'s own `root_pt` carve for why.
+        carve(state, 4096 * 2),
         carve(state, 4096 * 8),
         carve(state, P2_STACK_B_LEN as u64),
     ) {
@@ -575,7 +619,9 @@ fn setup_two_process(
 
     // Space B: kernel identity U=0, then user text / its own stack / the
     // shared frame, all U=1.
-    hal.map_ram_identity(root_pt_b, 3, false);
+    // SAFETY: single-core; only written once, by `enter`, before this runs.
+    let bytes_gib = unsafe { core::ptr::addr_of!(G_BYTES_GIB).read() };
+    hal.map_ram_identity(root_pt_b, bytes_gib, false);
     let mut ub = 0u32;
     let step = |vaddr, paddr, len, perm, ub: &mut u32| -> bool {
         let n = hal.map_range(
@@ -736,7 +782,8 @@ pub fn spawn_process(
             .map(|p| p.as_usize())
     };
 
-    let root_pt = carve(state, 4096)?;
+    // 2 pages, not 1 — see `enter`'s own `root_pt` carve for why.
+    let root_pt = carve(state, 4096 * 2)?;
     let pool = carve(state, 4096 * 8)?;
     let stack_phys = carve(state, round4k(stack_len) as u64)?;
     // SAFETY: fresh untyped RAM, identity-addressable (paging is not yet
@@ -744,7 +791,10 @@ pub fn spawn_process(
     // pre-zeroed.
     unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 8) };
 
-    hal.map_ram_identity(root_pt, 3, false);
+    // SAFETY: single-core; only written once, by `enter`, before any
+    // process (including this generic-spawn path) can run.
+    let bytes_gib = unsafe { core::ptr::addr_of!(G_BYTES_GIB).read() };
+    hal.map_ram_identity(root_pt, bytes_gib, false);
     let mut used = 0u32;
     let mut step = |vaddr: usize, paddr: usize, len: usize, perm: usize| -> bool {
         let n = hal.map_range(
@@ -1544,8 +1594,20 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     //    resume a user context (tracked in IMPLEMENTATION-PLAN.md).
     let two_space = (|| {
         let uid = || kernel_cap::UntypedId::new(0);
-        let sp_a = k.untyped_mut(uid())?.alloc(4096, 4096).ok()?.as_usize();
-        let sp_b = k.untyped_mut(uid())?.alloc(4096, 4096).ok()?.as_usize();
+        // 2 pages each, not 1 — see `enter`'s own `root_pt` carve (this
+        // function runs BEFORE `enter`'s own address-space setup, called
+        // from inside `enter` itself, but the SAME "some architectures'
+        // `root_frame` needs a companion page" reasoning applies here
+        // identically). **Real bug found via QEMU**: with 1 page each,
+        // x86_64's `map_ram_identity` (which always writes a PDPT at
+        // `root_frame + 4096`) silently OVERWROTE `sp_b` while building
+        // `sp_a`'s table, then overwrote `pool` while building `sp_b`'s —
+        // a cascading corruption whose only symptom was the CPU quietly
+        // executing garbage after `activate_address_space(sp_a)` (no
+        // panic, no fault visible in serial output — just silence,
+        // confirmed via `-d int`: no further kernel code ever ran).
+        let sp_a = k.untyped_mut(uid())?.alloc(4096, 4096 * 2).ok()?.as_usize();
+        let sp_b = k.untyped_mut(uid())?.alloc(4096, 4096 * 2).ok()?.as_usize();
         let pool = k.untyped_mut(uid())?.alloc(4096, 4096 * 4).ok()?.as_usize();
         Some((sp_a, sp_b, pool))
     })();
@@ -1563,8 +1625,10 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     }
     let phys = frame_phys.as_usize();
     let (va_a, va_b) = (0xE000_0000usize, 0xF000_0000usize);
-    hal.map_ram_identity(sp_a, 3, false);
-    hal.map_ram_identity(sp_b, 3, false);
+    // SAFETY: single-core; only written once, by `enter`, before this runs.
+    let bytes_gib = unsafe { core::ptr::addr_of!(G_BYTES_GIB).read() };
+    hal.map_ram_identity(sp_a, bytes_gib, false);
+    hal.map_ram_identity(sp_b, bytes_gib, false);
     let n_a = hal.map_range(sp_a, va_a, phys, 4096, 1 | 2, pool, 4);
     let n_b = if n_a == u32::MAX {
         u32::MAX

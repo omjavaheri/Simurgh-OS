@@ -260,9 +260,11 @@ fn serial_log(args: core::fmt::Arguments<'_>) {
 // the architecture-erased `kernel-arch-glue`.
 // ----------------------------------------------------------------------------
 
-/// Syscall selectors (a7 on RISC-V). Only the riscv64 build currently
-/// runs a U-mode Root Task and wires the trap handler.
-#[cfg(target_arch = "riscv64")]
+/// Syscall selectors (a7 on RISC-V; `rax` on x86_64). Only the riscv64
+/// and x86_64 builds currently run a U-mode Root Task and wire a trap
+/// handler; most of these opcodes below (everything past `ALIVE`/
+/// `REPORT`) are riscv64-only demo machinery x86_64 doesn't use yet.
+#[cfg(any(target_arch = "riscv64", target_arch = "x86_64"))]
 mod sys {
     /// Write `a1` bytes of UTF-8 at address `a0` to the kernel log.
     pub const DEBUG_LOG: usize = 0;
@@ -621,11 +623,112 @@ extern "C" fn umode_faulty_driver() -> ! {
 }
 
 /// Placeholder U-mode entry for the architectures whose real-kernel boot
-/// is not yet wired (x86_64 / aarch64 still boot `kernel-stub`).
-#[cfg(not(target_arch = "riscv64"))]
+/// is not yet wired (aarch64 still boots `kernel-stub`).
+#[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64")))]
 extern "C" fn umode_root() -> ! {
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// # Safety
+/// `int 0x80` from Ring 3 traps to the dedicated DPL-3 gate
+/// (`hal_x86_64::cpu`'s `isr_syscall_trampoline`), which preserves every
+/// register except `rax` (the return value) — this project's own
+/// convention (see `hal_x86_64::cpu::SyscallHandler`'s doc comment):
+/// `rax` = opcode, `rdi` = a0, `rsi` = a1.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn raw_syscall_x86(opcode: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") opcode => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// The x86_64 Root Task entry. Linked into `.user_text` (its own
+/// `U=1` `R+X` pages at the linked VMA, per hal-x86_64's linker.ld) and
+/// run in Ring 3 by `kernel-arch-glue::enter`. Deliberately minimal —
+/// the actual §0 layer-2↔3 boundary proof this milestone is about is
+/// "a real `int 0x80` from Ring 3 reaches the kernel and gets a real
+/// reply"; real paging correctness was already proven independently
+/// (`x86_64_paging_selftest`, entirely in Ring 0).
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_root_x86() -> ! {
+    // SAFETY: see `raw_syscall_x86`'s own contract.
+    unsafe {
+        raw_syscall_x86(sys::ALIVE, 0, 0);
+        raw_syscall_x86(sys::REPORT, 0x5eed_5eed, 0);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// The syscall handler `hal_x86_64::cpu`'s dedicated `int 0x80`
+/// trampoline calls for a syscall from U-mode. Runs at Ring 0.
+#[cfg(target_arch = "x86_64")]
+fn simurgh_syscall_x86(a7: usize, a0: usize, _a1: usize) -> hal_x86_64::cpu::TrapOutcome {
+    use hal_x86_64::cpu::TrapOutcome;
+    match a7 {
+        sys::ALIVE => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, x86_64, Ring 3): alive, made an int 0x80 syscall from U=1 pages\r\n"
+            ));
+        }
+        sys::REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, x86_64): syscall result = {:#x}\r\n",
+                a0
+            ));
+        }
+        _ => {}
+    }
+    TrapOutcome::Resume(0)
+}
+
+// Linker symbols for the x86_64 user (layer-3) Root Task image — see
+// hal-x86_64/src/linker.ld's `.user_text` / `.user_stack` sections.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_text_lma: u8;
+    static __user_stack_start: u8;
+    static __user_stack_end: u8;
+    static __user_stack_lma: u8;
+}
+
+/// Reads the `.user_*` linker symbols into the descriptor `enter` needs to
+/// map the Root Task's pages `U=1` before dropping to Ring 3.
+#[cfg(target_arch = "x86_64")]
+fn user_image() -> kernel_arch_glue::UserImage {
+    let sym = |s: &u8| s as *const u8 as usize;
+    // SAFETY: these are linker-defined addresses, taken by reference only,
+    // never dereferenced — the standard idiom for consuming linker script
+    // symbols.
+    unsafe {
+        kernel_arch_glue::UserImage {
+            text_vma: sym(&__user_text_start),
+            text_lma: sym(&__user_text_lma),
+            text_len: sym(&__user_text_end) - sym(&__user_text_start),
+            stack_vma: sym(&__user_stack_start),
+            stack_lma: sym(&__user_stack_lma),
+            stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
+            entry_vma: umode_root_x86 as usize,
+            worker_entry_vma: 0,
+            subsystem_entry_vma: 0,
+            a_loop_entry_vma: 0,
+        }
     }
 }
 
@@ -1237,21 +1340,32 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_fault_handler(simurgh_fault);
             // Real x86_64 paging self-test (see its own doc comment) —
-            // no user image on this architecture yet, so this runs
-            // standalone rather than through `enter`'s own page-table
-            // setup.
+            // an independent, kernel-mode-only sanity check that stays
+            // useful even now that `enter` below ALSO does real paging
+            // (for the Root Task's own, separate address space): if the
+            // U-mode path below ever regresses, this narrows whether
+            // paging itself or the U-mode/syscall boundary specifically
+            // is at fault.
             #[cfg(target_arch = "x86_64")]
             x86_64_paging_selftest(&hal, state);
-            // Never returns: runs the in-kernel demo, then (riscv64) maps
-            // the user image U=1, activates Sv39 paging, and drops the
-            // Root Task to U-mode isolated.
+            // Register the syscall handler `hal_x86_64::cpu`'s
+            // dedicated `int 0x80` (DPL 3) trampoline calls.
+            #[cfg(target_arch = "x86_64")]
+            hal_x86_64::cpu::set_syscall_handler(simurgh_syscall_x86);
+            // Never returns: runs the in-kernel demo, then (riscv64/
+            // x86_64) maps the user image U=1, activates paging, and
+            // drops the Root Task to U-mode isolated.
             #[cfg(target_arch = "riscv64")]
             {
-                kernel_arch_glue::enter(&hal, state, user_image())
+                kernel_arch_glue::enter(&hal, state, user_image(), &boot_info)
             }
-            #[cfg(not(target_arch = "riscv64"))]
+            #[cfg(target_arch = "x86_64")]
             {
-                kernel_arch_glue::enter(&hal, state, kernel_arch_glue::UserImage::EMPTY)
+                kernel_arch_glue::enter(&hal, state, user_image(), &boot_info)
+            }
+            #[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64")))]
+            {
+                kernel_arch_glue::enter(&hal, state, kernel_arch_glue::UserImage::EMPTY, &boot_info)
             }
         }
         Err(e) => {

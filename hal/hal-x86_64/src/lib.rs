@@ -256,11 +256,33 @@ pub const X86_64_CONTEXT_BYTES: usize = 160;
 #[no_mangle]
 pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // ------------------------------------------------------------------
-    // Step 1: bring up this core's CPU abstraction (feature detection,
-    // GDT/IDT — per hal-core section 3.1's per-core bootstrap
-    // responsibility) before anything that might fault or interrupt.
+    // Step 1: bring up this core's CPU abstraction (feature detection
+    // via `Cpu::new`, then GDT/IDT/TSS via `bootstrap_current_core` —
+    // per hal-core section 3.1's per-core bootstrap responsibility)
+    // before anything that might fault or interrupt.
+    //
+    // **Real bug found via QEMU**: `bootstrap_current_core` was never
+    // actually CALLED anywhere in this crate — `Cpu::new()` only does
+    // CPUID-based feature detection, not the GDT/IDT/TSS work its own
+    // doc comment describes. hal-riscv64's own entry point calls it
+    // explicitly (installs `stvec`); this one never did the x86_64
+    // equivalent, so `load_gdt`/`load_idt`/`load_tss` were dead code —
+    // every interrupt/exception (including this session's own `int
+    // 0x80` syscall gate and `enter_user`'s Ring 3 drop) ran under
+    // WHATEVER GDT/IDT the UEFI firmware itself left active, with
+    // predictably wrong results (a #GP loading `SegmentSelector::
+    // UserCode`, which names an index in OUR intended GDT, not
+    // firmware's).
     // ------------------------------------------------------------------
     let cpu = cpu::Cpu::new();
+    // SAFETY: called exactly once, here, before anything on this core
+    // can fault or take an interrupt — mirrors hal-riscv64's own
+    // `bootstrap_current_core` call at its entry point exactly.
+    if hal_core::cpu::CpuAbstraction::bootstrap_current_core(&cpu).is_err() {
+        // Nothing sensible to do this early; fall through and let the
+        // later BootInfo path surface the failure (same fallback
+        // hal-riscv64's own entry point uses).
+    }
 
     // ------------------------------------------------------------------
     // Step 2: parse the firmware memory map into
