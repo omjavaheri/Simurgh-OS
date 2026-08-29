@@ -57,8 +57,8 @@ pub const THREAD_STACK_SIZE: usize = 64 * 1024;
 struct Aligned([u8; THREAD_STACK_SIZE]);
 
 // Single-core boot scratch. Written once before the corresponding switch,
-// read on the other stack.
-static mut ROOT_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
+// read on the other stack. (The U-mode Root Task's own stack is
+// `.user_stack` in the final binary, not here — see `UserImage`.)
 static mut THREAD2_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut G_STATE: *mut KernelState = core::ptr::null_mut();
 static mut G_HAL: *const HalInterface = core::ptr::null();
@@ -154,15 +154,53 @@ pub fn build(
     Ok((report, state))
 }
 
+/// Where the final binary's user (layer-3) Root Task image lives: its
+/// `.user_text` and `.user_stack` regions, each as a `(vma, lma, len)`
+/// triple (linked for a virtual address, loaded at a physical address
+/// inside the kernel image), plus the U-mode entry point's virtual
+/// address. `enter` maps these `U=1` and drops to U-mode under paging.
+/// `EMPTY` (all zero) means "this architecture has no user image yet" —
+/// `enter` then just parks after the in-kernel demo.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserImage {
+    /// `.user_text` virtual base.
+    pub text_vma: usize,
+    /// `.user_text` physical (load) base.
+    pub text_lma: usize,
+    /// `.user_text` byte length.
+    pub text_len: usize,
+    /// `.user_stack` virtual base.
+    pub stack_vma: usize,
+    /// `.user_stack` physical (load) base.
+    pub stack_lma: usize,
+    /// `.user_stack` byte length.
+    pub stack_len: usize,
+    /// Virtual address to begin U-mode execution at (inside `.user_text`).
+    pub entry_vma: usize,
+}
+
+impl UserImage {
+    /// No user image (non-riscv64 for now).
+    pub const EMPTY: Self = Self {
+        text_vma: 0,
+        text_lma: 0,
+        text_len: 0,
+        stack_vma: 0,
+        stack_lma: 0,
+        stack_len: 0,
+        entry_vma: 0,
+    };
+}
+
 /// Runs the boot sequence and never returns:
 ///   1. stash the kernel-state / HAL pointers for later syscall handling;
 ///   2. run `inkernel_demo` (the in-kernel §8.1/§8.2/§8.5 milestones —
-///      still direct `dispatch` + `context_switch`, same privilege);
-///   3. drop the Root Task to U-mode at `umode_root_entry` via
-///      `HalInterface::enter_user`. From that point the Root Task is a
-///      real layer-3 process reaching the kernel only through `ecall`,
-///      routed to the `simurgh_syscall` symbol the final binary provides.
-pub fn enter(hal: &HalInterface, state: &'static mut KernelState, umode_root_entry: usize) -> ! {
+///      direct `dispatch` + `context_switch`, same privilege);
+///   3. if a `user` image is present: build an Sv39 page table (kernel
+///      identity `U=0`, the `.user_*` pages `U=1`), activate paging, and
+///      drop the Root Task to U-mode. From there it is a real, MMU-
+///      isolated layer-3 process reaching the kernel only through `ecall`.
+pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImage) -> ! {
     // SAFETY: single-core boot, called once, right after `build`.
     unsafe {
         core::ptr::addr_of_mut!(G_STATE).write(state as *mut KernelState);
@@ -171,83 +209,85 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, umode_root_ent
 
     inkernel_demo(state, hal);
 
-    let stack_top = (core::ptr::addr_of!(ROOT_STACK) as usize + THREAD_STACK_SIZE) & !0xF;
+    if user.text_len == 0 {
+        klog!("no user image for this architecture yet - halting after the in-kernel demo\r\n");
+        park();
+    }
+
     let root = state.root_thread;
     if let Some(tcb) = state.tcb_mut(root) {
-        tcb.entry = VirtAddr::new(umode_root_entry);
+        tcb.entry = VirtAddr::new(user.entry_vma);
         tcb.state = ThreadState::Runnable;
     }
 
-    // --- Sv39 paging: build a real page table, activate it, verify the
-    // MMU translates, then deactivate. ---------------------------------
-    //
-    // This must run AFTER `inkernel_demo` (whose `context_switch`es carry
-    // satp == 0). A flat identity map of the low 3 GiB with U = 0 lets
-    // S-mode keep executing; it is NOT kept active for the U-mode Root
-    // Task, because that needs the user's code/stack on dedicated U = 1
-    // pages separate from kernel text — a linker-level change tracked as
-    // the next step. So: activate, self-test, deactivate, then drop to
-    // U-mode on the (still working) unpaged path.
-    match state
+    // Build the Root Task's address space (must run AFTER `inkernel_demo`,
+    // whose context switches carry satp == 0):
+    //   - kernel RAM/MMIO: the low 3 GiB, 1 GiB identity leaves, U = 0
+    //     (S-mode executes the trap handler / drivers; U-mode cannot).
+    //   - `.user_text`: `U=1 R+X` at its linked VMA (an otherwise-empty
+    //     Sv39 GiB slot, so `map_range` needs no superpage split).
+    //   - `.user_stack`: `U=1 R+W`.
+    // Then activate paging and drop to U-mode WITHOUT deactivating — the
+    // Root Task runs isolated.
+    let root_pt = state
         .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096).ok())
-    {
-        Some(root_pt) => {
-            // Grab a 2-frame pool for `map_range`'s intermediate tables
-            // and one target frame for the mapped test page. `map_range`
-            // needs the pool zeroed.
-            let pool = state
-                .untyped_mut(kernel_cap::UntypedId::new(0))
-                .and_then(|u| u.alloc(4096, 4096 * 2).ok());
-            let target = state
-                .untyped_mut(kernel_cap::UntypedId::new(0))
-                .and_then(|u| u.alloc(4096, 4096).ok());
+        .and_then(|u| u.alloc(4096, 4096).ok());
+    let pool = state
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 4).ok());
 
-            hal.map_ram_identity(root_pt.as_usize(), 3, false);
-            hal.activate_address_space(root_pt.as_usize());
-
-            // Test the 4 KiB page-table walker: map a page at a virtual
-            // address the coarse identity map left open (GiB 3), then
-            // write/read through it and confirm the bytes landed at the
-            // target physical frame.
-            let walk_ok = match (pool, target) {
-                (Some(pool), Some(target)) => {
-                    let (pb, tp) = (pool.as_usize(), target.as_usize());
-                    // SAFETY: `pool`/`target` are fresh untyped RAM in the
-                    // identity-mapped low 3 GiB; single-core; nothing else
-                    // refers to them. Zero the pool for `map_range`.
-                    unsafe {
-                        core::ptr::write_bytes(pb as *mut u8, 0, 4096 * 2);
-                    }
-                    const TEST_VA: usize = 0xC000_0000; // GiB 3, unmapped by the identity pass
-                    let used = hal.map_range(root_pt.as_usize(), TEST_VA, tp, 4096, 0b0011, pb, 2);
-                    if used == u32::MAX {
-                        false
-                    } else {
-                        // SAFETY: `TEST_VA` is now mapped R+W to `tp` via
-                        // the freshly walked table; `tp` is identity-
-                        // mapped so we can cross-check it directly.
-                        unsafe {
-                            (TEST_VA as *mut u64).write_volatile(0x0BAD_C0DE_CAFE_F00D);
-                            (tp as *const u64).read_volatile() == 0x0BAD_C0DE_CAFE_F00D
-                        }
-                    }
-                }
-                _ => false,
-            };
-
-            hal.activate_address_space(0); // back to Bare mode (satp = 0)
-            klog!(
-                "root task: Sv39 paging - root PT {:#x}, identity map + 4KiB walker (VA 0xC0000000 -> new page): {}, deactivated\r\n",
-                root_pt.as_usize(),
-                if walk_ok { "OK" } else { "FAILED" }
-            );
+    let (root_pt, pool) = match (root_pt, pool) {
+        (Some(r), Some(p)) => (r.as_usize(), p.as_usize()),
+        _ => {
+            klog!("could not allocate page-table frames - halting\r\n");
+            park();
         }
-        None => klog!("root task: WARNING - could not allocate a root page table\r\n"),
+    };
+    // SAFETY: `pool` is fresh untyped RAM in the identity-mapped low RAM;
+    // single-core; `map_range` requires it pre-zeroed.
+    unsafe {
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 4);
     }
 
-    klog!("--- dropping Root Task to U-mode (entry {:#x}) ---\r\n", umode_root_entry);
-    hal.enter_user(umode_root_entry, stack_top)
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    hal.map_ram_identity(root_pt, 3, false);
+
+    // R=1 W=2 X=4 U=8.
+    let n1 = hal.map_range(
+        root_pt,
+        user.text_vma,
+        user.text_lma,
+        round4k(user.text_len),
+        1 | 4 | 8,
+        pool,
+        4,
+    );
+    let n2 = if n1 == u32::MAX {
+        u32::MAX
+    } else {
+        hal.map_range(
+            root_pt,
+            user.stack_vma,
+            user.stack_lma,
+            round4k(user.stack_len),
+            1 | 2 | 8,
+            pool + (n1 as usize) * 4096,
+            4 - n1 as usize,
+        )
+    };
+    if n1 == u32::MAX || n2 == u32::MAX {
+        klog!("failed to map the user image (map_range error) - halting\r\n");
+        park();
+    }
+
+    hal.activate_address_space(root_pt);
+    let user_sp = (user.stack_vma + user.stack_len) & !0xF;
+    klog!(
+        "--- Sv39 paging active; dropping Root Task to U-mode (entry {:#x}, sp {:#x}, isolated on U=1 pages) ---\r\n",
+        user.entry_vma,
+        user_sp
+    );
+    hal.enter_user(user.entry_vma, user_sp)
 }
 
 /// Busy-park forever. The in-kernel demo threads have nothing to return

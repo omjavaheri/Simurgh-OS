@@ -99,7 +99,44 @@ SECTIONS
         __bss_end = .;
     }
 
-    __kernel_image_phys_end = .;
+    /* ------------------------------------------------------------------
+     * User (layer-3) Root Task image.
+     *
+     * `.user_text` / `.user_stack` are linked for a VMA in an otherwise
+     * empty Sv39 GiB slot (0xC0000000) but LOADED (LMA) contiguously
+     * inside the kernel image, right after .bss. The microkernel maps
+     * these pages U=1 (see kernel-arch-glue::enter) while kernel .text
+     * stays U=0, then activates paging before dropping to U-mode — so
+     * the Root Task runs isolated. Kept in their own 4 KiB pages so no
+     * kernel code/data shares a U=1 page.
+     * ---------------------------------------------------------------- */
+    . = ALIGN(4K);
+    __user_load = .;              /* LMA cursor (still identity here) */
+
+    . = 0xC0000000;              /* jump VMA into the user GiB slot */
+
+    .user_text ALIGN(4K) : AT(__user_load)
+    {
+        __user_text_start = .;
+        KEEP(*(.user_text .user_text.*))
+        . = ALIGN(4K);
+        __user_text_end = .;
+    }
+
+    .user_stack ALIGN(4K) : AT(__user_load + SIZEOF(.user_text))
+    {
+        __user_stack_start = .;
+        . += 64K;
+        . = ALIGN(4K);
+        __user_stack_end = .;
+    }
+
+    __user_text_lma  = LOADADDR(.user_text);
+    __user_stack_lma = LOADADDR(.user_stack);
+
+    /* Everything the SBI loaded (kernel + the user image's LMA copy) is
+     * off-limits as free memory. */
+    __kernel_image_phys_end = LOADADDR(.user_stack) + SIZEOF(.user_stack);
 
     /DISCARD/ :
     {

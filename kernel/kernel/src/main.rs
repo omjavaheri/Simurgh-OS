@@ -217,6 +217,13 @@ mod sys {
     /// Translate `a0` = virtual address through the Root Task's address
     /// space; returns the physical address, or `usize::MAX` if unmapped.
     pub const TRANSLATE: usize = 3;
+    /// No arguments — the kernel logs a fixed "Root Task alive under
+    /// paging" line. Used by the isolated U-mode entry, which carries no
+    /// string literals of its own.
+    pub const ALIVE: usize = 9;
+    /// `a0` = a value the kernel should echo into the log (used to report
+    /// a `TRANSLATE` result from code that cannot format it itself).
+    pub const REPORT: usize = 10;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -237,41 +244,31 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     ret
 }
 
-/// The user-space Root Task entry (runs in U-mode on `kernel-arch-glue`'s
-/// `ROOT_STACK`). Reaches the kernel only via `raw_syscall` / `ecall`.
+/// The user-space Root Task entry. Linked into `.user_text` (its own
+/// U=1 R+X pages at VMA 0xC000_0000, per hal-riscv64's linker.ld) and run
+/// in U-mode under Sv39 paging by `kernel-arch-glue::enter`.
+///
+/// Deliberately self-contained — every arg is an immediate or comes back
+/// in a register — so the code is correct at its linked VA no matter
+/// where the loader placed the LMA copy, and `.user_text` carries no
+/// relocations to data in kernel `.rodata`. Any human-readable output is
+/// produced by the kernel (`sys::ALIVE`, `sys::REPORT`).
 #[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
 extern "C" fn umode_root() -> ! {
-    let hello = b"root task (U-mode): hello via ecall\r\n";
-    // SAFETY: syscall ABI; the kernel reads [ptr, ptr+len) from our
-    // (shared, satp=0) address space.
-    unsafe { raw_syscall(sys::DEBUG_LOG, hello.as_ptr() as usize, hello.len()) };
-
-    // SAFETY: same.
-    let cap = unsafe { raw_syscall(sys::RETYPE_ENDPOINT, 0, 0) };
-    let done: &[u8] = if cap != usize::MAX {
-        b"root task (U-mode): ecall Retype returned a capability - syscall boundary works\r\n"
-    } else {
-        b"root task (U-mode): ecall Retype FAILED\r\n"
-    };
-    // SAFETY: same.
-    unsafe { raw_syscall(sys::DEBUG_LOG, done.as_ptr() as usize, done.len()) };
-
-    // Map a page in our address space and translate it back.
-    let (va, pa) = (0x4000_0000usize, 0x8800_0000usize);
-    // SAFETY: same.
-    let mapped = unsafe { raw_syscall(sys::MAP_PAGE, va, pa) };
-    // SAFETY: same.
-    let back = unsafe { raw_syscall(sys::TRANSLATE, va + 0x40, 0) };
-    let map_line: &[u8] = if mapped == 0 && back == pa + 0x40 {
-        b"root task (U-mode): ecall Map + Translate round-trip OK (va+0x40 -> pa+0x40)\r\n"
-    } else {
-        b"root task (U-mode): ecall Map/Translate FAILED\r\n"
-    };
-    // SAFETY: same.
-    unsafe { raw_syscall(sys::DEBUG_LOG, map_line.as_ptr() as usize, map_line.len()) };
-
-    loop {
-        core::hint::spin_loop();
+    // SAFETY: `ecall` from U-mode traps to our S-mode handler, which
+    // preserves every register except a0. All arguments here are plain
+    // integers; nothing is dereferenced in U-mode.
+    unsafe {
+        raw_syscall(sys::ALIVE, 0, 0);
+        let _cap = raw_syscall(sys::RETYPE_ENDPOINT, 0, 0);
+        // Map a page in an empty part of our address space and read the
+        // translation back, then have the kernel report it.
+        raw_syscall(sys::MAP_PAGE, 0xD000_0000, 0x8800_0000);
+        let pa = raw_syscall(sys::TRANSLATE, 0xD000_0040, 0);
+        raw_syscall(sys::REPORT, pa, 0);
+        // Spin forever without touching memory or any relocation.
+        core::arch::asm!("1:", "j 1b", options(noreturn));
     }
 }
 
@@ -350,7 +347,53 @@ fn simurgh_syscall(
             Some((pa, _perms)) => pa.as_usize(),
             None => usize::MAX,
         },
+        sys::ALIVE => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, ISOLATED under Sv39): alive, made an ecall from U=1 pages\r\n"
+            ));
+            0
+        }
+        sys::REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode): ecall Map+Translate result = {:#x}\r\n",
+                a0
+            ));
+            0
+        }
         _ => usize::MAX,
+    }
+}
+
+// Linker symbols for the user (layer-3) Root Task image — see
+// hal-riscv64/src/linker.ld's `.user_text` / `.user_stack` sections.
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" {
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_text_lma: u8;
+    static __user_stack_start: u8;
+    static __user_stack_end: u8;
+    static __user_stack_lma: u8;
+}
+
+/// Reads the `.user_*` linker symbols into the descriptor `enter` needs to
+/// map the Root Task's pages `U=1` before dropping to U-mode.
+#[cfg(target_arch = "riscv64")]
+fn user_image() -> kernel_arch_glue::UserImage {
+    let sym = |s: &u8| s as *const u8 as usize;
+    // SAFETY: these are linker-defined addresses, taken by reference only,
+    // never dereferenced — the standard idiom for consuming linker script
+    // symbols.
+    unsafe {
+        kernel_arch_glue::UserImage {
+            text_vma: sym(&__user_text_start),
+            text_lma: sym(&__user_text_lma),
+            text_len: sym(&__user_text_end) - sym(&__user_text_start),
+            stack_vma: sym(&__user_stack_start),
+            stack_lma: sym(&__user_stack_lma),
+            stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
+            entry_vma: umode_root as usize,
+        }
     }
 }
 
@@ -387,9 +430,17 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             // invokes for an `ecall` from U-mode.
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_syscall_handler(simurgh_syscall);
-            // Never returns: runs the in-kernel demo, then drops the Root
-            // Task to U-mode at `umode_root`.
-            kernel_arch_glue::enter(&hal, state, umode_root as usize)
+            // Never returns: runs the in-kernel demo, then (riscv64) maps
+            // the user image U=1, activates Sv39 paging, and drops the
+            // Root Task to U-mode isolated.
+            #[cfg(target_arch = "riscv64")]
+            {
+                kernel_arch_glue::enter(&hal, state, user_image())
+            }
+            #[cfg(not(target_arch = "riscv64"))]
+            {
+                kernel_arch_glue::enter(&hal, state, kernel_arch_glue::UserImage::EMPTY)
+            }
         }
         Err(e) => {
             let _ = writeln!(s, "kernel bring-up FAILED: {e:?}");
