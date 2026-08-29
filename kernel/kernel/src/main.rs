@@ -442,6 +442,63 @@ extern "C" fn umode_worker() -> ! {
     }
 }
 
+/// A THIRD user-space process, spawned via `kernel_arch_glue::
+/// spawn_process` (the generic path, not `umode_root`/`umode_worker`'s
+/// hand-written A/B setup) into its OWN isolated Sv39 address space AND
+/// its OWN capability space — proof that process creation generalizes
+/// beyond the fixed two-process §8.4 proof (a step toward
+/// 03-Kernel-Subsystems-Layer.md §5's subsystems-as-processes). Shares
+/// `.user_text` with the other two (no separate subsystem binary yet).
+///
+/// Needs no endpoint/IPC of its own for this demo — it just bumps a
+/// private counter word at a fixed low address inside its OWN stack
+/// region (safe because this loop pushes no stack frame: pure register
+/// ops, so nothing else ever touches that address). `kernel-arch-glue`
+/// reads the SAME word later through the kernel's own identity map,
+/// using the physical address `spawn_process` returned, not this VA.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_subsystem() -> ! {
+    // SAFETY: `t1` addresses the low end of this process's own `U=1 R+W`
+    // stack mapping (`kernel_arch_glue::spawn_process` set it up); pure
+    // register ops, no stack frame, no relocation.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC030_0000usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// Process A's preemptive-phase counting loop, run by a FRESH thread
+/// `kernel_arch_glue::p2_preempt_start` spawns to share root's own
+/// address space (not `umode_root` continuing to run itself — see that
+/// function's doc comment on why root's own vruntime-loaded TCB is
+/// retired instead of reused). Bumps the SAME counter word `umode_root`
+/// would have (`P2_VA_A_CONST + 8`), since it runs in the SAME space A.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_a_loop() -> ! {
+    // SAFETY: `t1` addresses `0xC004_0008`, mapped `U=1 R+W` in space A by
+    // `enter`/`umode_root`'s own setup; pure register ops, no stack frame.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC004_0008usize,
+            options(noreturn),
+        );
+    }
+}
+
 /// Placeholder U-mode entry for the architectures whose real-kernel boot
 /// is not yet wired (x86_64 / aarch64 still boot `kernel-stub`).
 #[cfg(not(target_arch = "riscv64"))]
@@ -522,8 +579,10 @@ fn simurgh_syscall(
             return TrapOutcome::Resume(0);
         }
         sys::P2_PREEMPT_START => {
-            kernel_arch_glue::p2_preempt_start();
-            return TrapOutcome::Resume(0);
+            return match kernel_arch_glue::p2_preempt_start() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
         }
         _ => {}
     }
@@ -687,6 +746,8 @@ fn user_image() -> kernel_arch_glue::UserImage {
             stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
             entry_vma: umode_root as usize,
             worker_entry_vma: umode_worker as usize,
+            subsystem_entry_vma: umode_subsystem as usize,
+            a_loop_entry_vma: umode_a_loop as usize,
         }
     }
 }
