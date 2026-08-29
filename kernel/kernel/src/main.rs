@@ -33,6 +33,72 @@ use core::panic::PanicInfo;
 
 use hal_core::BootInfo;
 
+// ----------------------------------------------------------------------------
+// A minimal global allocator — boot-time only, for the Root Task's OWN
+// policy code (`root_task::plan_boot` returns a `Vec<MemoryGrant>`).
+// `kernel/*` itself stays heap-free by design (IMPLEMENTATION-PLAN.md D1);
+// this exists ONLY because `root-task` — a layer-3, user-space process —
+// genuinely has a heap "once it retypes some untyped memory" per that
+// crate's own docs, and this binary is presently the vehicle that runs its
+// boot-time planning in-kernel (MVP, before a real per-process heap wired
+// through `UntypedMemory` exists). A bump allocator with no reclaim is
+// deliberate and sufficient: the handful of small, short-lived boot-time
+// allocations this binary makes are never freed anyway.
+// ----------------------------------------------------------------------------
+
+const BOOT_HEAP_BYTES: usize = 64 * 1024;
+
+/// Backing storage for the bump allocator below. `.bss`, zeroed by the
+/// loader — never read before being written by an allocation.
+static mut BOOT_HEAP: [u8; BOOT_HEAP_BYTES] = [0; BOOT_HEAP_BYTES];
+
+struct BumpAllocator {
+    /// Byte offset of the next free slot in `BOOT_HEAP`. `AtomicUsize`
+    /// purely so `alloc` can take `&self` (the `GlobalAlloc` contract) —
+    /// this binary is single-core, so `Relaxed` ordering is all a bump
+    /// pointer needs.
+    offset: core::sync::atomic::AtomicUsize,
+}
+
+// SAFETY: `alloc`'s only memory access is through `BOOT_HEAP.as_mut_ptr()`
+// at an offset this same call reserved via the atomic bump (never handed
+// out to two callers — single-core, and the compare-exchange below is the
+// sole writer of `offset`); `dealloc` touches nothing.
+unsafe impl core::alloc::GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        use core::sync::atomic::Ordering;
+        let (align, size) = (layout.align(), layout.size());
+        loop {
+            let cur = self.offset.load(Ordering::Relaxed);
+            let aligned = (cur + align - 1) & !(align - 1);
+            let Some(new_offset) = aligned.checked_add(size) else {
+                return core::ptr::null_mut();
+            };
+            if new_offset > BOOT_HEAP_BYTES {
+                return core::ptr::null_mut();
+            }
+            if self
+                .offset
+                .compare_exchange(cur, new_offset, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // SAFETY: `aligned + size <= BOOT_HEAP_BYTES`, just checked;
+                // `aligned` is a multiple of `align` by construction.
+                return unsafe { core::ptr::addr_of_mut!(BOOT_HEAP).cast::<u8>().add(aligned) };
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
+        // No reclaim — see this section's module-level doc comment.
+    }
+}
+
+#[global_allocator]
+static BOOT_ALLOCATOR: BumpAllocator = BumpAllocator {
+    offset: core::sync::atomic::AtomicUsize::new(0),
+};
+
 // Link-only: pull in this architecture's boot assembly / `_start` /
 // panic-handler-adjacent code via its `hal-<arch>` crate. Never referenced
 // by type — `kernel_main` depends solely on the architecture-erased
@@ -264,6 +330,16 @@ mod sys {
     /// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an
     /// explicit `P2_YIELD`. Both then run unbounded counting loops.
     pub const P2_PREEMPT_START: usize = 23;
+
+    /// `device-manager::subsystem_entry`'s state-transition report — the
+    /// first REAL `subsystems/*` crate's own logic running as a spawned
+    /// isolated process, not this demo's own code. Must stay numerically
+    /// equal to `device_manager::subsystem_entry::DM_REPORT` (that
+    /// module's own doc comment says so too — no shared protocol crate
+    /// for this demo-scoped raw ABI number, same as every other opcode
+    /// above). `a0` = `DriverState` discriminant, `a1` =
+    /// `restarts_in_window`.
+    pub const DM_REPORT: usize = 30;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -590,10 +666,24 @@ fn simurgh_syscall(
             return TrapOutcome::Resume(0);
         }
         sys::P2_PREEMPT_START => {
+            spawn_device_manager(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
             };
+        }
+        sys::DM_REPORT => {
+            let name = match a0 {
+                0 => "Starting",
+                1 => "Running",
+                2 => "Restarting",
+                3 => "Failed",
+                _ => "?",
+            };
+            kernel_arch_glue::log(format_args!(
+                "device-manager (U-mode, isolated subsystem process): state={name} restarts_in_window={a1}\r\n"
+            ));
+            return TrapOutcome::Resume(0);
         }
         _ => {}
     }
@@ -785,6 +875,79 @@ fn user_image() -> kernel_arch_glue::UserImage {
             subsystem_entry_vma: umode_subsystem as usize,
             a_loop_entry_vma: umode_a_loop as usize,
         }
+    }
+}
+
+/// Layer-3 subsystems as processes (IMPLEMENTATION-PLAN.md follow-up):
+/// runs `root-task`'s REAL `plan_boot` (not a re-derived shortcut) and
+/// launches Device Manager — `Service::BOOT_ORDER[0]` — as a genuinely
+/// isolated process via the SAME generic `kernel_arch_glue::spawn_process`
+/// that spawns this demo's own process C, so it joins the SAME
+/// preemption loop. Called once, from the `P2_PREEMPT_START` ecall
+/// handler (the same transition point process C joins at, and for the
+/// same reason: `plan_boot`'s in-kernel computation touches nothing
+/// U-mode-visible, so its timing relative to the cooperative phase
+/// doesn't matter, but doing it here keeps every "who else joins the
+/// preemption loop" decision in one place).
+#[cfg(target_arch = "riscv64")]
+fn spawn_device_manager(hal: &hal_core::HalInterface) {
+    let k = kernel_arch_glue::kstate();
+
+    // The Root Task's own untyped total stands in for "RAM this boot has
+    // to plan with" at this MVP stage (a real Root Task would sum every
+    // `UntypedMemory` capability it holds, not just query the kernel
+    // directly like this).
+    let total = k.total_untyped_bytes();
+    match root_task::plan_boot(total) {
+        Ok(plan) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: plan_boot({} bytes) - root reserve {} bytes, {} service grant(s), {} bytes free\r\n",
+                total,
+                plan.root_reserve_bytes,
+                plan.grants.len(),
+                plan.free_bytes
+            ));
+            for g in plan.grants.iter() {
+                kernel_arch_glue::log(format_args!(
+                    "root task: plan_boot grant - {:?}: {} bytes\r\n",
+                    g.service, g.bytes
+                ));
+            }
+        }
+        Err(e) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: plan_boot failed: {:?} - device-manager not spawned\r\n",
+                e
+            ));
+            return;
+        }
+    }
+
+    // Device Manager is BOOT_ORDER[0] — launch it for real, sharing the
+    // Root Task's own `.user_text` mapping (see `spawn_process`'s doc
+    // comment) but on its OWN fresh stack/address space/capability space.
+    let user = user_image();
+    const DM_STACK_VMA: usize = 0xC040_0000;
+    const DM_STACK_LEN: usize = 4096 * 4;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        DM_STACK_VMA,
+        DM_STACK_LEN,
+        device_manager::subsystem_entry::subsystem_main as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned device-manager (tid {}) via the generic path, joining the preemption loop\r\n",
+                tid.as_u32()
+            ));
+        }
+        None => kernel_arch_glue::log(format_args!(
+            "root task: device-manager spawn skipped (out of resources)\r\n"
+        )),
     }
 }
 

@@ -654,17 +654,25 @@ fn setup_two_process(
 /// the kernel's own identity map, without needing that process's `satp`
 /// active).
 ///
-/// `text_*` describe the SAME `.user_text` image every demo process in
-/// this MVP shares — there is no separate subsystem ELF / loader yet
-/// (IMPLEMENTATION-PLAN.md's "subsystems as processes" follow-up); only
-/// `stack_vma` need be distinct per call (everything else — the root
-/// page table, its `map_range` pool, the physical stack frames — is
-/// fresh untyped RAM every time). Returns `None` (and logs) on any
-/// allocation failure — untyped RAM, an object-table slot, or `map_range`
-/// are all bounded resources a real capability-gated `Retype`/`Map`
-/// would also have to handle this way.
+/// `text_*` describe the SAME `.user_text` output section every process
+/// this binary spawns links into — including a real `subsystems/*`
+/// crate's own compiled code (its entry point just needs `#[link_section
+/// = ".user_text"]`, e.g. `device_manager::subsystem_entry::
+/// subsystem_main`), since the section is one contiguous, page-rounded
+/// range regardless of which crate contributed which bytes. There is
+/// still no PER-PROCESS separate ELF / loader (IMPLEMENTATION-PLAN.md's
+/// "subsystems as processes" follow-up) — every spawned process's code
+/// lives in this ONE shared range; only `stack_vma`/`entry_vma` need be
+/// distinct per call (the root page table, its `map_range` pool, and the
+/// physical stack frames are fresh untyped RAM every time regardless).
+/// `pub`: called both by this crate's own demo (`p2_preempt_start`, for
+/// process C) and directly by the final binary (`kernel/src/main.rs`) to
+/// launch a real subsystem process under `root-task`'s own boot policy.
+/// Returns `None` (and logs) on any allocation failure — untyped RAM, an
+/// object-table slot, or `map_range` are all bounded resources a real
+/// capability-gated `Retype`/`Map` would also have to handle this way.
 #[allow(clippy::too_many_arguments)]
-fn spawn_process(
+pub fn spawn_process(
     hal: &HalInterface,
     state: &mut KernelState,
     text_vma: usize,
