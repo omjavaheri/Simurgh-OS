@@ -1096,7 +1096,6 @@ pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u
         "FAULT: thread {} took a fatal U-mode exception (cause={:#x} sepc={:#x} stval={:#x}) - terminating IT, rest of the system continues (03 5.2)\r\n",
         tid.as_u32(), cause_code, sepc, stval
     );
-<<<<<<< HEAD
 
     // If the thread that just died is the one device-manager actually
     // supervises, hand off DIRECTLY to device-manager's own PERMANENT tid
@@ -1126,8 +1125,6 @@ pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u
         }
     }
 
-=======
->>>>>>> c823464 (feat(kernel): real per-thread fault isolation — a crashing process dies alone (riscv64))
     match k.terminate_thread(tid, hal.now_ns()) {
         kernel_core::TerminationOutcome::Switched { incoming } => {
             k.user_context_bytes(incoming).map(|c| c.as_ptr())
@@ -1142,7 +1139,6 @@ pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u
     }
 }
 
-<<<<<<< HEAD
 /// Records `tid` as the "faulty driver" instance `p2_fault` should treat
 /// specially. Called once by `kernel/src/main.rs`'s `spawn_faulty_driver`
 /// right after EVERY (re)spawn — a respawned driver gets a brand-new
@@ -1237,8 +1233,6 @@ pub fn p2_poll_crash() -> usize {
     pending.map(|(cause, _, _)| cause).unwrap_or(0)
 }
 
-=======
->>>>>>> c823464 (feat(kernel): real per-thread fault isolation — a crashing process dies alone (riscv64))
 /// Busy-park forever. The in-kernel demo threads have nothing to return
 /// to once their part is done; a real service would loop on `Recv`.
 fn park() -> ! {
