@@ -40,7 +40,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use core::fmt::Arguments;
-use hal_core::{BootInfo, HalInterface, MapPermissions, VirtAddr};
+use hal_core::{BootInfo, HalInterface, MapPermissions, VirtAddr, HAL_USER_CONTEXT_BYTES};
 use kernel_cap::{CapId, CapabilityRights, ThreadId};
 use kernel_core::{KernelInitError, KernelState, SyscallOp, SyscallReturn, ThreadState};
 use kernel_ipc::SmallMessage;
@@ -77,6 +77,44 @@ static mut G_MAP_POOL_USED: usize = 0;
 static mut G_T2: u32 = 0;
 static mut G_EP: u32 = 0;
 static mut G_ROOT: u32 = 0;
+
+// ---------------------------------------------------------------------------
+// Two-process zero-copy proof (02-Microkernel-Layer.md §8.4).
+//
+// `enter` builds a SECOND, fully isolated Sv39 address space with its own
+// U-mode thread, and maps ONE physical frame into both spaces at
+// different virtual addresses. The two threads then hand the core back
+// and forth through the kernel (`P2_YIELD` ecall -> `TrapOutcome::
+// SwitchTo`), each writing/reading the shared frame through its own VA.
+// If each side sees the other's write, the frame is genuinely shared
+// with no copy — across the MMU-enforced isolation boundary, which is
+// what "two processes" means here (vs the earlier in-kernel `satp`-bounce
+// proof in `inkernel_demo` step 7).
+// ---------------------------------------------------------------------------
+
+/// 8-byte-aligned backing for one `hal_core::UserContext` (the arch crate
+/// reinterprets it as a struct of `u64` fields).
+#[repr(align(8))]
+struct UserCtxBuf([u8; HAL_USER_CONTEXT_BYTES]);
+
+static mut P2_CTX_A: UserCtxBuf = UserCtxBuf([0; HAL_USER_CONTEXT_BYTES]);
+static mut P2_CTX_B: UserCtxBuf = UserCtxBuf([0; HAL_USER_CONTEXT_BYTES]);
+/// 0 = process A is on the CPU, 1 = process B. Flipped by `p2_yield`.
+static mut P2_TURN: u8 = 0;
+/// Physical frame shared by both address spaces.
+static mut P2_SHARED_PHYS: usize = 0;
+/// Virtual address the shared frame is mapped at in space A / space B.
+static mut P2_VA_A: usize = 0;
+static mut P2_VA_B: usize = 0;
+/// What process B reported reading through its VA (set by `p2_report_b`).
+static mut P2_B_SAW: usize = 0;
+
+/// The sentinel process A writes before the first hand-off, and the one
+/// process B writes back. Kept here so the kernel-side cross-check and
+/// the U-mode `sw` immediates cannot drift (the U-mode code hard-codes
+/// the same values as bare immediates — see `kernel/src/main.rs`).
+const P2_A_SENTINEL: usize = 0xC0DE;
+const P2_B_SENTINEL: usize = 0xB00B;
 
 /// Routes a formatted line to the logger the boot binary installed via
 /// `build`. A no-op if none was installed. Used by `klog!`.
@@ -185,6 +223,11 @@ pub struct UserImage {
     pub stack_len: usize,
     /// Virtual address to begin U-mode execution at (inside `.user_text`).
     pub entry_vma: usize,
+    /// Virtual address of the SECOND process's entry point (also inside
+    /// `.user_text` — the two U-mode threads share the same code pages,
+    /// different stacks and address spaces). `0` = no second process on
+    /// this architecture, so `enter` runs only the single-process path.
+    pub worker_entry_vma: usize,
 }
 
 impl UserImage {
@@ -197,6 +240,7 @@ impl UserImage {
         stack_lma: 0,
         stack_len: 0,
         entry_vma: 0,
+        worker_entry_vma: 0,
     };
 }
 
@@ -242,7 +286,8 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
         .and_then(|u| u.alloc(4096, 4096).ok());
     let pool = state
         .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 4).ok());
+        .and_then(|u| u.alloc(4096, 4096 * POOL_FRAMES as u64).ok());
+    // (POOL_FRAMES is usize; `as u64` above for the allocator API.)
 
     let (root_pt, pool) = match (root_pt, pool) {
         (Some(r), Some(p)) => (r.as_usize(), p.as_usize()),
@@ -268,13 +313,15 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
     // SAFETY: `pool` / `map_pool` are fresh untyped RAM in the identity-
     // mapped low RAM; single-core; `map_range` requires them pre-zeroed.
     unsafe {
-        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 4);
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * POOL_FRAMES);
         core::ptr::write_bytes(map_pool as *mut u8, 0, 4096 * 8);
     }
 
     let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
-    hal.map_ram_identity(root_pt, 3, false);
+    let user_sp = (user.stack_vma + user.stack_len) & !0xF;
 
+    // ---- Space A (the Root Task): kernel identity U=0, user image U=1 ----
+    hal.map_ram_identity(root_pt, 3, false);
     // R=1 W=2 X=4 U=8.
     let n1 = hal.map_range(
         root_pt,
@@ -283,7 +330,7 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
         round4k(user.text_len),
         1 | 4 | 8,
         pool,
-        4,
+        POOL_FRAMES as usize,
     );
     let n2 = if n1 == u32::MAX {
         u32::MAX
@@ -295,18 +342,40 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
             round4k(user.stack_len),
             1 | 2 | 8,
             pool + (n1 as usize) * 4096,
-            4 - n1 as usize,
+            POOL_FRAMES as usize - n1 as usize,
         )
     };
     if n1 == u32::MAX || n2 == u32::MAX {
         klog!("failed to map the user image (map_range error) - halting\r\n");
         park();
     }
+    let used_a = n1 + n2;
 
+    // ---- Space B (the second process), if this architecture has one ----
+    // Build a fully isolated Sv39 space with its own stack, sharing only
+    // ONE physical frame with space A (mapped at a different VA in each),
+    // then run BOTH via cooperative hand-off (02-Microkernel-Layer.md §8.4).
+    if user.worker_entry_vma != 0
+        && setup_two_process(hal, state, &user, root_pt, pool, used_a, user_sp)
+    {
+        hal.activate_address_space(root_pt);
+        // SAFETY: single-core boot; written once, before any syscall runs.
+        unsafe {
+            core::ptr::addr_of_mut!(G_ROOT_PT).write(root_pt);
+            core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
+            core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
+        }
+        // SAFETY: `P2_CTX_A` was just filled by `init_user_context` in
+        // `setup_two_process`; it is a valid, resumable U-mode context and
+        // interrupts are masked (never enabled on this core). Never returns.
+        unsafe {
+            let ctx_a = &(*core::ptr::addr_of!(P2_CTX_A)).0;
+            hal.resume_user(ctx_a)
+        }
+    }
+
+    // ---- Single-process fallback (unchanged behaviour) ----
     hal.activate_address_space(root_pt);
-
-    // Publish the live table + runtime pool so the final binary's `Map`
-    // syscall arm (`map_user_page`) can add pages after we drop to U-mode.
     // SAFETY: single-core boot; written once here, before any syscall can
     // run, and only read afterwards.
     unsafe {
@@ -314,14 +383,211 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
         core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
         core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
     }
-
-    let user_sp = (user.stack_vma + user.stack_len) & !0xF;
     klog!(
         "--- Sv39 paging active; dropping Root Task to U-mode (entry {:#x}, sp {:#x}, isolated on U=1 pages) ---\r\n",
         user.entry_vma,
         user_sp
     );
     hal.enter_user(user.entry_vma, user_sp)
+}
+
+/// Frames reserved for the boot-time `map_range` page-table pool (space A):
+/// one L1 + one L0 for the user image, with headroom for the shared-frame
+/// leaf and future growth.
+const POOL_FRAMES: usize = 8;
+
+/// Virtual addresses used by the two-process proof. `.user_text` is linked
+/// at 0xC000_0000 and `.user_stack` just above it, so everything below
+/// stays inside the same (already-a-page-table, not a superpage) Sv39 GiB
+/// slot — `map_range` needs no superpage split for any of them.
+const P2_STACK_B_VMA: usize = 0xC010_0000;
+const P2_STACK_B_LEN: usize = 4096 * 4;
+const P2_VA_A_CONST: usize = 0xC004_0000;
+const P2_VA_B_CONST: usize = 0xC020_0000;
+
+/// Builds address space B, maps the shared frame into both spaces, and
+/// initialises both `UserContext`s. Returns `false` (and logs) if untyped
+/// RAM or the page-table pool runs out — the caller then falls back to the
+/// single-process path. On `true`, `P2_CTX_A` / `P2_CTX_B` and the `P2_*`
+/// globals are ready and the caller may `resume_user(P2_CTX_A)`.
+fn setup_two_process(
+    hal: &HalInterface,
+    state: &mut KernelState,
+    user: &UserImage,
+    root_pt: usize,
+    pool_a: usize,
+    used_a: u32,
+    user_sp_a: usize,
+) -> bool {
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let carve = |st: &mut KernelState, bytes: u64| {
+        st.untyped_mut(kernel_cap::UntypedId::new(0))
+            .and_then(|u| u.alloc(4096, bytes).ok())
+            .map(|p| p.as_usize())
+    };
+
+    let (shared, root_pt_b, pool_b, stack_b) = match (
+        carve(state, 4096),
+        carve(state, 4096),
+        carve(state, 4096 * 8),
+        carve(state, P2_STACK_B_LEN as u64),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => {
+            klog!("two-process proof: out of untyped RAM - single-process path\r\n");
+            return false;
+        }
+    };
+
+    // SAFETY: all four regions are fresh untyped RAM, identity-addressable
+    // (paging not yet active on space B); single-core. `map_range` needs
+    // the pool pre-zeroed; the shared frame starts clean too.
+    unsafe {
+        core::ptr::write_bytes(pool_b as *mut u8, 0, 4096 * 8);
+        core::ptr::write_bytes(shared as *mut u8, 0, 4096);
+    }
+
+    // Shared frame into space A (uses the remaining space-A pool).
+    let sa = hal.map_range(
+        root_pt,
+        P2_VA_A_CONST,
+        shared,
+        4096,
+        1 | 2 | 8,
+        pool_a + used_a as usize * 4096,
+        POOL_FRAMES as usize - used_a as usize,
+    );
+
+    // Space B: kernel identity U=0, then user text / its own stack / the
+    // shared frame, all U=1.
+    hal.map_ram_identity(root_pt_b, 3, false);
+    let mut ub = 0u32;
+    let step = |vaddr, paddr, len, perm, ub: &mut u32| -> bool {
+        let n = hal.map_range(
+            root_pt_b,
+            vaddr,
+            paddr,
+            len,
+            perm,
+            pool_b + *ub as usize * 4096,
+            8 - *ub as usize,
+        );
+        if n == u32::MAX {
+            false
+        } else {
+            *ub += n;
+            true
+        }
+    };
+    let ok = sa != u32::MAX
+        && step(user.text_vma, user.text_lma, round4k(user.text_len), 1 | 4 | 8, &mut ub)
+        && step(P2_STACK_B_VMA, stack_b, P2_STACK_B_LEN, 1 | 2 | 8, &mut ub)
+        && step(P2_VA_B_CONST, shared, 4096, 1 | 2 | 8, &mut ub);
+    if !ok {
+        klog!("two-process proof: map_range error - single-process path\r\n");
+        return false;
+    }
+
+    let stack_b_top = (P2_STACK_B_VMA + P2_STACK_B_LEN) & !0xF;
+
+    // SAFETY: `P2_CTX_A` / `P2_CTX_B` are 8-byte-aligned
+    // `HAL_USER_CONTEXT_BYTES` buffers; single-core boot, written once.
+    unsafe {
+        let ctx_a = &mut (*core::ptr::addr_of_mut!(P2_CTX_A)).0;
+        hal.init_user_context(ctx_a, user.entry_vma, user_sp_a, root_pt);
+        let ctx_b = &mut (*core::ptr::addr_of_mut!(P2_CTX_B)).0;
+        hal.init_user_context(ctx_b, user.worker_entry_vma, stack_b_top, root_pt_b);
+
+        core::ptr::addr_of_mut!(P2_SHARED_PHYS).write(shared);
+        core::ptr::addr_of_mut!(P2_VA_A).write(P2_VA_A_CONST);
+        core::ptr::addr_of_mut!(P2_VA_B).write(P2_VA_B_CONST);
+        core::ptr::addr_of_mut!(P2_TURN).write(0);
+    }
+
+    klog!(
+        "--- Sv39 paging active; two isolated U-mode processes; shared frame {:#x} at VA {:#x} (A) / {:#x} (B) ---\r\n",
+        shared,
+        P2_VA_A_CONST,
+        P2_VA_B_CONST
+    );
+    true
+}
+
+/// Called by the riscv64 syscall handler when either process makes a
+/// `P2_YIELD` `ecall`. Returns `(save, into)` for `TrapOutcome::SwitchTo`
+/// — the outgoing context to snapshot and the incoming one to resume —
+/// and flips whose turn it is.
+pub fn p2_yield() -> (*mut u8, *const u8) {
+    // SAFETY: single-core; `P2_TURN` and the two context buffers are only
+    // touched from this cooperative hand-off path (and the one-time
+    // `setup_two_process` before any thread runs).
+    unsafe {
+        let a = core::ptr::addr_of_mut!(P2_CTX_A) as *mut u8;
+        let b = core::ptr::addr_of_mut!(P2_CTX_B) as *mut u8;
+        let turn = core::ptr::addr_of!(P2_TURN).read();
+        core::ptr::addr_of_mut!(P2_TURN).write(turn ^ 1);
+        if turn == 0 {
+            (a, b as *const u8) // A yields -> save A, resume B
+        } else {
+            (b, a as *const u8) // B yields -> save B, resume A
+        }
+    }
+}
+
+/// `P2_REPORT` from process B: it read `value` through its own mapping of
+/// the shared frame (which A wrote before the first hand-off).
+pub fn p2_report_b(value: usize) {
+    // SAFETY: single-core; `P2_*` set once by `setup_two_process`.
+    let (phys, va_b) = unsafe {
+        (
+            core::ptr::addr_of!(P2_SHARED_PHYS).read(),
+            core::ptr::addr_of!(P2_VA_B).read(),
+        )
+    };
+    // SAFETY: `phys` is identity-mapped U=0 in the live space; single-core.
+    let kernel_view = unsafe { core::ptr::read_volatile(phys as *const u32) as usize };
+    // SAFETY: single-core; only written here, read by `p2_report_a`.
+    unsafe { core::ptr::addr_of_mut!(P2_B_SAW).write(value) };
+    klog!(
+        "process B (space B, VA {:#x}): read {:#x} from the shared frame; kernel sees {:#x} at PA {:#x} ({})\r\n",
+        va_b,
+        value,
+        kernel_view,
+        phys,
+        if value == P2_A_SENTINEL && kernel_view == P2_A_SENTINEL {
+            "A's write crossed the isolation boundary"
+        } else {
+            "MISMATCH"
+        }
+    );
+}
+
+/// `P2_REPORT` from process A after B ran: it re-read `value` through its
+/// own mapping and should now see B's write. Logs the final verdict.
+pub fn p2_report_a(value: usize) {
+    // SAFETY: single-core; `P2_*` set once by `setup_two_process`.
+    let (phys, va_a, b_saw) = unsafe {
+        (
+            core::ptr::addr_of!(P2_SHARED_PHYS).read(),
+            core::ptr::addr_of!(P2_VA_A).read(),
+            core::ptr::addr_of!(P2_B_SAW).read(),
+        )
+    };
+    // SAFETY: `phys` is identity-mapped U=0 in the live space; single-core.
+    let kernel_view = unsafe { core::ptr::read_volatile(phys as *const u32) as usize };
+    let pass = b_saw == P2_A_SENTINEL && value == P2_B_SENTINEL && kernel_view == P2_B_SENTINEL;
+    klog!(
+        "process A (space A, VA {:#x}): re-read {:#x}; kernel sees {:#x} at PA {:#x} -> {}\r\n",
+        va_a,
+        value,
+        kernel_view,
+        phys,
+        if pass {
+            "TWO-PROCESS ZERO-COPY: A->B->A round-trip through one shared frame, no copy, MMU-isolated spaces (02 8.4)"
+        } else {
+            "MISMATCH"
+        }
+    );
 }
 
 /// Busy-park forever. The in-kernel demo threads have nothing to return

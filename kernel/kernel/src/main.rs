@@ -239,6 +239,26 @@ mod sys {
     /// hardware-level proof behind `02-Microkernel-Layer.md §8.4`
     /// (zero-copy shared memory).
     pub const XCHECK: usize = 11;
+
+    // -- Two-process zero-copy proof (02-Microkernel-Layer.md §8.4) --
+    //
+    // Cooperative hand-off between two U-mode threads living in two
+    // MMU-isolated Sv39 address spaces that share exactly one physical
+    // frame (mapped at a different VA in each). The kernel side is
+    // `kernel_arch_glue::{p2_yield, p2_report_a, p2_report_b}`.
+
+    /// No arguments. The calling U-mode thread is suspended (full context
+    /// saved) and the *other* process is resumed in its own address
+    /// space — `TrapOutcome::SwitchTo`. First `P2_YIELD` runs process A
+    /// -> B; the second (from B) runs B -> A.
+    pub const P2_YIELD: usize = 20;
+    /// `a0` = the value process A re-read through its VA of the shared
+    /// frame after process B ran. The kernel logs the final A->B->A
+    /// round-trip verdict.
+    pub const P2_REPORT_A: usize = 21;
+    /// `a0` = the value process B read through its VA of the shared frame
+    /// (which process A wrote before the first hand-off).
+    pub const P2_REPORT_B: usize = 22;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -312,7 +332,75 @@ extern "C" fn umode_root() -> ! {
         //    three views agree.
         raw_syscall(sys::XCHECK, pa, via_alias);
 
+        // 5. Two-process zero-copy proof (02-Microkernel-Layer.md §8.4).
+        //    `kernel-arch-glue::enter` has already mapped ONE physical
+        //    frame into BOTH this address space (at 0xC004_0000) and the
+        //    isolated space B (at a different VA). Write a sentinel
+        //    through our VA, then `P2_YIELD` — the kernel snapshots this
+        //    thread and resumes process B in space B.
+        core::arch::asm!(
+            "li {t}, 0xC0DE",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xC004_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
+        raw_syscall(sys::P2_YIELD, 0, 0);
+
+        // 6. Resumed here after process B ran. Re-read our VA: process B
+        //    wrote 0xB00B through ITS mapping of the same frame, in a
+        //    different address space, with no copy.
+        let after: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xC004_0000usize,
+            out = out(reg) after,
+            options(nostack, readonly),
+        );
+        raw_syscall(sys::P2_REPORT_A, after, 0);
+
         // Spin forever without touching memory or any relocation.
+        core::arch::asm!("1:", "j 1b", options(noreturn));
+    }
+}
+
+/// The SECOND user-space process (02-Microkernel-Layer.md §8.4). Linked
+/// into the same `.user_text` pages as `umode_root` but run in its OWN
+/// isolated Sv39 address space (space B) on its own stack by
+/// `kernel-arch-glue::enter`. Reads the shared frame through space B's VA
+/// (0xC020_0000), reports what it saw, writes its own sentinel back, and
+/// hands the core to process A. Self-contained: immediates only, no
+/// relocations, any human-readable output produced by the kernel.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_worker() -> ! {
+    // SAFETY: `ecall` traps to our S-mode handler; the `lw`/`sw` go
+    // through 0xC020_0000, which `enter` mapped `U=1 R+W` onto the shared
+    // physical frame in space B's page table.
+    unsafe {
+        // 1. Read what process A wrote (0xC0DE) through space A's VA —
+        //    seen here via space B's independent mapping of the frame.
+        let seen: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xC020_0000usize,
+            out = out(reg) seen,
+            options(nostack, readonly),
+        );
+        raw_syscall(sys::P2_REPORT_B, seen, 0);
+
+        // 2. Write our own sentinel back through space B's VA.
+        core::arch::asm!(
+            "li {t}, 0xB00B",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xC020_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
+
+        // 3. Hand the core back to process A (kernel resumes its saved
+        //    context in space A). We are never scheduled again.
+        raw_syscall(sys::P2_YIELD, 0, 0);
         core::arch::asm!("1:", "j 1b", options(noreturn));
     }
 }
@@ -374,15 +462,34 @@ fn simurgh_syscall(
     _a2: usize,
     _a3: usize,
     _a4: usize,
-) -> usize {
+) -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
     use kernel_core::{SyscallOp, SyscallReturn};
     use kernel_mm::KernelObjectType;
+
+    // Two-process hand-off / reporting arms resolve to a non-`Resume`
+    // outcome or run before the object-model borrow below.
+    match a7 {
+        sys::P2_YIELD => {
+            let (save, into) = kernel_arch_glue::p2_yield();
+            return TrapOutcome::SwitchTo { save, into };
+        }
+        sys::P2_REPORT_A => {
+            kernel_arch_glue::p2_report_a(a0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::P2_REPORT_B => {
+            kernel_arch_glue::p2_report_b(a0);
+            return TrapOutcome::Resume(0);
+        }
+        _ => {}
+    }
 
     let k = kernel_arch_glue::kstate();
     let hal = kernel_arch_glue::khal();
     let root = k.root_thread;
 
-    match a7 {
+    let ret: usize = match a7 {
         sys::DEBUG_LOG => {
             // SAFETY: MVP single-address-space (satp=0). `a0..a0+a1` is a
             // byte range in the shared address space; treat invalid UTF-8
@@ -413,10 +520,10 @@ fn simurgh_syscall(
             // software model so TRANSLATE still answers.
             let frame = match alloc_root_frame(k, hal) {
                 Some(f) => f,
-                None => return usize::MAX,
+                None => return TrapOutcome::Resume(usize::MAX),
             };
             if !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
-                return usize::MAX;
+                return TrapOutcome::Resume(usize::MAX);
             }
             if let Some(space) = k.addr_space_mut(k.root_addr_space) {
                 let _ = space.map(
@@ -434,7 +541,7 @@ fn simurgh_syscall(
             // SAFETY: single-core; set by the last MAP_PAGE.
             let frame = unsafe { core::ptr::addr_of!(LAST_MAPPED_FRAME).read() };
             if frame == 0 || !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
-                return usize::MAX;
+                return TrapOutcome::Resume(usize::MAX);
             }
             if let Some(space) = k.addr_space_mut(k.root_addr_space) {
                 let _ = space.map(
@@ -489,7 +596,8 @@ fn simurgh_syscall(
             0
         }
         _ => usize::MAX,
-    }
+    };
+    TrapOutcome::Resume(ret)
 }
 
 // Linker symbols for the user (layer-3) Root Task image — see
@@ -521,6 +629,7 @@ fn user_image() -> kernel_arch_glue::UserImage {
             stack_lma: sym(&__user_stack_lma),
             stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
             entry_vma: umode_root as usize,
+            worker_entry_vma: umode_worker as usize,
         }
     }
 }

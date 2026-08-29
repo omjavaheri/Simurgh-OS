@@ -180,6 +180,68 @@ impl<const ARCH_CONTEXT_BYTES: usize> CpuContext<ARCH_CONTEXT_BYTES> {
 }
 
 // ============================================================================
+// User context (section 3.1: context switch — the U-mode variant)
+// ============================================================================
+
+/// Fixed byte capacity of a `UserContext`. Deliberately WIDER than
+/// `HAL_CONTEXT_BYTES` (the S-mode/cooperative `CpuContext` size): a
+/// suspended U-mode thread must round-trip its *entire* integer register
+/// file (caller-saved registers and argument registers included, because
+/// a trap can land anywhere in user code — not just at a call boundary)
+/// plus the resume PC, the privilege/interrupt-enable snapshot, and the
+/// address-space root. On RISC-V that is 31 GPRs + `sepc` + `sstatus` +
+/// `satp` = 272 bytes; 320 leaves headroom and keeps the other two
+/// architectures' eventual layouts comfortable without another revision.
+pub const HAL_USER_CONTEXT_BYTES: usize = 320;
+
+/// Saved register state for one *user-mode* execution context, opaque at
+/// the hal-core level exactly like `CpuContext`. The architecture crate
+/// owns the concrete field layout; hal-core only needs a `#[repr(C)]`,
+/// fixed-size, `Copy`, 8-byte-aligned container it can pass by reference
+/// into `init_user_context` / `resume_user`.
+///
+/// Separate from `CpuContext` because the two are produced and consumed
+/// by different mechanisms: `CpuContext` is written at a call boundary by
+/// `context_switch` and resumed with an ordinary jump (kernel-to-kernel
+/// cooperative hand-off); `UserContext` is written from a trap frame and
+/// resumed with the architecture's return-from-trap instruction (`sret`
+/// / `iret` / `eret`), dropping privilege on the way out.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub struct UserContext {
+    bytes: [u8; HAL_USER_CONTEXT_BYTES],
+}
+
+impl Default for UserContext {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+impl UserContext {
+    /// A zeroed context. `init_user_context` turns it into a runnable
+    /// one; the microkernel keeps one per user thread in its TCB storage.
+    pub const fn zeroed() -> Self {
+        Self {
+            bytes: [0; HAL_USER_CONTEXT_BYTES],
+        }
+    }
+
+    /// Raw byte access for architecture code to read/write concrete
+    /// register fields at known offsets. Upper layers (layer 2+) must
+    /// never interpret these bytes — only the architecture crate that
+    /// defined the layout.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; HAL_USER_CONTEXT_BYTES] {
+        &mut self.bytes
+    }
+
+    /// Shared byte view — same contract as `as_bytes_mut`.
+    pub fn as_bytes(&self) -> &[u8; HAL_USER_CONTEXT_BYTES] {
+        &self.bytes
+    }
+}
+
+// ============================================================================
 // CpuAbstraction trait (section 4 pre-draft, verbatim contract)
 // ============================================================================
 
@@ -353,6 +415,56 @@ pub trait CpuAbstraction<const ARCH_CONTEXT_BYTES: usize> {
     /// Every real `hal-<arch>` crate overrides it.
     fn enter_user(&self, entry: usize, stack_top: usize) -> ! {
         let _ = (entry, stack_top);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Initializes a *fresh* `UserContext` so that the first `resume_user`
+    /// into it enters U-mode at `entry` with `stack_top` as the stack
+    /// pointer, in the address space whose root page table is at physical
+    /// frame `root_frame` (`0` = keep the currently active address space).
+    ///
+    /// This is the U-mode analogue of `init_context`: the microkernel
+    /// calls it once per user thread, then treats the context as
+    /// resumable. Unlike `enter_user` (a one-way drop of the boot core),
+    /// a `UserContext` can be suspended by a trap and resumed later, so a
+    /// second, third, ... user process can be launched into their own
+    /// address spaces from the same core.
+    ///
+    /// `entry` must point at a `-> !` function. Default: no-op (mock CPUs
+    /// never run user code); every real `hal-<arch>` crate overrides it.
+    fn init_user_context(
+        &self,
+        context: &mut UserContext,
+        entry: usize,
+        stack_top: usize,
+        root_frame: usize,
+    ) {
+        let _ = (context, entry, stack_top, root_frame);
+    }
+
+    /// Restores `context` and returns to U-mode at its saved PC (the
+    /// architecture's return-from-trap instruction), in `context`'s saved
+    /// address space and with its saved privilege/interrupt state. Never
+    /// returns to the caller — the only way back is a trap the kernel's
+    /// vector handles, which is where the *save* half lives (the trap
+    /// handler serialises the interrupted frame back into a `UserContext`
+    /// before choosing the next one to `resume_user`).
+    ///
+    /// `context` must have been produced by `init_user_context` or by the
+    /// architecture's trap-frame save path. Default: terminal spin — a
+    /// mock/test CPU never calls it; every real `hal-<arch>` crate
+    /// overrides it.
+    ///
+    /// # Safety
+    /// The caller must guarantee `context` holds a valid, resumable
+    /// U-mode context for THIS architecture (a live address-space root
+    /// that maps the kernel's own trap vector, a valid user stack and
+    /// entry PC), and that interrupts are masked on the current core
+    /// while the restore is in flight.
+    unsafe fn resume_user(&self, context: &UserContext) -> ! {
+        let _ = context;
         loop {
             core::hint::spin_loop();
         }

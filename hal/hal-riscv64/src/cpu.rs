@@ -279,10 +279,37 @@ impl TrapFrame {
     const A7: usize = 16; // x17
 }
 
+/// What the trap handler should do after the microkernel's syscall
+/// handler has run.
+///
+/// The `SwitchTo` variant is what makes cooperative *process* hand-off
+/// possible (02-Microkernel-Layer.md §8.4): the handler cannot itself
+/// change which U-mode thread is on the CPU — only the trap vector,
+/// which owns the interrupted register frame, can. So the handler
+/// returns its decision and the trap vector executes it.
+pub enum TrapOutcome {
+    /// Return to the trapping thread, placing `.0` in its `a0`, and
+    /// advance `sepc` past the 4-byte `ecall`. The ordinary syscall
+    /// return.
+    Resume(usize),
+    /// Serialise the trapping thread's full U-mode context (every GPR,
+    /// `sepc` advanced past the `ecall`, `sstatus`, `satp`) into the
+    /// `HAL_USER_CONTEXT_BYTES` blob at `save`, then restore the blob at
+    /// `into` and `sret` into it — a different U-mode thread, in general
+    /// a different address space. Both pointers are kernel-owned,
+    /// 8-byte-aligned `hal_core::UserContext` storage.
+    SwitchTo {
+        /// Where to write the outgoing thread's snapshot.
+        save: *mut u8,
+        /// The incoming thread's context to resume.
+        into: *const u8,
+    },
+}
+
 /// Signature of the S-mode handler the microkernel registers for an
-/// `ecall` from U-mode: raw `(a7, a0, a1, a2, a3, a4)`, returning the
-/// value to place in the caller's `a0`.
-pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> usize;
+/// `ecall` from U-mode: raw `(a7, a0, a1, a2, a3, a4)`, returning a
+/// `TrapOutcome` telling the trap vector how to resume.
+pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> TrapOutcome;
 
 #[cfg(target_os = "none")]
 static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
@@ -348,7 +375,7 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
         // SAFETY: single-core; `SYSCALL_HANDLER` is only written by
         // `set_syscall_handler` during boot, before any U-mode `ecall`.
         let handler = unsafe { core::ptr::addr_of!(SYSCALL_HANDLER).read() };
-        let ret = match handler {
+        let outcome = match handler {
             Some(h) => h(
                 f.regs[TrapFrame::A7] as usize,
                 f.regs[TrapFrame::A0] as usize,
@@ -362,11 +389,31 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                 halt_on_unexpected_exception();
             }
         };
-        f.regs[TrapFrame::A0] = ret as u64;
-        // Resume at the instruction after the 4-byte `ecall`.
-        // SAFETY: writing sepc is valid within a trap handler.
-        unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
-        return;
+        match outcome {
+            TrapOutcome::Resume(ret) => {
+                f.regs[TrapFrame::A0] = ret as u64;
+                // Resume at the instruction after the 4-byte `ecall`.
+                // SAFETY: writing sepc is valid within a trap handler.
+                unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
+                return;
+            }
+            TrapOutcome::SwitchTo { save, into } => {
+                // SAFETY: `save` / `into` are kernel-owned, 8-byte-
+                // aligned `HAL_USER_CONTEXT_BYTES` blobs (the trampoline
+                // / `UserContext` contract). Snapshot the outgoing
+                // thread — resuming AFTER its `ecall` — then never
+                // return: `restore_user_and_sret` abandons this trap
+                // frame's stack and `sret`s into the incoming thread.
+                unsafe {
+                    save_trap_frame_as_user_context(
+                        f,
+                        sepc + 4,
+                        save as *mut RiscvUserContext,
+                    );
+                    restore_user_and_sret(into as *const RiscvUserContext);
+                }
+            }
+        }
     }
 
     trap_diag(cause_code, sepc, stval);
@@ -484,6 +531,150 @@ struct Riscv64Context {
 const _: () = {
     assert!(size_of::<Riscv64Context>() == RISCV64_CONTEXT_BYTES);
 };
+
+// ============================================================================
+// Saved U-mode context layout (matches hal_core::HAL_USER_CONTEXT_BYTES = 320)
+//
+// Unlike `Riscv64Context` (callee-saved only, resumed with `jr` for the
+// kernel-to-kernel cooperative path), a suspended U-mode thread is
+// snapshotted from an arbitrary trap point, so every integer register has
+// to survive the round trip, plus the CSRs `sret` consumes: `sepc` (where
+// to resume), `sstatus` (SPP/SPIE — privilege + interrupt-enable to
+// restore), and `satp` (which address space the thread runs in). This is
+// the concrete form behind `hal_core::UserContext`.
+// ============================================================================
+
+/// `regs[i]` holds `x(i+1)` (x0 is hardwired zero, never stored): `regs[0]`
+/// = `x1`/`ra`, `regs[1]` = `x2`/`sp`, `regs[9]` = `x10`/`a0`, `regs[16]` =
+/// `x17`/`a7`, `regs[30]` = `x31`/`t6`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RiscvUserContext {
+    /// x1..x31, in order.
+    regs: [u64; 31],
+    /// Resume program counter in U-mode.
+    sepc: u64,
+    /// Privilege / interrupt-enable snapshot (`sret` restores SIE from
+    /// SPIE and the privilege level from SPP).
+    sstatus: u64,
+    /// Address-space root (`satp`) the thread executes under.
+    satp: u64,
+    /// Padding to `HAL_USER_CONTEXT_BYTES`: 34 live u64 = 272, + 6 = 320.
+    _reserved: [u64; 6],
+}
+
+const _: () = {
+    assert!(size_of::<RiscvUserContext>() == hal_core::HAL_USER_CONTEXT_BYTES);
+};
+
+/// SPP is `sstatus` bit 8 (Supervisor Previous Privilege): 0 = the trap
+/// that will be returned from via `sret` came from U-mode, so `sret`
+/// drops to U-mode. Only consumed on the bare-metal target (the host
+/// `init_user_context` path takes a fixed `sstatus`).
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+const SSTATUS_SPP: u64 = 1 << 8;
+/// SPIE is `sstatus` bit 5 (Supervisor Previous Interrupt Enable): `sret`
+/// copies it back into SIE. Set it so the resumed thread runs with
+/// S-mode interrupt delivery in the state it should be (harmless today —
+/// nothing is routed to S-mode yet).
+const SSTATUS_SPIE: u64 = 1 << 5;
+
+/// Restores a full `RiscvUserContext` and `sret`s into U-mode. Never
+/// returns. Shared by `resume_user` (first entry, from an
+/// `init_user_context` blob) and the trap handler's process hand-off
+/// path (from a blob it just serialised out of a trap frame).
+///
+/// # Safety
+/// `blob` must point at a valid, resumable `RiscvUserContext` whose
+/// `satp` names an address space that maps this core's trap vector and
+/// the identity-mapped low RAM `blob` itself lives in. Interrupts must be
+/// masked. Never returns, so it does not restore the caller's frame — a
+/// non-hand-off caller's stack frame is simply abandoned.
+#[cfg(target_os = "none")]
+unsafe fn restore_user_and_sret(blob: *const RiscvUserContext) -> ! {
+    // SAFETY: contract above. `t6` carries the blob base for the whole
+    // sequence; CSRs are written first (using `t5` as scratch, which is
+    // then given its real value by the GPR restore), then x1..x30, then
+    // `t6`/x31 loads its own final value from its slot last, then `sret`.
+    unsafe {
+        core::arch::asm!(
+            "ld  t5, 256(t6)",   // sstatus
+            "csrw sstatus, t5",
+            "ld  t5, 248(t6)",   // sepc
+            "csrw sepc, t5",
+            "ld  t5, 264(t6)",   // satp
+            "csrw satp, t5",
+            "sfence.vma",
+            "ld  x1,  0(t6)",
+            "ld  x2,  8(t6)",
+            "ld  x3,  16(t6)",
+            "ld  x4,  24(t6)",
+            "ld  x5,  32(t6)",
+            "ld  x6,  40(t6)",
+            "ld  x7,  48(t6)",
+            "ld  x8,  56(t6)",
+            "ld  x9,  64(t6)",
+            "ld  x10, 72(t6)",
+            "ld  x11, 80(t6)",
+            "ld  x12, 88(t6)",
+            "ld  x13, 96(t6)",
+            "ld  x14, 104(t6)",
+            "ld  x15, 112(t6)",
+            "ld  x16, 120(t6)",
+            "ld  x17, 128(t6)",
+            "ld  x18, 136(t6)",
+            "ld  x19, 144(t6)",
+            "ld  x20, 152(t6)",
+            "ld  x21, 160(t6)",
+            "ld  x22, 168(t6)",
+            "ld  x23, 176(t6)",
+            "ld  x24, 184(t6)",
+            "ld  x25, 192(t6)",
+            "ld  x26, 200(t6)",
+            "ld  x27, 208(t6)",
+            "ld  x28, 216(t6)",
+            "ld  x29, 224(t6)",
+            "ld  x30, 232(t6)",
+            "ld  x31, 240(t6)",
+            "sret",
+            in("t6") blob,
+            options(noreturn),
+        );
+    }
+}
+
+/// Serialises an interrupted U-mode trap frame into a `RiscvUserContext`
+/// so it can be `restore_user_and_sret`'d later. `resume_sepc` is where
+/// the thread should continue (the trap handler passes `sepc + 4` so a
+/// suspended `ecall` does not re-execute). Captures the *live* `sstatus`
+/// and `satp`, which for a trap taken from U-mode already describe the
+/// thread's own privilege state and address space.
+///
+/// # Safety
+/// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
+/// 8-byte-aligned storage.
+#[cfg(target_os = "none")]
+unsafe fn save_trap_frame_as_user_context(
+    frame: &TrapFrame,
+    resume_sepc: usize,
+    dst: *mut RiscvUserContext,
+) {
+    let (sstatus, satp): (u64, u64);
+    // SAFETY: reading sstatus/satp has no preconditions in S-mode.
+    unsafe {
+        core::arch::asm!("csrr {}, sstatus", out(reg) sstatus);
+        core::arch::asm!("csrr {}, satp", out(reg) satp);
+    }
+    // SAFETY: `dst` is valid writable storage of the matching size /
+    // alignment per this function's contract.
+    unsafe {
+        (*dst).regs = frame.regs; // regs[i] == x(i+1) in both layouts
+        (*dst).sepc = resume_sepc as u64;
+        (*dst).sstatus = sstatus;
+        (*dst).satp = satp;
+        (*dst)._reserved = [0; 6];
+    }
+}
 
 // ============================================================================
 // Cpu — CpuAbstraction<RISCV64_CONTEXT_BYTES> implementation
@@ -765,6 +956,74 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
                 options(noreturn),
             );
         }
+    }
+
+    fn init_user_context(
+        &self,
+        context: &mut hal_core::UserContext,
+        entry: usize,
+        stack_top: usize,
+        root_frame: usize,
+    ) {
+        // SAFETY: `hal_core::UserContext` is `#[repr(C, align(8))]` over
+        // exactly `[u8; HAL_USER_CONTEXT_BYTES]` and `RiscvUserContext`
+        // is `#[repr(C)]` of that same asserted size — so the buffer IS
+        // a valid `RiscvUserContext`.
+        let ctx = unsafe {
+            &mut *(context.as_bytes_mut().as_mut_ptr() as *mut RiscvUserContext)
+        };
+        *ctx = RiscvUserContext::default();
+        ctx.regs[1] = stack_top as u64; // x2 = sp
+        ctx.sepc = entry as u64;
+
+        // satp: Sv39 mode 8, ASID 0, PPN = root_frame >> 12. `root_frame
+        // == 0` means "keep whatever is active" — read it back so the
+        // first `resume_user` does not clobber the live translation.
+        ctx.satp = if root_frame != 0 {
+            (8u64 << 60) | ((root_frame as u64) >> 12)
+        } else {
+            #[cfg(target_os = "none")]
+            {
+                let satp: u64;
+                // SAFETY: `csrr satp` is always valid in S-mode.
+                unsafe { core::arch::asm!("csrr {0}, satp", out(reg) satp) };
+                satp
+            }
+            #[cfg(not(target_os = "none"))]
+            {
+                0
+            }
+        };
+
+        // sstatus for a fresh U-mode entry: start from the live value so
+        // fields like SUM are preserved, then force SPP = 0 (so `sret`
+        // targets U-mode) and SPIE = 1.
+        #[cfg(target_os = "none")]
+        {
+            let sstatus: u64;
+            // SAFETY: `csrr sstatus` is always valid in S-mode.
+            unsafe { core::arch::asm!("csrr {0}, sstatus", out(reg) sstatus) };
+            ctx.sstatus = (sstatus & !SSTATUS_SPP) | SSTATUS_SPIE;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ctx.sstatus = SSTATUS_SPIE;
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    unsafe fn resume_user(&self, context: &hal_core::UserContext) -> ! {
+        // SAFETY: the buffer is a valid `RiscvUserContext` (see
+        // `init_user_context`); the resumable-context + interrupts-masked
+        // obligations are this method's documented caller contract.
+        let blob = context.as_bytes().as_ptr() as *const RiscvUserContext;
+        unsafe { restore_user_and_sret(blob) }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    unsafe fn resume_user(&self, context: &hal_core::UserContext) -> ! {
+        let _ = context;
+        unreachable!("resume_user is bare-metal only (host test build)");
     }
 
     fn set_privilege_level(&self, level: PrivilegeLevel) -> Result<(), HalError> {

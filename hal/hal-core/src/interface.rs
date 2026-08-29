@@ -40,9 +40,19 @@
 //!     user/kernel split and drives Sv39 page tables. `flush_tlb` is the
 //!     invalidation half of the `Map` syscall: `map_range` walks entries
 //!     into the *live* table, `flush_tlb` makes the core honour them.
+//!   - v4 (microkernel, 02-Microkernel-Layer.md §8.4): `init_user_context`
+//!     and `resume_user` added. `enter_user` is a one-way drop of the boot
+//!     core — it cannot bring a SECOND user process onto the CPU. The
+//!     §8.4 acceptance criterion ("زیرو-کپی بین دو پروسه‌ی ایزوله") needs
+//!     two U-mode threads in two isolated address spaces handing the core
+//!     back and forth through the kernel, so the kernel now needs to
+//!     resume an arbitrary saved U-mode context (`resume_user`) and to
+//!     mint fresh ones (`init_user_context`). The *save* half is
+//!     arch-internal to the trap vector and needs no interface method.
 //! ============================================================================
 
 use crate::cpu::CpuAbstraction;
+use crate::cpu::HAL_USER_CONTEXT_BYTES;
 use crate::timer::TimerAbstraction;
 
 /// The single saved-register-context width the architecture-erased
@@ -122,6 +132,40 @@ unsafe fn trampoline_enter_user<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
     cpu.enter_user(entry, stack_top)
 }
 
+unsafe fn trampoline_init_user_context<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    context: *mut u8,
+    entry: usize,
+    stack_top: usize,
+    root_frame: usize,
+) {
+    // SAFETY: `state` is a valid `&C` (build_interface contract);
+    // `context` points at `HAL_USER_CONTEXT_BYTES` writable, 8-byte-
+    // aligned bytes owned by the caller, and `UserContext` is
+    // `#[repr(C, align(8))]` over exactly `[u8; HAL_USER_CONTEXT_BYTES]`
+    // — so such a buffer IS a valid `UserContext`.
+    let cpu = unsafe { &*(state as *const C) };
+    let ctx = unsafe { &mut *(context as *mut crate::cpu::UserContext) };
+    cpu.init_user_context(ctx, entry, stack_top, root_frame);
+}
+
+unsafe fn trampoline_resume_user<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    context: *const u8,
+) -> ! {
+    // SAFETY: `state` is a valid `&C` (build_interface contract);
+    // `context` points at `HAL_USER_CONTEXT_BYTES` initialised, 8-byte-
+    // aligned bytes holding a `UserContext` (see
+    // `trampoline_init_user_context`). The resumable-context and
+    // interrupts-masked obligations are forwarded to the caller by
+    // `HalInterface::resume_user`'s own `# Safety` section.
+    let cpu = unsafe { &*(state as *const C) };
+    let ctx = unsafe { &*(context as *const crate::cpu::UserContext) };
+    // SAFETY: forwards to the architecture implementation; preconditions
+    // inherited from this function's own contract above.
+    unsafe { cpu.resume_user(ctx) }
+}
+
 unsafe fn trampoline_map_ram_identity<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
     state: *const (),
     root_frame: usize,
@@ -194,6 +238,8 @@ pub struct HalInterface {
     cpu_flush_tlb: unsafe fn(*const ()),
     cpu_map_range: unsafe fn(*const (), usize, usize, usize, usize, usize, usize, usize) -> u32,
     cpu_enter_user: unsafe fn(*const (), usize, usize) -> !,
+    cpu_init_user_context: unsafe fn(*const (), *mut u8, usize, usize, usize),
+    cpu_resume_user: unsafe fn(*const (), *const u8) -> !,
     timer_now_ns: unsafe fn(*const ()) -> u64,
     timer_frequency_hz: unsafe fn(*const ()) -> u64,
 }
@@ -329,6 +375,47 @@ impl HalInterface {
         unsafe { (self.cpu_enter_user)(self.cpu_state, entry, stack_top) }
     }
 
+    /// Initialises a fresh `HAL_USER_CONTEXT_BYTES` buffer so the first
+    /// `resume_user` into it enters U-mode at `entry` on `stack_top`, in
+    /// the address space rooted at physical frame `root_frame` (`0` =
+    /// keep the active one). See `CpuAbstraction::init_user_context`.
+    pub fn init_user_context(
+        &self,
+        context: &mut [u8; HAL_USER_CONTEXT_BYTES],
+        entry: usize,
+        stack_top: usize,
+        root_frame: usize,
+    ) {
+        // SAFETY: `cpu_state`/`cpu_init_user_context` were produced
+        // together by `build_interface`; `context` is
+        // `HAL_USER_CONTEXT_BYTES` long and (as a `[u8; N]` in a struct /
+        // static the caller controls) the caller keeps it 8-byte aligned.
+        unsafe {
+            (self.cpu_init_user_context)(
+                self.cpu_state,
+                context.as_mut_ptr(),
+                entry,
+                stack_top,
+                root_frame,
+            )
+        }
+    }
+
+    /// Restores `context` and returns to U-mode at its saved PC. Never
+    /// returns. See `CpuAbstraction::resume_user`.
+    ///
+    /// # Safety
+    /// As `CpuAbstraction::resume_user`: `context` must hold a valid,
+    /// resumable U-mode context for this architecture, and interrupts
+    /// must be masked on the current core.
+    pub unsafe fn resume_user(&self, context: &[u8; HAL_USER_CONTEXT_BYTES]) -> ! {
+        // SAFETY: `cpu_state`/`cpu_resume_user` were produced together by
+        // `build_interface`; the resumable-context and interrupts-masked
+        // obligations are forwarded to the caller by this method's own
+        // `# Safety` section.
+        unsafe { (self.cpu_resume_user)(self.cpu_state, context.as_ptr()) }
+    }
+
     /// Current monotonic time in nanoseconds.
     pub fn now_ns(&self) -> u64 {
         // SAFETY: `timer_state`/`timer_now_ns` were produced together
@@ -378,6 +465,8 @@ where
         cpu_flush_tlb: trampoline_flush_tlb::<C>,
         cpu_map_range: trampoline_map_range::<C>,
         cpu_enter_user: trampoline_enter_user::<C>,
+        cpu_init_user_context: trampoline_init_user_context::<C>,
+        cpu_resume_user: trampoline_resume_user::<C>,
         timer_now_ns: trampoline_now_ns::<T>,
         timer_frequency_hz: trampoline_frequency_hz::<T>,
     }
