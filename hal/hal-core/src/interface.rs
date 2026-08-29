@@ -49,11 +49,20 @@
 //!     resume an arbitrary saved U-mode context (`resume_user`) and to
 //!     mint fresh ones (`init_user_context`). The *save* half is
 //!     arch-internal to the trap vector and needs no interface method.
+//!   - v5 (microkernel, 02-Microkernel-Layer.md §4): `arm_timer` /
+//!     `cancel_timer` added. The `TimerAbstraction` is already in the
+//!     interface for `now_ns` / `frequency_hz`; the preemptive scheduler
+//!     additionally needs to bound a thread's quantum by arming a
+//!     one-shot deadline and, when it stops preempting, disarming it.
+//!     The interrupt *delivery* wiring (`sie.STIE`, the trap-vector
+//!     branch that runs the scheduler on a tick) is arch-internal — the
+//!     kernel only registers a tick handler with the arch crate, exactly
+//!     as it registers a syscall handler.
 //! ============================================================================
 
 use crate::cpu::CpuAbstraction;
 use crate::cpu::HAL_USER_CONTEXT_BYTES;
-use crate::timer::TimerAbstraction;
+use crate::timer::{TimerAbstraction, TimerMode};
 
 /// The single saved-register-context width the architecture-erased
 /// interface works in, in bytes. Every architecture crate implements
@@ -214,6 +223,18 @@ unsafe fn trampoline_now_ns<T: TimerAbstraction>(state: *const ()) -> u64 {
     timer.now_ns()
 }
 
+unsafe fn trampoline_arm_timer<T: TimerAbstraction>(state: *const (), deadline_ns: u64) -> bool {
+    // SAFETY: same contract as `trampoline_now_ns`.
+    let timer = unsafe { &*(state as *const T) };
+    timer.set_oneshot(deadline_ns, TimerMode::Interactive).is_ok()
+}
+
+unsafe fn trampoline_cancel_timer<T: TimerAbstraction>(state: *const ()) {
+    // SAFETY: same contract as `trampoline_now_ns`.
+    let timer = unsafe { &*(state as *const T) };
+    timer.cancel_oneshot()
+}
+
 unsafe fn trampoline_frequency_hz<T: TimerAbstraction>(state: *const ()) -> u64 {
     // SAFETY: same contract as `trampoline_now_ns`.
     let timer = unsafe { &*(state as *const T) };
@@ -242,6 +263,8 @@ pub struct HalInterface {
     cpu_resume_user: unsafe fn(*const (), *const u8) -> !,
     timer_now_ns: unsafe fn(*const ()) -> u64,
     timer_frequency_hz: unsafe fn(*const ()) -> u64,
+    timer_arm: unsafe fn(*const (), u64) -> bool,
+    timer_cancel: unsafe fn(*const ()),
 }
 
 impl HalInterface {
@@ -428,6 +451,26 @@ impl HalInterface {
         // SAFETY: same contract as `now_ns`.
         unsafe { (self.timer_frequency_hz)(self.timer_state) }
     }
+
+    /// Arms the monotonic timer to raise an interrupt at absolute time
+    /// `deadline_ns` (same clock as `now_ns`). Returns `false` if the
+    /// platform timer could not be armed (deadline not in the future, or
+    /// no usable timer source). The microkernel's preemptive scheduler
+    /// uses this to bound each thread's quantum (02-Microkernel-Layer.md
+    /// §4).
+    pub fn arm_timer(&self, deadline_ns: u64) -> bool {
+        // SAFETY: `timer_state`/`timer_arm` were produced together by
+        // `build_interface`.
+        unsafe { (self.timer_arm)(self.timer_state, deadline_ns) }
+    }
+
+    /// Disarms the timer — no further timer interrupt until `arm_timer`
+    /// is called again. Used when the scheduler stops preempting (e.g.
+    /// a single runnable thread, or shutdown).
+    pub fn cancel_timer(&self) {
+        // SAFETY: same contract as `arm_timer`.
+        unsafe { (self.timer_cancel)(self.timer_state) }
+    }
 }
 
 /// Builds a `HalInterface` from a concrete CPU/timer implementation.
@@ -469,6 +512,8 @@ where
         cpu_resume_user: trampoline_resume_user::<C>,
         timer_now_ns: trampoline_now_ns::<T>,
         timer_frequency_hz: trampoline_frequency_hz::<T>,
+        timer_arm: trampoline_arm_timer::<T>,
+        timer_cancel: trampoline_cancel_timer::<T>,
     }
 }
 

@@ -171,6 +171,18 @@ pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) ->
         power,
     };
 
+    // Publish the timer pointer the trap dispatch reads when a
+    // supervisor timer interrupt fires (02-Microkernel-Layer.md §4's
+    // preemptive scheduler). `sie.STIE` is deliberately NOT set here:
+    // OpenSBI can hand off with a timer interrupt already pending (an
+    // uninitialised `mtimecmp`), and enabling delivery now would make it
+    // fire the instant the first `sret` reaches U-mode — before the
+    // kernel has armed a real deadline. Instead `TimerAbstraction::
+    // set_oneshot` enables `sie.STIE` right after its `sbi_set_timer`
+    // call, which clears any stale pending bit. `kernel-stub` never arms
+    // the timer, so it is unaffected either way.
+    interrupt::set_global_timer(&hal.timer);
+
     let kernel_image_phys_range = (
         unsafe { linker_symbol_addr(&__kernel_image_phys_start) },
         unsafe { linker_symbol_addr(&__kernel_image_phys_end) },

@@ -108,6 +108,8 @@ static mut P2_VA_A: usize = 0;
 static mut P2_VA_B: usize = 0;
 /// What process B reported reading through its VA (set by `p2_report_b`).
 static mut P2_B_SAW: usize = 0;
+/// Supervisor-timer ticks seen since `p2_preempt_start` armed the timer.
+static mut P2_TICKS: u32 = 0;
 
 /// The sentinel process A writes before the first hand-off, and the one
 /// process B writes back. Kept here so the kernel-side cross-check and
@@ -115,6 +117,20 @@ static mut P2_B_SAW: usize = 0;
 /// the same values as bare immediates — see `kernel/src/main.rs`).
 const P2_A_SENTINEL: usize = 0xC0DE;
 const P2_B_SENTINEL: usize = 0xB00B;
+
+/// Per-thread quantum for the preemption demo. 2 ms at QEMU virt's
+/// 10 MHz timebase is 20 000 ticks — long enough that each process's
+/// counting loop makes visible progress, short enough that the whole
+/// demo finishes well inside a QEMU smoke run.
+const P2_QUANTUM_NS: u64 = 2_000_000;
+/// Stop preempting after this many ticks and report. Both counters
+/// non-zero proves both processes ran with NO cooperative `P2_YIELD`.
+const P2_TICK_BUDGET: u32 = 40;
+/// Byte offsets into the shared frame each process bumps in its counting
+/// loop — distinct words (the frame is ONE physical page aliased into
+/// both spaces), clear of the `0`/`4` area the §8.4 round-trip used.
+const P2_COUNTER_A_OFF: usize = 8;
+const P2_COUNTER_B_OFF: usize = 12;
 
 /// Routes a formatted line to the logger the boot binary installed via
 /// `build`. A no-op if none was installed. Used by `klog!`.
@@ -588,6 +604,76 @@ pub fn p2_report_a(value: usize) {
             "MISMATCH"
         }
     );
+}
+
+/// `P2_PREEMPT_START` from process A: the cooperative §8.4 round-trip is
+/// done; arm the supervisor timer so from here the two processes are
+/// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an explicit
+/// `P2_YIELD`. `P2_CTX_B` already holds process B suspended just after
+/// its own `P2_YIELD` (i.e. at the head of its counting loop), so the
+/// first tick can switch straight into it.
+pub fn p2_preempt_start() {
+    // SAFETY: single-core; `G_HAL` was set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    // SAFETY: single-core; only reset here, before the first tick.
+    unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(0) };
+    let armed = hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+    klog!(
+        "process A: cooperative round-trip done - arming preemptive timer (quantum {} ns, armed: {}); NO more P2_YIELD from here\r\n",
+        P2_QUANTUM_NS,
+        armed
+    );
+}
+
+/// Preemptive-scheduler tick (registered as the arch `TickHandler`).
+/// Round-robins between the two U-mode processes on every supervisor
+/// timer interrupt, re-arming the next deadline. After `P2_TICK_BUDGET`
+/// ticks it reads both processes' private counters out of the shared
+/// frame, logs the verdict, disarms the timer and stops preempting
+/// (`None`) — the running process then keeps its loop and QEMU stays up
+/// for the smoke grep.
+///
+/// Returns `Some((save, into))` to switch (the trap vector snapshots the
+/// preempted thread into `save` and resumes `into`), or `None` to let it
+/// keep running.
+pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; every static here is touched only from this
+    // cooperative/preemptive hand-off path and the one-time setup.
+    unsafe {
+        let hal = &*core::ptr::addr_of!(G_HAL).read();
+        let ticks = core::ptr::addr_of!(P2_TICKS).read() + 1;
+        core::ptr::addr_of_mut!(P2_TICKS).write(ticks);
+
+        if ticks >= P2_TICK_BUDGET {
+            hal.cancel_timer();
+            let phys = core::ptr::addr_of!(P2_SHARED_PHYS).read();
+            let a = core::ptr::read_volatile((phys + P2_COUNTER_A_OFF) as *const u32);
+            let b = core::ptr::read_volatile((phys + P2_COUNTER_B_OFF) as *const u32);
+            klog!(
+                "preemption: {} timer ticks, NO P2_YIELD - process A's counter = {}, process B's counter = {} -> {}\r\n",
+                ticks,
+                a,
+                b,
+                if a > 0 && b > 0 {
+                    "PREEMPTIVE TWO-PROCESS SCHEDULING (02 4): both ran, timer-driven"
+                } else {
+                    "MISMATCH"
+                }
+            );
+            return None;
+        }
+
+        hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+        let turn = core::ptr::addr_of!(P2_TURN).read();
+        core::ptr::addr_of_mut!(P2_TURN).write(turn ^ 1);
+        let a = core::ptr::addr_of_mut!(P2_CTX_A) as *mut u8;
+        let b = core::ptr::addr_of_mut!(P2_CTX_B) as *mut u8;
+        if turn == 0 {
+            Some((a, b as *const u8))
+        } else {
+            Some((b, a as *const u8))
+        }
+    }
 }
 
 /// Busy-park forever. The in-kernel demo threads have nothing to return

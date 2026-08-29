@@ -259,6 +259,11 @@ mod sys {
     /// `a0` = the value process B read through its VA of the shared frame
     /// (which process A wrote before the first hand-off).
     pub const P2_REPORT_B: usize = 22;
+    /// No arguments. The cooperative §8.4 round-trip is done — the kernel
+    /// arms the supervisor timer so from here the two processes are
+    /// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an
+    /// explicit `P2_YIELD`. Both then run unbounded counting loops.
+    pub const P2_PREEMPT_START: usize = 23;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -359,8 +364,25 @@ extern "C" fn umode_root() -> ! {
         );
         raw_syscall(sys::P2_REPORT_A, after, 0);
 
-        // Spin forever without touching memory or any relocation.
-        core::arch::asm!("1:", "j 1b", options(noreturn));
+        // 7. Preemption phase (02-Microkernel-Layer.md §4). Ask the
+        //    kernel to arm the supervisor timer, then loop forever
+        //    bumping this process's private counter word in the shared
+        //    frame (offset +8). From here NO `P2_YIELD` is issued — the
+        //    timer interrupt alone switches between this process and the
+        //    worker. Hand-written `lw`/`addi`/`sw` (NOT
+        //    `core::ptr::*_volatile`, which a debug build compiles to a
+        //    call into kernel `.text` that U-mode cannot execute) so
+        //    `.user_text` stays call- and relocation-free.
+        raw_syscall(sys::P2_PREEMPT_START, 0, 0);
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC004_0008usize,
+            options(noreturn),
+        );
     }
 }
 
@@ -398,10 +420,25 @@ extern "C" fn umode_worker() -> ! {
             options(nostack),
         );
 
-        // 3. Hand the core back to process A (kernel resumes its saved
-        //    context in space A). We are never scheduled again.
+        // 3. Hand the core back to process A for its final §8.4 check.
         raw_syscall(sys::P2_YIELD, 0, 0);
-        core::arch::asm!("1:", "j 1b", options(noreturn));
+
+        // 4. Resumed here (either by that hand-off's partner, or — once
+        //    process A calls P2_PREEMPT_START — by a timer tick). Loop
+        //    forever bumping this process's private counter word in the
+        //    shared frame (offset +12), issuing NO `P2_YIELD`. If the
+        //    kernel's tick handler is switching us in and out this
+        //    counter climbs; if it were not, it would stay 0. Inline
+        //    `lw`/`addi`/`sw` for the same reason as `umode_root`'s loop.
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC020_000Cusize,
+            options(noreturn),
+        );
     }
 }
 
@@ -480,6 +517,10 @@ fn simurgh_syscall(
         }
         sys::P2_REPORT_B => {
             kernel_arch_glue::p2_report_b(a0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::P2_PREEMPT_START => {
+            kernel_arch_glue::p2_preempt_start();
             return TrapOutcome::Resume(0);
         }
         _ => {}
@@ -600,6 +641,20 @@ fn simurgh_syscall(
     TrapOutcome::Resume(ret)
 }
 
+/// The preemptive-scheduler tick handler the HAL trap vector calls for a
+/// supervisor timer interrupt taken on a running U-mode thread
+/// (registered via `hal_riscv64::cpu::set_tick_handler`). Delegates the
+/// round-robin decision to `kernel-arch-glue`; `Some((save, into))`
+/// preempts, `None` lets the current thread keep running.
+#[cfg(target_arch = "riscv64")]
+fn simurgh_tick() -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_tick() {
+        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
 // Linker symbols for the user (layer-3) Root Task image — see
 // hal-riscv64/src/linker.ld's `.user_text` / `.user_stack` sections.
 #[cfg(target_arch = "riscv64")]
@@ -664,9 +719,12 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             let _ = writeln!(s, "----------------------------------------------------------------------");
             let _ = writeln!(s, "handing control to the Root Task...");
             // Register the S-mode syscall handler the HAL trap vector
-            // invokes for an `ecall` from U-mode.
+            // invokes for an `ecall` from U-mode, and the tick handler it
+            // invokes for a supervisor timer interrupt on a U-mode thread.
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_syscall_handler(simurgh_syscall);
+            #[cfg(target_arch = "riscv64")]
+            hal_riscv64::cpu::set_tick_handler(simurgh_tick);
             // Never returns: runs the in-kernel demo, then (riscv64) maps
             // the user image U=1, activates Sv39 paging, and drops the
             // Root Task to U-mode isolated.

@@ -311,8 +311,20 @@ pub enum TrapOutcome {
 /// `TrapOutcome` telling the trap vector how to resume.
 pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> TrapOutcome;
 
+/// Signature of the handler the microkernel registers for a supervisor
+/// timer interrupt taken **while a U-mode thread was running** — the
+/// preemptive scheduler's entry point (02-Microkernel-Layer.md §4). It
+/// takes no arguments (the trap vector owns the interrupted frame) and
+/// returns a `TrapOutcome`: `Resume` to let the current thread keep its
+/// quantum, or `SwitchTo` to preempt it. The handler is responsible for
+/// re-arming (or cancelling) the timer via `HalInterface`.
+pub type TickHandler = fn() -> TrapOutcome;
+
 #[cfg(target_os = "none")]
 static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
+
+#[cfg(target_os = "none")]
+static mut TICK_HANDLER: Option<TickHandler> = None;
 
 /// Registers the handler `common_trap_entry` calls for an `ecall` from
 /// U-mode. The microkernel calls this once during boot, before it drops
@@ -326,6 +338,21 @@ pub fn set_syscall_handler(handler: SyscallHandler) {
     // can be taken.
     unsafe {
         core::ptr::addr_of_mut!(SYSCALL_HANDLER).write(Some(handler));
+    }
+}
+
+/// Registers the preemptive-scheduler tick handler `common_trap_entry`
+/// calls when a supervisor timer interrupt lands on a running U-mode
+/// thread. Set once during boot. Until it is set (and the kernel arms a
+/// deadline via `HalInterface::arm_timer`), timer interrupts do nothing
+/// beyond the arch-internal dispatch — so `kernel-stub`, which registers
+/// no handler and never enters U-mode, is unaffected.
+#[cfg(target_os = "none")]
+pub fn set_tick_handler(handler: TickHandler) {
+    // SAFETY: single-core boot; set exactly once before the timer is
+    // armed and before any drop to U-mode.
+    unsafe {
+        core::ptr::addr_of_mut!(TICK_HANDLER).write(Some(handler));
     }
 }
 
@@ -346,6 +373,15 @@ extern "C" fn common_trap_entry(_frame: *mut TrapFrame) {
 #[cfg(target_os = "none")]
 const CAUSE_ECALL_FROM_U: usize = 8;
 
+/// RISC-V `scause` interrupt code for the supervisor timer interrupt
+/// (the interrupt bit is already masked off by `common_trap_entry`).
+#[cfg(target_os = "none")]
+const CAUSE_TIMER_INTERRUPT: usize = 5;
+
+/// `sstatus.SPP` — 0 when the trap came from U-mode.
+#[cfg(target_os = "none")]
+const SSTATUS_SPP_BIT: usize = 1 << 8;
+
 #[cfg(target_os = "none")]
 #[no_mangle]
 extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
@@ -365,6 +401,47 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
 
     if is_interrupt {
         crate::interrupt::dispatch_current_interrupt(cause_code as u32);
+
+        // Preemption: a supervisor timer interrupt that landed on a
+        // running U-mode thread is the microkernel's cue to run its
+        // scheduler (02-Microkernel-Layer.md §4). The tick handler
+        // decides; the trap vector (which owns the interrupted frame)
+        // executes the switch, exactly like the `ecall` `SwitchTo` path
+        // — but resuming AT `sepc` (the preempted instruction), not
+        // `sepc + 4`.
+        if cause_code == CAUSE_TIMER_INTERRUPT {
+            let sstatus: usize;
+            // SAFETY: `csrr sstatus` has no preconditions in a trap
+            // handler.
+            unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) sstatus) };
+            let from_user = (sstatus & SSTATUS_SPP_BIT) == 0;
+            if from_user {
+                // SAFETY: single-core; `TICK_HANDLER` is only written by
+                // `set_tick_handler` during boot, before the timer is
+                // armed.
+                let handler = unsafe { core::ptr::addr_of!(TICK_HANDLER).read() };
+                if let Some(h) = handler {
+                    match h() {
+                        TrapOutcome::Resume(_) => return,
+                        TrapOutcome::SwitchTo { save, into } => {
+                            // SAFETY: `save` / `into` are kernel-owned
+                            // aligned `HAL_USER_CONTEXT_BYTES` blobs.
+                            // Snapshot the preempted thread at `sepc`
+                            // exactly, then never return.
+                            let f = unsafe { &mut *frame };
+                            unsafe {
+                                save_trap_frame_as_user_context(
+                                    f,
+                                    sepc,
+                                    save as *mut RiscvUserContext,
+                                );
+                                restore_user_and_sret(into as *const RiscvUserContext);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return;
     }
 
@@ -669,6 +746,13 @@ unsafe fn save_trap_frame_as_user_context(
     // alignment per this function's contract.
     unsafe {
         (*dst).regs = frame.regs; // regs[i] == x(i+1) in both layouts
+        // `trap_entry` saves x2 (sp) into the frame AFTER `addi sp, sp,
+        // -248`, so `frame.regs[1]` is 248 bytes below the thread's real
+        // stack pointer. The pre-trap sp is exactly one `TrapFrame`
+        // above `frame` itself — restore THAT, or the resumed thread's
+        // stack-relative accesses land in the abandoned trap frame.
+        (*dst).regs[1] =
+            frame as *const TrapFrame as u64 + core::mem::size_of::<TrapFrame>() as u64;
         (*dst).sepc = resume_sepc as u64;
         (*dst).sstatus = sstatus;
         (*dst).satp = satp;
