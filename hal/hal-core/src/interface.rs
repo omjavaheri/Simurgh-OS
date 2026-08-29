@@ -136,6 +136,22 @@ unsafe fn trampoline_activate_address_space<C: CpuAbstraction<HAL_CONTEXT_BYTES>
     cpu.activate_address_space(root_frame)
 }
 
+#[allow(clippy::too_many_arguments)]
+unsafe fn trampoline_map_range<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    root_frame: usize,
+    vaddr: usize,
+    paddr: usize,
+    len: usize,
+    perm_bits: usize,
+    pool_base: usize,
+    pool_len: usize,
+) -> u32 {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.map_range(root_frame, vaddr, paddr, len, perm_bits, pool_base, pool_len)
+}
+
 unsafe fn trampoline_now_ns<T: TimerAbstraction>(state: *const ()) -> u64 {
     // SAFETY: same contract, timer side.
     let timer = unsafe { &*(state as *const T) };
@@ -163,6 +179,7 @@ pub struct HalInterface {
     cpu_init_context: unsafe fn(*const (), *mut u8, usize, usize),
     cpu_map_ram_identity: unsafe fn(*const (), usize, usize, bool),
     cpu_activate_address_space: unsafe fn(*const (), usize),
+    cpu_map_range: unsafe fn(*const (), usize, usize, usize, usize, usize, usize, usize) -> u32,
     cpu_enter_user: unsafe fn(*const (), usize, usize) -> !,
     timer_now_ns: unsafe fn(*const ()) -> u64,
     timer_frequency_hz: unsafe fn(*const ()) -> u64,
@@ -249,6 +266,38 @@ impl HalInterface {
         unsafe { (self.cpu_activate_address_space)(self.cpu_state, root_frame) }
     }
 
+    /// Maps `[vaddr, vaddr+len)` -> `[paddr, ...)` at base-page
+    /// granularity in the table at `root_frame`, drawing missing table
+    /// levels from the pre-zeroed frame pool. `perm_bits`: `R=1 | W=2 |
+    /// X=4 | U=8`. Returns pool frames consumed, or `u32::MAX` on error.
+    /// See `CpuAbstraction::map_range`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_range(
+        &self,
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        // SAFETY: produced together by `build_interface`; the caller
+        // vouches for the frames and alignment.
+        unsafe {
+            (self.cpu_map_range)(
+                self.cpu_state,
+                root_frame,
+                vaddr,
+                paddr,
+                len,
+                perm_bits,
+                pool_base,
+                pool_len,
+            )
+        }
+    }
+
     /// One-way drop of the current core to user privilege, starting at
     /// `entry` (a `-> !` function) on `stack_top`. Never returns. See
     /// `CpuAbstraction::enter_user`.
@@ -305,6 +354,7 @@ where
         cpu_init_context: trampoline_init_context::<C>,
         cpu_map_ram_identity: trampoline_map_ram_identity::<C>,
         cpu_activate_address_space: trampoline_activate_address_space::<C>,
+        cpu_map_range: trampoline_map_range::<C>,
         cpu_enter_user: trampoline_enter_user::<C>,
         timer_now_ns: trampoline_now_ns::<T>,
         timer_frequency_hz: trampoline_frequency_hz::<T>,

@@ -656,34 +656,26 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
 
     #[cfg(target_os = "none")]
     fn map_ram_identity(&self, root_frame: usize, bytes_gib: usize, user_accessible: bool) {
-        // Sv39 PTE bits (RISC-V privileged spec, section 4.4).
-        const V: u64 = 1 << 0;
-        const R: u64 = 1 << 1;
-        const W: u64 = 1 << 2;
-        const X: u64 = 1 << 3;
-        const U: u64 = 1 << 4;
-        const A: u64 = 1 << 6; // accessed
-        const D: u64 = 1 << 7; // dirty
-
         let root = root_frame as *mut u64;
         // SAFETY: `root_frame` is a caller-guaranteed page-aligned,
-        // writable physical frame; paging is still off (satp == 0) so the
-        // physical address is directly addressable. Zero all 512 entries,
-        // then install one 1 GiB identity leaf per GiB requested (root
-        // index == VA[38:30] == the GiB number for VA = gib << 30).
+        // writable physical frame; paging is still off (satp == 0). Zero
+        // the root, then install one 1 GiB identity LEAF per GiB (root
+        // index == VA[38:30] == the GiB number). `map_range` can add finer
+        // mappings only for a VA whose GiB slot is still empty (not a
+        // gigapage leaf) — callers put per-process pages in a GiB above
+        // `bytes_gib`.
         unsafe {
             for i in 0..512 {
                 root.add(i).write_volatile(0);
             }
-            let mut flags = V | R | W | X | A | D;
+            let mut flags = riscv_sv39::V | riscv_sv39::R | riscv_sv39::W
+                | riscv_sv39::X | riscv_sv39::A | riscv_sv39::D;
             if user_accessible {
-                flags |= U;
+                flags |= riscv_sv39::U;
             }
-            let gib_count = bytes_gib.min(512);
-            for gib in 0..gib_count {
-                // paddr = gib * 1 GiB; ppn = paddr >> 12; pte = ppn << 10 | flags.
-                let pte = ((gib as u64) << 28) | flags;
-                root.add(gib).write_volatile(pte);
+            for gib in 0..bytes_gib.min(512) {
+                // ppn = (gib * 1 GiB) >> 12 == gib << 18; pte = ppn << 10 | flags.
+                root.add(gib).write_volatile(((gib as u64) << 28) | flags);
             }
         }
     }
@@ -700,17 +692,35 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
         };
         // SAFETY: `root_frame` is a caller-guaranteed valid Sv39 root that
         // maps at least all memory this core executes from and touches
-        // next (see `map_ram_identity`). `sfence.vma` before and after
-        // flushes stale entries around the `satp` write.
+        // next. `sfence.vma` around the `satp` write flushes stale
+        // entries; `csrs sstatus, SUM` lets S-mode reach U=1 pages (needed
+        // once the kernel dereferences user pointers from a trap).
         unsafe {
             core::arch::asm!(
                 "sfence.vma",
                 "csrw satp, {satp}",
                 "sfence.vma",
+                "li   {t}, 1 << 18",   // sstatus.SUM
+                "csrs sstatus, {t}",
                 satp = in(reg) satp,
+                t = out(reg) _,
                 options(nostack, preserves_flags),
             );
         }
+    }
+
+    #[cfg(target_os = "none")]
+    fn map_range(
+        &self,
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        riscv_sv39::map_range(root_frame, vaddr, paddr, len, perm_bits, pool_base, pool_len)
     }
 
     #[cfg(target_os = "none")]
@@ -808,5 +818,120 @@ mod tests {
         let scause: usize = (1 << (usize::BITS - 1)) | 5;
         let cause_code = scause & !(1 << (usize::BITS - 1));
         assert_eq!(cause_code, 5);
+    }
+}
+// ============================================================================
+// Sv39 page-table helpers
+//
+// Bare-metal only. `map_ram_identity` / `activate_address_space` (above) plus
+// `map_range` here are the whole page-table surface the microkernel drives
+// through `hal_core::HalInterface`. Sv39 (RISC-V privileged spec section 4.4):
+// three 9-bit VPN levels, 4 KiB pages, 2 MiB / 1 GiB superpages when the leaf
+// sits at level 1 / level 0.
+// ============================================================================
+#[cfg(target_os = "none")]
+pub(crate) mod riscv_sv39 {
+    /// PTE valid bit.
+    pub const V: u64 = 1 << 0;
+    /// PTE readable bit.
+    pub const R: u64 = 1 << 1;
+    /// PTE writable bit.
+    pub const W: u64 = 1 << 2;
+    /// PTE executable bit.
+    pub const X: u64 = 1 << 3;
+    /// PTE user-accessible bit.
+    pub const U: u64 = 1 << 4;
+    /// PTE accessed bit (pre-set so no hardware A/D fault is taken).
+    pub const A: u64 = 1 << 6;
+    /// PTE dirty bit (pre-set — see `A`).
+    pub const D: u64 = 1 << 7;
+
+    /// Maps `[vaddr, vaddr + len)` -> `[paddr, ...)` at 4 KiB granularity in
+    /// the Sv39 table rooted at `root_frame`, allocating any missing L1 / L0
+    /// tables from the pre-zeroed frame pool at `[pool_base, pool_base +
+    /// pool_len * 4096)`. `perm_bits` is `R=1 | W=2 | X=4 | U=8`.
+    ///
+    /// Returns the number of pool frames consumed, or `u32::MAX` on error
+    /// (misaligned args, a superpage leaf already covering the range, or the
+    /// pool running out).
+    ///
+    /// # Preconditions
+    /// Paging is off (`satp == 0`) so every physical address here is directly
+    /// addressable; the pool frames are zeroed; single core.
+    pub fn map_range(
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        if root_frame == 0 || len == 0 || ((vaddr | paddr | len) & 0xFFF) != 0 {
+            return u32::MAX;
+        }
+        let leaf = V | A | D
+            | if perm_bits & 1 != 0 { R } else { 0 }
+            | if perm_bits & 2 != 0 { W } else { 0 }
+            | if perm_bits & 4 != 0 { X } else { 0 }
+            | if perm_bits & 8 != 0 { U } else { 0 };
+
+        let mut used = 0usize;
+        let pages = len / 4096;
+        for p in 0..pages {
+            let va = vaddr + p * 4096;
+            let pa = paddr + p * 4096;
+            let (vpn2, vpn1, vpn0) = ((va >> 30) & 0x1FF, (va >> 21) & 0x1FF, (va >> 12) & 0x1FF);
+
+            // Descend / build L1.
+            // SAFETY: precondition — `root_frame` points at a writable,
+            // page-aligned frame; paging is off.
+            let l1 = unsafe {
+                let slot = (root_frame as *mut u64).add(vpn2);
+                let e = slot.read_volatile();
+                if e & V == 0 {
+                    if used >= pool_len {
+                        return u32::MAX;
+                    }
+                    let t = pool_base + used * 4096;
+                    used += 1;
+                    slot.write_volatile(((t as u64 >> 12) << 10) | V);
+                    t
+                } else if e & (R | W | X) != 0 {
+                    return u32::MAX; // a 1 GiB leaf already covers this VA
+                } else {
+                    (((e >> 10) & ((1 << 44) - 1)) << 12) as usize
+                }
+            };
+
+            // Descend / build L0.
+            // SAFETY: `l1` is a valid page-table frame just resolved above.
+            let l0 = unsafe {
+                let slot = (l1 as *mut u64).add(vpn1);
+                let e = slot.read_volatile();
+                if e & V == 0 {
+                    if used >= pool_len {
+                        return u32::MAX;
+                    }
+                    let t = pool_base + used * 4096;
+                    used += 1;
+                    slot.write_volatile(((t as u64 >> 12) << 10) | V);
+                    t
+                } else if e & (R | W | X) != 0 {
+                    return u32::MAX; // a 2 MiB leaf already covers this VA
+                } else {
+                    (((e >> 10) & ((1 << 44) - 1)) << 12) as usize
+                }
+            };
+
+            // Install the 4 KiB leaf.
+            // SAFETY: `l0` is a valid page-table frame just resolved above.
+            unsafe {
+                (l0 as *mut u64)
+                    .add(vpn0)
+                    .write_volatile(((pa as u64 >> 12) << 10) | leaf);
+            }
+        }
+        used as u32
     }
 }

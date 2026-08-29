@@ -193,31 +193,54 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, umode_root_ent
         .and_then(|u| u.alloc(4096, 4096).ok())
     {
         Some(root_pt) => {
+            // Grab a 2-frame pool for `map_range`'s intermediate tables
+            // and one target frame for the mapped test page. `map_range`
+            // needs the pool zeroed.
+            let pool = state
+                .untyped_mut(kernel_cap::UntypedId::new(0))
+                .and_then(|u| u.alloc(4096, 4096 * 2).ok());
+            let target = state
+                .untyped_mut(kernel_cap::UntypedId::new(0))
+                .and_then(|u| u.alloc(4096, 4096).ok());
+
             hal.map_ram_identity(root_pt.as_usize(), 3, false);
             hal.activate_address_space(root_pt.as_usize());
 
-            // MMU self-test: with paging live, write a pattern through a
-            // (now virtually addressed) scratch page and read it back.
-            let ok = if let Some(scratch) = state
-                .untyped_mut(kernel_cap::UntypedId::new(0))
-                .and_then(|u| u.alloc(4096, 4096).ok())
-            {
-                let p = scratch.as_usize() as *mut u64;
-                // SAFETY: `scratch` is fresh untyped RAM, identity-mapped
-                // R+W by `map_ram_identity`; single-core; nothing else
-                // references it.
-                unsafe {
-                    p.write_volatile(0xA5A5_1234_DEAD_BEEF);
-                    p.read_volatile() == 0xA5A5_1234_DEAD_BEEF
+            // Test the 4 KiB page-table walker: map a page at a virtual
+            // address the coarse identity map left open (GiB 3), then
+            // write/read through it and confirm the bytes landed at the
+            // target physical frame.
+            let walk_ok = match (pool, target) {
+                (Some(pool), Some(target)) => {
+                    let (pb, tp) = (pool.as_usize(), target.as_usize());
+                    // SAFETY: `pool`/`target` are fresh untyped RAM in the
+                    // identity-mapped low 3 GiB; single-core; nothing else
+                    // refers to them. Zero the pool for `map_range`.
+                    unsafe {
+                        core::ptr::write_bytes(pb as *mut u8, 0, 4096 * 2);
+                    }
+                    const TEST_VA: usize = 0xC000_0000; // GiB 3, unmapped by the identity pass
+                    let used = hal.map_range(root_pt.as_usize(), TEST_VA, tp, 4096, 0b0011, pb, 2);
+                    if used == u32::MAX {
+                        false
+                    } else {
+                        // SAFETY: `TEST_VA` is now mapped R+W to `tp` via
+                        // the freshly walked table; `tp` is identity-
+                        // mapped so we can cross-check it directly.
+                        unsafe {
+                            (TEST_VA as *mut u64).write_volatile(0x0BAD_C0DE_CAFE_F00D);
+                            (tp as *const u64).read_volatile() == 0x0BAD_C0DE_CAFE_F00D
+                        }
+                    }
                 }
-            } else {
-                false
+                _ => false,
             };
+
             hal.activate_address_space(0); // back to Bare mode (satp = 0)
             klog!(
-                "root task: Sv39 paging - built + activated root PT at {:#x}, MMU read/write self-test {}, deactivated\r\n",
+                "root task: Sv39 paging - root PT {:#x}, identity map + 4KiB walker (VA 0xC0000000 -> new page): {}, deactivated\r\n",
                 root_pt.as_usize(),
-                if ok { "OK" } else { "FAILED" }
+                if walk_ok { "OK" } else { "FAILED" }
             );
         }
         None => klog!("root task: WARNING - could not allocate a root page table\r\n"),

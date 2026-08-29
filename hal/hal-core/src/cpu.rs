@@ -282,6 +282,36 @@ pub trait CpuAbstraction<const ARCH_CONTEXT_BYTES: usize> {
         let _ = (root_frame, bytes_gib, user_accessible);
     }
 
+    /// Maps `[vaddr, vaddr + len)` -> `[paddr, ...)` at base-page
+    /// granularity in the page table rooted at `root_frame`, allocating
+    /// any missing intermediate table levels from the pre-zeroed physical
+    /// frame pool at `[pool_base, pool_base + pool_len * page_size)`.
+    /// `perm_bits` is a small portable bitfield: `READ = 1`, `WRITE = 2`,
+    /// `EXECUTE = 4`, `USER = 8`.
+    ///
+    /// Returns the number of pool frames consumed, or `u32::MAX` on error
+    /// (misaligned arguments, a superpage leaf already covering the
+    /// range, or the pool running out).
+    ///
+    /// The caller must have built the coarse mapping first (see
+    /// `map_ram_identity`) and place per-process pages in address ranges
+    /// that coarse mapping left open. Paging must still be off (or the
+    /// pool + tables must themselves be mapped) when this is called.
+    /// Default: `u32::MAX` (unimplemented).
+    fn map_range(
+        &self,
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        let _ = (root_frame, vaddr, paddr, len, perm_bits, pool_base, pool_len);
+        u32::MAX
+    }
+
     /// Activates the address space whose root page table is at physical
     /// address `root_frame` on the CURRENT core (loads `satp` on RISC-V,
     /// `CR3` on x86_64, `TTBR0_EL1` on ARM64) and flushes stale
