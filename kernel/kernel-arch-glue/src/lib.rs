@@ -64,14 +64,14 @@ static mut THREAD3_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut G_STATE: *mut KernelState = core::ptr::null_mut();
 static mut G_HAL: *const HalInterface = core::ptr::null();
 static mut G_LOG: Option<fn(Arguments<'_>)> = None;
-// The Root Task's live page-table root and a pre-zeroed pool of frames for
-// `map_range` to draw missing L1/L0 tables from when a `Map` syscall adds a
-// page at runtime. Set once by `enter` after paging is activated; consumed
-// by `map_user_page`. `G_MAP_POOL_USED` is the pool high-water mark.
-static mut G_ROOT_PT: usize = 0;
-static mut G_MAP_POOL: usize = 0;
-static mut G_MAP_POOL_LEN: usize = 0;
-static mut G_MAP_POOL_USED: usize = 0;
+// The runtime `Map` syscall's hardware page-table pool used to live here
+// (arch-glue-owned globals `map_user_page` drew from); it is now
+// `KernelState::install_map_pool` / `map_pool_remaining` — plain integer
+// bookkeeping owned by `kernel-core`, consumed by `syscall::do_map`
+// itself, so a capability-gated `Map` and the hardware walk are the same
+// syscall instead of two parallel mechanisms. `enter` still carves and
+// zeroes the pool's physical memory (kernel-core never touches raw
+// memory), then hands it to `KernelState` with one `install_map_pool` call.
 // Set by `root_task_main` before it starts thread 2, so `thread2_main`
 // knows its own thread id, the endpoint capability to `Send` on, and the
 // Root Task's thread id to hand control back to. `G_T3` is the same idea
@@ -101,6 +101,14 @@ const IPC_BENCH_ITERATIONS: u32 = 200;
 // `P2_PREEMPT_START` arms the timer and the two threads run counting loops
 // switched by the timer interrupt alone (`p2_tick` -> `KernelState::
 // preempt_tick`).
+//
+// A THIRD process (space C) is then spawned via the GENERIC `spawn_process`
+// helper below — not the hand-written A/B setup — and joins the SAME
+// preemption loop with no changes to `p2_tick`/`preempt_tick`/`pick_next`:
+// admitting any thread via `init_user_thread` is enough for `kernel-sched`
+// to round-robin it. This is the proof that the mechanism generalizes
+// beyond exactly two hardcoded processes (a step toward
+// 03-Kernel-Subsystems-Layer.md §5's subsystems-as-processes).
 // ---------------------------------------------------------------------------
 
 /// Physical frame shared by both address spaces.
@@ -112,6 +120,27 @@ static mut P2_VA_B: usize = 0;
 static mut P2_B_SAW: usize = 0;
 /// Supervisor-timer ticks seen since `p2_preempt_start` armed the timer.
 static mut P2_TICKS: u32 = 0;
+/// Physical address of process C's private counter word (see
+/// `spawn_process` / `PROC_C_ENTRY`), or `0` if it was never spawned
+/// (e.g. `spawn_process` ran out of untyped RAM — the demo then falls
+/// back to reporting just A/B, unaffected).
+static mut P3_COUNTER_PHYS: usize = 0;
+/// `.user_text`'s vma/lma/len and process C's entry point, stashed by
+/// `setup_two_process` for `p2_preempt_start` to spawn it from — see
+/// that function's doc comment for why the spawn is deferred this late.
+static mut G_TEXT_VMA: usize = 0;
+static mut G_TEXT_LMA: usize = 0;
+static mut G_TEXT_LEN: usize = 0;
+static mut G_SUBSYS_ENTRY: usize = 0;
+/// Process A's entry point for the FRESH, vruntime-zero thread
+/// `p2_preempt_start` hands the counting loop to — see that function's
+/// doc comment for why root's own (heavily-run) TCB is not reused here.
+static mut G_A_LOOP_ENTRY: usize = 0;
+/// Stack pointer that fresh thread starts with — reusing the SAME VA
+/// root's own U-mode stack already ends at (still `U=1 R+W` mapped in
+/// space A); safe because the loop is pure register ops and never
+/// pushes a frame, so nothing about the stack's prior contents matters.
+static mut G_A_STACK_TOP: usize = 0;
 
 /// The sentinel process A writes before the first hand-off, and the one
 /// process B writes back. Kept here so the kernel-side cross-check and
@@ -246,6 +275,21 @@ pub struct UserImage {
     /// different stacks and address spaces). `0` = no second process on
     /// this architecture, so `enter` runs only the single-process path.
     pub worker_entry_vma: usize,
+    /// Virtual address of a THIRD process's entry point (again inside
+    /// `.user_text`), spawned via the generic `spawn_process` — proof
+    /// that address-space + capability-space + scheduler admission is a
+    /// reusable mechanism, not hardcoded to exactly two processes. `0` =
+    /// skip spawning it (e.g. no `worker_entry_vma` either, or this
+    /// architecture has no user image at all).
+    pub subsystem_entry_vma: usize,
+    /// Virtual address of process A's counting-loop-only entry point
+    /// (again inside `.user_text`) — a FRESH `vruntime = 0` thread
+    /// `p2_preempt_start` spawns, sharing root's OWN address space and
+    /// capability space, to take over the preemptive phase (see that
+    /// function's doc comment for why root's own TCB isn't reused for
+    /// it). `0` = skip (falls back to letting root's own TCB keep running
+    /// — possibly starved for the reason documented there).
+    pub a_loop_entry_vma: usize,
 }
 
 impl UserImage {
@@ -259,6 +303,8 @@ impl UserImage {
         stack_len: 0,
         entry_vma: 0,
         worker_entry_vma: 0,
+        subsystem_entry_vma: 0,
+        a_loop_entry_vma: 0,
     };
 }
 
@@ -314,10 +360,20 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
             park();
         }
     };
+    // The Root Task's software-model address space was created back in
+    // `populate_from_boot_info` from `BootInfo::initial_page_table_phys`
+    // (whatever satp/CR3/TTBR held at HAL handoff — Bare mode on riscv64,
+    // so `0`) — rebind it to the REAL root we just allocated, or
+    // `syscall::do_map`'s hardware walk would target the wrong frame for
+    // every `Map` into the Root Task's own space (see
+    // `AddressSpace::set_root_phys`'s doc comment).
+    if let Some(space) = state.addr_space_mut(state.root_addr_space) {
+        space.set_root_phys(hal_core::PhysAddr::new(root_pt));
+    }
     // A second, larger pool the runtime `Map` syscall path draws from
-    // (see `map_user_page`) — kept separate from the boot-time `pool`
-    // above so a later `Map` can never trip over the boot mapping's
-    // bookkeeping.
+    // (`KernelState::install_map_pool`) — kept separate from the
+    // boot-time `pool` above so a later `Map` can never trip over the
+    // boot mapping's bookkeeping.
     let map_pool = state
         .untyped_mut(kernel_cap::UntypedId::new(0))
         .and_then(|u| u.alloc(4096, 4096 * 8).ok());
@@ -377,12 +433,8 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
         && setup_two_process(hal, state, &user, root_pt, pool, used_a, user_sp)
     {
         hal.activate_address_space(root_pt);
-        // SAFETY: single-core boot; written once, before any syscall runs.
-        unsafe {
-            core::ptr::addr_of_mut!(G_ROOT_PT).write(root_pt);
-            core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
-            core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
-        }
+        // `do_map`'s hardware walk needs this pool from here on.
+        state.install_map_pool(map_pool, 8);
         // The Root Task's `Tcb::user_context` was filled by
         // `init_user_thread` in `setup_two_process` and it is the
         // scheduler's `running` thread. Resume it in U-mode.
@@ -396,13 +448,7 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
 
     // ---- Single-process fallback (unchanged behaviour) ----
     hal.activate_address_space(root_pt);
-    // SAFETY: single-core boot; written once here, before any syscall can
-    // run, and only read afterwards.
-    unsafe {
-        core::ptr::addr_of_mut!(G_ROOT_PT).write(root_pt);
-        core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
-        core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
-    }
+    state.install_map_pool(map_pool, 8);
     klog!(
         "--- Sv39 paging active; dropping Root Task to U-mode (entry {:#x}, sp {:#x}, isolated on U=1 pages) ---\r\n",
         user.entry_vma,
@@ -540,6 +586,41 @@ fn setup_two_process(
         hal,
     );
 
+    // Process C is deliberately NOT spawned here. `kernel-sched` admits
+    // every thread at the same priority with `vruntime = 0`
+    // (`init_user_thread`), and `cooperative_yield`'s `pick_next` compares
+    // vruntime BEFORE `ThreadId` — so a freshly-admitted, never-run C
+    // would outrank the just-ran Root Task the moment B's own `P2_YIELD`
+    // looks for who to switch to, stealing the hand-off `umode_worker`
+    // expects to go back to process A. Spawning C only once the
+    // cooperative phase is over and `p2_preempt_start` has moved to
+    // TIMER-driven switching (where fairness among Ready threads is
+    // exactly the point) avoids that: see `p2_preempt_start` below.
+    //
+    // Same reasoning is why `p2_preempt_start` does NOT keep root's own
+    // (tid 0) TCB running the counting loop either: by the time the
+    // cooperative phase ends, root has accumulated real, QEMU-timing-
+    // dependent `vruntime` from its own ecall sequence — sometimes far
+    // more than 40 short ticks can let B/C's vruntime catch up to, which
+    // starves root for the WHOLE demo (observed: 0/40 ticks in some
+    // runs). `kernel-sched`'s own invariant is that vruntime only ever
+    // INCREASES (no reset primitive, by design), so the fix is not to
+    // reuse root's loaded TCB at all: `p2_preempt_start` spawns a FRESH
+    // thread (vruntime = 0, same footing as B/C) sharing root's EXISTING
+    // address space + capability space to run the loop, and root's own
+    // tid 0 TCB is retired (its demo narrative is complete). Stash what
+    // both spawns need (this is bootstrap glue, not a real per-process
+    // image table yet).
+    // SAFETY: single-core boot; written once, before any syscall.
+    unsafe {
+        core::ptr::addr_of_mut!(G_TEXT_VMA).write(user.text_vma);
+        core::ptr::addr_of_mut!(G_TEXT_LMA).write(user.text_lma);
+        core::ptr::addr_of_mut!(G_TEXT_LEN).write(user.text_len);
+        core::ptr::addr_of_mut!(G_SUBSYS_ENTRY).write(user.subsystem_entry_vma);
+        core::ptr::addr_of_mut!(G_A_LOOP_ENTRY).write(user.a_loop_entry_vma);
+        core::ptr::addr_of_mut!(G_A_STACK_TOP).write(user_sp_a);
+    }
+
     // Make the Root Task the scheduler's running thread, so the first
     // `preempt_tick` (or cooperative `P2_YIELD`) has it as `outgoing`.
     let _ = state.sched.dispatch(root, hal.now_ns());
@@ -560,6 +641,94 @@ fn setup_two_process(
         P2_VA_B_CONST
     );
     true
+}
+
+/// Generic process spawn (03-Kernel-Subsystems-Layer.md §0's "ordinary
+/// user-space process" model, in miniature): builds a FRESH, fully
+/// isolated Sv39 address space and a FRESH capability space (not shared
+/// with the Root Task's, unlike A/B's MVP shortcut above — a real
+/// layer-3 process gets its own of both) for a new U-mode thread, admits
+/// it to `kernel-core`/`kernel-sched` via `init_user_thread`, and returns
+/// its `ThreadId`, `CapSpaceId`, and the physical base of the stack frame
+/// it carved (so the caller can address anything it placed there through
+/// the kernel's own identity map, without needing that process's `satp`
+/// active).
+///
+/// `text_*` describe the SAME `.user_text` output section every process
+/// this binary spawns links into — including a real `subsystems/*`
+/// crate's own compiled code (its entry point just needs `#[link_section
+/// = ".user_text"]`, e.g. `device_manager::subsystem_entry::
+/// subsystem_main`), since the section is one contiguous, page-rounded
+/// range regardless of which crate contributed which bytes. There is
+/// still no PER-PROCESS separate ELF / loader (IMPLEMENTATION-PLAN.md's
+/// "subsystems as processes" follow-up) — every spawned process's code
+/// lives in this ONE shared range; only `stack_vma`/`entry_vma` need be
+/// distinct per call (the root page table, its `map_range` pool, and the
+/// physical stack frames are fresh untyped RAM every time regardless).
+/// `pub`: called both by this crate's own demo (`p2_preempt_start`, for
+/// process C) and directly by the final binary (`kernel/src/main.rs`) to
+/// launch a real subsystem process under `root-task`'s own boot policy.
+/// Returns `None` (and logs) on any allocation failure — untyped RAM, an
+/// object-table slot, or `map_range` are all bounded resources a real
+/// capability-gated `Retype`/`Map` would also have to handle this way.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_process(
+    hal: &HalInterface,
+    state: &mut KernelState,
+    text_vma: usize,
+    text_lma: usize,
+    text_len: usize,
+    stack_vma: usize,
+    stack_len: usize,
+    entry_vma: usize,
+) -> Option<(ThreadId, kernel_cap::CapSpaceId, usize)> {
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let carve = |st: &mut KernelState, bytes: u64| {
+        st.untyped_mut(kernel_cap::UntypedId::new(0))
+            .and_then(|u| u.alloc(4096, bytes).ok())
+            .map(|p| p.as_usize())
+    };
+
+    let root_pt = carve(state, 4096)?;
+    let pool = carve(state, 4096 * 8)?;
+    let stack_phys = carve(state, round4k(stack_len) as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable (paging is not yet
+    // active on this new space); single-core. `map_range` needs the pool
+    // pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 8) };
+
+    hal.map_ram_identity(root_pt, 3, false);
+    let mut used = 0u32;
+    let mut step = |vaddr: usize, paddr: usize, len: usize, perm: usize| -> bool {
+        let n = hal.map_range(
+            root_pt,
+            vaddr,
+            paddr,
+            len,
+            perm,
+            pool + used as usize * 4096,
+            8 - used as usize,
+        );
+        if n == u32::MAX {
+            false
+        } else {
+            used += n;
+            true
+        }
+    };
+    if !step(text_vma, text_lma, round4k(text_len), 1 | 4 | 8) // R+X+U
+        || !step(stack_vma, stack_phys, round4k(stack_len), 1 | 2 | 8) // R+W+U
+    {
+        klog!("spawn_process: map_range error\r\n");
+        return None;
+    }
+
+    let addr_space = state.alloc_addr_space(root_pt as u64)?;
+    let cap_space = state.alloc_cap_space()?;
+    let tid = state.alloc_tcb(cap_space, addr_space)?;
+    let stack_top = (stack_vma + stack_len) & !0xF;
+    state.init_user_thread(tid, entry_vma, stack_top, root_pt, hal);
+    Some((tid, cap_space, stack_phys))
 }
 
 /// Called by the riscv64 syscall handler when a process makes a
@@ -642,9 +811,114 @@ pub fn p2_report_a(value: usize) {
 /// suspended just after its own `P2_YIELD` (the head of its counting
 /// loop) and it is `Ready` in `kernel-sched`, so the first tick's
 /// `preempt_tick` switches straight into it.
-pub fn p2_preempt_start() {
-    // SAFETY: single-core; `G_HAL` was set by `enter` before any syscall.
+/// Ends the cooperative phase and arms the preemptive scheduler. Returns
+/// `Some((save, into))` for `TrapOutcome::SwitchTo` if a fresh thread took
+/// over process A's counting loop (see the doc comment inline below for
+/// why root's own TCB is retired rather than reused), or `None` (→
+/// `Resume`, root's own context just continues) if that spawn failed —
+/// the demo then falls back to whatever fairness root's pre-existing
+/// vruntime gets it, unaffected otherwise.
+pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL`/`G_STATE` were set by `enter` before any
+    // syscall.
     let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let state = kstate();
+
+    // Spawn process C NOW, not during the cooperative A<->B round-trip —
+    // see `setup_two_process`'s doc comment on why an earlier spawn would
+    // have hijacked B's `P2_YIELD` hand-off back to A (a fresh,
+    // never-run thread's `vruntime = 0` outranks A's own nonzero vruntime
+    // in `cooperative_yield`'s fairness comparison). Once we are about to
+    // switch to TIMER-driven `preempt_tick`, that fairness is exactly the
+    // point, so this is the right moment for C to join.
+    // SAFETY: these were written once by `setup_two_process` before any
+    // syscall could run.
+    let (text_vma, text_lma, text_len, subsys_entry, a_loop_entry, a_stack_top) = unsafe {
+        (
+            core::ptr::addr_of!(G_TEXT_VMA).read(),
+            core::ptr::addr_of!(G_TEXT_LMA).read(),
+            core::ptr::addr_of!(G_TEXT_LEN).read(),
+            core::ptr::addr_of!(G_SUBSYS_ENTRY).read(),
+            core::ptr::addr_of!(G_A_LOOP_ENTRY).read(),
+            core::ptr::addr_of!(G_A_STACK_TOP).read(),
+        )
+    };
+    if subsys_entry != 0 {
+        const PROC_C_STACK_VMA: usize = 0xC030_0000;
+        const PROC_C_STACK_LEN: usize = 4096 * 4;
+        match spawn_process(
+            hal,
+            state,
+            text_vma,
+            text_lma,
+            text_len,
+            PROC_C_STACK_VMA,
+            PROC_C_STACK_LEN,
+            subsys_entry,
+        ) {
+            Some((tid, _cap_space, stack_phys)) => {
+                // SAFETY: single-core; only written here, read by `p2_tick`.
+                unsafe { core::ptr::addr_of_mut!(P3_COUNTER_PHYS).write(stack_phys) };
+                klog!(
+                    "process A: process C spawned (tid {}) via the generic path, joining the preemption loop\r\n",
+                    tid.as_u32()
+                );
+            }
+            None => klog!("process A: process C spawn skipped (out of resources) - A/B unaffected\r\n"),
+        }
+    }
+
+    // Retire root's own tid-0 TCB from the counting-loop role. It has
+    // accumulated real, QEMU-timing-dependent `vruntime` from its own
+    // ecall sequence during the cooperative phase — sometimes far more
+    // than `P2_TICK_BUDGET` short ticks can let B/C's vruntime catch up
+    // to, starving it for the WHOLE demo (`kernel-sched`'s own invariant
+    // is that vruntime only ever increases — no reset primitive, by
+    // design, so "give root a fresh start" has to mean a literally fresh
+    // THREAD). A brand-new TCB sharing root's EXISTING address space and
+    // capability space (multiple threads, one process — same model a
+    // real OS uses) starts at `vruntime = 0`, the same footing as B/C,
+    // and takes over the loop. Root's own TCB is marked `Exited` +
+    // removed from the scheduler BEFORE this switch — same discipline as
+    // `thread2_main`'s tail, and for the same reason: nothing ever
+    // dispatches it again, so leaving it `Ready` would be a phantom
+    // scheduler entity `pick_next` could later select into a thread that
+    // can never make progress.
+    if a_loop_entry == 0 {
+        return None;
+    }
+    let root = state.root_thread;
+    let fresh_tid = match state.alloc_tcb(state.root_cap_space, state.root_addr_space) {
+        Some(t) => t,
+        None => {
+            klog!("process A: no TCB slot for the fresh loop thread - root's own TCB keeps running\r\n");
+            return None;
+        }
+    };
+    // `root_frame = 0`: keep whatever address space is already active
+    // (root's own space A, unchanged — this fresh TCB shares it).
+    state.init_user_thread(fresh_tid, a_loop_entry, a_stack_top, 0, hal);
+    if let Some(t) = state.tcb_mut(root) {
+        t.state = ThreadState::Exited;
+    }
+    state.sched.remove(root);
+    // `state.sched.remove(root)` clears `running` (root was it), and this
+    // switch to `fresh_tid` happens directly via `user_ctx_switch_ptrs`,
+    // bypassing `preempt_tick`/`cooperative_yield` (whose own `Switch`
+    // branches always call `dispatch` before returning). Without this,
+    // the scheduler's bookkeeping would say NOBODY is running while
+    // `fresh_tid` is physically executing — so the NEXT tick's
+    // `account()` would charge whatever `pick_next` picks (having found
+    // `running == None`) instead of `fresh_tid`, silently misattributing
+    // real CPU time to a thread that never actually ran.
+    let _ = state.sched.dispatch(fresh_tid, hal.now_ns());
+    klog!(
+        "process A: retiring tid {} (its own vruntime is too QEMU-timing-dependent to fairly compete for {} short ticks) - spawned fresh tid {} (vruntime 0) to run the counting loop\r\n",
+        root.as_u32(),
+        P2_TICK_BUDGET,
+        fresh_tid.as_u32()
+    );
+
     // SAFETY: single-core; only reset here, before the first tick.
     unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(0) };
     let armed = hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
@@ -653,6 +927,8 @@ pub fn p2_preempt_start() {
         P2_QUANTUM_NS,
         armed
     );
+
+    state.user_ctx_switch_ptrs(root, fresh_tid)
 }
 
 /// Preemptive-scheduler tick (registered as the arch `TickHandler`).
@@ -676,20 +952,36 @@ pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
     if ticks >= P2_TICK_BUDGET {
         hal.cancel_timer();
         let phys = unsafe { core::ptr::addr_of!(P2_SHARED_PHYS).read() };
-        // SAFETY: `phys` is identity-mapped U=0 in the live space.
+        let c_phys = unsafe { core::ptr::addr_of!(P3_COUNTER_PHYS).read() };
+        // SAFETY: both are identity-mapped U=0 in the live space (`phys`
+        // from the §8.4 shared frame; `c_phys` from `spawn_process`'s
+        // stack carve — `0` if process C was never spawned, in which case
+        // this read is skipped below).
         let (a, b) = unsafe {
             (
                 core::ptr::read_volatile((phys + P2_COUNTER_A_OFF) as *const u32),
                 core::ptr::read_volatile((phys + P2_COUNTER_B_OFF) as *const u32),
             )
         };
+        let c = if c_phys != 0 {
+            // SAFETY: as above.
+            Some(unsafe { core::ptr::read_volatile(c_phys as *const u32) })
+        } else {
+            None
+        };
+        let all_ran = a > 0 && b > 0 && c.unwrap_or(1) > 0;
         klog!(
-            "preemption: {} timer ticks, NO P2_YIELD - process A's counter = {}, process B's counter = {} -> {}\r\n",
+            "preemption: {} timer ticks, NO P2_YIELD - process A's counter = {}, process B's counter = {}, process C's counter = {:?} -> {}\r\n",
             ticks,
             a,
             b,
-            if a > 0 && b > 0 {
-                "PREEMPTIVE TWO-PROCESS SCHEDULING (02 4): both ran, timer-driven"
+            c,
+            if all_ran {
+                if c.is_some() {
+                    "PREEMPTIVE THREE-PROCESS SCHEDULING (02 4): all three ran, timer-driven, C spawned via the generic path"
+                } else {
+                    "PREEMPTIVE TWO-PROCESS SCHEDULING (02 4): both ran, timer-driven"
+                }
             } else {
                 "MISMATCH"
             }
@@ -702,6 +994,49 @@ pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
     match k.preempt_tick(hal.now_ns()) {
         PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
         PreemptStep::Continue | PreemptStep::Idle => None,
+    }
+}
+
+/// Per-process fault isolation (03-Kernel-Subsystems-Layer.md §2.1/§5.2):
+/// registered as the arch `FaultHandler` for a synchronous exception
+/// taken from U-mode that is not an `ecall`. `cause_code`/`sepc`/`stval`
+/// are the raw architecture trap values, logged for diagnosis; WHICH
+/// thread faulted is `kernel-sched`'s own `running()` bookkeeping — the
+/// arch trap vector has no other way to know, since the exception could
+/// be anything (illegal instruction, page fault, ...), not a syscall
+/// naming its own caller.
+///
+/// Terminates that thread (`KernelState::terminate_thread`) and returns
+/// the next runnable thread's context to resume, or `None` if nothing
+/// else is runnable (the caller then has no thread left to `sret` into
+/// — a real kernel would idle; logged as fatal here since every demo
+/// process in this MVP either counts forever or has already finished).
+pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u8> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    let Some(tid) = k.sched.running() else {
+        klog!(
+            "FAULT: no thread was running when exception (cause={:#x} sepc={:#x} stval={:#x}) landed - halting\r\n",
+            cause_code, sepc, stval
+        );
+        return None;
+    };
+    klog!(
+        "FAULT: thread {} took a fatal U-mode exception (cause={:#x} sepc={:#x} stval={:#x}) - terminating IT, rest of the system continues (03 5.2)\r\n",
+        tid.as_u32(), cause_code, sepc, stval
+    );
+    match k.terminate_thread(tid, hal.now_ns()) {
+        kernel_core::TerminationOutcome::Switched { incoming } => {
+            k.user_context_bytes(incoming).map(|c| c.as_ptr())
+        }
+        kernel_core::TerminationOutcome::Idle => {
+            klog!(
+                "FAULT: nothing else runnable after terminating thread {} - halting\r\n",
+                tid.as_u32()
+            );
+            None
+        }
     }
 }
 
@@ -730,54 +1065,6 @@ pub fn khal() -> &'static HalInterface {
     unsafe { &*core::ptr::addr_of!(G_HAL).read() }
 }
 
-/// Installs one 4 KiB mapping `vaddr -> paddr` (`perm_bits` = `R1 | W2 |
-/// X4 | U8`) into the Root Task's **live** page table, drawing any missing
-/// intermediate table from the runtime pool `enter` reserved, then flushes
-/// the TLB. Returns `false` if `enter` never ran the paging path, the pool
-/// is exhausted, or `map_range` rejects the request (misaligned, or a
-/// superpage leaf already covers the VA).
-///
-/// The final binary's `Map` syscall arm calls this from the S-mode trap
-/// handler — where every page-table frame it walks is in the identity-
-/// mapped low RAM, so the walk is valid even though paging is now active.
-/// This is the mechanism side of 02-Microkernel-Layer.md §6; the software
-/// `AddressSpace` model is updated separately by the caller so `Translate`
-/// still answers.
-pub fn map_user_page(hal: &HalInterface, vaddr: usize, paddr: usize, perm_bits: usize) -> bool {
-    // SAFETY: single-core; these globals are set once by `enter` before
-    // any syscall can run, and only mutated here (the pool high-water
-    // mark) from that same single-core syscall path.
-    let (root_pt, pool, pool_len, used) = unsafe {
-        (
-            core::ptr::addr_of!(G_ROOT_PT).read(),
-            core::ptr::addr_of!(G_MAP_POOL).read(),
-            core::ptr::addr_of!(G_MAP_POOL_LEN).read(),
-            core::ptr::addr_of!(G_MAP_POOL_USED).read(),
-        )
-    };
-    if root_pt == 0 || used >= pool_len {
-        return false;
-    }
-    let consumed = hal.map_range(
-        root_pt,
-        vaddr,
-        paddr,
-        4096,
-        perm_bits,
-        pool + used * 4096,
-        pool_len - used,
-    );
-    if consumed == u32::MAX {
-        return false;
-    }
-    // SAFETY: see the contract above — single-core advance of a pool
-    // high-water mark only this function touches.
-    unsafe {
-        core::ptr::addr_of_mut!(G_MAP_POOL_USED).write(used + consumed as usize);
-    }
-    hal.flush_tlb();
-    true
-}
 
 /// The in-kernel milestone demo (02-Microkernel-Layer.md §8.1 / §8.2 /
 /// §8.5): retype an `Endpoint`, exercise capability revocation, retype
@@ -797,6 +1084,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             target_type: KernelObjectType::Endpoint,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         other => {
@@ -823,7 +1111,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             .cap_space(cs)
             .map(|t| t.lookup(child_a).is_some() && t.lookup(child_b).is_some())
             .unwrap_or(false);
-        let freed = match k.dispatch(root, hal.now_ns(), SyscallOp::CapRevoke { cap: child_a }) {
+        let freed = match k.dispatch(root, hal.now_ns(), SyscallOp::CapRevoke { cap: child_a }, hal) {
             Ok(SyscallReturn::Revoked { freed }) => freed,
             other => {
                 klog!("root task: CapRevoke unexpected: {:?}\r\n", other);
@@ -856,6 +1144,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             target_type: KernelObjectType::ThreadControlBlock,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         other => {
@@ -893,7 +1182,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
 
     // 4. Block in Recv, then hand the CPU to whoever the scheduler picked
     //    (thread 2).
-    match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }) {
+    match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }, hal) {
         Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
             klog!("root task: blocked on Recv - switching to thread {}\r\n", n.as_u32());
             k.yield_to(root, n, hal);
@@ -944,6 +1233,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             target_type: KernelObjectType::ThreadControlBlock,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => Some(cap),
         other => {
@@ -972,7 +1262,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
         let (mut min_ns, mut max_ns, mut sum_ns) = (u64::MAX, 0u64, 0u64);
         for _ in 0..IPC_BENCH_ITERATIONS {
             let t0 = hal.now_ns();
-            match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }) {
+            match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }, hal) {
                 Ok(SyscallReturn::Reschedule { next: Some(n) }) => k.yield_to(root, n, hal),
                 other => {
                     klog!("root task: bench Recv unexpected: {:?}\r\n", other);
@@ -1007,6 +1297,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             target_type: KernelObjectType::Untyped,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         _ => return,
@@ -1141,7 +1432,7 @@ extern "C" fn thread2_main() -> ! {
     klog!("thread 2: running (tid {})\r\n", me.as_u32());
 
     let msg = SmallMessage::from_words(0xABCD, &[42, 7]).unwrap_or_else(|_| SmallMessage::new(0xABCD));
-    match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }) {
+    match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }, hal) {
         Ok(SyscallReturn::Delivered { woke }) => {
             klog!("thread 2: sent message; woke thread {}\r\n", woke.as_u32())
         }
@@ -1185,7 +1476,7 @@ extern "C" fn bench_thread_main() -> ! {
 
     for i in 0..IPC_BENCH_ITERATIONS {
         let msg = SmallMessage::from_words(0xBEEF, &[1, 2]).unwrap_or_else(|_| SmallMessage::new(0xBEEF));
-        match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }) {
+        match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }, hal) {
             Ok(SyscallReturn::Delivered { .. }) => {}
             other => klog!("bench thread: Send unexpected: {:?}\r\n", other),
         }

@@ -33,6 +33,72 @@ use core::panic::PanicInfo;
 
 use hal_core::BootInfo;
 
+// ----------------------------------------------------------------------------
+// A minimal global allocator — boot-time only, for the Root Task's OWN
+// policy code (`root_task::plan_boot` returns a `Vec<MemoryGrant>`).
+// `kernel/*` itself stays heap-free by design (IMPLEMENTATION-PLAN.md D1);
+// this exists ONLY because `root-task` — a layer-3, user-space process —
+// genuinely has a heap "once it retypes some untyped memory" per that
+// crate's own docs, and this binary is presently the vehicle that runs its
+// boot-time planning in-kernel (MVP, before a real per-process heap wired
+// through `UntypedMemory` exists). A bump allocator with no reclaim is
+// deliberate and sufficient: the handful of small, short-lived boot-time
+// allocations this binary makes are never freed anyway.
+// ----------------------------------------------------------------------------
+
+const BOOT_HEAP_BYTES: usize = 64 * 1024;
+
+/// Backing storage for the bump allocator below. `.bss`, zeroed by the
+/// loader — never read before being written by an allocation.
+static mut BOOT_HEAP: [u8; BOOT_HEAP_BYTES] = [0; BOOT_HEAP_BYTES];
+
+struct BumpAllocator {
+    /// Byte offset of the next free slot in `BOOT_HEAP`. `AtomicUsize`
+    /// purely so `alloc` can take `&self` (the `GlobalAlloc` contract) —
+    /// this binary is single-core, so `Relaxed` ordering is all a bump
+    /// pointer needs.
+    offset: core::sync::atomic::AtomicUsize,
+}
+
+// SAFETY: `alloc`'s only memory access is through `BOOT_HEAP.as_mut_ptr()`
+// at an offset this same call reserved via the atomic bump (never handed
+// out to two callers — single-core, and the compare-exchange below is the
+// sole writer of `offset`); `dealloc` touches nothing.
+unsafe impl core::alloc::GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        use core::sync::atomic::Ordering;
+        let (align, size) = (layout.align(), layout.size());
+        loop {
+            let cur = self.offset.load(Ordering::Relaxed);
+            let aligned = (cur + align - 1) & !(align - 1);
+            let Some(new_offset) = aligned.checked_add(size) else {
+                return core::ptr::null_mut();
+            };
+            if new_offset > BOOT_HEAP_BYTES {
+                return core::ptr::null_mut();
+            }
+            if self
+                .offset
+                .compare_exchange(cur, new_offset, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // SAFETY: `aligned + size <= BOOT_HEAP_BYTES`, just checked;
+                // `aligned` is a multiple of `align` by construction.
+                return unsafe { core::ptr::addr_of_mut!(BOOT_HEAP).cast::<u8>().add(aligned) };
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
+        // No reclaim — see this section's module-level doc comment.
+    }
+}
+
+#[global_allocator]
+static BOOT_ALLOCATOR: BumpAllocator = BumpAllocator {
+    offset: core::sync::atomic::AtomicUsize::new(0),
+};
+
 // Link-only: pull in this architecture's boot assembly / `_start` /
 // panic-handler-adjacent code via its `hal-<arch>` crate. Never referenced
 // by type — `kernel_main` depends solely on the architecture-erased
@@ -264,6 +330,16 @@ mod sys {
     /// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an
     /// explicit `P2_YIELD`. Both then run unbounded counting loops.
     pub const P2_PREEMPT_START: usize = 23;
+
+    /// `device-manager::subsystem_entry`'s state-transition report — the
+    /// first REAL `subsystems/*` crate's own logic running as a spawned
+    /// isolated process, not this demo's own code. Must stay numerically
+    /// equal to `device_manager::subsystem_entry::DM_REPORT` (that
+    /// module's own doc comment says so too — no shared protocol crate
+    /// for this demo-scoped raw ABI number, same as every other opcode
+    /// above). `a0` = `DriverState` discriminant, `a1` =
+    /// `restarts_in_window`.
+    pub const DM_REPORT: usize = 30;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -442,6 +518,86 @@ extern "C" fn umode_worker() -> ! {
     }
 }
 
+/// A THIRD user-space process, spawned via `kernel_arch_glue::
+/// spawn_process` (the generic path, not `umode_root`/`umode_worker`'s
+/// hand-written A/B setup) into its OWN isolated Sv39 address space AND
+/// its OWN capability space — proof that process creation generalizes
+/// beyond the fixed two-process §8.4 proof (a step toward
+/// 03-Kernel-Subsystems-Layer.md §5's subsystems-as-processes). Shares
+/// `.user_text` with the other two (no separate subsystem binary yet).
+///
+/// Needs no endpoint/IPC of its own for this demo — it just bumps a
+/// private counter word at a fixed low address inside its OWN stack
+/// region (safe because this loop pushes no stack frame: pure register
+/// ops, so nothing else ever touches that address). `kernel-arch-glue`
+/// reads the SAME word later through the kernel's own identity map,
+/// using the physical address `spawn_process` returned, not this VA.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_subsystem() -> ! {
+    // SAFETY: `t1` addresses the low end of this process's own `U=1 R+W`
+    // stack mapping (`kernel_arch_glue::spawn_process` set it up); pure
+    // register ops, no stack frame, no relocation.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC030_0000usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// Process A's preemptive-phase counting loop, run by a FRESH thread
+/// `kernel_arch_glue::p2_preempt_start` spawns to share root's own
+/// address space (not `umode_root` continuing to run itself — see that
+/// function's doc comment on why root's own vruntime-loaded TCB is
+/// retired instead of reused). Bumps the SAME counter word `umode_root`
+/// would have (`P2_VA_A_CONST + 8`), since it runs in the SAME space A.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_a_loop() -> ! {
+    // SAFETY: `t1` addresses `0xC004_0008`, mapped `U=1 R+W` in space A by
+    // `enter`/`umode_root`'s own setup; pure register ops, no stack frame.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC004_0008usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
+/// Layer.md §5.2 acceptance-test demo: "inject a panic in a driver,
+/// prove the rest of the system is unaffected". Executes an illegal
+/// instruction the instant it is scheduled, taking a synchronous U-mode
+/// exception (scause=2) that `hal_riscv64`'s trap vector routes to the
+/// registered `FaultHandler` (`simurgh_fault` -> `kernel_arch_glue::
+/// p2_fault` -> `KernelState::terminate_thread`) instead of halting the
+/// system — proving per-thread fault isolation end-to-end, not just at
+/// the unit-test level (`kernel-core`'s `terminate_thread` tests already
+/// cover the state-machine in isolation).
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_faulty_driver() -> ! {
+    // SAFETY: `.word 0` is not a valid RV64GC instruction encoding —
+    // deliberately triggers an illegal-instruction exception, which is
+    // the entire point of this process. `options(noreturn)` is honest:
+    // control never falls through this instruction (the thread is
+    // terminated by the fault handler and never resumed).
+    unsafe {
+        core::arch::asm!(".word 0", options(noreturn));
+    }
+}
+
 /// Placeholder U-mode entry for the architectures whose real-kernel boot
 /// is not yet wired (x86_64 / aarch64 still boot `kernel-stub`).
 #[cfg(not(target_arch = "riscv64"))]
@@ -452,19 +608,28 @@ extern "C" fn umode_root() -> ! {
 }
 
 /// Physical address of the frame the most recent `MAP_PAGE` handed the
-/// Root Task. `MAP_ALIAS` maps a second VA onto exactly this frame, so a
-/// caller can never smuggle in an arbitrary physical address to alias.
+/// Root Task (for `XCHECK`'s kernel-side cross-check read).
 #[cfg(target_arch = "riscv64")]
 static mut LAST_MAPPED_FRAME: usize = 0;
+/// The Frame capability (an `UntypedMemory` cap) the most recent
+/// `MAP_PAGE` retyped. `MAP_ALIAS` maps this SAME capability at a second
+/// VA — real capability-gated aliasing (`do_map` resolves it exactly like
+/// the first `Map` did), not a kernel-side "trust the last physical
+/// address" shortcut: a caller can never smuggle in an arbitrary
+/// physical address, only a capability it actually holds.
+#[cfg(target_arch = "riscv64")]
+static mut LAST_MAPPED_FRAME_CAP: u32 = 0;
 
 /// Retypes one page-sized `Untyped` object from the Root Task's first
-/// `UntypedMemory` capability and returns its physical base, or `None` if
-/// the retype or the cap lookup fails.
+/// `UntypedMemory` capability, returning both the new Frame capability
+/// (for `SyscallOp::Map`'s `frame` argument) and its physical base (for
+/// `XCHECK`'s kernel-side read — `Map` itself does not hand this back).
+/// `None` if the retype or the cap lookup fails.
 #[cfg(target_arch = "riscv64")]
 fn alloc_root_frame(
     k: &mut kernel_core::KernelState,
     hal: &hal_core::HalInterface,
-) -> Option<usize> {
+) -> Option<(kernel_cap::CapId, usize)> {
     use kernel_core::{SyscallOp, SyscallReturn};
     use kernel_mm::KernelObjectType;
 
@@ -476,6 +641,7 @@ fn alloc_root_frame(
             target_type: KernelObjectType::Untyped,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         _ => return None,
@@ -485,7 +651,8 @@ fn alloc_root_frame(
             .and_then(|t| t.lookup(cap))
             .map(|c| c.object.id.as_u32())?,
     );
-    Some(k.untyped_mut(uid)?.base().as_usize())
+    let phys = k.untyped_mut(uid)?.base().as_usize();
+    Some((cap, phys))
 }
 
 /// The syscall handler the HAL trap vector calls for an `ecall` from
@@ -522,7 +689,24 @@ fn simurgh_syscall(
             return TrapOutcome::Resume(0);
         }
         sys::P2_PREEMPT_START => {
-            kernel_arch_glue::p2_preempt_start();
+            spawn_device_manager(kernel_arch_glue::khal());
+            spawn_faulty_driver(kernel_arch_glue::khal());
+            return match kernel_arch_glue::p2_preempt_start() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DM_REPORT => {
+            let name = match a0 {
+                0 => "Starting",
+                1 => "Running",
+                2 => "Restarting",
+                3 => "Failed",
+                _ => "?",
+            };
+            kernel_arch_glue::log(format_args!(
+                "device-manager (U-mode, isolated subsystem process): state={name} restarts_in_window={a1}\r\n"
+            ));
             return TrapOutcome::Resume(0);
         }
         _ => {}
@@ -552,47 +736,72 @@ fn simurgh_syscall(
                     target_type: KernelObjectType::Endpoint,
                     count: 1,
                 },
+                hal,
             ) {
                 Ok(SyscallReturn::NewCaps { cap, .. }) => cap.as_u32() as usize,
                 _ => usize::MAX,
             }
         }
         sys::MAP_PAGE => {
-            // Allocate a real frame, walk a genuine Sv39 leaf for it into
-            // the LIVE page table (R|W|U = 1|2|8), then mirror it in the
-            // software model so TRANSLATE still answers.
-            let frame = match alloc_root_frame(k, hal) {
+            // Retype a real Frame (Untyped) capability, then the REAL,
+            // capability-gated `Map` syscall: `do_map` resolves
+            // `page_table` (WRITE) and `frame` (rights matching `perms`),
+            // records the software-model mapping, AND walks a genuine
+            // Sv39 leaf into the LIVE page table (the map pool `enter`
+            // installed makes this real, not just a model update).
+            let (frame_cap, frame_phys) = match alloc_root_frame(k, hal) {
                 Some(f) => f,
                 None => return TrapOutcome::Resume(usize::MAX),
             };
-            if !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
-                return TrapOutcome::Resume(usize::MAX);
-            }
-            if let Some(space) = k.addr_space_mut(k.root_addr_space) {
-                let _ = space.map(
-                    hal_core::VirtAddr::new(a0),
-                    hal_core::PhysAddr::new(frame),
-                    kernel_mm::PAGE_SIZE,
-                    hal_core::MapPermissions::KERNEL_DATA,
-                );
+            match k.dispatch(
+                root,
+                hal.now_ns(),
+                SyscallOp::Map {
+                    page_table: k.root_page_table_cap,
+                    frame: frame_cap,
+                    vaddr: hal_core::VirtAddr::new(a0),
+                    perms: hal_core::MapPermissions::KERNEL_DATA,
+                },
+                hal,
+            ) {
+                Ok(SyscallReturn::Mapped) => {}
+                _ => return TrapOutcome::Resume(usize::MAX),
             }
             // SAFETY: single-core syscall path; only written here.
-            unsafe { core::ptr::addr_of_mut!(LAST_MAPPED_FRAME).write(frame) };
-            frame
+            unsafe {
+                core::ptr::addr_of_mut!(LAST_MAPPED_FRAME).write(frame_phys);
+                core::ptr::addr_of_mut!(LAST_MAPPED_FRAME_CAP).write(frame_cap.as_u32());
+            }
+            frame_phys
         }
         sys::MAP_ALIAS => {
             // SAFETY: single-core; set by the last MAP_PAGE.
-            let frame = unsafe { core::ptr::addr_of!(LAST_MAPPED_FRAME).read() };
-            if frame == 0 || !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
+            let (frame_phys, frame_cap) = unsafe {
+                (
+                    core::ptr::addr_of!(LAST_MAPPED_FRAME).read(),
+                    kernel_cap::CapId::new(core::ptr::addr_of!(LAST_MAPPED_FRAME_CAP).read()),
+                )
+            };
+            if frame_phys == 0 {
                 return TrapOutcome::Resume(usize::MAX);
             }
-            if let Some(space) = k.addr_space_mut(k.root_addr_space) {
-                let _ = space.map(
-                    hal_core::VirtAddr::new(a0),
-                    hal_core::PhysAddr::new(frame),
-                    kernel_mm::PAGE_SIZE,
-                    hal_core::MapPermissions::KERNEL_DATA,
-                );
+            // Map the SAME Frame capability at a second VA — the
+            // capability-gated form of the alias: the kernel does not
+            // pick or trust a bare physical address, `do_map` resolves
+            // `frame_cap` exactly like the first `Map` did.
+            match k.dispatch(
+                root,
+                hal.now_ns(),
+                SyscallOp::Map {
+                    page_table: k.root_page_table_cap,
+                    frame: frame_cap,
+                    vaddr: hal_core::VirtAddr::new(a0),
+                    perms: hal_core::MapPermissions::KERNEL_DATA,
+                },
+                hal,
+            ) {
+                Ok(SyscallReturn::Mapped) => {}
+                _ => return TrapOutcome::Resume(usize::MAX),
             }
             0
         }
@@ -657,6 +866,23 @@ fn simurgh_tick() -> hal_riscv64::cpu::TrapOutcome {
     }
 }
 
+/// The per-process fault-isolation handler the HAL trap vector calls for
+/// a synchronous exception taken from a running U-mode thread that is
+/// not an `ecall` (registered via `hal_riscv64::cpu::set_fault_handler`)
+/// — 03-Kernel-Subsystems-Layer.md §2.1/§5.2. Delegates to
+/// `kernel-arch-glue`, which terminates the faulting thread and picks
+/// whatever else is runnable; `Some(into)` resumes it, `None` means
+/// nothing else was runnable (fatal — the trap vector falls through to
+/// the system-halt dump in that case).
+#[cfg(target_arch = "riscv64")]
+fn simurgh_fault(cause_code: usize, sepc: usize, stval: usize) -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_fault(cause_code, sepc, stval) {
+        Some(into) => TrapOutcome::Terminate { into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
 // Linker symbols for the user (layer-3) Root Task image — see
 // hal-riscv64/src/linker.ld's `.user_text` / `.user_stack` sections.
 #[cfg(target_arch = "riscv64")]
@@ -687,7 +913,115 @@ fn user_image() -> kernel_arch_glue::UserImage {
             stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
             entry_vma: umode_root as usize,
             worker_entry_vma: umode_worker as usize,
+            subsystem_entry_vma: umode_subsystem as usize,
+            a_loop_entry_vma: umode_a_loop as usize,
         }
+    }
+}
+
+/// Layer-3 subsystems as processes (IMPLEMENTATION-PLAN.md follow-up):
+/// runs `root-task`'s REAL `plan_boot` (not a re-derived shortcut) and
+/// launches Device Manager — `Service::BOOT_ORDER[0]` — as a genuinely
+/// isolated process via the SAME generic `kernel_arch_glue::spawn_process`
+/// that spawns this demo's own process C, so it joins the SAME
+/// preemption loop. Called once, from the `P2_PREEMPT_START` ecall
+/// handler (the same transition point process C joins at, and for the
+/// same reason: `plan_boot`'s in-kernel computation touches nothing
+/// U-mode-visible, so its timing relative to the cooperative phase
+/// doesn't matter, but doing it here keeps every "who else joins the
+/// preemption loop" decision in one place).
+#[cfg(target_arch = "riscv64")]
+fn spawn_device_manager(hal: &hal_core::HalInterface) {
+    let k = kernel_arch_glue::kstate();
+
+    // The Root Task's own untyped total stands in for "RAM this boot has
+    // to plan with" at this MVP stage (a real Root Task would sum every
+    // `UntypedMemory` capability it holds, not just query the kernel
+    // directly like this).
+    let total = k.total_untyped_bytes();
+    match root_task::plan_boot(total) {
+        Ok(plan) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: plan_boot({} bytes) - root reserve {} bytes, {} service grant(s), {} bytes free\r\n",
+                total,
+                plan.root_reserve_bytes,
+                plan.grants.len(),
+                plan.free_bytes
+            ));
+            for g in plan.grants.iter() {
+                kernel_arch_glue::log(format_args!(
+                    "root task: plan_boot grant - {:?}: {} bytes\r\n",
+                    g.service, g.bytes
+                ));
+            }
+        }
+        Err(e) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: plan_boot failed: {:?} - device-manager not spawned\r\n",
+                e
+            ));
+            return;
+        }
+    }
+
+    // Device Manager is BOOT_ORDER[0] — launch it for real, sharing the
+    // Root Task's own `.user_text` mapping (see `spawn_process`'s doc
+    // comment) but on its OWN fresh stack/address space/capability space.
+    let user = user_image();
+    const DM_STACK_VMA: usize = 0xC040_0000;
+    const DM_STACK_LEN: usize = 4096 * 4;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        DM_STACK_VMA,
+        DM_STACK_LEN,
+        device_manager::subsystem_entry::subsystem_main as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned device-manager (tid {}) via the generic path, joining the preemption loop\r\n",
+                tid.as_u32()
+            ));
+        }
+        None => kernel_arch_glue::log(format_args!(
+            "root task: device-manager spawn skipped (out of resources)\r\n"
+        )),
+    }
+}
+
+/// Spawns `umode_faulty_driver` (see its doc comment) via the SAME
+/// generic `kernel_arch_glue::spawn_process` path as device-manager, so
+/// it joins the same preemption loop and its crash can be observed
+/// happening concurrently with the rest of the demo — the real §5.2
+/// proof point is that A/B/C and device-manager are unaffected by it.
+#[cfg(target_arch = "riscv64")]
+fn spawn_faulty_driver(hal: &hal_core::HalInterface) {
+    let k = kernel_arch_glue::kstate();
+    let user = user_image();
+    const FAULTY_STACK_VMA: usize = 0xC050_0000;
+    const FAULTY_STACK_LEN: usize = 4096 * 4;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        FAULTY_STACK_VMA,
+        FAULTY_STACK_LEN,
+        umode_faulty_driver as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned faulty-driver (tid {}) - it will fault on its first instruction (fault-isolation demo, 03 5.2)\r\n",
+                tid.as_u32()
+            ));
+        }
+        None => kernel_arch_glue::log(format_args!(
+            "root task: faulty-driver spawn skipped (out of resources)\r\n"
+        )),
     }
 }
 
@@ -721,12 +1055,17 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             let _ = writeln!(s, "----------------------------------------------------------------------");
             let _ = writeln!(s, "handing control to the Root Task...");
             // Register the S-mode syscall handler the HAL trap vector
-            // invokes for an `ecall` from U-mode, and the tick handler it
-            // invokes for a supervisor timer interrupt on a U-mode thread.
+            // invokes for an `ecall` from U-mode, the tick handler it
+            // invokes for a supervisor timer interrupt on a U-mode thread,
+            // and the fault handler it invokes for any other synchronous
+            // exception taken from U-mode (03-Kernel-Subsystems-Layer.md
+            // §2.1/§5.2 per-process fault isolation).
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_syscall_handler(simurgh_syscall);
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_tick_handler(simurgh_tick);
+            #[cfg(target_arch = "riscv64")]
+            hal_riscv64::cpu::set_fault_handler(simurgh_fault);
             // Never returns: runs the in-kernel demo, then (riscv64) maps
             // the user image U=1, activates Sv39 paging, and drops the
             // Root Task to U-mode isolated.

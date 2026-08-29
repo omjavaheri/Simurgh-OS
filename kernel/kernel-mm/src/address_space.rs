@@ -21,11 +21,15 @@
 //!   - no `Mapping` is simultaneously writable and executable;
 //!   - all addresses and lengths are multiples of `PAGE_SIZE`.
 //!
-//! MVP scope: this is a pure software model. It does not yet write real
-//! hardware page-table entries — a `feat:` follow-up will walk these
-//! `Mapping`s into architecture PTEs through a HAL-provided address-space
-//! handle (see the TODO in `map`). Until then the model is the source of
-//! truth the syscall layer reasons about.
+//! MVP scope: `AddressSpace` itself stays a pure software model with no
+//! HAL dependency (matches its test suite: plain unit tests, no mock
+//! hardware needed) — it is `syscall::do_map` (kernel-core), not this
+//! type, that walks a successful `map()` into real architecture PTEs via
+//! `hal_core::HalInterface::map_range`, then rolls this model's mapping
+//! back with `unmap()` if that hardware walk fails, so the two can never
+//! drift out of sync. This module remains the source of truth the
+//! syscall layer reasons about (`translate`, overlap/W^X checks) whether
+//! or not the current architecture has a working `map_range`.
 //! ============================================================================
 
 use crate::{MmError, PAGE_SIZE};
@@ -85,6 +89,19 @@ impl<const M: usize> AddressSpace<M> {
         self.root_phys
     }
 
+    /// Rebinds this space's recorded page-table root — for when the REAL
+    /// hardware root frame is only known/allocated after this
+    /// `AddressSpace` was constructed. The Root Task's own space, in
+    /// particular, is created from `BootInfo::initial_page_table_phys`
+    /// (whatever was active at HAL handoff — often `0`/Bare mode) long
+    /// before `kernel-arch-glue::enter` allocates and activates the real
+    /// Sv39 (or architecture-equivalent) root; without rebinding it here
+    /// once that happens, `syscall::do_map`'s hardware walk would target
+    /// the wrong (stale) root frame and always fail.
+    pub fn set_root_phys(&mut self, root_phys: PhysAddr) {
+        self.root_phys = root_phys;
+    }
+
     /// Number of live mappings.
     pub fn len(&self) -> usize {
         self.count
@@ -142,11 +159,9 @@ impl<const M: usize> AddressSpace<M> {
             perms,
         });
         self.count += 1;
-        // TODO(omid): walk this mapping into real architecture page-table
-        // entries via a HAL address-space handle. Requires hal-core to
-        // expose a per-space PTE-write primitive (a small addition to
-        // MemoryBootstrap or a new trait) — tracked as Q2-adjacent in
-        // IMPLEMENTATION-PLAN.md.
+        // The real hardware PTE walk (`hal_core::HalInterface::map_range`)
+        // is `syscall::do_map`'s job, run right after this call succeeds —
+        // see this module's doc comment.
         Ok(())
     }
 

@@ -206,4 +206,120 @@ impl KernelState {
             .admit(tid, SchedulerMode::Interactive, MAX_PRIORITY, None);
         let _ = self.sched.note_ready(tid, hal.now_ns());
     }
+
+    /// `tid` took a fatal U-mode exception — per-process fault isolation
+    /// (03-Kernel-Subsystems-Layer.md §2.1/§5.2: a crash kills only that
+    /// ONE process, never the system). Marks `tid`'s TCB `Exited` and
+    /// removes it from the scheduler UNCONDITIONALLY (unlike
+    /// `preempt_tick`, there is no question of `tid` staying `Ready` for
+    /// a future tick — a genuinely isolated microkernel does not resume a
+    /// thread that just faulted), then picks whatever else is `Ready`.
+    ///
+    /// `tid` is expected to be `self.sched.running()` at the point of the
+    /// fault (the caller — the arch trap vector — has no OTHER thread to
+    /// blame the fault on); if the scheduler's `running` bookkeeping still
+    /// names `tid`, this charges it its final (partial) run slice via
+    /// `account` first, purely to leave `kernel-sched`'s own state
+    /// internally consistent — irrelevant to `tid` itself, which is being
+    /// destroyed either way.
+    pub fn terminate_thread(&mut self, tid: ThreadId, now_ns: u64) -> TerminationOutcome {
+        if self.sched.running() == Some(tid) {
+            self.sched.account(now_ns);
+        }
+        if let Some(t) = self.tcb_mut(tid) {
+            t.state = ThreadState::Exited;
+        }
+        self.sched.remove(tid);
+
+        match self.sched.pick_next(now_ns) {
+            Some(incoming) => {
+                let _ = self.sched.dispatch(incoming, now_ns);
+                TerminationOutcome::Switched { incoming }
+            }
+            None => TerminationOutcome::Idle,
+        }
+    }
+}
+
+/// What `terminate_thread` resolved to. Unlike `PreemptStep`, there is no
+/// "keep running" case — the terminated thread can never be `pick_next`'s
+/// answer again (it was just removed from the scheduler entirely), so the
+/// only two possibilities are "someone else is Ready" or "nothing is".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationOutcome {
+    /// `incoming` was picked to run next. The caller resumes its
+    /// `user_context` (via `KernelState::user_context_bytes`) — there is
+    /// nothing to save for the terminated thread, unlike `PreemptStep::
+    /// Switch`'s `outgoing`.
+    Switched {
+        /// The thread to run next.
+        incoming: ThreadId,
+    },
+    /// Nothing else is runnable. The caller has no thread left to
+    /// resume — a real kernel would idle/wait for an interrupt; this
+    /// MVP's callers simply have nothing to `sret` into.
+    Idle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hal_core::{BootInfo, BootProtocol};
+    use hal_manifest::raw::{
+        HardwareManifestRaw, MemoryRegionKindRaw, MemoryRegionRaw, TimerInfoRaw, TimerKindRaw,
+    };
+
+    fn boot() -> BootInfo {
+        let mut m = HardwareManifestRaw::zeroed();
+        m.cpu_core_count = 1;
+        m.push_memory_region(MemoryRegionRaw::new(
+            0x100_0000,
+            32 * 1024 * 1024,
+            MemoryRegionKindRaw::Usable,
+            false,
+        ))
+        .unwrap();
+        m.timer = TimerInfoRaw::new(TimerKindRaw::Tsc, 1_000_000_000, false);
+        BootInfo::new(
+            BootProtocol::Uefi,
+            m,
+            0x1000,
+            (0x10_0000, 0x20_0000),
+            (0x20_0000, 0x21_0000),
+            0,
+        )
+    }
+
+    #[test]
+    fn terminate_thread_marks_exited_and_removed() {
+        let mut k = KernelState::from_boot_info(&boot()).unwrap();
+        let root = k.root_thread;
+        // Root Task is admitted+ready at boot but never `dispatch`ed —
+        // give `terminate_thread` a `running() == Some(root)` to charge.
+        let _ = k.sched.dispatch(root, 0);
+
+        let outcome = k.terminate_thread(root, 1_000);
+        assert_eq!(outcome, TerminationOutcome::Idle);
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::Exited);
+        assert!(k.sched.entity(root).is_none());
+        assert_eq!(k.sched.running(), None);
+    }
+
+    #[test]
+    fn terminate_thread_switches_to_another_ready_thread() {
+        let mut k = KernelState::from_boot_info(&boot()).unwrap();
+        let root = k.root_thread;
+        let other = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let _ = k
+            .sched
+            .admit(other, SchedulerMode::Interactive, MAX_PRIORITY, None);
+        let _ = k.sched.note_ready(other, 0);
+        let _ = k.sched.dispatch(root, 0);
+
+        let outcome = k.terminate_thread(root, 1_000);
+        assert_eq!(outcome, TerminationOutcome::Switched { incoming: other });
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::Exited);
+        assert!(k.sched.entity(root).is_none());
+        assert_eq!(k.sched.running(), Some(other));
+    }
 }

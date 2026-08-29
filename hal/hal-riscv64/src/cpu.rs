@@ -304,6 +304,17 @@ pub enum TrapOutcome {
         /// The incoming thread's context to resume.
         into: *const u8,
     },
+    /// The trapping thread has been TERMINATED by the microkernel (a
+    /// fatal U-mode exception — 03-Kernel-Subsystems-Layer.md §2.1/§5.2's
+    /// per-process fault isolation) — deliberately does NOT save its
+    /// context first: a terminated thread never resumes, so there is
+    /// nothing worth snapshotting (unlike `SwitchTo`, which switches
+    /// AWAY from a thread that is still alive and Ready). Just restores
+    /// `into` and `sret`s into it.
+    Terminate {
+        /// The next thread's context to resume.
+        into: *const u8,
+    },
 }
 
 /// Signature of the S-mode handler the microkernel registers for an
@@ -320,11 +331,28 @@ pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> TrapOu
 /// re-arming (or cancelling) the timer via `HalInterface`.
 pub type TickHandler = fn() -> TrapOutcome;
 
+/// Signature of the handler the microkernel registers for a synchronous
+/// exception (illegal instruction, page/access fault, etc. — anything
+/// that is neither an `ecall` nor an interrupt) taken **while a U-mode
+/// thread was running**. Per-process fault isolation
+/// (03-Kernel-Subsystems-Layer.md §2.1/§5.2): a driver crash must kill
+/// only that ONE process, not the whole system. `(cause_code, sepc,
+/// stval)` are the raw `scause`/`sepc`/`stval` values, for logging —
+/// which thread faulted is the kernel's own `kernel_sched::Scheduler::
+/// running()` bookkeeping, not something this signature needs to carry.
+/// Always expected to return `TrapOutcome::Terminate` in practice (the
+/// faulting thread cannot safely resume), though `Resume`/`SwitchTo`
+/// remain valid if a future policy wants to retry or reschedule instead.
+pub type FaultHandler = fn(usize, usize, usize) -> TrapOutcome;
+
 #[cfg(target_os = "none")]
 static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
 
 #[cfg(target_os = "none")]
 static mut TICK_HANDLER: Option<TickHandler> = None;
+
+#[cfg(target_os = "none")]
+static mut FAULT_HANDLER: Option<FaultHandler> = None;
 
 /// Registers the handler `common_trap_entry` calls for an `ecall` from
 /// U-mode. The microkernel calls this once during boot, before it drops
@@ -353,6 +381,21 @@ pub fn set_tick_handler(handler: TickHandler) {
     // armed and before any drop to U-mode.
     unsafe {
         core::ptr::addr_of_mut!(TICK_HANDLER).write(Some(handler));
+    }
+}
+
+/// Registers the handler `common_trap_entry` calls for a synchronous
+/// exception taken from U-mode that is not an `ecall`. Set once during
+/// boot, before any drop to U-mode. Until it is set, a U-mode exception
+/// falls through to the fatal system-halt dump — same "no handler, no
+/// behavior change" contract as `set_syscall_handler`/`set_tick_handler`,
+/// so `kernel-stub` (which never registers one) is unaffected.
+#[cfg(target_os = "none")]
+pub fn set_fault_handler(handler: FaultHandler) {
+    // SAFETY: single-core boot; set exactly once before any drop to
+    // U-mode.
+    unsafe {
+        core::ptr::addr_of_mut!(FAULT_HANDLER).write(Some(handler));
     }
 }
 
@@ -438,6 +481,16 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                                 restore_user_and_sret(into as *const RiscvUserContext);
                             }
                         }
+                        TrapOutcome::Terminate { into } => {
+                            // Not the normal path for a timer tick, but
+                            // the type is shared with the fault-isolation
+                            // path below, so this arm must exist. No
+                            // save: the preempted thread is being
+                            // terminated, not merely switched out.
+                            // SAFETY: `into` is a kernel-owned, 8-byte-
+                            // aligned `HAL_USER_CONTEXT_BYTES` blob.
+                            unsafe { restore_user_and_sret(into as *const RiscvUserContext) };
+                        }
                     }
                 }
             }
@@ -488,6 +541,60 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                         save as *mut RiscvUserContext,
                     );
                     restore_user_and_sret(into as *const RiscvUserContext);
+                }
+            }
+            TrapOutcome::Terminate { into } => {
+                // Not the normal path for an `ecall` (a syscall handler
+                // "terminating" the caller mid-syscall is unusual, but
+                // the type is shared with the exception-fault path
+                // below, so this arm must exist). No save: this trap
+                // frame is simply abandoned, same as any other
+                // terminated thread.
+                // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+                // `HAL_USER_CONTEXT_BYTES` blob.
+                unsafe { restore_user_and_sret(into as *const RiscvUserContext) };
+            }
+        }
+    }
+
+    // A synchronous exception that is neither an `ecall` nor (handled
+    // above) a timer interrupt. If it came from a U-mode thread and the
+    // microkernel registered a fault handler, this is per-process fault
+    // isolation (03-Kernel-Subsystems-Layer.md §2.1/§5.2): terminate
+    // THAT thread and switch to whatever else is runnable, rather than
+    // halting the whole system. An S-mode fault (the kernel's own bug)
+    // or no registered handler (e.g. `kernel-stub`) keeps the original,
+    // unconditional system-halt behavior — a kernel-mode fault is
+    // genuinely fatal for this MVP.
+    let sstatus_now: usize;
+    // SAFETY: `csrr sstatus` has no preconditions in a trap handler.
+    unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) sstatus_now) };
+    let from_user = (sstatus_now & SSTATUS_SPP_BIT) == 0;
+    if from_user {
+        // SAFETY: single-core; `FAULT_HANDLER` is only written by
+        // `set_fault_handler` during boot, before any drop to U-mode.
+        let handler = unsafe { core::ptr::addr_of!(FAULT_HANDLER).read() };
+        if let Some(h) = handler {
+            match h(cause_code, sepc, stval) {
+                TrapOutcome::Resume(_) => return,
+                TrapOutcome::SwitchTo { save, into } => {
+                    // SAFETY: `frame` is the on-stack register file
+                    // `trap_entry` just saved; valid here, no other live
+                    // reference (the `ecall` branch above already
+                    // returned by this point). `save`/`into` as the
+                    // `ecall` `SwitchTo` arm above.
+                    let f = unsafe { &mut *frame };
+                    unsafe {
+                        save_trap_frame_as_user_context(f, sepc, save as *mut RiscvUserContext);
+                        restore_user_and_sret(into as *const RiscvUserContext);
+                    }
+                }
+                TrapOutcome::Terminate { into } => {
+                    // The expected outcome: the faulting thread is dead,
+                    // its trap frame abandoned, no save.
+                    // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+                    // `HAL_USER_CONTEXT_BYTES` blob.
+                    unsafe { restore_user_and_sret(into as *const RiscvUserContext) };
                 }
             }
         }

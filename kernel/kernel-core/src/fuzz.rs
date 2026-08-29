@@ -35,13 +35,69 @@
 
 use crate::state::KernelState;
 use crate::syscall::SyscallOp;
-use hal_core::{BootInfo, BootProtocol, MapPermissions, VirtAddr};
+use hal_core::cpu::{CpuAbstraction, CpuContext, CpuFeatureFlags, PrivilegeLevel};
+use hal_core::timer::{TimerAbstraction, TimerCallback, TimerMode};
+use hal_core::{
+    BootInfo, BootProtocol, HalError, MapPermissions, VirtAddr, HAL_CONTEXT_BYTES,
+};
 use hal_manifest::raw::{
     HardwareManifestRaw, MemoryRegionKindRaw, MemoryRegionRaw, TimerInfoRaw, TimerKindRaw,
 };
 use kernel_cap::{CapId, CapabilityRights, ThreadId};
 use kernel_ipc::SmallMessage;
 use kernel_mm::KernelObjectType;
+
+/// Minimal mock `HalInterface` for `dispatch`'s `hal` parameter. Its
+/// default (no-op / `u32::MAX`-returning) `map_range` means every `Map`
+/// this fuzzer generates that reaches `do_map`'s hardware branch (once
+/// `install_map_pool` below makes `map_pool_base() != 0`) takes the
+/// ROLLBACK path — exercising that under thousands of adversarial inputs
+/// is as much the point of this harness as the rest of the surface.
+struct MockCpu;
+impl CpuAbstraction<HAL_CONTEXT_BYTES> for MockCpu {
+    fn core_count(&self) -> usize {
+        1
+    }
+    fn current_core_id(&self) -> usize {
+        0
+    }
+    fn feature_flags(&self) -> CpuFeatureFlags {
+        CpuFeatureFlags::empty()
+    }
+    unsafe fn context_switch(
+        &self,
+        _from: &mut CpuContext<HAL_CONTEXT_BYTES>,
+        _to: &CpuContext<HAL_CONTEXT_BYTES>,
+    ) {
+    }
+    fn set_privilege_level(&self, _level: PrivilegeLevel) -> Result<(), HalError> {
+        Ok(())
+    }
+    fn bootstrap_current_core(&self) -> Result<(), HalError> {
+        Ok(())
+    }
+}
+
+struct MockTimer;
+impl TimerAbstraction for MockTimer {
+    fn now_ns(&self) -> u64 {
+        0
+    }
+    fn set_oneshot(&self, _deadline_ns: u64, _mode: TimerMode) -> Result<(), HalError> {
+        Ok(())
+    }
+    fn cancel_oneshot(&self) {}
+    fn set_tickless(&self, _enabled: bool) -> Result<(), HalError> {
+        Ok(())
+    }
+    fn set_timer_callback(&self, _callback: TimerCallback) {}
+    fn supports_tickless(&self) -> bool {
+        false
+    }
+    fn frequency_hz(&self) -> u64 {
+        1_000_000_000
+    }
+}
 
 /// splitmix64 — a small, dependency-free, non-cryptographic PRNG. Fast
 /// and spreads bits well enough over many iterations to hit boundary
@@ -204,6 +260,13 @@ fn syscall_dispatch_survives_random_malformed_input() {
         let root = state.root_thread;
         let root_cs = state.root_cap_space;
         let mut rng = Rng(seed);
+        let (cpu, timer) = (MockCpu, MockTimer);
+        let hal = hal_core::build_interface(&cpu, &timer);
+        // A fake pool (never dereferenced — `MockCpu`'s default
+        // `map_range` ignores its args and always reports failure) so
+        // `do_map`'s hardware-walk-then-rollback path actually runs
+        // under fuzzing, not just the "no pool installed" skip.
+        state.install_map_pool(0x1000, 4);
 
         for i in 0..ITERATIONS {
             // Mostly the real Root Task (so legitimate-looking sequences
@@ -221,7 +284,7 @@ fn syscall_dispatch_survives_random_malformed_input() {
             // typed Err — no matter how malformed `caller`/`op` are. If
             // this ever panics, the test process aborts and reports
             // which seed/iteration/op triggered it.
-            let _ = state.dispatch(caller, now_ns, op);
+            let _ = state.dispatch(caller, now_ns, op, &hal);
 
             // An adversarial syscall aimed at some other (possibly
             // nonexistent) object must never corrupt the Root Task's OWN
