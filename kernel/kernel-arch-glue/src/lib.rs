@@ -149,6 +149,53 @@ static mut G_A_STACK_TOP: usize = 0;
 const P2_A_SENTINEL: usize = 0xC0DE;
 const P2_B_SENTINEL: usize = 0xB00B;
 
+// ---------------------------------------------------------------------------
+// Real IPC-driven driver supervision demo (03-Kernel-Subsystems-Layer.md
+// §5.2's actual acceptance test: device-manager reacts to a REAL driver
+// crash, not its own timer). Device Manager blocks on `p2_dm_wait_crash`;
+// `p2_fault` hands off DIRECTLY to it (`KernelState::
+// terminate_thread_and_handoff`, not the generic fairness-driven
+// `terminate_thread`) when the WATCHED driver thread specifically is the
+// one that faulted, handing over the raw trap values via `PENDING_CRASH`
+// (consumed by `p2_poll_crash`) — the same sticky signal-then-poll shape
+// as `kernel_ipc::Notification`, just realized on this demo's own raw
+// -ecall ABI instead of the general capability-checked syscall path
+// (that path's own Send/Recv/Call blocking semantics are a separate,
+// still-unresolved design question — see IMPLEMENTATION-PLAN.md).
+//
+// The hand-off targets device-manager's OWN, PERMANENT `ThreadId`
+// (`DM_TID`) UNCONDITIONALLY, not "whichever thread most recently called
+// `p2_dm_wait_crash` and is registered as blocked" — two real QEMU-found
+// bugs converge on why: (1) device-manager's own vruntime (real
+// wall-clock nanoseconds under QEMU/TCG for each genuine `spawn_process`
+// respawn it does) can exceed the demo's long-running A/B/C counting
+// loops', so a plain fairness-driven `pick_next` can starve it forever
+// right after an ordinary wake; (2) with the 40-tick preemption timer
+// STILL armed (the crash/restart cycle and that timer run concurrently),
+// device-manager can be preempted by an ORDINARY timer tick — not
+// `block_thread` — between one respawn and its next `DM_WAIT_CRASH`
+// call, leaving no "registered waiter" for `p2_fault` to find even
+// though device-manager is unambiguously who should run next. Both
+// collapse to the same fix: always target `DM_TID` directly. This is
+// safe unconditionally because device-manager can never itself be
+// `self.sched.running()` at the exact instant some OTHER thread (the
+// driver) traps — single-core, only one thread runs at a time — so it is
+// always either `Ready` or `Blocked`, and `dispatch()` accepts either.
+static mut WATCHED_DRIVER_TID: Option<ThreadId> = None;
+/// The most recent watched-driver crash's raw trap values
+/// (cause_code/sepc/stval), set by `p2_fault` and consumed by
+/// `p2_poll_crash`. Sticky exactly like `kernel_ipc::Notification`'s
+/// signal word: a crash that happens before device-manager gets around to
+/// waiting is not lost.
+static mut PENDING_CRASH: Option<(usize, usize, usize)> = None;
+/// Device Manager's own, PERMANENT `ThreadId` (it is spawned once and
+/// never respawned — only the driver is), recorded by `p2_register_
+/// device_manager` right after `spawn_device_manager` succeeds. See the
+/// section doc comment above for why `p2_fault` targets this
+/// unconditionally rather than tracking "is device-manager currently
+/// blocked".
+static mut DM_TID: Option<ThreadId> = None;
+
 /// Per-thread quantum for the preemption demo. 2 ms at QEMU virt's
 /// 10 MHz timebase is 20 000 ticks — long enough that each process's
 /// counting loop makes visible progress, short enough that the whole
@@ -1026,6 +1073,35 @@ pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u
         "FAULT: thread {} took a fatal U-mode exception (cause={:#x} sepc={:#x} stval={:#x}) - terminating IT, rest of the system continues (03 5.2)\r\n",
         tid.as_u32(), cause_code, sepc, stval
     );
+
+    // If the thread that just died is the one device-manager actually
+    // supervises, hand off DIRECTLY to device-manager's own PERMANENT tid
+    // (`KernelState::terminate_thread_and_handoff`) instead of the
+    // generic `terminate_thread`/`pick_next` fairness path below — see
+    // this module's own "Real IPC-driven driver supervision demo" doc
+    // comment (above `WATCHED_DRIVER_TID`) for the two QEMU-found races
+    // this unconditional hand-off exists to close. Fault isolation itself
+    // (below, the non-watched-driver case) stays fully general — this
+    // hand-off is an additional, demo-specific policy layered on top for
+    // this ONE well-defined case (device-manager is DEFINITELY who
+    // should run next).
+    // SAFETY: single-core.
+    if unsafe { core::ptr::addr_of!(WATCHED_DRIVER_TID).read() } == Some(tid) {
+        // SAFETY: single-core; only written here, read by `p2_poll_crash`.
+        unsafe { core::ptr::addr_of_mut!(PENDING_CRASH).write(Some((cause_code, sepc, stval))) };
+        // SAFETY: single-core; only written once, by `p2_register_device_manager`.
+        if let Some(dm_tid) = unsafe { core::ptr::addr_of!(DM_TID).read() } {
+            klog!(
+                "FAULT: hand-off to device-manager (tid {}) - direct, not generic fairness (03 5.2)\r\n",
+                dm_tid.as_u32()
+            );
+            let now = hal.now_ns();
+            k.wake_blocked(dm_tid, now);
+            k.terminate_thread_and_handoff(tid, dm_tid, now);
+            return k.user_context_bytes(dm_tid).map(|c| c.as_ptr());
+        }
+    }
+
     match k.terminate_thread(tid, hal.now_ns()) {
         kernel_core::TerminationOutcome::Switched { incoming } => {
             k.user_context_bytes(incoming).map(|c| c.as_ptr())
@@ -1038,6 +1114,88 @@ pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u
             None
         }
     }
+}
+
+/// Records `tid` as the "faulty driver" instance `p2_fault` should treat
+/// specially. Called once by `kernel/src/main.rs`'s `spawn_faulty_driver`
+/// right after EVERY (re)spawn — a respawned driver gets a brand-new
+/// `ThreadId`, so this must be re-armed each time, not just at boot.
+pub fn p2_watch_driver(tid: ThreadId) {
+    // SAFETY: single-core; only written here, read by `p2_fault`.
+    unsafe { core::ptr::addr_of_mut!(WATCHED_DRIVER_TID).write(Some(tid)) };
+}
+
+/// Records `tid` as device-manager's own, PERMANENT `ThreadId` — called
+/// once by `kernel/src/main.rs`'s `spawn_device_manager` right after it
+/// succeeds. `p2_fault` targets this directly on a watched-driver crash
+/// (see `DM_TID`'s own doc comment for why unconditionally, not via a
+/// "currently blocked" registration).
+pub fn p2_register_device_manager(tid: ThreadId) {
+    // SAFETY: single-core; only written here, read by `p2_fault`.
+    unsafe { core::ptr::addr_of_mut!(DM_TID).write(Some(tid)) };
+}
+
+/// `DM_WAIT_CRASH` from device-manager: block until the watched driver
+/// process dies (real IPC-driven supervision — 03-Kernel-Subsystems-
+/// Layer.md §5.2). If a crash is already pending — it happened before
+/// device-manager got around to waiting, always possible since spawning
+/// and scheduling order are not synchronized — returns `None` (→
+/// `TrapOutcome::Resume`) immediately so device-manager can go straight to
+/// `p2_poll_crash`; otherwise genuinely blocks (`KernelState::
+/// block_thread`) and returns `Some((save, into))` for `TrapOutcome::
+/// SwitchTo`. Blocking here is purely for `kernel-sched`'s own bookkeeping
+/// (so device-manager does not appear to still be `Running` while it
+/// waits) — `p2_fault` does not depend on this call having happened; it
+/// always targets `DM_TID` directly regardless of device-manager's exact
+/// state when the driver dies.
+pub fn p2_dm_wait_crash() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    // SAFETY: single-core; only `p2_fault`/`p2_poll_crash` touch this too.
+    if unsafe { core::ptr::addr_of!(PENDING_CRASH).read() }.is_some() {
+        return None;
+    }
+    let Some(tid) = k.sched.running() else {
+        return None;
+    };
+    match k.block_thread(tid, hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
+    }
+}
+
+/// `DM_RESPAWN_DRIVER` from device-manager, called right after
+/// `kernel/src/main.rs`'s `spawn_faulty_driver` succeeds: hands the CPU
+/// DIRECTLY to the fresh driver thread (`KernelState::yield_to_thread`)
+/// instead of just returning and trusting the ordinary fairness scheduler
+/// (or an already-cancelled preemption timer) to ever pick it up — the
+/// respawn-direction counterpart of the crash-notify hand-off above (see
+/// `WATCHED_DRIVER_TID`'s doc comment for the starvation this whole
+/// pattern exists to close). The fresh driver's only instruction faults
+/// immediately, so control comes straight back via `p2_fault`'s own
+/// hand-off to `DM_TID` — this call never really "returns" in the normal
+/// sense, it just describes device-manager's OWN snapshot point.
+pub fn p2_dm_handoff_to_driver(new_driver_tid: ThreadId) -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    let caller = k.sched.running()?;
+    match k.yield_to_thread(caller, new_driver_tid, hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
+    }
+}
+
+/// `DM_POLL_CRASH` from device-manager, called right after waking from
+/// `p2_dm_wait_crash` (or finding a crash already pending): consumes and
+/// returns the pending crash's `cause_code` raw trap value, or `0` if
+/// somehow nothing is pending (should not happen given `p2_dm_wait_crash`'s
+/// contract, but this stays total rather than panicking).
+pub fn p2_poll_crash() -> usize {
+    // SAFETY: single-core; only this function clears `PENDING_CRASH`.
+    let pending = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(PENDING_CRASH), None) };
+    pending.map(|(cause, _, _)| cause).unwrap_or(0)
 }
 
 /// Busy-park forever. The in-kernel demo threads have nothing to return

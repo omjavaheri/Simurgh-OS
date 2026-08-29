@@ -340,6 +340,28 @@ mod sys {
     /// above). `a0` = `DriverState` discriminant, `a1` =
     /// `restarts_in_window`.
     pub const DM_REPORT: usize = 30;
+
+    // Real IPC-driven driver supervision (03-Kernel-Subsystems-Layer.md
+    // §5.2's actual acceptance test): device-manager reacts to a REAL
+    // crash of `umode_faulty_driver`, not its own timer. Kernel side is
+    // `kernel_arch_glue::{p2_watch_driver, p2_dm_wait_crash,
+    // p2_poll_crash}` and `spawn_faulty_driver`'s respawn path.
+
+    /// No arguments. Blocks the calling thread until the driver process
+    /// `kernel_arch_glue::p2_watch_driver` currently names takes a fatal
+    /// exception, or returns immediately if that already happened before
+    /// this call. The caller must follow up with `DM_POLL_CRASH` to
+    /// consume the crash's raw trap value.
+    pub const DM_WAIT_CRASH: usize = 31;
+    /// No arguments. Consumes and returns (via `a0`) the pending crash's
+    /// raw `scause` value recorded by `DM_WAIT_CRASH`'s wake, or `0` if
+    /// none is pending.
+    pub const DM_POLL_CRASH: usize = 32;
+    /// No arguments. Spawns a fresh instance of the faulty-driver demo
+    /// process — the automatic-restart half of §5.2 — and re-arms
+    /// `p2_watch_driver` on its new `ThreadId` (a respawned driver is a
+    /// brand-new thread, not the dead one coming back).
+    pub const DM_RESPAWN_DRIVER: usize = 33;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -690,7 +712,7 @@ fn simurgh_syscall(
         }
         sys::P2_PREEMPT_START => {
             spawn_device_manager(kernel_arch_glue::khal());
-            spawn_faulty_driver(kernel_arch_glue::khal());
+            let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
@@ -708,6 +730,24 @@ fn simurgh_syscall(
                 "device-manager (U-mode, isolated subsystem process): state={name} restarts_in_window={a1}\r\n"
             ));
             return TrapOutcome::Resume(0);
+        }
+        sys::DM_WAIT_CRASH => {
+            return match kernel_arch_glue::p2_dm_wait_crash() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DM_POLL_CRASH => {
+            return TrapOutcome::Resume(kernel_arch_glue::p2_poll_crash());
+        }
+        sys::DM_RESPAWN_DRIVER => {
+            return match spawn_faulty_driver(kernel_arch_glue::khal()) {
+                Some(new_tid) => match kernel_arch_glue::p2_dm_handoff_to_driver(new_tid) {
+                    Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                    None => TrapOutcome::Resume(0),
+                },
+                None => TrapOutcome::Resume(0),
+            };
         }
         _ => {}
     }
@@ -969,7 +1009,21 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
     // comment) but on its OWN fresh stack/address space/capability space.
     let user = user_image();
     const DM_STACK_VMA: usize = 0xC040_0000;
-    const DM_STACK_LEN: usize = 4096 * 4;
+    // 64 KiB, not the 16 KiB every other spawned demo process uses:
+    // device-manager's own ecall handlers (`DM_RESPAWN_DRIVER`) now call
+    // BACK INTO `spawn_process` itself, on device-manager's OWN stack (an
+    // `ecall`'s handler runs on the caller's stack — see `raw_syscall`'s
+    // doc comment) — and `kernel`/`kernel-arch-glue`'s unoptimized (`dev`
+    // profile, no per-package `opt-level` override unlike `device-manager`
+    // itself) call chain into `spawn_process` needs real headroom.
+    // **Bug found via QEMU** (`-d int`): with the old 16 KiB, the very
+    // first `DM_RESPAWN_DRIVER` overflowed BELOW `DM_STACK_VMA` (unmapped)
+    // — `trap_entry`'s own prologue then faulted pushing the NEXT trap
+    // frame onto the now-invalid `sp`, an infinite recursive-trap storm
+    // (millions of `store_page_fault`/`fault_store` entries at
+    // `trap_entry`'s first instruction, `tval` walking down from just
+    // below `DM_STACK_VMA` in exact `sizeof(TrapFrame)`=248-byte steps).
+    const DM_STACK_LEN: usize = 4096 * 16;
     match kernel_arch_glue::spawn_process(
         hal,
         k,
@@ -981,6 +1035,7 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
         device_manager::subsystem_entry::subsystem_main as usize,
     ) {
         Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_register_device_manager(tid);
             kernel_arch_glue::log(format_args!(
                 "root task: spawned device-manager (tid {}) via the generic path, joining the preemption loop\r\n",
                 tid.as_u32()
@@ -997,8 +1052,10 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
 /// it joins the same preemption loop and its crash can be observed
 /// happening concurrently with the rest of the demo — the real §5.2
 /// proof point is that A/B/C and device-manager are unaffected by it.
+/// Returns the new thread's id (or `None` if spawning failed) so a
+/// respawn caller (`sys::DM_RESPAWN_DRIVER`) can hand off to it directly.
 #[cfg(target_arch = "riscv64")]
-fn spawn_faulty_driver(hal: &hal_core::HalInterface) {
+fn spawn_faulty_driver(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
     let user = user_image();
     const FAULTY_STACK_VMA: usize = 0xC050_0000;
@@ -1014,14 +1071,19 @@ fn spawn_faulty_driver(hal: &hal_core::HalInterface) {
         umode_faulty_driver as usize,
     ) {
         Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_watch_driver(tid);
             kernel_arch_glue::log(format_args!(
                 "root task: spawned faulty-driver (tid {}) - it will fault on its first instruction (fault-isolation demo, 03 5.2)\r\n",
                 tid.as_u32()
             ));
+            Some(tid)
         }
-        None => kernel_arch_glue::log(format_args!(
-            "root task: faulty-driver spawn skipped (out of resources)\r\n"
-        )),
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: faulty-driver spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
     }
 }
 

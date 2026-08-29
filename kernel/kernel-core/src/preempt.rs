@@ -239,6 +239,105 @@ impl KernelState {
             None => TerminationOutcome::Idle,
         }
     }
+
+    /// `tid` voluntarily blocks waiting on an external event (this
+    /// session's real crash-notification wait — `kernel-arch-glue::
+    /// p2_dm_wait_crash` — is the first caller) rather than yielding to
+    /// the back of the ready queue. Unlike `cooperative_yield` (which
+    /// re-admits the caller to `Ready` immediately, just hidden from that
+    /// ONE `pick_next` selection), `tid` stays genuinely `Blocked` until
+    /// something else calls `wake_blocked` on it — there is no built-in
+    /// timeout or self-wake here, by design: the caller is expected to
+    /// know the wake condition can genuinely never fire on its own (the
+    /// way a real IPC `Recv` blocks until a matching `Send`).
+    ///
+    /// If nothing else is `Ready` to take over, blocking the only
+    /// runnable thread would strand the CPU with nothing to run at all —
+    /// so the block is undone (mirrors `preempt_tick`'s `(Some(o), None)`
+    /// arm) and `tid` keeps running (`Continue`). The caller must not
+    /// assume it was really put to sleep just because it called this —
+    /// only a `Switch` result means another thread is now running instead.
+    pub fn block_thread(&mut self, tid: ThreadId, now_ns: u64) -> PreemptStep {
+        self.sched.account(now_ns);
+        let _ = self.sched.note_blocked(tid);
+        match self.sched.pick_next(now_ns) {
+            Some(incoming) if incoming != tid => {
+                let _ = self.sched.dispatch(incoming, now_ns);
+                PreemptStep::Switch {
+                    outgoing: tid,
+                    incoming,
+                }
+            }
+            _ => {
+                // Nothing else `Ready` (or, impossible with `tid` now
+                // `Blocked`, `pick_next` naming `tid` itself): undo the
+                // block rather than strand the CPU.
+                let _ = self.sched.note_ready(tid, now_ns);
+                let _ = self.sched.dispatch(tid, now_ns);
+                PreemptStep::Continue
+            }
+        }
+    }
+
+    /// Wakes a thread previously put to sleep by `block_thread`: makes it
+    /// `Ready` again so a future `pick_next` (the next timer tick, or
+    /// another `block_thread`/`terminate_thread` call) can select it.
+    /// Does not itself switch to it — the caller (typically `p2_fault`,
+    /// reacting to an unrelated thread's crash) keeps running; `tid` only
+    /// becomes eligible for the NEXT dispatch.
+    pub fn wake_blocked(&mut self, tid: ThreadId, now_ns: u64) {
+        let _ = self.sched.note_ready(tid, now_ns);
+    }
+
+    /// Like `terminate_thread`, but for when the caller ALREADY knows
+    /// exactly which thread should run next — typically a supervisor
+    /// that was specifically `block_thread`ed waiting for `tid`'s death
+    /// (`kernel_arch_glue::p2_fault`'s crash-notify hand-off). Skips
+    /// `pick_next`'s generic fairness entirely and dispatches `incoming`
+    /// directly: the same "direct hand-off" philosophy a real IPC
+    /// reply/wake uses, since `incoming` is DEFINITELY who should run
+    /// next here, not one more competitor in a vruntime race against
+    /// unrelated best-effort work (which is exactly the race a
+    /// long-running supervisor CAN lose — see IMPLEMENTATION-PLAN.md's
+    /// note on this).
+    ///
+    /// `incoming` must already be `Ready` (e.g. via `wake_blocked`) —
+    /// this does not check or change its readiness, only commits it as
+    /// `running`.
+    pub fn terminate_thread_and_handoff(&mut self, tid: ThreadId, incoming: ThreadId, now_ns: u64) {
+        if self.sched.running() == Some(tid) {
+            self.sched.account(now_ns);
+        }
+        if let Some(t) = self.tcb_mut(tid) {
+            t.state = ThreadState::Exited;
+        }
+        self.sched.remove(tid);
+        let _ = self.sched.dispatch(incoming, now_ns);
+    }
+
+    /// Voluntarily hands the CPU from `from` DIRECTLY to `to` — `from` is
+    /// blocked (exactly like `block_thread`), but the incoming thread is
+    /// CHOSEN BY THE CALLER instead of `pick_next`. Used when the caller
+    /// already knows exactly who should run next and cannot afford to
+    /// trust the ordinary fairness scheduler (or an already-cancelled
+    /// preemption timer) to ever pick it — `kernel_arch_glue::
+    /// p2_dm_handoff_to_driver` (device-manager, having just spawned a
+    /// fresh driver thread, gives it the CPU immediately) is the first
+    /// caller. The same class of starvation `terminate_thread_and_handoff`
+    /// closes for the crash-notify direction; this closes it for the
+    /// respawn direction.
+    ///
+    /// Always succeeds (`from` and `to` are assumed distinct, already-
+    /// admitted threads — the caller controls both).
+    pub fn yield_to_thread(&mut self, from: ThreadId, to: ThreadId, now_ns: u64) -> PreemptStep {
+        self.sched.account(now_ns);
+        let _ = self.sched.note_blocked(from);
+        let _ = self.sched.dispatch(to, now_ns);
+        PreemptStep::Switch {
+            outgoing: from,
+            incoming: to,
+        }
+    }
 }
 
 /// What `terminate_thread` resolved to. Unlike `PreemptStep`, there is no
@@ -265,6 +364,7 @@ pub enum TerminationOutcome {
 mod tests {
     use super::*;
     use hal_core::{BootInfo, BootProtocol};
+    use kernel_sched::RunState;
     use hal_manifest::raw::{
         HardwareManifestRaw, MemoryRegionKindRaw, MemoryRegionRaw, TimerInfoRaw, TimerKindRaw,
     };
@@ -321,5 +421,130 @@ mod tests {
         assert_eq!(k.tcb(root).unwrap().state, ThreadState::Exited);
         assert!(k.sched.entity(root).is_none());
         assert_eq!(k.sched.running(), Some(other));
+    }
+
+    #[test]
+    fn block_thread_switches_to_another_ready_thread() {
+        let mut k = KernelState::from_boot_info(&boot()).unwrap();
+        let root = k.root_thread;
+        let other = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let _ = k
+            .sched
+            .admit(other, SchedulerMode::Interactive, MAX_PRIORITY, None);
+        let _ = k.sched.note_ready(other, 0);
+        let _ = k.sched.dispatch(root, 0);
+
+        let step = k.block_thread(root, 1_000);
+        assert_eq!(
+            step,
+            PreemptStep::Switch {
+                outgoing: root,
+                incoming: other
+            }
+        );
+        assert_eq!(k.sched.entity(root).unwrap().state, RunState::Blocked);
+        assert_eq!(k.sched.running(), Some(other));
+    }
+
+    #[test]
+    fn block_thread_undoes_the_block_when_nothing_else_is_ready() {
+        let mut k = KernelState::from_boot_info(&boot()).unwrap();
+        let root = k.root_thread;
+        let _ = k.sched.dispatch(root, 0);
+
+        // No other thread is Ready - blocking `root` would strand the CPU,
+        // so it stays `Running` instead.
+        let step = k.block_thread(root, 1_000);
+        assert_eq!(step, PreemptStep::Continue);
+        assert_eq!(k.sched.entity(root).unwrap().state, RunState::Running);
+        assert_eq!(k.sched.running(), Some(root));
+    }
+
+    #[test]
+    fn wake_blocked_makes_a_blocked_thread_pickable_again() {
+        let mut k = KernelState::from_boot_info(&boot()).unwrap();
+        let root = k.root_thread;
+        let other = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let _ = k
+            .sched
+            .admit(other, SchedulerMode::Interactive, MAX_PRIORITY, None);
+        let _ = k.sched.note_ready(other, 0);
+        let _ = k.sched.dispatch(root, 0);
+
+        // `root` blocks (switches to `other`), then something wakes it.
+        let _ = k.block_thread(root, 1_000);
+        assert_eq!(k.sched.entity(root).unwrap().state, RunState::Blocked);
+        k.wake_blocked(root, 2_000);
+        assert_eq!(k.sched.entity(root).unwrap().state, RunState::Ready);
+
+        // A subsequent `terminate_thread` on `other` (standing in for
+        // "whatever runs next picks it up") should now be able to select
+        // the woken `root`.
+        let outcome = k.terminate_thread(other, 3_000);
+        assert_eq!(outcome, TerminationOutcome::Switched { incoming: root });
+    }
+
+    #[test]
+    fn terminate_thread_and_handoff_dispatches_incoming_unconditionally() {
+        let mut k = KernelState::from_boot_info(&boot()).unwrap();
+        let root = k.root_thread;
+        // A third, much-longer-vruntime thread that a fairness-driven
+        // `pick_next` would normally prefer over a freshly-woken one -
+        // exactly the starvation `terminate_thread_and_handoff` exists to
+        // bypass (see its own doc comment).
+        let hog = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let waiter = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let _ = k
+            .sched
+            .admit(hog, SchedulerMode::Interactive, MAX_PRIORITY, None);
+        let _ = k.sched.note_ready(hog, 0);
+        let _ = k.sched.dispatch(hog, 0);
+        let _ = k.sched.account(1_000_000_000); // `hog` accrues a lot of vruntime
+        let _ = k.sched.note_ready(hog, 1_000_000_000);
+        let _ = k
+            .sched
+            .admit(waiter, SchedulerMode::Interactive, MAX_PRIORITY, None);
+        let _ = k.sched.note_ready(waiter, 1_000_000_000); // fresh, vruntime 0
+        let _ = k.sched.dispatch(root, 1_000_000_000);
+
+        // A plain `pick_next` here would favor `hog`'s zero-wait / plain
+        // fairness comparison in ways this test does not need to pin down
+        // exactly - the point of `terminate_thread_and_handoff` is that it
+        // is never even asked.
+        k.terminate_thread_and_handoff(root, waiter, 1_000_001_000);
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::Exited);
+        assert!(k.sched.entity(root).is_none());
+        assert_eq!(k.sched.running(), Some(waiter));
+    }
+
+    #[test]
+    fn yield_to_thread_switches_to_the_named_target_unconditionally() {
+        let mut k = KernelState::from_boot_info(&boot()).unwrap();
+        let root = k.root_thread;
+        // A thread with a much lower vruntime that a fairness-driven
+        // `pick_next` would normally prefer over whichever target
+        // `yield_to_thread` is asked for - exactly the race this method
+        // exists to bypass.
+        let favored = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let target = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let _ = k
+            .sched
+            .admit(favored, SchedulerMode::Interactive, MAX_PRIORITY, None);
+        let _ = k.sched.note_ready(favored, 0); // vruntime 0 - pick_next would love this one
+        let _ = k
+            .sched
+            .admit(target, SchedulerMode::Interactive, MAX_PRIORITY, None);
+        let _ = k.sched.dispatch(root, 0);
+
+        let step = k.yield_to_thread(root, target, 1_000);
+        assert_eq!(
+            step,
+            PreemptStep::Switch {
+                outgoing: root,
+                incoming: target
+            }
+        );
+        assert_eq!(k.sched.running(), Some(target));
+        assert_eq!(k.sched.entity(root).unwrap().state, RunState::Blocked);
     }
 }
