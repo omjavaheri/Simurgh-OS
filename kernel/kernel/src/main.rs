@@ -132,23 +132,34 @@ mod backend {
 
 #[cfg(target_arch = "riscv64")]
 mod backend {
-    //! RISC-V: SBI legacy console putchar (extension 0x01), always present
-    //! on OpenSBI / QEMU virt.
-    const SBI_EXT_LEGACY_CONSOLE_PUTCHAR: usize = 0x01;
+    //! RISC-V: NS16550 UART via MMIO at QEMU virt's documented base
+    //! (0x1000_0000). Deliberately NOT the SBI console `ecall` used by
+    //! `kernel-stub`: once the microkernel runs a U-mode Root Task, an
+    //! `ecall` from S-mode would trap to M-mode (SBI) while every U-mode
+    //! `ecall` traps to *our* S-mode handler — mixing the two consoles
+    //! is confusing and couples the kernel's own logging to firmware.
+    //! MMIO polled transmit has neither problem and matches the ARM64
+    //! backend's shape.
+    const UART_BASE: usize = 0x1000_0000;
+    const UART_THR: usize = 0x0; // transmit holding register
+    const UART_LSR: usize = 0x5; // line status register
+    const LSR_THRE: u8 = 1 << 5; // transmit-holding-register empty
 
-    pub fn init() {}
+    pub fn init() {
+        // QEMU's NS16550 starts usable for polled transmit; no line-
+        // control / baud programming needed for this diagnostics path.
+    }
 
     pub fn write_byte(byte: u8) {
-        // SAFETY: SBI legacy console putchar is universally implemented and
-        // well-defined for any byte value per the SBI spec.
+        // SAFETY: `UART_BASE` is QEMU virt's fixed, documented NS16550
+        // MMIO base; OpenSBI leaves S/U with R/W access to it (PMP
+        // region 07 in the boot log). Poll LSR.THRE before writing THR —
+        // the standard 16550 polled-transmit sequence.
         unsafe {
-            core::arch::asm!(
-                "ecall",
-                in("a7") SBI_EXT_LEGACY_CONSOLE_PUTCHAR,
-                in("a6") 0usize,
-                in("a0") byte as usize,
-                lateout("a0") _,
-            );
+            while core::ptr::read_volatile((UART_BASE + UART_LSR) as *const u8) & LSR_THRE == 0 {
+                core::hint::spin_loop();
+            }
+            core::ptr::write_volatile((UART_BASE + UART_THR) as *mut u8, byte);
         }
     }
 }
@@ -172,6 +183,126 @@ impl Write for SerialWriter {
 fn serial_log(args: core::fmt::Arguments<'_>) {
     let mut s = SerialWriter;
     let _ = s.write_fmt(args);
+}
+
+// ----------------------------------------------------------------------------
+// User-space (layer 3) Root Task + the syscall the trap handler routes to.
+//
+// This is the arch-specific bottom of the syscall ABI — `ecall` on RISC-V,
+// analogous instructions on the others — so it lives here in the final
+// binary (which is already `#[cfg(target_arch)]`-gated throughout), not in
+// the architecture-erased `kernel-arch-glue`.
+// ----------------------------------------------------------------------------
+
+/// Syscall selectors (a7 on RISC-V). Only the riscv64 build currently
+/// runs a U-mode Root Task and wires the trap handler.
+#[cfg(target_arch = "riscv64")]
+mod sys {
+    /// Write `a1` bytes of UTF-8 at address `a0` to the kernel log.
+    pub const DEBUG_LOG: usize = 0;
+    /// Retype one `Endpoint` from the Root Task's first `UntypedMemory`
+    /// capability; returns the new capability slot.
+    pub const RETYPE_ENDPOINT: usize = 1;
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret;
+    // SAFETY: `ecall` from U-mode traps to our S-mode handler, which
+    // saves and restores every register except a0 (the return value).
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") a7,
+            inlateout("a0") a0 => ret,
+            in("a1") a1,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// The user-space Root Task entry (runs in U-mode on `kernel-arch-glue`'s
+/// `ROOT_STACK`). Reaches the kernel only via `raw_syscall` / `ecall`.
+#[cfg(target_arch = "riscv64")]
+extern "C" fn umode_root() -> ! {
+    let hello = b"root task (U-mode): hello via ecall\r\n";
+    // SAFETY: syscall ABI; the kernel reads [ptr, ptr+len) from our
+    // (shared, satp=0) address space.
+    unsafe { raw_syscall(sys::DEBUG_LOG, hello.as_ptr() as usize, hello.len()) };
+
+    // SAFETY: same.
+    let cap = unsafe { raw_syscall(sys::RETYPE_ENDPOINT, 0, 0) };
+
+    let done: &[u8] = if cap != usize::MAX {
+        b"root task (U-mode): ecall Retype returned a capability - syscall boundary works\r\n"
+    } else {
+        b"root task (U-mode): ecall Retype FAILED\r\n"
+    };
+    // SAFETY: same.
+    unsafe { raw_syscall(sys::DEBUG_LOG, done.as_ptr() as usize, done.len()) };
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Placeholder U-mode entry for the architectures whose real-kernel boot
+/// is not yet wired (x86_64 / aarch64 still boot `kernel-stub`).
+#[cfg(not(target_arch = "riscv64"))]
+extern "C" fn umode_root() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// The syscall handler the HAL trap vector calls for an `ecall` from
+/// U-mode (registered via `hal_riscv64::set_syscall_handler`). Runs at
+/// S-mode privilege.
+#[cfg(target_arch = "riscv64")]
+fn simurgh_syscall(
+    a7: usize,
+    a0: usize,
+    a1: usize,
+    _a2: usize,
+    _a3: usize,
+    _a4: usize,
+) -> usize {
+    use kernel_core::{SyscallOp, SyscallReturn};
+    use kernel_mm::KernelObjectType;
+
+    let k = kernel_arch_glue::kstate();
+    let hal = kernel_arch_glue::khal();
+    let root = k.root_thread;
+
+    match a7 {
+        sys::DEBUG_LOG => {
+            // SAFETY: MVP single-address-space (satp=0). `a0..a0+a1` is a
+            // byte range in the shared address space; treat invalid UTF-8
+            // leniently. A real kernel validates the pointer against the
+            // caller's address space first.
+            let bytes = unsafe { core::slice::from_raw_parts(a0 as *const u8, a1) };
+            let text = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+            kernel_arch_glue::log(format_args!("{}", text));
+            0
+        }
+        sys::RETYPE_ENDPOINT => {
+            match k.dispatch(
+                root,
+                hal.now_ns(),
+                SyscallOp::Retype {
+                    untyped: kernel_cap::CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+            ) {
+                Ok(SyscallReturn::NewCaps { cap, .. }) => cap.as_u32() as usize,
+                _ => usize::MAX,
+            }
+        }
+        _ => usize::MAX,
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -203,8 +334,13 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             let _ = writeln!(s, "KernelState built: OK");
             let _ = writeln!(s, "----------------------------------------------------------------------");
             let _ = writeln!(s, "handing control to the Root Task...");
-            // Never returns: seeds the Root Task context and switches in.
-            kernel_arch_glue::enter(&hal, state)
+            // Register the S-mode syscall handler the HAL trap vector
+            // invokes for an `ecall` from U-mode.
+            #[cfg(target_arch = "riscv64")]
+            hal_riscv64::cpu::set_syscall_handler(simurgh_syscall);
+            // Never returns: runs the in-kernel demo, then drops the Root
+            // Task to U-mode at `umode_root`.
+            kernel_arch_glue::enter(&hal, state, umode_root as usize)
         }
         Err(e) => {
             let _ = writeln!(s, "kernel bring-up FAILED: {e:?}");
