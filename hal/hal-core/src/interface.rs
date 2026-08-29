@@ -106,6 +106,16 @@ unsafe fn trampoline_init_context<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
     cpu.init_context(ctx, entry, stack_top);
 }
 
+unsafe fn trampoline_enter_user<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    entry: usize,
+    stack_top: usize,
+) -> ! {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.enter_user(entry, stack_top)
+}
+
 unsafe fn trampoline_now_ns<T: TimerAbstraction>(state: *const ()) -> u64 {
     // SAFETY: same contract, timer side.
     let timer = unsafe { &*(state as *const T) };
@@ -131,6 +141,7 @@ pub struct HalInterface {
     cpu_feature_flags_bits: unsafe fn(*const ()) -> u64,
     cpu_context_switch: unsafe fn(*const (), *mut u8, *const u8),
     cpu_init_context: unsafe fn(*const (), *mut u8, usize, usize),
+    cpu_enter_user: unsafe fn(*const (), usize, usize) -> !,
     timer_now_ns: unsafe fn(*const ()) -> u64,
     timer_frequency_hz: unsafe fn(*const ()) -> u64,
 }
@@ -197,6 +208,16 @@ impl HalInterface {
         unsafe { (self.cpu_init_context)(self.cpu_state, context.as_mut_ptr(), entry, stack_top) }
     }
 
+    /// One-way drop of the current core to user privilege, starting at
+    /// `entry` (a `-> !` function) on `stack_top`. Never returns. See
+    /// `CpuAbstraction::enter_user`.
+    pub fn enter_user(&self, entry: usize, stack_top: usize) -> ! {
+        // SAFETY: `cpu_state`/`cpu_enter_user` were produced together by
+        // `build_interface`; `entry`/`stack_top` are the caller's to
+        // vouch for.
+        unsafe { (self.cpu_enter_user)(self.cpu_state, entry, stack_top) }
+    }
+
     /// Current monotonic time in nanoseconds.
     pub fn now_ns(&self) -> u64 {
         // SAFETY: `timer_state`/`timer_now_ns` were produced together
@@ -241,6 +262,7 @@ where
         cpu_feature_flags_bits: trampoline_feature_flags_bits::<C>,
         cpu_context_switch: trampoline_context_switch::<C>,
         cpu_init_context: trampoline_init_context::<C>,
+        cpu_enter_user: trampoline_enter_user::<C>,
         timer_now_ns: trampoline_now_ns::<T>,
         timer_frequency_hz: trampoline_frequency_hz::<T>,
     }
