@@ -203,6 +203,20 @@ mod sys {
     /// Retype one `Endpoint` from the Root Task's first `UntypedMemory`
     /// capability; returns the new capability slot.
     pub const RETYPE_ENDPOINT: usize = 1;
+    /// Map one page: `a0` = virtual address, `a1` = physical address, RW.
+    /// Records the mapping in the Root Task's address space. Returns 0 on
+    /// success, `usize::MAX` on error.
+    ///
+    /// MVP: operates on the Root Task's address space directly (not yet
+    /// capability-gated per `02-Microkernel-Layer.md §6`), and the
+    /// address space is still a software model — no Sv39 page-table
+    /// entries are written and `satp` stays 0. This exercises the
+    /// syscall -> `AddressSpace::map` path; real PTEs + a capability
+    /// argument are the follow-up.
+    pub const MAP_PAGE: usize = 2;
+    /// Translate `a0` = virtual address through the Root Task's address
+    /// space; returns the physical address, or `usize::MAX` if unmapped.
+    pub const TRANSLATE: usize = 3;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -234,7 +248,6 @@ extern "C" fn umode_root() -> ! {
 
     // SAFETY: same.
     let cap = unsafe { raw_syscall(sys::RETYPE_ENDPOINT, 0, 0) };
-
     let done: &[u8] = if cap != usize::MAX {
         b"root task (U-mode): ecall Retype returned a capability - syscall boundary works\r\n"
     } else {
@@ -242,6 +255,20 @@ extern "C" fn umode_root() -> ! {
     };
     // SAFETY: same.
     unsafe { raw_syscall(sys::DEBUG_LOG, done.as_ptr() as usize, done.len()) };
+
+    // Map a page in our address space and translate it back.
+    let (va, pa) = (0x4000_0000usize, 0x8800_0000usize);
+    // SAFETY: same.
+    let mapped = unsafe { raw_syscall(sys::MAP_PAGE, va, pa) };
+    // SAFETY: same.
+    let back = unsafe { raw_syscall(sys::TRANSLATE, va + 0x40, 0) };
+    let map_line: &[u8] = if mapped == 0 && back == pa + 0x40 {
+        b"root task (U-mode): ecall Map + Translate round-trip OK (va+0x40 -> pa+0x40)\r\n"
+    } else {
+        b"root task (U-mode): ecall Map/Translate FAILED\r\n"
+    };
+    // SAFETY: same.
+    unsafe { raw_syscall(sys::DEBUG_LOG, map_line.as_ptr() as usize, map_line.len()) };
 
     loop {
         core::hint::spin_loop();
@@ -301,6 +328,28 @@ fn simurgh_syscall(
                 _ => usize::MAX,
             }
         }
+        sys::MAP_PAGE => {
+            let space = match k.addr_space_mut(k.root_addr_space) {
+                Some(s) => s,
+                None => return usize::MAX,
+            };
+            match space.map(
+                hal_core::VirtAddr::new(a0),
+                hal_core::PhysAddr::new(a1),
+                kernel_mm::PAGE_SIZE,
+                hal_core::MapPermissions::KERNEL_DATA,
+            ) {
+                Ok(()) => 0,
+                Err(_) => usize::MAX,
+            }
+        }
+        sys::TRANSLATE => match k
+            .addr_space_mut(k.root_addr_space)
+            .and_then(|s| s.translate(hal_core::VirtAddr::new(a0)))
+        {
+            Some((pa, _perms)) => pa.as_usize(),
+            None => usize::MAX,
+        },
         _ => usize::MAX,
     }
 }

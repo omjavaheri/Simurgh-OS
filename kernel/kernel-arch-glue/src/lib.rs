@@ -40,7 +40,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use core::fmt::Arguments;
-use hal_core::{BootInfo, HalInterface, VirtAddr};
+use hal_core::{BootInfo, HalInterface, MapPermissions, VirtAddr};
 use kernel_cap::{CapId, CapabilityRights, ThreadId};
 use kernel_core::{KernelInitError, KernelState, SyscallOp, SyscallReturn, ThreadState};
 use kernel_ipc::SmallMessage;
@@ -350,6 +350,53 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     }
 
     klog!("root task: 8.2 milestone - 2nd thread + synchronous IPC round-trip complete\r\n");
+
+    // 6. Shared-memory groundwork (02-Microkernel-Layer.md §5.2 / §8.4):
+    //    alias ONE physical frame at two virtual addresses in the Root
+    //    Task's address space and confirm both translate to it. This is
+    //    the aliasing structure zero-copy shared memory needs; hardware-
+    //    enforced cross-process zero-copy still awaits active page tables.
+    let frame_cap = match k.dispatch(
+        root,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Untyped,
+            count: 1,
+        },
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return,
+    };
+    let frame_phys = {
+        let uid = kernel_cap::UntypedId::new(
+            k.cap_space(k.root_cap_space)
+                .and_then(|t| t.lookup(frame_cap))
+                .map(|c| c.object.id.as_u32())
+                .unwrap_or(0),
+        );
+        match k.untyped_mut(uid) {
+            Some(u) => u.base(),
+            None => return,
+        }
+    };
+    let (va1, va2) = (VirtAddr::new(0x5000_0000), VirtAddr::new(0x6000_0000));
+    let rw = MapPermissions::KERNEL_DATA;
+    if let Some(space) = k.addr_space_mut(k.root_addr_space) {
+        let _ = space.map(va1, frame_phys, kernel_mm::PAGE_SIZE, rw);
+        let _ = space.map(va2, frame_phys, kernel_mm::PAGE_SIZE, rw);
+        let p1 = space.translate(VirtAddr::new(va1.as_usize() + 0x80)).map(|(p, _)| p.as_usize());
+        let p2 = space.translate(VirtAddr::new(va2.as_usize() + 0x80)).map(|(p, _)| p.as_usize());
+        klog!(
+            "root task: shared-memory model - va {:#x} -> {:?}, va {:#x} -> {:?} (one frame {:#x}, two mappings, aliased: {})\r\n",
+            va1.as_usize(),
+            p1,
+            va2.as_usize(),
+            p2,
+            frame_phys.as_usize(),
+            p1.is_some() && p1 == p2
+        );
+    }
 }
 
 /// The second thread's entry point (runs on `THREAD2_STACK`). Sends one
