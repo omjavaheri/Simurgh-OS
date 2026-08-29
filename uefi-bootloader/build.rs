@@ -14,6 +14,14 @@
 // uefi-bootloader. If the expected file is missing, this build script
 // fails with a clear message rather than producing a bootloader that
 // embeds stale or absent kernel bytes.
+//
+// `SIMURGH_UEFI_KERNEL_BIN` (optional, defaults to `kernel-stub`) picks
+// WHICH built binary gets embedded — set it to `kernel` to have this
+// same UEFI+OVMF pipeline boot the real microkernel instead, for manual
+// verification (e.g. `cargo xbuild-microkernel-x86_64` then
+// `SIMURGH_UEFI_KERNEL_BIN=kernel cargo build -p uefi-bootloader
+// --target x86_64-unknown-uefi`). `scripts/qemu-smoke.sh` never sets
+// this, so its own kernel-stub smoke test is unaffected.
 // ============================================================================
 
 use std::path::PathBuf;
@@ -55,11 +63,20 @@ fn main() {
         ),
     };
 
-    let build_alias = match target_arch.as_str() {
-        "x86_64" => "cargo xbuild-kernel-x86_64",
-        "aarch64" => "cargo xbuild-kernel-aarch64",
-        "riscv64" => "cargo xbuild-kernel-riscv64",
-        _ => unreachable!("already matched above"),
+    let kernel_bin_name =
+        std::env::var("SIMURGH_UEFI_KERNEL_BIN").unwrap_or_else(|_| "kernel-stub".to_string());
+
+    let build_alias = match (target_arch.as_str(), kernel_bin_name.as_str()) {
+        ("x86_64", "kernel-stub") => "cargo xbuild-kernel-x86_64",
+        ("aarch64", "kernel-stub") => "cargo xbuild-kernel-aarch64",
+        ("riscv64", "kernel-stub") => "cargo xbuild-kernel-riscv64",
+        ("x86_64", "kernel") => "cargo xbuild-microkernel-x86_64",
+        ("aarch64", "kernel") => "cargo xbuild-microkernel-aarch64",
+        ("riscv64", "kernel") => "cargo xbuild-microkernel-riscv64",
+        (_, "kernel-stub" | "kernel") => unreachable!("already matched above"),
+        (_, other) => panic!(
+            "uefi-bootloader build.rs: SIMURGH_UEFI_KERNEL_BIN={other} is not `kernel-stub` or `kernel`"
+        ),
     };
 
     let kernel_path = PathBuf::from(&manifest_dir)
@@ -67,17 +84,18 @@ fn main() {
         .join("target")
         .join(kernel_target_dir_name)
         .join("debug")
-        .join("kernel-stub");
+        .join(&kernel_bin_name);
 
     if !kernel_path.exists() {
         panic!(
-            "uefi-bootloader build.rs: kernel-stub binary not found at {} (target_arch = {target_arch}).\n\
+            "uefi-bootloader build.rs: {kernel_bin_name} binary not found at {} (target_arch = {target_arch}).\n\
              Build it first with: {build_alias}",
             kernel_path.display()
         );
     }
 
     println!("cargo:rerun-if-changed={}", kernel_path.display());
+    println!("cargo:rerun-if-env-changed=SIMURGH_UEFI_KERNEL_BIN");
     println!(
         "cargo:rustc-env=KERNEL_STUB_PATH={}",
         kernel_path.canonicalize().unwrap().display()

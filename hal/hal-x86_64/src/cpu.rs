@@ -646,6 +646,65 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
         }
     }
 
+    #[cfg(target_os = "none")]
+    fn map_ram_identity(&self, root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        x86_64_paging::map_ram_identity(root_frame, bytes_gib, user_accessible)
+    }
+
+    #[cfg(target_os = "none")]
+    fn activate_address_space(&self, root_frame: usize) {
+        if root_frame == 0 {
+            // Unlike riscv64's Bare-mode sentinel, x86_64 cannot run
+            // without paging active at all (long mode REQUIRES
+            // `CR0.PG = 1`) — there is no "disable" state to return to.
+            // `0` is simply a no-op here.
+            return;
+        }
+        // SAFETY: the caller guarantees `root_frame` is a valid, fully
+        // built PML4 (via `map_ram_identity` / `map_range`) that maps at
+        // least all memory this core is currently executing from and
+        // about to touch.
+        unsafe {
+            core::arch::asm!(
+                "mov cr3, {root}",
+                root = in(reg) root_frame as u64,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn flush_tlb(&self) {
+        // SAFETY: reloading CR3 with its own current value is
+        // architecturally guaranteed to flush every non-global TLB
+        // entry — the simplest whole-TLB shootdown, matching
+        // hal-riscv64's `sfence.vma` (no rs1/rs2) in scope; a single-
+        // address `invlpg` is a later optimisation, mirroring that same
+        // tracked follow-up there.
+        unsafe {
+            core::arch::asm!(
+                "mov {tmp}, cr3",
+                "mov cr3, {tmp}",
+                tmp = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn map_range(
+        &self,
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        x86_64_paging::map_range(root_frame, vaddr, paddr, len, perm_bits, pool_base, pool_len)
+    }
+
     fn set_privilege_level(&self, level: PrivilegeLevel) -> Result<(), HalError> {
         match level {
             // x86_64 has no direct equivalent of ARM64 EL2 / RISC-V
@@ -863,5 +922,200 @@ mod tests {
             leaf_a: CpuidResult::default(),
         };
         assert_eq!(read_initial_apic_id(&mock), 7);
+    }
+}
+
+// ============================================================================
+// x86_64 4-level page-table helpers (PML4 -> PDPT -> PD -> PT)
+//
+// Bare-metal only. `map_ram_identity` / `activate_address_space` (above)
+// plus `map_range` here are the whole page-table surface the microkernel
+// drives through `hal_core::HalInterface` — mirrors hal-riscv64's own
+// `riscv_sv39` module (that crate's cpu.rs) almost exactly: below the top
+// level, both architectures use 9-bit-per-level, 4 KiB-page, 3-level
+// tables at the SAME virtual-address bit positions (bits 38:30 / 29:21 /
+// 20:12) — Sv39 was designed to structurally resemble this.
+//
+// The one real difference `map_ram_identity`/`map_range` must account
+// for: x86_64's CR3 ALWAYS points at a PML4 (mapping the full 256 TiB
+// address space via 512 entries of 512 GiB each) — there is no ISA-level
+// way to make CR3 point directly at a "1 GiB-per-entry" table the way
+// Sv39's root does. So `root_frame` here names TWO CONTIGUOUS PAGES: the
+// PML4 itself, and (at `root_frame + 4096`) a companion PDPT that
+// `map_ram_identity` links as PML4[0]. `kernel-arch-glue::enter` carves 2
+// pages for every architecture's `root_pt` uniformly (harmless waste of
+// one page on Sv39/AArch64, which only ever use the first) precisely so
+// this crate can rely on that second page always being there.
+// ============================================================================
+#[cfg(target_os = "none")]
+pub(crate) mod x86_64_paging {
+    /// PTE present bit.
+    pub const PRESENT: u64 = 1 << 0;
+    /// PTE writable bit.
+    pub const WRITABLE: u64 = 1 << 1;
+    /// PTE user-accessible bit. Unlike Sv39 (where only the LEAF's `U`
+    /// bit matters), x86_64 ANDs the U/S bit across EVERY level of the
+    /// walk — an intermediate entry with this bit clear blocks Ring 3
+    /// access to everything beneath it, regardless of the leaf's own
+    /// bit. `map_ram_identity` therefore always sets this on the PML4
+    /// entry (shared infrastructure for both kernel- and user-mapped
+    /// regions under it) and only gates it, per the caller's
+    /// `user_accessible` argument, on the PDPT identity leaves
+    /// themselves; `map_range` mirrors that same always-set-on-
+    /// intermediates rule for the PD/PT levels it builds.
+    pub const USER: u64 = 1 << 2;
+    /// PDPT/PD leaf (huge-page) bit — "PS" in the Intel SDM's
+    /// terminology.
+    pub const HUGE_PAGE: u64 = 1 << 7;
+    /// PTE no-execute bit. x86_64's execute permission is INVERTED
+    /// relative to hal_core's portable `perm_bits` (RISC-V/ARM64 set a
+    /// bit to ALLOW execute; x86_64 sets a bit to FORBID it) — the one
+    /// flag here with the opposite sense of its `perm_bits` source bit.
+    pub const NO_EXECUTE: u64 = 1 << 63;
+    /// Physical-address mask within a present, non-huge PTE (bits
+    /// 51:12; bits 62:52 are available/ignored, bit 63 is `NO_EXECUTE`
+    /// above).
+    const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+    /// Zeroes `root_frame` (the PML4) and `root_frame + 4096` (its
+    /// companion PDPT — see this module's doc comment) and installs
+    /// `bytes_gib` 1 GiB identity leaves (VA == PA) into the PDPT, with
+    /// PML4[0] pointing at that PDPT. R+W+X (x86_64 has no separate
+    /// "readable" bit — `PRESENT` alone means readable) and, if
+    /// `user_accessible`, the PDPT leaves are `USER` too (PML4[0] itself
+    /// is ALWAYS `USER` — see the `USER` constant's doc comment for why
+    /// narrowing it here would also block any later user-accessible
+    /// mapping under this same PML4 entry, e.g. `.user_text` mapped
+    /// afterward via `map_range`).
+    ///
+    /// # Preconditions
+    /// `root_frame` and `root_frame + 4096` are page-aligned, writable
+    /// physical frames; single core; called before
+    /// `activate_address_space` switches CR3 to this table (both frames
+    /// must stay directly addressable via the CURRENTLY active mapping
+    /// while this runs).
+    pub fn map_ram_identity(root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        let pml4 = root_frame as *mut u64;
+        let pdpt = (root_frame + 4096) as *mut u64;
+        // SAFETY: precondition above — `pml4`/`pdpt` are two distinct,
+        // writable, page-aligned frames.
+        unsafe {
+            for i in 0..512 {
+                pml4.add(i).write_volatile(0);
+                pdpt.add(i).write_volatile(0);
+            }
+            let pml4_flags = PRESENT | WRITABLE | USER;
+            let mut leaf_flags = PRESENT | WRITABLE | HUGE_PAGE;
+            if user_accessible {
+                leaf_flags |= USER;
+            }
+            pml4.write_volatile((root_frame as u64 + 4096) | pml4_flags);
+            for gib in 0..bytes_gib.min(512) {
+                pdpt.add(gib).write_volatile(((gib as u64) << 30) | leaf_flags);
+            }
+        }
+    }
+
+    /// Maps `[vaddr, vaddr + len)` -> `[paddr, ...)` at 4 KiB granularity,
+    /// descending from `root_frame`'s companion PDPT (NOT PML4 itself —
+    /// `map_ram_identity` already linked PML4[0] to it, and every VA
+    /// this microkernel ever maps lives below 512 GiB, so `map_range`
+    /// never needs to touch PML4 again), allocating any missing PD/PT
+    /// levels from the pre-zeroed pool at
+    /// `[pool_base, pool_base + pool_len * 4096)`. `perm_bits` is
+    /// `READ=1, WRITE=2, EXECUTE=4, USER=8` (`READ` is a no-op on
+    /// x86_64 — there is no way to make a `PRESENT` page unreadable).
+    ///
+    /// Returns the number of pool frames consumed, or `u32::MAX` on
+    /// error (misaligned args, a huge-page leaf already covering the
+    /// range, or the pool running out).
+    ///
+    /// # Preconditions
+    /// `map_ram_identity` has already run on this `root_frame`; the pool
+    /// frames are zeroed; single core; every physical address here
+    /// (root, pool, leaves) is directly addressable via the CURRENTLY
+    /// active mapping.
+    pub fn map_range(
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        if root_frame == 0 || len == 0 || ((vaddr | paddr | len) & 0xFFF) != 0 {
+            return u32::MAX;
+        }
+        let mut leaf = PRESENT;
+        if perm_bits & 2 != 0 {
+            leaf |= WRITABLE;
+        }
+        if perm_bits & 8 != 0 {
+            leaf |= USER;
+        }
+        if perm_bits & 4 == 0 {
+            leaf |= NO_EXECUTE;
+        }
+
+        let pdpt = root_frame + 4096;
+        let mut used = 0usize;
+        let pages = len / 4096;
+        for p in 0..pages {
+            let va = vaddr + p * 4096;
+            let pa = paddr + p * 4096;
+            let (pdpt_i, pd_i, pt_i) = ((va >> 30) & 0x1FF, (va >> 21) & 0x1FF, (va >> 12) & 0x1FF);
+
+            // Descend / build PD.
+            // SAFETY: `pdpt` is `root_frame`'s companion PDPT, already
+            // built by `map_ram_identity`; paging still addresses it
+            // directly per this function's precondition.
+            let pd = unsafe {
+                let slot = (pdpt as *mut u64).add(pdpt_i);
+                let e = slot.read_volatile();
+                if e & PRESENT == 0 {
+                    if used >= pool_len {
+                        return u32::MAX;
+                    }
+                    let t = pool_base + used * 4096;
+                    used += 1;
+                    slot.write_volatile((t as u64) | PRESENT | WRITABLE | USER);
+                    t
+                } else if e & HUGE_PAGE != 0 {
+                    return u32::MAX; // a 1 GiB leaf already covers this VA
+                } else {
+                    (e & PHYS_MASK) as usize
+                }
+            };
+
+            // Descend / build PT.
+            // SAFETY: `pd` is a valid page-table frame just resolved above.
+            let pt = unsafe {
+                let slot = (pd as *mut u64).add(pd_i);
+                let e = slot.read_volatile();
+                if e & PRESENT == 0 {
+                    if used >= pool_len {
+                        return u32::MAX;
+                    }
+                    let t = pool_base + used * 4096;
+                    used += 1;
+                    slot.write_volatile((t as u64) | PRESENT | WRITABLE | USER);
+                    t
+                } else if e & HUGE_PAGE != 0 {
+                    return u32::MAX; // a 2 MiB leaf already covers this VA
+                } else {
+                    (e & PHYS_MASK) as usize
+                }
+            };
+
+            // Install the 4 KiB leaf.
+            // SAFETY: `pt` is a valid page-table frame just resolved above.
+            unsafe {
+                (pt as *mut u64)
+                    .add(pt_i)
+                    .write_volatile((pa as u64 & PHYS_MASK) | leaf);
+            }
+        }
+        used as u32
     }
 }

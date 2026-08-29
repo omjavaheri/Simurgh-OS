@@ -677,6 +677,101 @@ fn alloc_root_frame(
     Some((cap, phys))
 }
 
+/// Real x86_64 paging, proven the same way hal-riscv64's OWN first Sv39
+/// milestone was: build a fresh, hardware-real page table via the
+/// generic `HalInterface` (not this crate's own early-boot identity
+/// map — see `hal_x86_64::memory`'s module doc comment on that being a
+/// SEPARATE, pre-`kernel_main` table), activate it, `map_range` one
+/// fresh 4 KiB page at a VA no identity leaf covers, write a sentinel
+/// through that VA, and cross-check it against the SAME physical frame
+/// read through its (still-identity-mapped) own address — proving the
+/// VA the walker just built genuinely translates to that physical page,
+/// not merely "whatever `map_range` happened to write is what comes
+/// back". No U-mode / `.user_text` / syscall boundary yet — see
+/// IMPLEMENTATION-PLAN.md for that follow-up (this session's own
+/// `map_ram_identity`/`map_range`/`activate_address_space`/`flush_tlb`
+/// implementations are the piece it is gated on).
+///
+/// Runs before `kernel_arch_glue::enter` (which still parks — no user
+/// image on this architecture yet); this function's own new page table
+/// stays active afterward (x86_64 cannot return to a "no paging" state
+/// the way riscv64's Bare-mode sentinel does — see
+/// `Cpu::activate_address_space`'s doc comment), which is harmless: it
+/// identity-maps everything the kernel itself needs, same as the
+/// bootloader's own table did.
+#[cfg(target_arch = "x86_64")]
+fn x86_64_paging_selftest(hal: &hal_core::HalInterface, k: &mut kernel_core::KernelState) {
+    let carve = |k: &mut kernel_core::KernelState, align: u64, bytes: u64| {
+        k.untyped_mut(kernel_cap::UntypedId::new(0))
+            .and_then(|u| u.alloc(align, bytes).ok())
+            .map(|p| p.as_usize())
+    };
+
+    // `root_pt`: 2 CONTIGUOUS pages — PML4 then its companion PDPT (see
+    // `hal_x86_64::cpu::x86_64_paging`'s module doc comment on why
+    // x86_64 needs a second page every other architecture's `root_frame`
+    // convention doesn't). `pool`: PD/PT levels `map_range` builds below
+    // that PDPT — one of each is enough for a single 4 KiB test page.
+    let (Some(root_pt), Some(pool), Some(test_phys)) = (
+        carve(k, 4096, 4096 * 2),
+        carve(k, 4096, 4096 * 2),
+        carve(k, 4096, 4096),
+    ) else {
+        kernel_arch_glue::log(format_args!(
+            "x86_64: paging self-test skipped (out of untyped RAM)\r\n"
+        ));
+        return;
+    };
+    // SAFETY: fresh untyped RAM, identity-addressable (this core's
+    // bootloader-built table is still active); single-core. `map_range`
+    // needs the pool pre-zeroed; the test frame starts clean too.
+    unsafe {
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2);
+        core::ptr::write_bytes(test_phys as *mut u8, 0, 4096);
+    }
+
+    hal.map_ram_identity(root_pt, 3, false);
+    // A VA in GiB 3 (0xC000_0000) — deliberately ABOVE the 3 GiB
+    // `map_ram_identity` just identity-mapped, so its PDPT slot is still
+    // absent and `map_range` must walk/allocate PD + PT for it, exactly
+    // like the fine-grained mappings a real per-process address space
+    // needs (`.user_text` etc., once that follow-up lands).
+    const TEST_VA: usize = 0xC000_0000;
+    let n = hal.map_range(root_pt, TEST_VA, test_phys, 4096, 1 | 2, pool, 2);
+    if n == u32::MAX {
+        kernel_arch_glue::log(format_args!("x86_64: paging self-test FAILED (map_range error)\r\n"));
+        return;
+    }
+    hal.activate_address_space(root_pt);
+    hal.flush_tlb();
+
+    // SAFETY: `TEST_VA` was just mapped R+W by `map_range`, backed by
+    // `test_phys` — writing through it and reading `test_phys` back
+    // through its own (still identity-mapped, GiB 0-2) VA proves the
+    // walker's translation is genuinely correct, not merely "whatever
+    // was written comes back through the same pointer".
+    let (via_va, via_identity) = unsafe {
+        core::ptr::write_volatile(TEST_VA as *mut u32, 0x5eed_5eed);
+        (
+            core::ptr::read_volatile(TEST_VA as *const u32),
+            core::ptr::read_volatile(test_phys as *const u32),
+        )
+    };
+    kernel_arch_glue::log(format_args!(
+        "x86_64: MMU read/write self-test - wrote {:#x} at VA {:#x}, read back {:#x}, kernel sees {:#x} at PA {:#x} -> {}\r\n",
+        0x5eed_5eed_u32,
+        TEST_VA,
+        via_va,
+        via_identity,
+        test_phys,
+        if via_va == 0x5eed_5eed && via_identity == 0x5eed_5eed {
+            "OK"
+        } else {
+            "MISMATCH"
+        }
+    ));
+}
+
 /// The syscall handler the HAL trap vector calls for an `ecall` from
 /// U-mode (registered via `hal_riscv64::set_syscall_handler`). Runs at
 /// S-mode privilege.
@@ -1141,6 +1236,12 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             hal_riscv64::cpu::set_tick_handler(simurgh_tick);
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_fault_handler(simurgh_fault);
+            // Real x86_64 paging self-test (see its own doc comment) —
+            // no user image on this architecture yet, so this runs
+            // standalone rather than through `enter`'s own page-table
+            // setup.
+            #[cfg(target_arch = "x86_64")]
+            x86_64_paging_selftest(&hal, state);
             // Never returns: runs the in-kernel demo, then (riscv64) maps
             // the user image U=1, activates Sv39 paging, and drops the
             // Root Task to U-mode isolated.
