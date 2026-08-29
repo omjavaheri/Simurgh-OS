@@ -60,6 +60,7 @@ struct Aligned([u8; THREAD_STACK_SIZE]);
 // read on the other stack. (The U-mode Root Task's own stack is
 // `.user_stack` in the final binary, not here — see `UserImage`.)
 static mut THREAD2_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
+static mut THREAD3_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut G_STATE: *mut KernelState = core::ptr::null_mut();
 static mut G_HAL: *const HalInterface = core::ptr::null();
 static mut G_LOG: Option<fn(Arguments<'_>)> = None;
@@ -73,10 +74,20 @@ static mut G_MAP_POOL_LEN: usize = 0;
 static mut G_MAP_POOL_USED: usize = 0;
 // Set by `root_task_main` before it starts thread 2, so `thread2_main`
 // knows its own thread id, the endpoint capability to `Send` on, and the
-// Root Task's thread id to hand control back to.
+// Root Task's thread id to hand control back to. `G_T3` is the same idea
+// for the §8.3 benchmark thread (`bench_thread_main`), started later on
+// the same endpoint/root — `G_EP`/`G_ROOT` are reused unchanged.
 static mut G_T2: u32 = 0;
+static mut G_T3: u32 = 0;
 static mut G_EP: u32 = 0;
 static mut G_ROOT: u32 = 0;
+
+/// Iterations for the `§8.3` IPC round-trip micro-benchmark below. Kept
+/// small enough that a QEMU/TCG boot (which single-steps every
+/// instruction, unlike real silicon) finishes in a reasonable time, while
+/// still large enough to average out the first couple of iterations'
+/// cold-cache noise.
+const IPC_BENCH_ITERATIONS: u32 = 200;
 
 // ---------------------------------------------------------------------------
 // Two-process proof (02-Microkernel-Layer.md §8.4 zero-copy + §4 preemption).
@@ -913,6 +924,77 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
 
     klog!("root task: 8.2 milestone - 2nd thread + synchronous IPC round-trip complete\r\n");
 
+    // 5b. IPC round-trip micro-benchmark (02-Microkernel-Layer.md §8.3
+    //     acceptance harness: "ipc_call fast-path < 500 ns on reference
+    //     hardware"). A dedicated thread 3 sends `IPC_BENCH_ITERATIONS`
+    //     messages, one per round trip; the Root Task times each Recv +
+    //     yield_to(t3) + (t3's Send + yield_to back) cycle via
+    //     `hal.now_ns()`. This measures the CURRENT general dispatch +
+    //     full `context_switch` path — the L4-style register-only fast
+    //     path `kernel_ipc::fastpath` describes needs a HAL primitive
+    //     (partial context switch preserving message registers) that does
+    //     not exist yet, so this is an honest baseline / harness (Phase D6
+    //     of IMPLEMENTATION-PLAN.md), not the tuned <500ns number itself —
+    //     labelled as such in the log line below.
+    let t3_cap = match k.dispatch(
+        root,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::ThreadControlBlock,
+            count: 1,
+        },
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => Some(cap),
+        other => {
+            klog!("root task: bench TCB Retype failed: {:?} - skipping §8.3 benchmark\r\n", other);
+            None
+        }
+    };
+    if let Some(t3_cap) = t3_cap {
+        let t3 = {
+            let cs = k.root_cap_space;
+            let id = k
+                .cap_space(cs)
+                .and_then(|t| t.lookup(t3_cap))
+                .map(|c| c.object.id.as_u32())
+                .expect("bench thread TCB cap resolves");
+            ThreadId::new(id)
+        };
+        let t3_stack_top =
+            (core::ptr::addr_of!(THREAD3_STACK) as usize + THREAD_STACK_SIZE) & !0xF;
+        // SAFETY: single-core; written before `start_thread` makes thread 3
+        // runnable, read only by `bench_thread_main`. G_EP/G_ROOT are
+        // unchanged from thread 2's setup above (same endpoint, same root).
+        unsafe { core::ptr::addr_of_mut!(G_T3).write(t3.as_u32()) };
+        k.start_thread(t3, bench_thread_main as usize, t3_stack_top, hal);
+
+        let (mut min_ns, mut max_ns, mut sum_ns) = (u64::MAX, 0u64, 0u64);
+        for _ in 0..IPC_BENCH_ITERATIONS {
+            let t0 = hal.now_ns();
+            match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }) {
+                Ok(SyscallReturn::Reschedule { next: Some(n) }) => k.yield_to(root, n, hal),
+                other => {
+                    klog!("root task: bench Recv unexpected: {:?}\r\n", other);
+                    break;
+                }
+            }
+            let dt = hal.now_ns().saturating_sub(t0);
+            min_ns = min_ns.min(dt);
+            max_ns = max_ns.max(dt);
+            sum_ns += dt;
+            let _ = k.tcb_mut(root).and_then(|t| t.pending_msg.take());
+        }
+        let avg_ns = sum_ns / IPC_BENCH_ITERATIONS as u64;
+        klog!(
+            "root task: ipc round-trip benchmark (02 8.3, {} iters, general dispatch path - NOT the L4 fast path) - min {} ns, avg {} ns, max {} ns\r\n",
+            IPC_BENCH_ITERATIONS,
+            min_ns,
+            avg_ns,
+            max_ns
+        );
+    }
+
     // 6. Shared-memory model (02-Microkernel-Layer.md §5.2 / §8.4):
     //    alias ONE physical frame at two virtual addresses in the Root
     //    Task's address space and confirm both translate to it. This is
@@ -1067,7 +1149,54 @@ extern "C" fn thread2_main() -> ! {
     }
 
     klog!("thread 2: done - handing control back to the Root Task\r\n");
+    // Mark ourselves Exited and drop out of the scheduler BEFORE the final
+    // yield_to. `yield_to` only re-admits an outgoing thread to `Ready` if
+    // the scheduler still finds it `Running` — thread 2 never runs dispatch
+    // again after this point (it just parks), so without this it would sit
+    // forever as a phantom `Ready` entity that a later `pick_next` (e.g.
+    // the §8.3 benchmark below) could select, switching into a thread that
+    // can only spin — hanging the kernel.
+    if let Some(t) = k.tcb_mut(me) {
+        t.state = kernel_core::ThreadState::Exited;
+    }
+    k.sched.remove(me);
     k.yield_to(me, root, hal);
+    park();
+}
+
+/// The `02-Microkernel-Layer.md §8.3` IPC round-trip benchmark's second
+/// thread (runs on `THREAD3_STACK`): sends `IPC_BENCH_ITERATIONS` messages
+/// on the shared endpoint, one per round trip with the Root Task.
+///
+/// The exit-the-scheduler step (same reasoning as `thread2_main`'s tail)
+/// has to happen BEFORE the last iteration's `yield_to`, not after the
+/// loop: once that last `yield_to` runs, this thread's saved context sits
+/// frozen at that exact call site, and the Root Task's own loop below
+/// never switches back in — any code written after the `for` here would
+/// be dead. Folding the removal into the last iteration is what makes it
+/// actually execute.
+extern "C" fn bench_thread_main() -> ! {
+    let k = kstate();
+    let hal = khal();
+    // SAFETY: set by `inkernel_demo` before `start_thread`.
+    let me = ThreadId::new(unsafe { core::ptr::addr_of!(G_T3).read() });
+    let ep = CapId::new(unsafe { core::ptr::addr_of!(G_EP).read() });
+    let root = ThreadId::new(unsafe { core::ptr::addr_of!(G_ROOT).read() });
+
+    for i in 0..IPC_BENCH_ITERATIONS {
+        let msg = SmallMessage::from_words(0xBEEF, &[1, 2]).unwrap_or_else(|_| SmallMessage::new(0xBEEF));
+        match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }) {
+            Ok(SyscallReturn::Delivered { .. }) => {}
+            other => klog!("bench thread: Send unexpected: {:?}\r\n", other),
+        }
+        if i + 1 == IPC_BENCH_ITERATIONS {
+            if let Some(t) = k.tcb_mut(me) {
+                t.state = kernel_core::ThreadState::Exited;
+            }
+            k.sched.remove(me);
+        }
+        k.yield_to(me, root, hal);
+    }
     park();
 }
 

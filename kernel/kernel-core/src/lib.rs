@@ -42,6 +42,7 @@ pub mod state;
 pub mod syscall;
 pub mod run;
 pub mod preempt;
+mod fuzz;
 
 pub use config::CONTEXT_BYTES;
 pub use preempt::PreemptStep;
