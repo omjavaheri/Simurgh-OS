@@ -263,6 +263,27 @@ pub trait CpuAbstraction<const ARCH_CONTEXT_BYTES: usize> {
         let _ = (context, entry, stack_top);
     }
 
+    /// One-way drop of the CURRENT core to the unprivileged level (Ring 3
+    /// / EL0 / U-mode), beginning execution at `entry` with `stack_top`
+    /// as the stack pointer. Never returns to the caller — the only way
+    /// back to kernel privilege afterward is a trap (a syscall, fault, or
+    /// interrupt) that the kernel's trap vector handles.
+    ///
+    /// Used once, by the microkernel, to launch the first user-space
+    /// process (the Root Task, layer 3). `set_privilege_level` above is
+    /// the *validation* counterpart; this is the *do it now* primitive.
+    ///
+    /// `entry` must be a `-> !` function. The default implementation is a
+    /// terminal spin — a mock/test `CpuAbstraction` never calls it, and
+    /// there is no architecture-independent way to change privilege.
+    /// Every real `hal-<arch>` crate overrides it.
+    fn enter_user(&self, entry: usize, stack_top: usize) -> ! {
+        let _ = (entry, stack_top);
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
     /// Requests a privilege level transition for the CURRENT core.
     ///
     /// Returns `Err(HalError::UnsupportedPrivilegeLevel)` if the

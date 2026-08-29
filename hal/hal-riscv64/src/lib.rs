@@ -136,6 +136,18 @@ pub const RISCV64_CONTEXT_BYTES: usize = 160;
 pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) -> ! {
     let cpu = cpu::Cpu::new(hart_id);
 
+    // Per-core bootstrap (hal_core::CpuAbstraction::bootstrap_current_core):
+    // on RISC-V this installs `stvec` -> `trap_entry`, which the
+    // microkernel needs BEFORE it drops the Root Task to U-mode — an
+    // `ecall` from U-mode with an unset `stvec` traps into firmware /
+    // nowhere. Called here, once, at the architecture entry point, exactly
+    // as that trait method's doc comment prescribes. Interrupts are still
+    // masked (SBI hands off S-mode with SIE clear; boot.S never sets it).
+    if hal_core::cpu::CpuAbstraction::bootstrap_current_core(&cpu).is_err() {
+        // Nothing sensible to do this early; fall through and let the
+        // later BootInfo path surface the failure.
+    }
+
     // SAFETY: `dtb_phys` was validated by this function's own safety
     // contract above — a valid Device Tree Blob pointer per the SBI
     // boot protocol's mandatory guarantee (01-HAL-Layer.md section

@@ -42,7 +42,7 @@
 use core::fmt::Arguments;
 use hal_core::{BootInfo, HalInterface, VirtAddr};
 use kernel_cap::{CapId, CapabilityRights, ThreadId};
-use kernel_core::{KernelInitError, KernelState, ScheduleOutcome, SyscallOp, SyscallReturn, ThreadState};
+use kernel_core::{KernelInitError, KernelState, SyscallOp, SyscallReturn, ThreadState};
 use kernel_ipc::SmallMessage;
 use kernel_mm::KernelObjectType;
 
@@ -154,73 +154,64 @@ pub fn build(
     Ok((report, state))
 }
 
-/// Seeds the Root Task's register context and switches into it. Never
-/// returns: after the first `context_switch` the Root Task is running on
-/// its own stack, and this function's frame is abandoned (its caller,
-/// `kernel_main`, is `-> !` too).
-pub fn enter(hal: &HalInterface, state: &'static mut KernelState) -> ! {
+/// Runs the boot sequence and never returns:
+///   1. stash the kernel-state / HAL pointers for later syscall handling;
+///   2. run `inkernel_demo` (the in-kernel §8.1/§8.2/§8.5 milestones —
+///      still direct `dispatch` + `context_switch`, same privilege);
+///   3. drop the Root Task to U-mode at `umode_root_entry` via
+///      `HalInterface::enter_user`. From that point the Root Task is a
+///      real layer-3 process reaching the kernel only through `ecall`,
+///      routed to the `simurgh_syscall` symbol the final binary provides.
+pub fn enter(hal: &HalInterface, state: &'static mut KernelState, umode_root_entry: usize) -> ! {
     // SAFETY: single-core boot, called once, right after `build`.
     unsafe {
         core::ptr::addr_of_mut!(G_STATE).write(state as *mut KernelState);
         core::ptr::addr_of_mut!(G_HAL).write(hal as *const HalInterface);
     }
 
-    let root = state.root_thread;
-    // `addr_of!` on the `static mut` array forms no reference, so this is
-    // not an unsafe operation; used only to compute the (16-byte-aligned)
-    // top of the stack region.
-    let stack_top = (core::ptr::addr_of!(ROOT_STACK) as usize + THREAD_STACK_SIZE) & !0xF;
+    inkernel_demo(state, hal);
 
-    {
-        let tcb = state.tcb_mut(root).expect("root TCB exists");
-        hal.init_context(tcb.context.as_bytes_mut(), root_task_main as usize, stack_top);
-        tcb.entry = VirtAddr::new(root_task_main as usize);
+    let stack_top = (core::ptr::addr_of!(ROOT_STACK) as usize + THREAD_STACK_SIZE) & !0xF;
+    let root = state.root_thread;
+    if let Some(tcb) = state.tcb_mut(root) {
+        tcb.entry = VirtAddr::new(umode_root_entry);
         tcb.state = ThreadState::Runnable;
     }
-
-    // Drive the scheduler. The first step cold-switches into
-    // `root_task_main` and does not return here. If it ever yields back
-    // with nothing else runnable, idle.
-    loop {
-        match state.schedule_step(hal) {
-            ScheduleOutcome::Switched { .. } => {}
-            ScheduleOutcome::NotStartable { .. } | ScheduleOutcome::Idle => {
-                core::hint::spin_loop();
-            }
-        }
-    }
+    klog!("--- dropping Root Task to U-mode (entry {:#x}) ---\r\n", umode_root_entry);
+    hal.enter_user(umode_root_entry, stack_top)
 }
 
-/// Busy-park forever. The in-kernel MVP threads have nothing to return to
-/// once their demo finishes; a real service would loop on `Recv`.
+/// Busy-park forever. The in-kernel demo threads have nothing to return
+/// to once their part is done; a real service would loop on `Recv`.
 fn park() -> ! {
     loop {
         core::hint::spin_loop();
     }
 }
 
-/// Accessors for the single-core boot statics, set before the switch that
-/// reaches the reader.
-fn kstate() -> &'static mut KernelState {
-    // SAFETY: `G_STATE` is set by `enter` before any thread runs;
-    // single-core, so the `&mut` is never aliased across threads.
+/// Accessor for the kernel state, valid after `enter` has been called.
+///
+/// # Safety contract
+/// Single-core; `enter` sets the pointer once before anything else runs,
+/// so the returned `&mut` is never aliased. The final binary's
+/// `simurgh_syscall` uses this from the S-mode trap handler.
+pub fn kstate() -> &'static mut KernelState {
+    // SAFETY: see the contract above.
     unsafe { &mut *core::ptr::addr_of_mut!(G_STATE).read() }
 }
-fn khal() -> &'static HalInterface {
+
+/// Accessor for the HAL interface, valid after `enter` has been called.
+pub fn khal() -> &'static HalInterface {
     // SAFETY: `G_HAL` is set by `enter` before any thread runs.
     unsafe { &*core::ptr::addr_of!(G_HAL).read() }
 }
 
-/// The Root Task's entry point (runs on `ROOT_STACK`).
-///
-/// 02-Microkernel-Layer.md §8.2 MVP: retype an `Endpoint`, retype and
-/// start a second thread, then do a synchronous IPC round-trip - the
-/// Root Task blocks in `Recv`, hands the CPU to thread 2, thread 2
-/// `Send`s, the message is delivered, and the Root Task resumes and reads
-/// it.
-extern "C" fn root_task_main() -> ! {
-    let k = kstate();
-    let hal = khal();
+/// The in-kernel milestone demo (02-Microkernel-Layer.md §8.1 / §8.2 /
+/// §8.5): retype an `Endpoint`, exercise capability revocation, retype
+/// and start a second thread, and complete a synchronous IPC round-trip.
+/// Runs at kernel privilege, reaching the kernel by calling `dispatch`
+/// directly. Returns normally when done.
+fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     let root = k.root_thread;
     klog!("root task: running (thread {})\r\n", root.as_u32());
 
@@ -359,7 +350,6 @@ extern "C" fn root_task_main() -> ! {
     }
 
     klog!("root task: 8.2 milestone - 2nd thread + synchronous IPC round-trip complete\r\n");
-    park();
 }
 
 /// The second thread's entry point (runs on `THREAD2_STACK`). Sends one

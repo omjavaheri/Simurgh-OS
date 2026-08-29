@@ -222,6 +222,11 @@ core::arch::global_asm!(
         sd x30, 232(sp)
         sd x31, 240(sp)
 
+        // Pass the saved-register frame (= current sp) as the first
+        // argument. `common_trap_entry` may write the saved a0 slot
+        // (72(sp)) to deliver a syscall return value before the restore
+        // below reloads it.
+        mv a0, sp
         call common_trap_entry
 
         ld x1,  0(sp)
@@ -259,28 +264,71 @@ core::arch::global_asm!(
     "#
 );
 
-/// Called from `trap_entry`'s assembly trampoline. Reads `scause` to
-/// disambiguate interrupt vs. exception (per this file's module docs
-/// on RISC-V's single-entry-point trap model), and — for interrupts —
-/// dispatches to `interrupt.rs`'s handler table via
-/// `crate::interrupt::dispatch_current_interrupt`.
+/// Saved integer register file laid out by `trap_entry` on the stack:
+/// `regs[i]` holds `x(i+1)` (x0 is hardwired zero and never saved), so
+/// `regs[9]` is `a0`/`x10`, `regs[16]` is `a7`/`x17`, etc.
+#[repr(C)]
+pub struct TrapFrame {
+    /// x1..x31, in order.
+    pub regs: [u64; 31],
+}
+
+#[cfg(target_os = "none")]
+impl TrapFrame {
+    const A0: usize = 9; // x10
+    const A7: usize = 16; // x17
+}
+
+/// Signature of the S-mode handler the microkernel registers for an
+/// `ecall` from U-mode: raw `(a7, a0, a1, a2, a3, a4)`, returning the
+/// value to place in the caller's `a0`.
+pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> usize;
+
+#[cfg(target_os = "none")]
+static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
+
+/// Registers the handler `common_trap_entry` calls for an `ecall` from
+/// U-mode. The microkernel calls this once during boot, before it drops
+/// any process to user mode — analogous to hal-core's timer / IRQ
+/// callback registration. A binary that links `hal-riscv64` but never
+/// runs user code (e.g. `kernel-stub`) simply never registers one, and an
+/// unexpected U-mode `ecall` then falls through to the fatal-trap dump.
+#[cfg(target_os = "none")]
+pub fn set_syscall_handler(handler: SyscallHandler) {
+    // SAFETY: single-core boot; set exactly once before any U-mode `ecall`
+    // can be taken.
+    unsafe {
+        core::ptr::addr_of_mut!(SYSCALL_HANDLER).write(Some(handler));
+    }
+}
+
+/// Called from `trap_entry`'s assembly trampoline with `frame` pointing
+/// at the saved register file. Reads `scause` to disambiguate interrupt
+/// vs. exception; routes an `ecall` from U-mode (cause 8) to
+/// `simurgh_syscall` and advances `sepc` past it; dispatches interrupts
+/// to `interrupt.rs`; dumps and halts on anything else.
 #[cfg(not(target_os = "none"))]
 #[no_mangle]
-extern "C" fn common_trap_entry() {
+extern "C" fn common_trap_entry(_frame: *mut TrapFrame) {
     // Host (`cargo test`) stub — reached only from the bare-metal
     // `trap_entry` trampoline, which is not linked off the bare-metal
     // target.
 }
 
+/// RISC-V `scause` code for "environment call from U-mode".
+#[cfg(target_os = "none")]
+const CAUSE_ECALL_FROM_U: usize = 8;
+
 #[cfg(target_os = "none")]
 #[no_mangle]
-extern "C" fn common_trap_entry() {
-    let scause: usize;
-    // SAFETY: reading `scause` has no preconditions — it is always
-    // valid to read within a trap handler, which this function's only
-    // caller (`trap_entry`) guarantees it runs inside of.
+extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
+    let (scause, sepc, stval): (usize, usize, usize);
+    // SAFETY: reading scause/sepc/stval has no preconditions inside a
+    // trap handler, which `trap_entry` guarantees this runs inside of.
     unsafe {
         core::arch::asm!("csrr {}, scause", out(reg) scause);
+        core::arch::asm!("csrr {}, sepc", out(reg) sepc);
+        core::arch::asm!("csrr {}, stval", out(reg) stval);
     }
 
     // Top bit set = interrupt; clear = synchronous exception. Per the
@@ -290,16 +338,80 @@ extern "C" fn common_trap_entry() {
 
     if is_interrupt {
         crate::interrupt::dispatch_current_interrupt(cause_code as u32);
-    } else {
-        // Synchronous exceptions (illegal instruction, page fault,
-        // ecall from U-mode, etc.) are not yet dispatched to a
-        // registered handler in this MVP phase — same documented gap
-        // as ARM64's sync_exception_entry (cpu.rs) and x86_64's
-        // reliance on the IDT's per-vector gates for exceptions this
-        // phase does not expect to occur given the identity/kernel-
-        // only mapping memory.rs establishes.
-        halt_on_unexpected_exception();
+        return;
     }
+
+    if cause_code == CAUSE_ECALL_FROM_U {
+        // SAFETY: `frame` is the on-stack register file `trap_entry`
+        // just saved; valid for this call, with no other live reference.
+        let f = unsafe { &mut *frame };
+        // SAFETY: single-core; `SYSCALL_HANDLER` is only written by
+        // `set_syscall_handler` during boot, before any U-mode `ecall`.
+        let handler = unsafe { core::ptr::addr_of!(SYSCALL_HANDLER).read() };
+        let ret = match handler {
+            Some(h) => h(
+                f.regs[TrapFrame::A7] as usize,
+                f.regs[TrapFrame::A0] as usize,
+                f.regs[TrapFrame::A0 + 1] as usize,
+                f.regs[TrapFrame::A0 + 2] as usize,
+                f.regs[TrapFrame::A0 + 3] as usize,
+                f.regs[TrapFrame::A0 + 4] as usize,
+            ),
+            None => {
+                trap_diag(cause_code, sepc, stval);
+                halt_on_unexpected_exception();
+            }
+        };
+        f.regs[TrapFrame::A0] = ret as u64;
+        // Resume at the instruction after the 4-byte `ecall`.
+        // SAFETY: writing sepc is valid within a trap handler.
+        unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
+        return;
+    }
+
+    trap_diag(cause_code, sepc, stval);
+    halt_on_unexpected_exception();
+}
+
+/// Minimal MMIO dump of an unexpected trap over QEMU virt's NS16550
+/// (0x1000_0000) so a fault is visible instead of a silent hang. Only
+/// used on the bare-metal target's fatal path.
+#[cfg(target_os = "none")]
+fn trap_diag(cause_code: usize, sepc: usize, stval: usize) {
+    const UART_THR: usize = 0x1000_0000;
+    const UART_LSR: usize = 0x1000_0005;
+    fn putb(b: u8) {
+        // SAFETY: fixed, OpenSBI-accessible NS16550 MMIO; poll THRE then
+        // write THR.
+        unsafe {
+            while core::ptr::read_volatile(UART_LSR as *const u8) & 0x20 == 0 {}
+            core::ptr::write_volatile(UART_THR as *mut u8, b);
+        }
+    }
+    fn puts(s: &str) {
+        for b in s.bytes() {
+            putb(b);
+        }
+    }
+    fn puthex(mut v: usize) {
+        puts("0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                putb(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+            }
+        }
+        let _ = &mut v;
+    }
+    puts("\r\nUNHANDLED TRAP: scause=");
+    puthex(cause_code);
+    puts(" sepc=");
+    puthex(sepc);
+    puts(" stval=");
+    puthex(stval);
+    puts("\r\n");
 }
 
 fn halt_on_unexpected_exception() -> ! {
@@ -539,6 +651,36 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
         #[cfg(not(target_os = "none"))]
         {
             ctx.satp = 0;
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn enter_user(&self, entry: usize, stack_top: usize) -> ! {
+        // The sstatus bit masks are passed as inputs (not built with `li`
+        // into a scratch register) because `options(noreturn)` forbids
+        // asm outputs/clobbers, and we must not risk the assembler
+        // picking `sp`/`ra` for a `{}` operand — `in(reg)` operands are
+        // always compiler-allocated GPRs other than those.
+        let clear_spp: usize = 1 << 8; // sstatus.SPP
+        let set_spie: usize = 1 << 5; // sstatus.SPIE
+
+        // SAFETY: a one-way `sret` into U-mode: clears SPP so the sret
+        // targets U-mode, sets SPIE, points sepc at `entry`, installs
+        // `stack_top` as sp. Interrupts are routed nowhere in S-mode yet,
+        // so enabling SIE via SPIE is harmless. Never returns.
+        unsafe {
+            core::arch::asm!(
+                "csrc sstatus, {clr}",
+                "csrs sstatus, {set}",
+                "csrw sepc, {entry}",
+                "mv   sp, {sp}",
+                "sret",
+                clr = in(reg) clear_spp,
+                set = in(reg) set_spie,
+                entry = in(reg) entry,
+                sp = in(reg) stack_top,
+                options(noreturn),
+            );
         }
     }
 

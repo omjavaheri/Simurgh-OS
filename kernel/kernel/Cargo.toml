@@ -33,8 +33,10 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-hal-core        = { path = "../../hal/hal-core" }
-kernel-core     = { path = "../kernel-core" }
+hal-core         = { path = "../../hal/hal-core" }
+kernel-core      = { path = "../kernel-core" }
+kernel-cap       = { path = "../kernel-cap" }
+kernel-mm        = { path = "../kernel-mm" }
 kernel-arch-glue = { path = "../kernel-arch-glue" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
