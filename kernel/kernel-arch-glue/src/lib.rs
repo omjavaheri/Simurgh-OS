@@ -64,14 +64,14 @@ static mut THREAD3_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut G_STATE: *mut KernelState = core::ptr::null_mut();
 static mut G_HAL: *const HalInterface = core::ptr::null();
 static mut G_LOG: Option<fn(Arguments<'_>)> = None;
-// The Root Task's live page-table root and a pre-zeroed pool of frames for
-// `map_range` to draw missing L1/L0 tables from when a `Map` syscall adds a
-// page at runtime. Set once by `enter` after paging is activated; consumed
-// by `map_user_page`. `G_MAP_POOL_USED` is the pool high-water mark.
-static mut G_ROOT_PT: usize = 0;
-static mut G_MAP_POOL: usize = 0;
-static mut G_MAP_POOL_LEN: usize = 0;
-static mut G_MAP_POOL_USED: usize = 0;
+// The runtime `Map` syscall's hardware page-table pool used to live here
+// (arch-glue-owned globals `map_user_page` drew from); it is now
+// `KernelState::install_map_pool` / `map_pool_remaining` — plain integer
+// bookkeeping owned by `kernel-core`, consumed by `syscall::do_map`
+// itself, so a capability-gated `Map` and the hardware walk are the same
+// syscall instead of two parallel mechanisms. `enter` still carves and
+// zeroes the pool's physical memory (kernel-core never touches raw
+// memory), then hands it to `KernelState` with one `install_map_pool` call.
 // Set by `root_task_main` before it starts thread 2, so `thread2_main`
 // knows its own thread id, the endpoint capability to `Send` on, and the
 // Root Task's thread id to hand control back to. `G_T3` is the same idea
@@ -360,10 +360,20 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
             park();
         }
     };
+    // The Root Task's software-model address space was created back in
+    // `populate_from_boot_info` from `BootInfo::initial_page_table_phys`
+    // (whatever satp/CR3/TTBR held at HAL handoff — Bare mode on riscv64,
+    // so `0`) — rebind it to the REAL root we just allocated, or
+    // `syscall::do_map`'s hardware walk would target the wrong frame for
+    // every `Map` into the Root Task's own space (see
+    // `AddressSpace::set_root_phys`'s doc comment).
+    if let Some(space) = state.addr_space_mut(state.root_addr_space) {
+        space.set_root_phys(hal_core::PhysAddr::new(root_pt));
+    }
     // A second, larger pool the runtime `Map` syscall path draws from
-    // (see `map_user_page`) — kept separate from the boot-time `pool`
-    // above so a later `Map` can never trip over the boot mapping's
-    // bookkeeping.
+    // (`KernelState::install_map_pool`) — kept separate from the
+    // boot-time `pool` above so a later `Map` can never trip over the
+    // boot mapping's bookkeeping.
     let map_pool = state
         .untyped_mut(kernel_cap::UntypedId::new(0))
         .and_then(|u| u.alloc(4096, 4096 * 8).ok());
@@ -423,12 +433,8 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
         && setup_two_process(hal, state, &user, root_pt, pool, used_a, user_sp)
     {
         hal.activate_address_space(root_pt);
-        // SAFETY: single-core boot; written once, before any syscall runs.
-        unsafe {
-            core::ptr::addr_of_mut!(G_ROOT_PT).write(root_pt);
-            core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
-            core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
-        }
+        // `do_map`'s hardware walk needs this pool from here on.
+        state.install_map_pool(map_pool, 8);
         // The Root Task's `Tcb::user_context` was filled by
         // `init_user_thread` in `setup_two_process` and it is the
         // scheduler's `running` thread. Resume it in U-mode.
@@ -442,13 +448,7 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
 
     // ---- Single-process fallback (unchanged behaviour) ----
     hal.activate_address_space(root_pt);
-    // SAFETY: single-core boot; written once here, before any syscall can
-    // run, and only read afterwards.
-    unsafe {
-        core::ptr::addr_of_mut!(G_ROOT_PT).write(root_pt);
-        core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
-        core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
-    }
+    state.install_map_pool(map_pool, 8);
     klog!(
         "--- Sv39 paging active; dropping Root Task to U-mode (entry {:#x}, sp {:#x}, isolated on U=1 pages) ---\r\n",
         user.entry_vma,
@@ -1014,54 +1014,6 @@ pub fn khal() -> &'static HalInterface {
     unsafe { &*core::ptr::addr_of!(G_HAL).read() }
 }
 
-/// Installs one 4 KiB mapping `vaddr -> paddr` (`perm_bits` = `R1 | W2 |
-/// X4 | U8`) into the Root Task's **live** page table, drawing any missing
-/// intermediate table from the runtime pool `enter` reserved, then flushes
-/// the TLB. Returns `false` if `enter` never ran the paging path, the pool
-/// is exhausted, or `map_range` rejects the request (misaligned, or a
-/// superpage leaf already covers the VA).
-///
-/// The final binary's `Map` syscall arm calls this from the S-mode trap
-/// handler — where every page-table frame it walks is in the identity-
-/// mapped low RAM, so the walk is valid even though paging is now active.
-/// This is the mechanism side of 02-Microkernel-Layer.md §6; the software
-/// `AddressSpace` model is updated separately by the caller so `Translate`
-/// still answers.
-pub fn map_user_page(hal: &HalInterface, vaddr: usize, paddr: usize, perm_bits: usize) -> bool {
-    // SAFETY: single-core; these globals are set once by `enter` before
-    // any syscall can run, and only mutated here (the pool high-water
-    // mark) from that same single-core syscall path.
-    let (root_pt, pool, pool_len, used) = unsafe {
-        (
-            core::ptr::addr_of!(G_ROOT_PT).read(),
-            core::ptr::addr_of!(G_MAP_POOL).read(),
-            core::ptr::addr_of!(G_MAP_POOL_LEN).read(),
-            core::ptr::addr_of!(G_MAP_POOL_USED).read(),
-        )
-    };
-    if root_pt == 0 || used >= pool_len {
-        return false;
-    }
-    let consumed = hal.map_range(
-        root_pt,
-        vaddr,
-        paddr,
-        4096,
-        perm_bits,
-        pool + used * 4096,
-        pool_len - used,
-    );
-    if consumed == u32::MAX {
-        return false;
-    }
-    // SAFETY: see the contract above — single-core advance of a pool
-    // high-water mark only this function touches.
-    unsafe {
-        core::ptr::addr_of_mut!(G_MAP_POOL_USED).write(used + consumed as usize);
-    }
-    hal.flush_tlb();
-    true
-}
 
 /// The in-kernel milestone demo (02-Microkernel-Layer.md §8.1 / §8.2 /
 /// §8.5): retype an `Endpoint`, exercise capability revocation, retype
@@ -1081,6 +1033,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             target_type: KernelObjectType::Endpoint,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         other => {
@@ -1107,7 +1060,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             .cap_space(cs)
             .map(|t| t.lookup(child_a).is_some() && t.lookup(child_b).is_some())
             .unwrap_or(false);
-        let freed = match k.dispatch(root, hal.now_ns(), SyscallOp::CapRevoke { cap: child_a }) {
+        let freed = match k.dispatch(root, hal.now_ns(), SyscallOp::CapRevoke { cap: child_a }, hal) {
             Ok(SyscallReturn::Revoked { freed }) => freed,
             other => {
                 klog!("root task: CapRevoke unexpected: {:?}\r\n", other);
@@ -1140,6 +1093,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             target_type: KernelObjectType::ThreadControlBlock,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         other => {
@@ -1177,7 +1131,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
 
     // 4. Block in Recv, then hand the CPU to whoever the scheduler picked
     //    (thread 2).
-    match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }) {
+    match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }, hal) {
         Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
             klog!("root task: blocked on Recv - switching to thread {}\r\n", n.as_u32());
             k.yield_to(root, n, hal);
@@ -1228,6 +1182,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             target_type: KernelObjectType::ThreadControlBlock,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => Some(cap),
         other => {
@@ -1256,7 +1211,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
         let (mut min_ns, mut max_ns, mut sum_ns) = (u64::MAX, 0u64, 0u64);
         for _ in 0..IPC_BENCH_ITERATIONS {
             let t0 = hal.now_ns();
-            match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }) {
+            match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }, hal) {
                 Ok(SyscallReturn::Reschedule { next: Some(n) }) => k.yield_to(root, n, hal),
                 other => {
                     klog!("root task: bench Recv unexpected: {:?}\r\n", other);
@@ -1291,6 +1246,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             target_type: KernelObjectType::Untyped,
             count: 1,
         },
+        hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         _ => return,
@@ -1425,7 +1381,7 @@ extern "C" fn thread2_main() -> ! {
     klog!("thread 2: running (tid {})\r\n", me.as_u32());
 
     let msg = SmallMessage::from_words(0xABCD, &[42, 7]).unwrap_or_else(|_| SmallMessage::new(0xABCD));
-    match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }) {
+    match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }, hal) {
         Ok(SyscallReturn::Delivered { woke }) => {
             klog!("thread 2: sent message; woke thread {}\r\n", woke.as_u32())
         }
@@ -1469,7 +1425,7 @@ extern "C" fn bench_thread_main() -> ! {
 
     for i in 0..IPC_BENCH_ITERATIONS {
         let msg = SmallMessage::from_words(0xBEEF, &[1, 2]).unwrap_or_else(|_| SmallMessage::new(0xBEEF));
-        match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }) {
+        match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }, hal) {
             Ok(SyscallReturn::Delivered { .. }) => {}
             other => klog!("bench thread: Send unexpected: {:?}\r\n", other),
         }

@@ -26,8 +26,8 @@ use crate::tcb::{Tcb, ThreadState};
 use hal_core::{BootInfo, VirtAddr};
 use hal_manifest::raw::MemoryRegionKindRaw;
 use kernel_cap::{
-    CapSpaceId, CapTable, Capability, EndpointId, KernelObjectKind, NotificationId, ObjectId,
-    ObjectRef, PageTableId, ThreadId, UntypedId,
+    CapId, CapSpaceId, CapTable, Capability, EndpointId, KernelObjectKind, NotificationId,
+    ObjectId, ObjectRef, PageTableId, ThreadId, UntypedId,
 };
 use kernel_ipc::{Endpoint, Notification};
 use kernel_mm::{AddressSpace, UntypedMemory};
@@ -76,8 +76,38 @@ pub struct KernelState {
     pub root_cap_space: CapSpaceId,
     /// The Root Task's address space.
     pub root_addr_space: PageTableId,
+    /// The capability, in the Root Task's own cap space, naming
+    /// `root_addr_space` — the `page_table` argument it passes to
+    /// `SyscallOp::Map` for its own space. `CapId::new(u32::MAX)` if
+    /// seeding it at boot failed (cap space full — see
+    /// `populate_from_boot_info`'s Step 3b); `Map` into the Root Task's
+    /// own space then always fails with `BadCap`, matching what an
+    /// absent capability should do.
+    pub root_page_table_cap: CapId,
     /// How many `UntypedMemory` objects the boot path created.
     pub untyped_count: u32,
+
+    // ---- `Map` syscall hardware page-table pool (see `install_map_pool`) ----
+    //
+    // The physical, pre-zeroed scratch frames `hal_core::HalInterface::
+    // map_range` draws missing L1/L0 (or architecture-equivalent)
+    // intermediate table nodes from when `do_map` walks a mapping into
+    // real hardware PTEs. `kernel-core` only tracks WHICH frames of this
+    // pool are already spoken for (plain integers — no raw-pointer
+    // access, no `unsafe`); the pool's actual physical memory is carved
+    // and zeroed by `kernel-arch-glue` at boot (`install_map_pool`),
+    // exactly as it already does for the boot-time `.user_text`/
+    // `.user_stack` mappings — kernel-core never touches physical memory
+    // directly.
+    /// Physical base of the pool, or `0` if none has been installed yet
+    /// (the architecture has no working `map_range`, or boot hasn't
+    /// reached that point) — `do_map` then skips the hardware walk
+    /// entirely and stays software-model-only.
+    map_pool_base: usize,
+    /// Total frames in the pool.
+    map_pool_len: u32,
+    /// Frames already consumed (the high-water mark `do_map` advances).
+    map_pool_used: u32,
 }
 
 impl KernelState {
@@ -231,8 +261,54 @@ impl KernelState {
         root_thread: ThreadId::new(0),
         root_cap_space: CapSpaceId::new(0),
         root_addr_space: PageTableId::new(0),
+        root_page_table_cap: CapId::new(u32::MAX),
         untyped_count: 0,
+        map_pool_base: 0,
+        map_pool_len: 0,
+        map_pool_used: 0,
     };
+
+    /// Installs the physical scratch-frame pool `do_map` draws from to
+    /// walk a `Map` syscall into real hardware page-table entries.
+    /// `base` must be a page-aligned, pre-zeroed physical range of `len`
+    /// pages that `kernel-arch-glue` carved from untyped RAM and that
+    /// stays identity-addressable for the life of the system (the same
+    /// contract `map_user_page`'s pool already relies on). Resets the
+    /// high-water mark to `0`.
+    ///
+    /// Called once, at boot, after the architecture's Sv39-equivalent
+    /// paging is up. Never called (pool stays `0`/absent) on an
+    /// architecture with no working `map_range` yet — `do_map` then
+    /// silently stays software-model-only for `Map` (see `MmError::
+    /// HardwareMapFailed`'s doc comment).
+    pub fn install_map_pool(&mut self, base: usize, len: u32) {
+        self.map_pool_base = base;
+        self.map_pool_len = len;
+        self.map_pool_used = 0;
+    }
+
+    /// Physical base of the pool, or `0` if none is installed — `do_map`
+    /// (`syscall.rs`) checks this to decide whether to attempt the
+    /// hardware walk at all.
+    pub fn map_pool_base(&self) -> usize {
+        self.map_pool_base
+    }
+
+    /// `(pool_base_for_next_call, frames_still_free)` — where `do_map`'s
+    /// next `hal.map_range` call should draw from, and how many frames it
+    /// may still consume.
+    pub fn map_pool_remaining(&self) -> (usize, usize) {
+        (
+            self.map_pool_base + self.map_pool_used as usize * kernel_mm::PAGE_SIZE,
+            (self.map_pool_len - self.map_pool_used) as usize,
+        )
+    }
+
+    /// Advances the pool's high-water mark by `consumed` frames (the
+    /// count `hal.map_range` returned).
+    pub fn map_pool_advance(&mut self, consumed: u32) {
+        self.map_pool_used += consumed;
+    }
 
     /// Fills an `EMPTY` `KernelState` in place from the HAL handoff —
     /// same work as `from_boot_info`, minus the by-value construction.
@@ -308,6 +384,28 @@ impl KernelState {
             return Err(KernelInitError::NoUsableMemory);
         }
 
+        // Step 3b: seed a `PageTable` capability naming the Root Task's
+        // OWN address space (`root_as`) into its cap space. Unlike every
+        // other kernel object, `root_as` was created directly via
+        // `alloc_addr_space` above, not through a `Retype` — so without
+        // this, the Root Task would have no capability satisfying
+        // `SyscallOp::Map`'s `page_table` argument for its own space,
+        // even though it plainly has authority over it. Best-effort: a
+        // full cap-space or a duplicate slot is not fatal to boot (the
+        // Root Task just cannot `Map` into its own space via the real
+        // syscall in that case — the untyped-exhaustion path above is the
+        // only genuinely fatal one, since untyped memory is what every
+        // other object is retyped from).
+        let pt_cap = Capability::full(ObjectRef::new(
+            KernelObjectKind::PageTable,
+            ObjectId::new(root_as.as_u32()),
+        ));
+        let root_page_table_cap = self
+            .cap_space_mut(root_cs)
+            .expect("root cap space exists")
+            .insert_root(pt_cap)
+            .unwrap_or(CapId::new(u32::MAX));
+
         // Step 4: schedule the Root Task.
         self.sched
             .admit(root_tid, SchedulerMode::Interactive, kernel_sched::MAX_PRIORITY, None)
@@ -323,6 +421,7 @@ impl KernelState {
         self.root_thread = root_tid;
         self.root_cap_space = root_cs;
         self.root_addr_space = root_as;
+        self.root_page_table_cap = root_page_table_cap;
         self.untyped_count = untyped_made;
         Ok(())
     }
