@@ -116,6 +116,26 @@ unsafe fn trampoline_enter_user<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
     cpu.enter_user(entry, stack_top)
 }
 
+unsafe fn trampoline_map_ram_identity<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    root_frame: usize,
+    bytes_gib: usize,
+    user_accessible: bool,
+) {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.map_ram_identity(root_frame, bytes_gib, user_accessible)
+}
+
+unsafe fn trampoline_activate_address_space<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    root_frame: usize,
+) {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.activate_address_space(root_frame)
+}
+
 unsafe fn trampoline_now_ns<T: TimerAbstraction>(state: *const ()) -> u64 {
     // SAFETY: same contract, timer side.
     let timer = unsafe { &*(state as *const T) };
@@ -141,6 +161,8 @@ pub struct HalInterface {
     cpu_feature_flags_bits: unsafe fn(*const ()) -> u64,
     cpu_context_switch: unsafe fn(*const (), *mut u8, *const u8),
     cpu_init_context: unsafe fn(*const (), *mut u8, usize, usize),
+    cpu_map_ram_identity: unsafe fn(*const (), usize, usize, bool),
+    cpu_activate_address_space: unsafe fn(*const (), usize),
     cpu_enter_user: unsafe fn(*const (), usize, usize) -> !,
     timer_now_ns: unsafe fn(*const ()) -> u64,
     timer_frequency_hz: unsafe fn(*const ()) -> u64,
@@ -208,6 +230,25 @@ impl HalInterface {
         unsafe { (self.cpu_init_context)(self.cpu_state, context.as_mut_ptr(), entry, stack_top) }
     }
 
+    /// Writes a flat identity map of the low `bytes_gib` GiB of physical
+    /// memory into the page-table root frame at `root_frame`. See
+    /// `CpuAbstraction::map_ram_identity`.
+    pub fn map_ram_identity(&self, root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        // SAFETY: produced together by `build_interface`.
+        unsafe {
+            (self.cpu_map_ram_identity)(self.cpu_state, root_frame, bytes_gib, user_accessible)
+        }
+    }
+
+    /// Activates the address space rooted at `root_frame` on this core
+    /// (loads `satp`/`CR3`/`TTBR0`). See
+    /// `CpuAbstraction::activate_address_space`.
+    pub fn activate_address_space(&self, root_frame: usize) {
+        // SAFETY: produced together by `build_interface`; the caller
+        // vouches for `root_frame` mapping current execution.
+        unsafe { (self.cpu_activate_address_space)(self.cpu_state, root_frame) }
+    }
+
     /// One-way drop of the current core to user privilege, starting at
     /// `entry` (a `-> !` function) on `stack_top`. Never returns. See
     /// `CpuAbstraction::enter_user`.
@@ -262,6 +303,8 @@ where
         cpu_feature_flags_bits: trampoline_feature_flags_bits::<C>,
         cpu_context_switch: trampoline_context_switch::<C>,
         cpu_init_context: trampoline_init_context::<C>,
+        cpu_map_ram_identity: trampoline_map_ram_identity::<C>,
+        cpu_activate_address_space: trampoline_activate_address_space::<C>,
         cpu_enter_user: trampoline_enter_user::<C>,
         timer_now_ns: trampoline_now_ns::<T>,
         timer_frequency_hz: trampoline_frequency_hz::<T>,

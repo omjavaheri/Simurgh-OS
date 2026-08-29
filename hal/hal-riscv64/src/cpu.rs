@@ -655,6 +655,65 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
     }
 
     #[cfg(target_os = "none")]
+    fn map_ram_identity(&self, root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        // Sv39 PTE bits (RISC-V privileged spec, section 4.4).
+        const V: u64 = 1 << 0;
+        const R: u64 = 1 << 1;
+        const W: u64 = 1 << 2;
+        const X: u64 = 1 << 3;
+        const U: u64 = 1 << 4;
+        const A: u64 = 1 << 6; // accessed
+        const D: u64 = 1 << 7; // dirty
+
+        let root = root_frame as *mut u64;
+        // SAFETY: `root_frame` is a caller-guaranteed page-aligned,
+        // writable physical frame; paging is still off (satp == 0) so the
+        // physical address is directly addressable. Zero all 512 entries,
+        // then install one 1 GiB identity leaf per GiB requested (root
+        // index == VA[38:30] == the GiB number for VA = gib << 30).
+        unsafe {
+            for i in 0..512 {
+                root.add(i).write_volatile(0);
+            }
+            let mut flags = V | R | W | X | A | D;
+            if user_accessible {
+                flags |= U;
+            }
+            let gib_count = bytes_gib.min(512);
+            for gib in 0..gib_count {
+                // paddr = gib * 1 GiB; ppn = paddr >> 12; pte = ppn << 10 | flags.
+                let pte = ((gib as u64) << 28) | flags;
+                root.add(gib).write_volatile(pte);
+            }
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn activate_address_space(&self, root_frame: usize) {
+        // satp (Sv39): mode = 8 in bits [63:60], ASID = 0, PPN = root >> 12.
+        // `root_frame == 0` is the sentinel for "disable paging" (satp = 0,
+        // Bare mode) — used to return to flat physical addressing.
+        let satp = if root_frame == 0 {
+            0u64
+        } else {
+            (8u64 << 60) | ((root_frame as u64) >> 12)
+        };
+        // SAFETY: `root_frame` is a caller-guaranteed valid Sv39 root that
+        // maps at least all memory this core executes from and touches
+        // next (see `map_ram_identity`). `sfence.vma` before and after
+        // flushes stale entries around the `satp` write.
+        unsafe {
+            core::arch::asm!(
+                "sfence.vma",
+                "csrw satp, {satp}",
+                "sfence.vma",
+                satp = in(reg) satp,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[cfg(target_os = "none")]
     fn enter_user(&self, entry: usize, stack_top: usize) -> ! {
         // The sstatus bit masks are passed as inputs (not built with `li`
         // into a scratch register) because `options(noreturn)` forbids

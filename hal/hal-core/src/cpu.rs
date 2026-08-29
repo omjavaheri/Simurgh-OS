@@ -263,6 +263,37 @@ pub trait CpuAbstraction<const ARCH_CONTEXT_BYTES: usize> {
         let _ = (context, entry, stack_top);
     }
 
+    /// Writes an identity mapping of the low `bytes_gib` GiB of physical
+    /// address space (VA == PA) into the page-table root frame at physical
+    /// address `root_frame`, using the largest leaf entries the
+    /// architecture supports (1 GiB superpages on RISC-V Sv39). The
+    /// mapping is R+W+X and, if `user_accessible`, also usable from
+    /// unprivileged code.
+    ///
+    /// `root_frame` must be a page-aligned, writable physical frame; this
+    /// method zeroes it first. Used once by the microkernel to build the
+    /// first real address space before activating paging — a flat
+    /// identity map keeps every existing physical pointer (kernel code,
+    /// the trap handler, MMIO, stacks) valid across the `satp`/`CR3`
+    /// switch. Narrowing it for per-process isolation is a later step.
+    ///
+    /// Default: no-op. Only the real `hal-<arch>` crates implement it.
+    fn map_ram_identity(&self, root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        let _ = (root_frame, bytes_gib, user_accessible);
+    }
+
+    /// Activates the address space whose root page table is at physical
+    /// address `root_frame` on the CURRENT core (loads `satp` on RISC-V,
+    /// `CR3` on x86_64, `TTBR0_EL1` on ARM64) and flushes stale
+    /// translations. After this call, virtual addressing is live.
+    ///
+    /// The caller must guarantee `root_frame` contains a valid page table
+    /// that maps at least all memory this core is currently executing
+    /// from and about to touch (see `map_ram_identity`). Default: no-op.
+    fn activate_address_space(&self, root_frame: usize) {
+        let _ = root_frame;
+    }
+
     /// One-way drop of the CURRENT core to the unprivileged level (Ring 3
     /// / EL0 / U-mode), beginning execution at `entry` with `stack_top`
     /// as the stack pointer. Never returns to the caller — the only way

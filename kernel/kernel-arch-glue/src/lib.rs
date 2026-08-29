@@ -177,6 +177,52 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, umode_root_ent
         tcb.entry = VirtAddr::new(umode_root_entry);
         tcb.state = ThreadState::Runnable;
     }
+
+    // --- Sv39 paging: build a real page table, activate it, verify the
+    // MMU translates, then deactivate. ---------------------------------
+    //
+    // This must run AFTER `inkernel_demo` (whose `context_switch`es carry
+    // satp == 0). A flat identity map of the low 3 GiB with U = 0 lets
+    // S-mode keep executing; it is NOT kept active for the U-mode Root
+    // Task, because that needs the user's code/stack on dedicated U = 1
+    // pages separate from kernel text — a linker-level change tracked as
+    // the next step. So: activate, self-test, deactivate, then drop to
+    // U-mode on the (still working) unpaged path.
+    match state
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096).ok())
+    {
+        Some(root_pt) => {
+            hal.map_ram_identity(root_pt.as_usize(), 3, false);
+            hal.activate_address_space(root_pt.as_usize());
+
+            // MMU self-test: with paging live, write a pattern through a
+            // (now virtually addressed) scratch page and read it back.
+            let ok = if let Some(scratch) = state
+                .untyped_mut(kernel_cap::UntypedId::new(0))
+                .and_then(|u| u.alloc(4096, 4096).ok())
+            {
+                let p = scratch.as_usize() as *mut u64;
+                // SAFETY: `scratch` is fresh untyped RAM, identity-mapped
+                // R+W by `map_ram_identity`; single-core; nothing else
+                // references it.
+                unsafe {
+                    p.write_volatile(0xA5A5_1234_DEAD_BEEF);
+                    p.read_volatile() == 0xA5A5_1234_DEAD_BEEF
+                }
+            } else {
+                false
+            };
+            hal.activate_address_space(0); // back to Bare mode (satp = 0)
+            klog!(
+                "root task: Sv39 paging - built + activated root PT at {:#x}, MMU read/write self-test {}, deactivated\r\n",
+                root_pt.as_usize(),
+                if ok { "OK" } else { "FAILED" }
+            );
+        }
+        None => klog!("root task: WARNING - could not allocate a root page table\r\n"),
+    }
+
     klog!("--- dropping Root Task to U-mode (entry {:#x}) ---\r\n", umode_root_entry);
     hal.enter_user(umode_root_entry, stack_top)
 }
