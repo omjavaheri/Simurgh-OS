@@ -154,6 +154,26 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // ------------------------------------------------------------------
     let cpu = cpu::Cpu::new();
 
+    // PRE-EXISTING GAP found while bringing up this session's U-mode/
+    // syscall work (mirrors the identical gap found and fixed in
+    // hal-x86_64's own entry point in the prior session): this call was
+    // simply never here at all — confirmed via `grep -rn
+    // "bootstrap_current_core"` across this crate turning up only the
+    // method's own definition, never a call site. VBAR_EL1 was therefore
+    // never installed, so any exception taken on this core (synchronous
+    // or IRQ) would vector through whatever VBAR_EL1 value firmware left
+    // active rather than this crate's own `arm64_vector_table`. Fixed by
+    // calling it here, mirroring hal-riscv64's own entry point exactly.
+    //
+    // SAFETY: called exactly once, here, before anything on this core
+    // can fault or take an interrupt (boot.S never unmasks DAIF between
+    // `_start` and this point).
+    if hal_core::cpu::CpuAbstraction::bootstrap_current_core(&cpu).is_err() {
+        // Nothing sensible to do this early; fall through and let the
+        // later BootInfo path surface the failure (same fallback
+        // hal-riscv64's own entry point uses).
+    }
+
     // ------------------------------------------------------------------
     // Step 2: parse the firmware memory map into
     // hal_manifest::raw::MemoryRegionRaw entries (section 3.2) and

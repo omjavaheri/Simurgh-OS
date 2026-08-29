@@ -76,7 +76,64 @@ SECTIONS
         __bss_end = .;
     }
 
-    __kernel_image_phys_end = . ;
+    /* ------------------------------------------------------------------
+     * User (layer-3) Root Task image.
+     *
+     * `.user_text` / `.user_stack` are linked for a VMA in an otherwise
+     * empty GiB slot of the 39-bit identity-mappable VA range this
+     * crate's own `aarch64_paging` module (cpu.rs) uses, but LOADED
+     * (LMA) contiguously inside the kernel image, right after `.bss` —
+     * same `__user_load`/LOADADDR split pattern hal-riscv64/linker.ld
+     * and hal-x86_64/linker.ld use for the same purpose.
+     *
+     * VMA is 0x8000_0000 (GiB 2): `kernel-arch-glue::enter` computes
+     * how many GiB to `map_ram_identity` generically from
+     * `BootInfo::kernel_image_phys_end` (`(end / 1_GiB) + 1`, no
+     * hardcoded per-architecture constant) — this crate's
+     * `KERNEL_LMA_BASE` (0x4020_0000, ~1 GiB + 2 MiB) needs 2 GiB of
+     * that, so GiB 2 is the first slot the identity map leaves free.
+     *
+     * Unlike hal-x86_64 (which is pinned to GiB 0-1 or the real
+     * higher-half range by its `code-model: "kernel"` target setting),
+     * this target's `code-model: "large"` (targets/aarch64-hal.json)
+     * imposes NO restriction on symbol addresses — every access already
+     * goes through a full 64-bit literal (MOVZ/MOVK sequence), not a
+     * PC-relative displacement with a narrower field — so, like
+     * riscv64, any GiB slot works equally well; GiB 2 is simply the
+     * first one this image's own size leaves free, not a constraint
+     * this architecture forces.
+     * ------------------------------------------------------------------ */
+    . = ALIGN(4K);
+    __user_load = .;              /* LMA cursor (still identity here) */
+
+    . = 0x80000000;               /* jump VMA into the user GiB slot */
+
+    .user_text ALIGN(4K) : AT(__user_load)
+    {
+        __user_text_start = .;
+        KEEP(*(.user_text .user_text.*))
+        . = ALIGN(4K);
+        __user_text_end = .;
+    }
+
+    .user_stack ALIGN(4K) : AT(__user_load + SIZEOF(.user_text))
+    {
+        __user_stack_start = .;
+        . += 64K;
+        . = ALIGN(4K);
+        __user_stack_end = .;
+    }
+
+    __user_text_lma  = LOADADDR(.user_text);
+    __user_stack_lma = LOADADDR(.user_stack);
+
+    /* Symbol upper layers use, alongside __kernel_image_phys_start
+     * above, to bound the kernel image range reported in BootInfo
+     * (hal-core/src/boot.rs: kernel_image_phys_start/end) — computed
+     * from the final VMA position translated back to LMA space.
+     * Everything the bootloader loaded (kernel + the user image's LMA
+     * copy) is off-limits as free memory. */
+    __kernel_image_phys_end = LOADADDR(.user_stack) + SIZEOF(.user_stack);
 
     /DISCARD/ :
     {

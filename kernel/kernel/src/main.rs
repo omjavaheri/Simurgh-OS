@@ -260,11 +260,16 @@ fn serial_log(args: core::fmt::Arguments<'_>) {
 // the architecture-erased `kernel-arch-glue`.
 // ----------------------------------------------------------------------------
 
-/// Syscall selectors (a7 on RISC-V; `rax` on x86_64). Only the riscv64
-/// and x86_64 builds currently run a U-mode Root Task and wire a trap
-/// handler; most of these opcodes below (everything past `ALIVE`/
-/// `REPORT`) are riscv64-only demo machinery x86_64 doesn't use yet.
-#[cfg(any(target_arch = "riscv64", target_arch = "x86_64"))]
+/// Syscall selectors (a7 on RISC-V; `rax` on x86_64; `x8` on AArch64).
+/// riscv64, x86_64, and aarch64 all now run a U-mode/EL0 Root Task and
+/// wire a trap handler; most of these opcodes below (everything past
+/// `ALIVE`/`REPORT`) are riscv64-only demo machinery the other two
+/// don't use yet.
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+))]
 mod sys {
     /// Write `a1` bytes of UTF-8 at address `a0` to the kernel log.
     pub const DEBUG_LOG: usize = 0;
@@ -622,9 +627,15 @@ extern "C" fn umode_faulty_driver() -> ! {
     }
 }
 
-/// Placeholder U-mode entry for the architectures whose real-kernel boot
-/// is not yet wired (aarch64 still boots `kernel-stub`).
-#[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64")))]
+/// Placeholder U-mode entry for architectures whose real-kernel boot is
+/// not yet wired (none currently — riscv64, x86_64, and aarch64 all
+/// have their own `umode_root_*` below; kept for forward-compatibility
+/// with a future fourth architecture).
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+)))]
 extern "C" fn umode_root() -> ! {
     loop {
         core::hint::spin_loop();
@@ -725,6 +736,105 @@ fn user_image() -> kernel_arch_glue::UserImage {
             stack_lma: sym(&__user_stack_lma),
             stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
             entry_vma: umode_root_x86 as usize,
+            worker_entry_vma: 0,
+            subsystem_entry_vma: 0,
+            a_loop_entry_vma: 0,
+        }
+    }
+}
+
+/// # Safety
+/// `svc #0` from EL0 traps to the shared EL0-synchronous vector
+/// (`hal_arm64::cpu`'s `sync_el0_entry`), which preserves every register
+/// except `x0` (the return value) — this project's own convention (see
+/// `hal_arm64::cpu::SyscallHandler`'s doc comment): `x8` = opcode,
+/// `x0`/`x1` = a0/a1.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn raw_syscall_aarch64(opcode: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") opcode,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+        );
+    }
+    ret
+}
+
+/// The aarch64 Root Task entry. Linked into `.user_text` (its own
+/// `AP_USER` `R+X` pages at the linked VMA, per hal-arm64's linker.ld)
+/// and run at EL0 by `kernel-arch-glue::enter`. Deliberately minimal —
+/// same scope as `umode_root_x86`: the §0 layer-2↔3 boundary proof this
+/// milestone is about is "a real `svc` from EL0 reaches the kernel and
+/// gets a real reply".
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_root_aarch64() -> ! {
+    // SAFETY: see `raw_syscall_aarch64`'s own contract.
+    unsafe {
+        raw_syscall_aarch64(sys::ALIVE, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, 0x5eed_5eed, 0);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// The syscall handler `hal_arm64::cpu`'s shared EL0-synchronous vector
+/// calls for a `svc` from EL0. Runs at EL1.
+#[cfg(target_arch = "aarch64")]
+fn simurgh_syscall_aarch64(x8: usize, x0: usize, _x1: usize) -> hal_arm64::cpu::TrapOutcome {
+    use hal_arm64::cpu::TrapOutcome;
+    match x8 {
+        sys::ALIVE => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, aarch64, EL0): alive, made a svc syscall from AP_USER pages\r\n"
+            ));
+        }
+        sys::REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, aarch64): syscall result = {:#x}\r\n",
+                x0
+            ));
+        }
+        _ => {}
+    }
+    TrapOutcome::Resume(0)
+}
+
+// Linker symbols for the aarch64 user (layer-3) Root Task image — see
+// hal-arm64/src/linker.ld's `.user_text` / `.user_stack` sections.
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" {
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_text_lma: u8;
+    static __user_stack_start: u8;
+    static __user_stack_end: u8;
+    static __user_stack_lma: u8;
+}
+
+/// Reads the `.user_*` linker symbols into the descriptor `enter` needs to
+/// map the Root Task's pages `AP_USER` before dropping to EL0.
+#[cfg(target_arch = "aarch64")]
+fn user_image() -> kernel_arch_glue::UserImage {
+    let sym = |s: &u8| s as *const u8 as usize;
+    // SAFETY: these are linker-defined addresses, taken by reference only,
+    // never dereferenced — the standard idiom for consuming linker script
+    // symbols.
+    unsafe {
+        kernel_arch_glue::UserImage {
+            text_vma: sym(&__user_text_start),
+            text_lma: sym(&__user_text_lma),
+            text_len: sym(&__user_text_end) - sym(&__user_text_start),
+            stack_vma: sym(&__user_stack_start),
+            stack_lma: sym(&__user_stack_lma),
+            stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
+            entry_vma: umode_root_aarch64 as usize,
             worker_entry_vma: 0,
             subsystem_entry_vma: 0,
             a_loop_entry_vma: 0,
@@ -1352,9 +1462,13 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             // dedicated `int 0x80` (DPL 3) trampoline calls.
             #[cfg(target_arch = "x86_64")]
             hal_x86_64::cpu::set_syscall_handler(simurgh_syscall_x86);
+            // Register the syscall handler `hal_arm64::cpu`'s shared
+            // EL0-synchronous vector calls.
+            #[cfg(target_arch = "aarch64")]
+            hal_arm64::cpu::set_syscall_handler(simurgh_syscall_aarch64);
             // Never returns: runs the in-kernel demo, then (riscv64/
-            // x86_64) maps the user image U=1, activates paging, and
-            // drops the Root Task to U-mode isolated.
+            // x86_64/aarch64) maps the user image U=1/AP_USER, activates
+            // paging, and drops the Root Task to U-mode/EL0 isolated.
             #[cfg(target_arch = "riscv64")]
             {
                 kernel_arch_glue::enter(&hal, state, user_image(), &boot_info)
@@ -1363,7 +1477,15 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             {
                 kernel_arch_glue::enter(&hal, state, user_image(), &boot_info)
             }
-            #[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64")))]
+            #[cfg(target_arch = "aarch64")]
+            {
+                kernel_arch_glue::enter(&hal, state, user_image(), &boot_info)
+            }
+            #[cfg(not(any(
+                target_arch = "riscv64",
+                target_arch = "x86_64",
+                target_arch = "aarch64"
+            )))]
             {
                 kernel_arch_glue::enter(&hal, state, kernel_arch_glue::UserImage::EMPTY, &boot_info)
             }
