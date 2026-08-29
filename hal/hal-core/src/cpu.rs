@@ -324,6 +324,19 @@ pub trait CpuAbstraction<const ARCH_CONTEXT_BYTES: usize> {
         let _ = root_frame;
     }
 
+    /// Flushes this core's entire translation cache (TLB / paging-structure
+    /// caches), so page-table edits made after `activate_address_space`
+    /// take effect. The microkernel calls this after servicing a `Map`
+    /// syscall that walked new entries into the *live* page table
+    /// (02-Microkernel-Layer.md §6) — `map_range` itself performs no
+    /// invalidation.
+    ///
+    /// A full flush (not a single-address invalidate) is deliberate: the
+    /// MVP `Map` path maps one page at a time and a whole-TLB shootdown is
+    /// simplest to reason about; a range/ASID-scoped variant is a later
+    /// optimisation. Default: no-op (mock/test CPUs never enable paging).
+    fn flush_tlb(&self) {}
+
     /// One-way drop of the CURRENT core to the unprivileged level (Ring 3
     /// / EL0 / U-mode), beginning execution at `entry` with `stack_top`
     /// as the stack pointer. Never returns to the caller — the only way

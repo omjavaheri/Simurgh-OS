@@ -34,6 +34,12 @@
 //!     are NOT added yet — cooperative `Yield` + IPC block/unblock is
 //!     enough for the §8.2 milestone; they are the next growth when the
 //!     preemptive scheduler lands.
+//!   - v3 (microkernel, 02-Microkernel-Layer.md §6/§8.4): `init_context`,
+//!     `enter_user`, `map_ram_identity`, `activate_address_space`,
+//!     `map_range`, and now `flush_tlb` added as the kernel gained a real
+//!     user/kernel split and drives Sv39 page tables. `flush_tlb` is the
+//!     invalidation half of the `Map` syscall: `map_range` walks entries
+//!     into the *live* table, `flush_tlb` makes the core honour them.
 //! ============================================================================
 
 use crate::cpu::CpuAbstraction;
@@ -136,6 +142,12 @@ unsafe fn trampoline_activate_address_space<C: CpuAbstraction<HAL_CONTEXT_BYTES>
     cpu.activate_address_space(root_frame)
 }
 
+unsafe fn trampoline_flush_tlb<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(state: *const ()) {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.flush_tlb()
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn trampoline_map_range<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
     state: *const (),
@@ -179,6 +191,7 @@ pub struct HalInterface {
     cpu_init_context: unsafe fn(*const (), *mut u8, usize, usize),
     cpu_map_ram_identity: unsafe fn(*const (), usize, usize, bool),
     cpu_activate_address_space: unsafe fn(*const (), usize),
+    cpu_flush_tlb: unsafe fn(*const ()),
     cpu_map_range: unsafe fn(*const (), usize, usize, usize, usize, usize, usize, usize) -> u32,
     cpu_enter_user: unsafe fn(*const (), usize, usize) -> !,
     timer_now_ns: unsafe fn(*const ()) -> u64,
@@ -264,6 +277,14 @@ impl HalInterface {
         // SAFETY: produced together by `build_interface`; the caller
         // vouches for `root_frame` mapping current execution.
         unsafe { (self.cpu_activate_address_space)(self.cpu_state, root_frame) }
+    }
+
+    /// Flushes this core's entire TLB / paging-structure cache. Call after
+    /// walking new entries into the live page table (e.g. servicing a
+    /// `Map` syscall). See `CpuAbstraction::flush_tlb`.
+    pub fn flush_tlb(&self) {
+        // SAFETY: produced together by `build_interface`.
+        unsafe { (self.cpu_flush_tlb)(self.cpu_state) }
     }
 
     /// Maps `[vaddr, vaddr+len)` -> `[paddr, ...)` at base-page
@@ -354,6 +375,7 @@ where
         cpu_init_context: trampoline_init_context::<C>,
         cpu_map_ram_identity: trampoline_map_ram_identity::<C>,
         cpu_activate_address_space: trampoline_activate_address_space::<C>,
+        cpu_flush_tlb: trampoline_flush_tlb::<C>,
         cpu_map_range: trampoline_map_range::<C>,
         cpu_enter_user: trampoline_enter_user::<C>,
         timer_now_ns: trampoline_now_ns::<T>,

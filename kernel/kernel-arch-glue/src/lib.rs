@@ -63,6 +63,14 @@ static mut THREAD2_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut G_STATE: *mut KernelState = core::ptr::null_mut();
 static mut G_HAL: *const HalInterface = core::ptr::null();
 static mut G_LOG: Option<fn(Arguments<'_>)> = None;
+// The Root Task's live page-table root and a pre-zeroed pool of frames for
+// `map_range` to draw missing L1/L0 tables from when a `Map` syscall adds a
+// page at runtime. Set once by `enter` after paging is activated; consumed
+// by `map_user_page`. `G_MAP_POOL_USED` is the pool high-water mark.
+static mut G_ROOT_PT: usize = 0;
+static mut G_MAP_POOL: usize = 0;
+static mut G_MAP_POOL_LEN: usize = 0;
+static mut G_MAP_POOL_USED: usize = 0;
 // Set by `root_task_main` before it starts thread 2, so `thread2_main`
 // knows its own thread id, the endpoint capability to `Send` on, and the
 // Root Task's thread id to hand control back to.
@@ -243,10 +251,25 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
             park();
         }
     };
-    // SAFETY: `pool` is fresh untyped RAM in the identity-mapped low RAM;
-    // single-core; `map_range` requires it pre-zeroed.
+    // A second, larger pool the runtime `Map` syscall path draws from
+    // (see `map_user_page`) — kept separate from the boot-time `pool`
+    // above so a later `Map` can never trip over the boot mapping's
+    // bookkeeping.
+    let map_pool = state
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 8).ok());
+    let map_pool = match map_pool {
+        Some(p) => p.as_usize(),
+        None => {
+            klog!("could not allocate the runtime Map pool - halting\r\n");
+            park();
+        }
+    };
+    // SAFETY: `pool` / `map_pool` are fresh untyped RAM in the identity-
+    // mapped low RAM; single-core; `map_range` requires them pre-zeroed.
     unsafe {
         core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 4);
+        core::ptr::write_bytes(map_pool as *mut u8, 0, 4096 * 8);
     }
 
     let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
@@ -281,6 +304,17 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImag
     }
 
     hal.activate_address_space(root_pt);
+
+    // Publish the live table + runtime pool so the final binary's `Map`
+    // syscall arm (`map_user_page`) can add pages after we drop to U-mode.
+    // SAFETY: single-core boot; written once here, before any syscall can
+    // run, and only read afterwards.
+    unsafe {
+        core::ptr::addr_of_mut!(G_ROOT_PT).write(root_pt);
+        core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
+        core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
+    }
+
     let user_sp = (user.stack_vma + user.stack_len) & !0xF;
     klog!(
         "--- Sv39 paging active; dropping Root Task to U-mode (entry {:#x}, sp {:#x}, isolated on U=1 pages) ---\r\n",
@@ -313,6 +347,55 @@ pub fn kstate() -> &'static mut KernelState {
 pub fn khal() -> &'static HalInterface {
     // SAFETY: `G_HAL` is set by `enter` before any thread runs.
     unsafe { &*core::ptr::addr_of!(G_HAL).read() }
+}
+
+/// Installs one 4 KiB mapping `vaddr -> paddr` (`perm_bits` = `R1 | W2 |
+/// X4 | U8`) into the Root Task's **live** page table, drawing any missing
+/// intermediate table from the runtime pool `enter` reserved, then flushes
+/// the TLB. Returns `false` if `enter` never ran the paging path, the pool
+/// is exhausted, or `map_range` rejects the request (misaligned, or a
+/// superpage leaf already covers the VA).
+///
+/// The final binary's `Map` syscall arm calls this from the S-mode trap
+/// handler — where every page-table frame it walks is in the identity-
+/// mapped low RAM, so the walk is valid even though paging is now active.
+/// This is the mechanism side of 02-Microkernel-Layer.md §6; the software
+/// `AddressSpace` model is updated separately by the caller so `Translate`
+/// still answers.
+pub fn map_user_page(hal: &HalInterface, vaddr: usize, paddr: usize, perm_bits: usize) -> bool {
+    // SAFETY: single-core; these globals are set once by `enter` before
+    // any syscall can run, and only mutated here (the pool high-water
+    // mark) from that same single-core syscall path.
+    let (root_pt, pool, pool_len, used) = unsafe {
+        (
+            core::ptr::addr_of!(G_ROOT_PT).read(),
+            core::ptr::addr_of!(G_MAP_POOL).read(),
+            core::ptr::addr_of!(G_MAP_POOL_LEN).read(),
+            core::ptr::addr_of!(G_MAP_POOL_USED).read(),
+        )
+    };
+    if root_pt == 0 || used >= pool_len {
+        return false;
+    }
+    let consumed = hal.map_range(
+        root_pt,
+        vaddr,
+        paddr,
+        4096,
+        perm_bits,
+        pool + used * 4096,
+        pool_len - used,
+    );
+    if consumed == u32::MAX {
+        return false;
+    }
+    // SAFETY: see the contract above — single-core advance of a pool
+    // high-water mark only this function touches.
+    unsafe {
+        core::ptr::addr_of_mut!(G_MAP_POOL_USED).write(used + consumed as usize);
+    }
+    hal.flush_tlb();
+    true
 }
 
 /// The in-kernel milestone demo (02-Microkernel-Layer.md §8.1 / §8.2 /

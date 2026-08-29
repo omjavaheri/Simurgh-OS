@@ -203,20 +203,28 @@ mod sys {
     /// Retype one `Endpoint` from the Root Task's first `UntypedMemory`
     /// capability; returns the new capability slot.
     pub const RETYPE_ENDPOINT: usize = 1;
-    /// Map one page: `a0` = virtual address, `a1` = physical address, RW.
-    /// Records the mapping in the Root Task's address space. Returns 0 on
-    /// success, `usize::MAX` on error.
+    /// Map one fresh page at `a0` = virtual address. The kernel allocates
+    /// a real physical frame from the Root Task's `UntypedMemory`, walks a
+    /// genuine Sv39 leaf (`R+W+U`) for it into the Root Task's **live**
+    /// page table, records it in the software `AddressSpace` model too,
+    /// and returns the physical address it chose (`usize::MAX` on error).
     ///
-    /// MVP: operates on the Root Task's address space directly (not yet
-    /// capability-gated per `02-Microkernel-Layer.md §6`), and the
-    /// address space is still a software model — no Sv39 page-table
-    /// entries are written and `satp` stays 0. This exercises the
-    /// syscall -> `AddressSpace::map` path; real PTEs + a capability
-    /// argument are the follow-up.
+    /// MVP: still not capability-gated per `02-Microkernel-Layer.md §6`
+    /// (a real `Map` takes a `Frame` + `PageTable` capability); the frame
+    /// is picked by the kernel rather than named by the caller. What is
+    /// now real: the hardware mapping and `satp`.
     pub const MAP_PAGE: usize = 2;
     /// Translate `a0` = virtual address through the Root Task's address
-    /// space; returns the physical address, or `usize::MAX` if unmapped.
+    /// space (software model); returns the physical address, or
+    /// `usize::MAX` if unmapped.
     pub const TRANSLATE: usize = 3;
+    /// Map a second virtual address `a0` onto the SAME physical frame the
+    /// most recent `MAP_PAGE` returned — an intra-address-space alias, the
+    /// zero-copy shared-memory primitive of `02-Microkernel-Layer.md
+    /// §5.2 / §8.4`. Real Sv39 leaf + model update. Returns 0 /
+    /// `usize::MAX`. `a1` is ignored (the frame is kernel-tracked so a
+    /// bogus physical address cannot be smuggled in).
+    pub const MAP_ALIAS: usize = 4;
     /// No arguments — the kernel logs a fixed "Root Task alive under
     /// paging" line. Used by the isolated U-mode entry, which carries no
     /// string literals of its own.
@@ -224,6 +232,13 @@ mod sys {
     /// `a0` = a value the kernel should echo into the log (used to report
     /// a `TRANSLATE` result from code that cannot format it itself).
     pub const REPORT: usize = 10;
+    /// Cross-check a shared frame: `a0` = the physical address `MAP_PAGE`
+    /// returned, `a1` = the value the Root Task read back through the
+    /// alias VA. The kernel reads the SAME physical frame through its own
+    /// identity map and logs whether all three views agree — the
+    /// hardware-level proof behind `02-Microkernel-Layer.md §8.4`
+    /// (zero-copy shared memory).
+    pub const XCHECK: usize = 11;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -257,16 +272,46 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
 #[link_section = ".user_text"]
 extern "C" fn umode_root() -> ! {
     // SAFETY: `ecall` from U-mode traps to our S-mode handler, which
-    // preserves every register except a0. All arguments here are plain
-    // integers; nothing is dereferenced in U-mode.
+    // preserves every register except a0. The two direct memory accesses
+    // below go through pages the kernel maps `U=1 R+W` in response to our
+    // `MAP_PAGE` / `MAP_ALIAS` calls; they are written as inline `sw`/`lw`
+    // so `.user_text` stays free of calls into kernel `.text` and of any
+    // relocation.
     unsafe {
         raw_syscall(sys::ALIVE, 0, 0);
         let _cap = raw_syscall(sys::RETYPE_ENDPOINT, 0, 0);
-        // Map a page in an empty part of our address space and read the
-        // translation back, then have the kernel report it.
-        raw_syscall(sys::MAP_PAGE, 0xD000_0000, 0x8800_0000);
-        let pa = raw_syscall(sys::TRANSLATE, 0xD000_0040, 0);
-        raw_syscall(sys::REPORT, pa, 0);
+
+        // 1. Ask the kernel to back VA 0xD000_0000 with a real frame
+        //    (genuine Sv39 leaf, U=1 R+W). `pa` is the physical address it
+        //    picked.
+        let pa = raw_syscall(sys::MAP_PAGE, 0xD000_0000, 0);
+
+        // 2. Store a sentinel THROUGH the virtual address. This completes
+        //    only if the PTE is real and user-writable; otherwise it
+        //    faults into the kernel trap handler.
+        core::arch::asm!(
+            "li {t}, 0x5eed",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xD000_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
+
+        // 3. Map a SECOND VA onto the same physical frame and read the
+        //    sentinel back through it — zero-copy aliasing, MMU-enforced.
+        raw_syscall(sys::MAP_ALIAS, 0xD000_1000, 0);
+        let via_alias: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xD000_1000usize,
+            out = out(reg) via_alias,
+            options(nostack, readonly),
+        );
+
+        // 4. Have the kernel read the frame directly and confirm all
+        //    three views agree.
+        raw_syscall(sys::XCHECK, pa, via_alias);
+
         // Spin forever without touching memory or any relocation.
         core::arch::asm!("1:", "j 1b", options(noreturn));
     }
@@ -279,6 +324,43 @@ extern "C" fn umode_root() -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Physical address of the frame the most recent `MAP_PAGE` handed the
+/// Root Task. `MAP_ALIAS` maps a second VA onto exactly this frame, so a
+/// caller can never smuggle in an arbitrary physical address to alias.
+#[cfg(target_arch = "riscv64")]
+static mut LAST_MAPPED_FRAME: usize = 0;
+
+/// Retypes one page-sized `Untyped` object from the Root Task's first
+/// `UntypedMemory` capability and returns its physical base, or `None` if
+/// the retype or the cap lookup fails.
+#[cfg(target_arch = "riscv64")]
+fn alloc_root_frame(
+    k: &mut kernel_core::KernelState,
+    hal: &hal_core::HalInterface,
+) -> Option<usize> {
+    use kernel_core::{SyscallOp, SyscallReturn};
+    use kernel_mm::KernelObjectType;
+
+    let cap = match k.dispatch(
+        k.root_thread,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: kernel_cap::CapId::new(0),
+            target_type: KernelObjectType::Untyped,
+            count: 1,
+        },
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    let uid = kernel_cap::UntypedId::new(
+        k.cap_space(k.root_cap_space)
+            .and_then(|t| t.lookup(cap))
+            .map(|c| c.object.id.as_u32())?,
+    );
+    Some(k.untyped_mut(uid)?.base().as_usize())
 }
 
 /// The syscall handler the HAL trap vector calls for an `ecall` from
@@ -326,19 +408,43 @@ fn simurgh_syscall(
             }
         }
         sys::MAP_PAGE => {
-            let space = match k.addr_space_mut(k.root_addr_space) {
-                Some(s) => s,
+            // Allocate a real frame, walk a genuine Sv39 leaf for it into
+            // the LIVE page table (R|W|U = 1|2|8), then mirror it in the
+            // software model so TRANSLATE still answers.
+            let frame = match alloc_root_frame(k, hal) {
+                Some(f) => f,
                 None => return usize::MAX,
             };
-            match space.map(
-                hal_core::VirtAddr::new(a0),
-                hal_core::PhysAddr::new(a1),
-                kernel_mm::PAGE_SIZE,
-                hal_core::MapPermissions::KERNEL_DATA,
-            ) {
-                Ok(()) => 0,
-                Err(_) => usize::MAX,
+            if !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
+                return usize::MAX;
             }
+            if let Some(space) = k.addr_space_mut(k.root_addr_space) {
+                let _ = space.map(
+                    hal_core::VirtAddr::new(a0),
+                    hal_core::PhysAddr::new(frame),
+                    kernel_mm::PAGE_SIZE,
+                    hal_core::MapPermissions::KERNEL_DATA,
+                );
+            }
+            // SAFETY: single-core syscall path; only written here.
+            unsafe { core::ptr::addr_of_mut!(LAST_MAPPED_FRAME).write(frame) };
+            frame
+        }
+        sys::MAP_ALIAS => {
+            // SAFETY: single-core; set by the last MAP_PAGE.
+            let frame = unsafe { core::ptr::addr_of!(LAST_MAPPED_FRAME).read() };
+            if frame == 0 || !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
+                return usize::MAX;
+            }
+            if let Some(space) = k.addr_space_mut(k.root_addr_space) {
+                let _ = space.map(
+                    hal_core::VirtAddr::new(a0),
+                    hal_core::PhysAddr::new(frame),
+                    kernel_mm::PAGE_SIZE,
+                    hal_core::MapPermissions::KERNEL_DATA,
+                );
+            }
+            0
         }
         sys::TRANSLATE => match k
             .addr_space_mut(k.root_addr_space)
@@ -355,8 +461,30 @@ fn simurgh_syscall(
         }
         sys::REPORT => {
             kernel_arch_glue::log(format_args!(
-                "root task (U-mode): ecall Map+Translate result = {:#x}\r\n",
+                "root task (U-mode): ecall result = {:#x}\r\n",
                 a0
+            ));
+            0
+        }
+        sys::XCHECK => {
+            // `a0` = the physical frame MAP_PAGE returned; `a1` = the u32
+            // the Root Task read back through the alias VA. Read the same
+            // frame through the kernel's own identity map and report
+            // whether the U-mode write, the alias read, and the kernel
+            // view all agree.
+            // SAFETY: `a0` is a frame the kernel just allocated from
+            // untyped and identity-maps `U=0` in the active table; a u32
+            // read from it is valid and non-aliasing here.
+            let at_phys = unsafe { core::ptr::read_volatile(a0 as *const u32) } as usize;
+            let expected = unsafe { core::ptr::addr_of!(LAST_MAPPED_FRAME).read() };
+            let ok = at_phys == a1 && a1 == 0x5EED && a0 == expected;
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode): zero-copy proof - U-mode wrote {:#x} at VA 0xd0000000, read {:#x} at alias VA 0xd0001000; kernel reads {:#x} at PA {:#x} -> {}\r\n",
+                0x5EED_usize,
+                a1,
+                at_phys,
+                a0,
+                if ok { "ALL THREE AGREE" } else { "MISMATCH" }
             ));
             0
         }

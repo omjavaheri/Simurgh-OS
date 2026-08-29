@@ -710,6 +710,20 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
     }
 
     #[cfg(target_os = "none")]
+    fn flush_tlb(&self) {
+        // SAFETY: `sfence.vma` with no rs1/rs2 (x0, x0) flushes every
+        // address-translation cache entry for the current ASID space on
+        // this hart. It has no preconditions in S-mode and no effect
+        // beyond the flush — the microkernel issues it after `map_range`
+        // has walked new leaves into the active Sv39 table so a
+        // subsequent access (or the U-mode task's first touch of the new
+        // page) does not hit a stale negative entry.
+        unsafe {
+            core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
+        }
+    }
+
+    #[cfg(target_os = "none")]
     fn map_range(
         &self,
         root_frame: usize,
