@@ -129,7 +129,9 @@ pub mod interface;
 
 pub use error::HalError;
 
-pub use cpu::{CpuAbstraction, CpuContext, CpuFeatureFlags, PrivilegeLevel};
+pub use cpu::{
+    CpuAbstraction, CpuContext, CpuFeatureFlags, PrivilegeLevel, UserContext, HAL_USER_CONTEXT_BYTES,
+};
 
 pub use memory::{MapPermissions, MemoryBootstrap, MemoryRegion, MemoryRegionKind, PhysAddr, VirtAddr};
 

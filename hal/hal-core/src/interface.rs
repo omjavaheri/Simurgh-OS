@@ -34,10 +34,35 @@
 //!     are NOT added yet — cooperative `Yield` + IPC block/unblock is
 //!     enough for the §8.2 milestone; they are the next growth when the
 //!     preemptive scheduler lands.
+//!   - v3 (microkernel, 02-Microkernel-Layer.md §6/§8.4): `init_context`,
+//!     `enter_user`, `map_ram_identity`, `activate_address_space`,
+//!     `map_range`, and now `flush_tlb` added as the kernel gained a real
+//!     user/kernel split and drives Sv39 page tables. `flush_tlb` is the
+//!     invalidation half of the `Map` syscall: `map_range` walks entries
+//!     into the *live* table, `flush_tlb` makes the core honour them.
+//!   - v4 (microkernel, 02-Microkernel-Layer.md §8.4): `init_user_context`
+//!     and `resume_user` added. `enter_user` is a one-way drop of the boot
+//!     core — it cannot bring a SECOND user process onto the CPU. The
+//!     §8.4 acceptance criterion ("زیرو-کپی بین دو پروسه‌ی ایزوله") needs
+//!     two U-mode threads in two isolated address spaces handing the core
+//!     back and forth through the kernel, so the kernel now needs to
+//!     resume an arbitrary saved U-mode context (`resume_user`) and to
+//!     mint fresh ones (`init_user_context`). The *save* half is
+//!     arch-internal to the trap vector and needs no interface method.
+//!   - v5 (microkernel, 02-Microkernel-Layer.md §4): `arm_timer` /
+//!     `cancel_timer` added. The `TimerAbstraction` is already in the
+//!     interface for `now_ns` / `frequency_hz`; the preemptive scheduler
+//!     additionally needs to bound a thread's quantum by arming a
+//!     one-shot deadline and, when it stops preempting, disarming it.
+//!     The interrupt *delivery* wiring (`sie.STIE`, the trap-vector
+//!     branch that runs the scheduler on a tick) is arch-internal — the
+//!     kernel only registers a tick handler with the arch crate, exactly
+//!     as it registers a syscall handler.
 //! ============================================================================
 
 use crate::cpu::CpuAbstraction;
-use crate::timer::TimerAbstraction;
+use crate::cpu::HAL_USER_CONTEXT_BYTES;
+use crate::timer::{TimerAbstraction, TimerMode};
 
 /// The single saved-register-context width the architecture-erased
 /// interface works in, in bytes. Every architecture crate implements
@@ -116,10 +141,98 @@ unsafe fn trampoline_enter_user<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
     cpu.enter_user(entry, stack_top)
 }
 
+unsafe fn trampoline_init_user_context<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    context: *mut u8,
+    entry: usize,
+    stack_top: usize,
+    root_frame: usize,
+) {
+    // SAFETY: `state` is a valid `&C` (build_interface contract);
+    // `context` points at `HAL_USER_CONTEXT_BYTES` writable, 8-byte-
+    // aligned bytes owned by the caller, and `UserContext` is
+    // `#[repr(C, align(8))]` over exactly `[u8; HAL_USER_CONTEXT_BYTES]`
+    // — so such a buffer IS a valid `UserContext`.
+    let cpu = unsafe { &*(state as *const C) };
+    let ctx = unsafe { &mut *(context as *mut crate::cpu::UserContext) };
+    cpu.init_user_context(ctx, entry, stack_top, root_frame);
+}
+
+unsafe fn trampoline_resume_user<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    context: *const u8,
+) -> ! {
+    // SAFETY: `state` is a valid `&C` (build_interface contract);
+    // `context` points at `HAL_USER_CONTEXT_BYTES` initialised, 8-byte-
+    // aligned bytes holding a `UserContext` (see
+    // `trampoline_init_user_context`). The resumable-context and
+    // interrupts-masked obligations are forwarded to the caller by
+    // `HalInterface::resume_user`'s own `# Safety` section.
+    let cpu = unsafe { &*(state as *const C) };
+    let ctx = unsafe { &*(context as *const crate::cpu::UserContext) };
+    // SAFETY: forwards to the architecture implementation; preconditions
+    // inherited from this function's own contract above.
+    unsafe { cpu.resume_user(ctx) }
+}
+
+unsafe fn trampoline_map_ram_identity<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    root_frame: usize,
+    bytes_gib: usize,
+    user_accessible: bool,
+) {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.map_ram_identity(root_frame, bytes_gib, user_accessible)
+}
+
+unsafe fn trampoline_activate_address_space<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    root_frame: usize,
+) {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.activate_address_space(root_frame)
+}
+
+unsafe fn trampoline_flush_tlb<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(state: *const ()) {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.flush_tlb()
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn trampoline_map_range<C: CpuAbstraction<HAL_CONTEXT_BYTES>>(
+    state: *const (),
+    root_frame: usize,
+    vaddr: usize,
+    paddr: usize,
+    len: usize,
+    perm_bits: usize,
+    pool_base: usize,
+    pool_len: usize,
+) -> u32 {
+    // SAFETY: `state` is a valid `&C` (build_interface contract).
+    let cpu = unsafe { &*(state as *const C) };
+    cpu.map_range(root_frame, vaddr, paddr, len, perm_bits, pool_base, pool_len)
+}
+
 unsafe fn trampoline_now_ns<T: TimerAbstraction>(state: *const ()) -> u64 {
     // SAFETY: same contract, timer side.
     let timer = unsafe { &*(state as *const T) };
     timer.now_ns()
+}
+
+unsafe fn trampoline_arm_timer<T: TimerAbstraction>(state: *const (), deadline_ns: u64) -> bool {
+    // SAFETY: same contract as `trampoline_now_ns`.
+    let timer = unsafe { &*(state as *const T) };
+    timer.set_oneshot(deadline_ns, TimerMode::Interactive).is_ok()
+}
+
+unsafe fn trampoline_cancel_timer<T: TimerAbstraction>(state: *const ()) {
+    // SAFETY: same contract as `trampoline_now_ns`.
+    let timer = unsafe { &*(state as *const T) };
+    timer.cancel_oneshot()
 }
 
 unsafe fn trampoline_frequency_hz<T: TimerAbstraction>(state: *const ()) -> u64 {
@@ -141,9 +254,17 @@ pub struct HalInterface {
     cpu_feature_flags_bits: unsafe fn(*const ()) -> u64,
     cpu_context_switch: unsafe fn(*const (), *mut u8, *const u8),
     cpu_init_context: unsafe fn(*const (), *mut u8, usize, usize),
+    cpu_map_ram_identity: unsafe fn(*const (), usize, usize, bool),
+    cpu_activate_address_space: unsafe fn(*const (), usize),
+    cpu_flush_tlb: unsafe fn(*const ()),
+    cpu_map_range: unsafe fn(*const (), usize, usize, usize, usize, usize, usize, usize) -> u32,
     cpu_enter_user: unsafe fn(*const (), usize, usize) -> !,
+    cpu_init_user_context: unsafe fn(*const (), *mut u8, usize, usize, usize),
+    cpu_resume_user: unsafe fn(*const (), *const u8) -> !,
     timer_now_ns: unsafe fn(*const ()) -> u64,
     timer_frequency_hz: unsafe fn(*const ()) -> u64,
+    timer_arm: unsafe fn(*const (), u64) -> bool,
+    timer_cancel: unsafe fn(*const ()),
 }
 
 impl HalInterface {
@@ -208,6 +329,65 @@ impl HalInterface {
         unsafe { (self.cpu_init_context)(self.cpu_state, context.as_mut_ptr(), entry, stack_top) }
     }
 
+    /// Writes a flat identity map of the low `bytes_gib` GiB of physical
+    /// memory into the page-table root frame at `root_frame`. See
+    /// `CpuAbstraction::map_ram_identity`.
+    pub fn map_ram_identity(&self, root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        // SAFETY: produced together by `build_interface`.
+        unsafe {
+            (self.cpu_map_ram_identity)(self.cpu_state, root_frame, bytes_gib, user_accessible)
+        }
+    }
+
+    /// Activates the address space rooted at `root_frame` on this core
+    /// (loads `satp`/`CR3`/`TTBR0`). See
+    /// `CpuAbstraction::activate_address_space`.
+    pub fn activate_address_space(&self, root_frame: usize) {
+        // SAFETY: produced together by `build_interface`; the caller
+        // vouches for `root_frame` mapping current execution.
+        unsafe { (self.cpu_activate_address_space)(self.cpu_state, root_frame) }
+    }
+
+    /// Flushes this core's entire TLB / paging-structure cache. Call after
+    /// walking new entries into the live page table (e.g. servicing a
+    /// `Map` syscall). See `CpuAbstraction::flush_tlb`.
+    pub fn flush_tlb(&self) {
+        // SAFETY: produced together by `build_interface`.
+        unsafe { (self.cpu_flush_tlb)(self.cpu_state) }
+    }
+
+    /// Maps `[vaddr, vaddr+len)` -> `[paddr, ...)` at base-page
+    /// granularity in the table at `root_frame`, drawing missing table
+    /// levels from the pre-zeroed frame pool. `perm_bits`: `R=1 | W=2 |
+    /// X=4 | U=8`. Returns pool frames consumed, or `u32::MAX` on error.
+    /// See `CpuAbstraction::map_range`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn map_range(
+        &self,
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        // SAFETY: produced together by `build_interface`; the caller
+        // vouches for the frames and alignment.
+        unsafe {
+            (self.cpu_map_range)(
+                self.cpu_state,
+                root_frame,
+                vaddr,
+                paddr,
+                len,
+                perm_bits,
+                pool_base,
+                pool_len,
+            )
+        }
+    }
+
     /// One-way drop of the current core to user privilege, starting at
     /// `entry` (a `-> !` function) on `stack_top`. Never returns. See
     /// `CpuAbstraction::enter_user`.
@@ -216,6 +396,47 @@ impl HalInterface {
         // `build_interface`; `entry`/`stack_top` are the caller's to
         // vouch for.
         unsafe { (self.cpu_enter_user)(self.cpu_state, entry, stack_top) }
+    }
+
+    /// Initialises a fresh `HAL_USER_CONTEXT_BYTES` buffer so the first
+    /// `resume_user` into it enters U-mode at `entry` on `stack_top`, in
+    /// the address space rooted at physical frame `root_frame` (`0` =
+    /// keep the active one). See `CpuAbstraction::init_user_context`.
+    pub fn init_user_context(
+        &self,
+        context: &mut [u8; HAL_USER_CONTEXT_BYTES],
+        entry: usize,
+        stack_top: usize,
+        root_frame: usize,
+    ) {
+        // SAFETY: `cpu_state`/`cpu_init_user_context` were produced
+        // together by `build_interface`; `context` is
+        // `HAL_USER_CONTEXT_BYTES` long and (as a `[u8; N]` in a struct /
+        // static the caller controls) the caller keeps it 8-byte aligned.
+        unsafe {
+            (self.cpu_init_user_context)(
+                self.cpu_state,
+                context.as_mut_ptr(),
+                entry,
+                stack_top,
+                root_frame,
+            )
+        }
+    }
+
+    /// Restores `context` and returns to U-mode at its saved PC. Never
+    /// returns. See `CpuAbstraction::resume_user`.
+    ///
+    /// # Safety
+    /// As `CpuAbstraction::resume_user`: `context` must hold a valid,
+    /// resumable U-mode context for this architecture, and interrupts
+    /// must be masked on the current core.
+    pub unsafe fn resume_user(&self, context: &[u8; HAL_USER_CONTEXT_BYTES]) -> ! {
+        // SAFETY: `cpu_state`/`cpu_resume_user` were produced together by
+        // `build_interface`; the resumable-context and interrupts-masked
+        // obligations are forwarded to the caller by this method's own
+        // `# Safety` section.
+        unsafe { (self.cpu_resume_user)(self.cpu_state, context.as_ptr()) }
     }
 
     /// Current monotonic time in nanoseconds.
@@ -229,6 +450,26 @@ impl HalInterface {
     pub fn frequency_hz(&self) -> u64 {
         // SAFETY: same contract as `now_ns`.
         unsafe { (self.timer_frequency_hz)(self.timer_state) }
+    }
+
+    /// Arms the monotonic timer to raise an interrupt at absolute time
+    /// `deadline_ns` (same clock as `now_ns`). Returns `false` if the
+    /// platform timer could not be armed (deadline not in the future, or
+    /// no usable timer source). The microkernel's preemptive scheduler
+    /// uses this to bound each thread's quantum (02-Microkernel-Layer.md
+    /// §4).
+    pub fn arm_timer(&self, deadline_ns: u64) -> bool {
+        // SAFETY: `timer_state`/`timer_arm` were produced together by
+        // `build_interface`.
+        unsafe { (self.timer_arm)(self.timer_state, deadline_ns) }
+    }
+
+    /// Disarms the timer — no further timer interrupt until `arm_timer`
+    /// is called again. Used when the scheduler stops preempting (e.g.
+    /// a single runnable thread, or shutdown).
+    pub fn cancel_timer(&self) {
+        // SAFETY: same contract as `arm_timer`.
+        unsafe { (self.timer_cancel)(self.timer_state) }
     }
 }
 
@@ -262,9 +503,17 @@ where
         cpu_feature_flags_bits: trampoline_feature_flags_bits::<C>,
         cpu_context_switch: trampoline_context_switch::<C>,
         cpu_init_context: trampoline_init_context::<C>,
+        cpu_map_ram_identity: trampoline_map_ram_identity::<C>,
+        cpu_activate_address_space: trampoline_activate_address_space::<C>,
+        cpu_flush_tlb: trampoline_flush_tlb::<C>,
+        cpu_map_range: trampoline_map_range::<C>,
         cpu_enter_user: trampoline_enter_user::<C>,
+        cpu_init_user_context: trampoline_init_user_context::<C>,
+        cpu_resume_user: trampoline_resume_user::<C>,
         timer_now_ns: trampoline_now_ns::<T>,
         timer_frequency_hz: trampoline_frequency_hz::<T>,
+        timer_arm: trampoline_arm_timer::<T>,
+        timer_cancel: trampoline_cancel_timer::<T>,
     }
 }
 

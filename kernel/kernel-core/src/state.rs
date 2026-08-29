@@ -176,6 +176,14 @@ impl KernelState {
         self.tcbs.get(id.as_usize()).and_then(|s| s.as_ref())
     }
 
+    /// Element pointer of the TCB table, for `preempt.rs` to form
+    /// non-aliasing raw pointers into two distinct `Tcb::user_context`
+    /// buffers during a preemptive switch (the borrow checker cannot see
+    /// that two different indices don't overlap).
+    pub(crate) fn tcbs_mut_ptr(&mut self) -> *mut Option<Tcb> {
+        self.tcbs.as_mut_ptr()
+    }
+
     // ---- boot construction -------------------------------------
 
     /// Builds the initial kernel state from the HAL handoff.
@@ -255,6 +263,16 @@ impl KernelState {
         let holes = [
             (boot.kernel_image_phys_start, boot.kernel_image_phys_end),
             (boot.boot_reserved_phys_start, boot.boot_reserved_phys_end),
+            // Everything below where the kernel image was loaded: on
+            // RISC-V/QEMU this is the OpenSBI firmware, which is PMP-
+            // protected against S/U access — handing it out as
+            // `UntypedMemory` produces access faults the moment anything
+            // touches it. On UEFI targets this conservatively drops a
+            // few MiB of low RAM, which is acceptable for the MVP.
+            // TODO(omid): have the HAL memory discovery classify the
+            // firmware region as `Reserved` so this blanket hole is
+            // unnecessary.
+            (0, boot.kernel_image_phys_start),
         ];
         let page = kernel_mm::PAGE_SIZE as u64;
         let manifest = &boot.hardware_manifest;

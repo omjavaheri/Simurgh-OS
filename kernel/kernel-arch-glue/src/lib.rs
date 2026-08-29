@@ -42,7 +42,7 @@
 use core::fmt::Arguments;
 use hal_core::{BootInfo, HalInterface, MapPermissions, VirtAddr};
 use kernel_cap::{CapId, CapabilityRights, ThreadId};
-use kernel_core::{KernelInitError, KernelState, SyscallOp, SyscallReturn, ThreadState};
+use kernel_core::{KernelInitError, KernelState, PreemptStep, SyscallOp, SyscallReturn, ThreadState};
 use kernel_ipc::SmallMessage;
 use kernel_mm::KernelObjectType;
 
@@ -57,18 +57,82 @@ pub const THREAD_STACK_SIZE: usize = 64 * 1024;
 struct Aligned([u8; THREAD_STACK_SIZE]);
 
 // Single-core boot scratch. Written once before the corresponding switch,
-// read on the other stack.
-static mut ROOT_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
+// read on the other stack. (The U-mode Root Task's own stack is
+// `.user_stack` in the final binary, not here — see `UserImage`.)
 static mut THREAD2_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
+static mut THREAD3_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut G_STATE: *mut KernelState = core::ptr::null_mut();
 static mut G_HAL: *const HalInterface = core::ptr::null();
 static mut G_LOG: Option<fn(Arguments<'_>)> = None;
+// The Root Task's live page-table root and a pre-zeroed pool of frames for
+// `map_range` to draw missing L1/L0 tables from when a `Map` syscall adds a
+// page at runtime. Set once by `enter` after paging is activated; consumed
+// by `map_user_page`. `G_MAP_POOL_USED` is the pool high-water mark.
+static mut G_ROOT_PT: usize = 0;
+static mut G_MAP_POOL: usize = 0;
+static mut G_MAP_POOL_LEN: usize = 0;
+static mut G_MAP_POOL_USED: usize = 0;
 // Set by `root_task_main` before it starts thread 2, so `thread2_main`
 // knows its own thread id, the endpoint capability to `Send` on, and the
-// Root Task's thread id to hand control back to.
+// Root Task's thread id to hand control back to. `G_T3` is the same idea
+// for the §8.3 benchmark thread (`bench_thread_main`), started later on
+// the same endpoint/root — `G_EP`/`G_ROOT` are reused unchanged.
 static mut G_T2: u32 = 0;
+static mut G_T3: u32 = 0;
 static mut G_EP: u32 = 0;
 static mut G_ROOT: u32 = 0;
+
+/// Iterations for the `§8.3` IPC round-trip micro-benchmark below. Kept
+/// small enough that a QEMU/TCG boot (which single-steps every
+/// instruction, unlike real silicon) finishes in a reasonable time, while
+/// still large enough to average out the first couple of iterations'
+/// cold-cache noise.
+const IPC_BENCH_ITERATIONS: u32 = 200;
+
+// ---------------------------------------------------------------------------
+// Two-process proof (02-Microkernel-Layer.md §8.4 zero-copy + §4 preemption).
+//
+// `enter` builds a SECOND, fully isolated Sv39 address space with its own
+// U-mode thread (a real `kernel-core` TCB — its saved U-mode context lives
+// in `Tcb::user_context`, and `kernel-sched` round-robins the two), and
+// maps ONE physical frame into both spaces at different virtual addresses.
+// First a cooperative round-trip (`P2_YIELD` ecall) proves the frame is
+// genuinely shared with no copy across the MMU boundary; then
+// `P2_PREEMPT_START` arms the timer and the two threads run counting loops
+// switched by the timer interrupt alone (`p2_tick` -> `KernelState::
+// preempt_tick`).
+// ---------------------------------------------------------------------------
+
+/// Physical frame shared by both address spaces.
+static mut P2_SHARED_PHYS: usize = 0;
+/// Virtual address the shared frame is mapped at in space A / space B.
+static mut P2_VA_A: usize = 0;
+static mut P2_VA_B: usize = 0;
+/// What process B reported reading through its VA (set by `p2_report_b`).
+static mut P2_B_SAW: usize = 0;
+/// Supervisor-timer ticks seen since `p2_preempt_start` armed the timer.
+static mut P2_TICKS: u32 = 0;
+
+/// The sentinel process A writes before the first hand-off, and the one
+/// process B writes back. Kept here so the kernel-side cross-check and
+/// the U-mode `sw` immediates cannot drift (the U-mode code hard-codes
+/// the same values as bare immediates — see `kernel/src/main.rs`).
+const P2_A_SENTINEL: usize = 0xC0DE;
+const P2_B_SENTINEL: usize = 0xB00B;
+
+/// Per-thread quantum for the preemption demo. 2 ms at QEMU virt's
+/// 10 MHz timebase is 20 000 ticks — long enough that each process's
+/// counting loop makes visible progress, short enough that the whole
+/// demo finishes well inside a QEMU smoke run.
+const P2_QUANTUM_NS: u64 = 2_000_000;
+/// Stop preempting after this many ticks and report. Both counters
+/// non-zero proves both processes ran with NO cooperative `P2_YIELD`.
+const P2_TICK_BUDGET: u32 = 40;
+/// Byte offsets into the shared frame each process bumps in its counting
+/// loop — distinct words (the frame is ONE physical page aliased into
+/// both spaces), clear of the `0`/`4` area the §8.4 round-trip used.
+const P2_COUNTER_A_OFF: usize = 8;
+const P2_COUNTER_B_OFF: usize = 12;
 
 /// Routes a formatted line to the logger the boot binary installed via
 /// `build`. A no-op if none was installed. Used by `klog!`.
@@ -154,15 +218,59 @@ pub fn build(
     Ok((report, state))
 }
 
+/// Where the final binary's user (layer-3) Root Task image lives: its
+/// `.user_text` and `.user_stack` regions, each as a `(vma, lma, len)`
+/// triple (linked for a virtual address, loaded at a physical address
+/// inside the kernel image), plus the U-mode entry point's virtual
+/// address. `enter` maps these `U=1` and drops to U-mode under paging.
+/// `EMPTY` (all zero) means "this architecture has no user image yet" —
+/// `enter` then just parks after the in-kernel demo.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserImage {
+    /// `.user_text` virtual base.
+    pub text_vma: usize,
+    /// `.user_text` physical (load) base.
+    pub text_lma: usize,
+    /// `.user_text` byte length.
+    pub text_len: usize,
+    /// `.user_stack` virtual base.
+    pub stack_vma: usize,
+    /// `.user_stack` physical (load) base.
+    pub stack_lma: usize,
+    /// `.user_stack` byte length.
+    pub stack_len: usize,
+    /// Virtual address to begin U-mode execution at (inside `.user_text`).
+    pub entry_vma: usize,
+    /// Virtual address of the SECOND process's entry point (also inside
+    /// `.user_text` — the two U-mode threads share the same code pages,
+    /// different stacks and address spaces). `0` = no second process on
+    /// this architecture, so `enter` runs only the single-process path.
+    pub worker_entry_vma: usize,
+}
+
+impl UserImage {
+    /// No user image (non-riscv64 for now).
+    pub const EMPTY: Self = Self {
+        text_vma: 0,
+        text_lma: 0,
+        text_len: 0,
+        stack_vma: 0,
+        stack_lma: 0,
+        stack_len: 0,
+        entry_vma: 0,
+        worker_entry_vma: 0,
+    };
+}
+
 /// Runs the boot sequence and never returns:
 ///   1. stash the kernel-state / HAL pointers for later syscall handling;
 ///   2. run `inkernel_demo` (the in-kernel §8.1/§8.2/§8.5 milestones —
-///      still direct `dispatch` + `context_switch`, same privilege);
-///   3. drop the Root Task to U-mode at `umode_root_entry` via
-///      `HalInterface::enter_user`. From that point the Root Task is a
-///      real layer-3 process reaching the kernel only through `ecall`,
-///      routed to the `simurgh_syscall` symbol the final binary provides.
-pub fn enter(hal: &HalInterface, state: &'static mut KernelState, umode_root_entry: usize) -> ! {
+///      direct `dispatch` + `context_switch`, same privilege);
+///   3. if a `user` image is present: build an Sv39 page table (kernel
+///      identity `U=0`, the `.user_*` pages `U=1`), activate paging, and
+///      drop the Root Task to U-mode. From there it is a real, MMU-
+///      isolated layer-3 process reaching the kernel only through `ecall`.
+pub fn enter(hal: &HalInterface, state: &'static mut KernelState, user: UserImage) -> ! {
     // SAFETY: single-core boot, called once, right after `build`.
     unsafe {
         core::ptr::addr_of_mut!(G_STATE).write(state as *mut KernelState);
@@ -171,14 +279,430 @@ pub fn enter(hal: &HalInterface, state: &'static mut KernelState, umode_root_ent
 
     inkernel_demo(state, hal);
 
-    let stack_top = (core::ptr::addr_of!(ROOT_STACK) as usize + THREAD_STACK_SIZE) & !0xF;
+    if user.text_len == 0 {
+        klog!("no user image for this architecture yet - halting after the in-kernel demo\r\n");
+        park();
+    }
+
     let root = state.root_thread;
     if let Some(tcb) = state.tcb_mut(root) {
-        tcb.entry = VirtAddr::new(umode_root_entry);
+        tcb.entry = VirtAddr::new(user.entry_vma);
         tcb.state = ThreadState::Runnable;
     }
-    klog!("--- dropping Root Task to U-mode (entry {:#x}) ---\r\n", umode_root_entry);
-    hal.enter_user(umode_root_entry, stack_top)
+
+    // Build the Root Task's address space (must run AFTER `inkernel_demo`,
+    // whose context switches carry satp == 0):
+    //   - kernel RAM/MMIO: the low 3 GiB, 1 GiB identity leaves, U = 0
+    //     (S-mode executes the trap handler / drivers; U-mode cannot).
+    //   - `.user_text`: `U=1 R+X` at its linked VMA (an otherwise-empty
+    //     Sv39 GiB slot, so `map_range` needs no superpage split).
+    //   - `.user_stack`: `U=1 R+W`.
+    // Then activate paging and drop to U-mode WITHOUT deactivating — the
+    // Root Task runs isolated.
+    let root_pt = state
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096).ok());
+    let pool = state
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * POOL_FRAMES as u64).ok());
+    // (POOL_FRAMES is usize; `as u64` above for the allocator API.)
+
+    let (root_pt, pool) = match (root_pt, pool) {
+        (Some(r), Some(p)) => (r.as_usize(), p.as_usize()),
+        _ => {
+            klog!("could not allocate page-table frames - halting\r\n");
+            park();
+        }
+    };
+    // A second, larger pool the runtime `Map` syscall path draws from
+    // (see `map_user_page`) — kept separate from the boot-time `pool`
+    // above so a later `Map` can never trip over the boot mapping's
+    // bookkeeping.
+    let map_pool = state
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 8).ok());
+    let map_pool = match map_pool {
+        Some(p) => p.as_usize(),
+        None => {
+            klog!("could not allocate the runtime Map pool - halting\r\n");
+            park();
+        }
+    };
+    // SAFETY: `pool` / `map_pool` are fresh untyped RAM in the identity-
+    // mapped low RAM; single-core; `map_range` requires them pre-zeroed.
+    unsafe {
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * POOL_FRAMES);
+        core::ptr::write_bytes(map_pool as *mut u8, 0, 4096 * 8);
+    }
+
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let user_sp = (user.stack_vma + user.stack_len) & !0xF;
+
+    // ---- Space A (the Root Task): kernel identity U=0, user image U=1 ----
+    hal.map_ram_identity(root_pt, 3, false);
+    // R=1 W=2 X=4 U=8.
+    let n1 = hal.map_range(
+        root_pt,
+        user.text_vma,
+        user.text_lma,
+        round4k(user.text_len),
+        1 | 4 | 8,
+        pool,
+        POOL_FRAMES as usize,
+    );
+    let n2 = if n1 == u32::MAX {
+        u32::MAX
+    } else {
+        hal.map_range(
+            root_pt,
+            user.stack_vma,
+            user.stack_lma,
+            round4k(user.stack_len),
+            1 | 2 | 8,
+            pool + (n1 as usize) * 4096,
+            POOL_FRAMES as usize - n1 as usize,
+        )
+    };
+    if n1 == u32::MAX || n2 == u32::MAX {
+        klog!("failed to map the user image (map_range error) - halting\r\n");
+        park();
+    }
+    let used_a = n1 + n2;
+
+    // ---- Space B (the second process), if this architecture has one ----
+    // Build a fully isolated Sv39 space with its own stack, sharing only
+    // ONE physical frame with space A (mapped at a different VA in each),
+    // then run BOTH via cooperative hand-off (02-Microkernel-Layer.md §8.4).
+    if user.worker_entry_vma != 0
+        && setup_two_process(hal, state, &user, root_pt, pool, used_a, user_sp)
+    {
+        hal.activate_address_space(root_pt);
+        // SAFETY: single-core boot; written once, before any syscall runs.
+        unsafe {
+            core::ptr::addr_of_mut!(G_ROOT_PT).write(root_pt);
+            core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
+            core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
+        }
+        // The Root Task's `Tcb::user_context` was filled by
+        // `init_user_thread` in `setup_two_process` and it is the
+        // scheduler's `running` thread. Resume it in U-mode.
+        let ctx_a = state
+            .user_context_bytes(state.root_thread)
+            .expect("root TCB present");
+        // SAFETY: a valid, resumable U-mode context; interrupts are
+        // masked (never enabled in S-mode on this core). Never returns.
+        unsafe { hal.resume_user(ctx_a) }
+    }
+
+    // ---- Single-process fallback (unchanged behaviour) ----
+    hal.activate_address_space(root_pt);
+    // SAFETY: single-core boot; written once here, before any syscall can
+    // run, and only read afterwards.
+    unsafe {
+        core::ptr::addr_of_mut!(G_ROOT_PT).write(root_pt);
+        core::ptr::addr_of_mut!(G_MAP_POOL).write(map_pool);
+        core::ptr::addr_of_mut!(G_MAP_POOL_LEN).write(8);
+    }
+    klog!(
+        "--- Sv39 paging active; dropping Root Task to U-mode (entry {:#x}, sp {:#x}, isolated on U=1 pages) ---\r\n",
+        user.entry_vma,
+        user_sp
+    );
+    hal.enter_user(user.entry_vma, user_sp)
+}
+
+/// Frames reserved for the boot-time `map_range` page-table pool (space A):
+/// one L1 + one L0 for the user image, with headroom for the shared-frame
+/// leaf and future growth.
+const POOL_FRAMES: usize = 8;
+
+/// Virtual addresses used by the two-process proof. `.user_text` is linked
+/// at 0xC000_0000 and `.user_stack` just above it, so everything below
+/// stays inside the same (already-a-page-table, not a superpage) Sv39 GiB
+/// slot — `map_range` needs no superpage split for any of them.
+const P2_STACK_B_VMA: usize = 0xC010_0000;
+const P2_STACK_B_LEN: usize = 4096 * 4;
+const P2_VA_A_CONST: usize = 0xC004_0000;
+const P2_VA_B_CONST: usize = 0xC020_0000;
+
+/// Builds address space B, maps the shared frame into both spaces, gives
+/// the second process a real `kernel-core` TCB (its `user_context`
+/// seeded, admitted to `kernel-sched`), and seeds the Root Task's TCB the
+/// same way. Returns `false` (and logs) if untyped RAM, the page-table
+/// pool, or a kernel table runs out — the caller then falls back to the
+/// single-process path. On `true` the Root Task is the scheduler's
+/// `running` thread and the caller may `resume_user` its `user_context`.
+fn setup_two_process(
+    hal: &HalInterface,
+    state: &mut KernelState,
+    user: &UserImage,
+    root_pt: usize,
+    pool_a: usize,
+    used_a: u32,
+    user_sp_a: usize,
+) -> bool {
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let carve = |st: &mut KernelState, bytes: u64| {
+        st.untyped_mut(kernel_cap::UntypedId::new(0))
+            .and_then(|u| u.alloc(4096, bytes).ok())
+            .map(|p| p.as_usize())
+    };
+
+    let (shared, root_pt_b, pool_b, stack_b) = match (
+        carve(state, 4096),
+        carve(state, 4096),
+        carve(state, 4096 * 8),
+        carve(state, P2_STACK_B_LEN as u64),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => {
+            klog!("two-process proof: out of untyped RAM - single-process path\r\n");
+            return false;
+        }
+    };
+
+    // SAFETY: all four regions are fresh untyped RAM, identity-addressable
+    // (paging not yet active on space B); single-core. `map_range` needs
+    // the pool pre-zeroed; the shared frame starts clean too.
+    unsafe {
+        core::ptr::write_bytes(pool_b as *mut u8, 0, 4096 * 8);
+        core::ptr::write_bytes(shared as *mut u8, 0, 4096);
+    }
+
+    // Shared frame into space A (uses the remaining space-A pool).
+    let sa = hal.map_range(
+        root_pt,
+        P2_VA_A_CONST,
+        shared,
+        4096,
+        1 | 2 | 8,
+        pool_a + used_a as usize * 4096,
+        POOL_FRAMES as usize - used_a as usize,
+    );
+
+    // Space B: kernel identity U=0, then user text / its own stack / the
+    // shared frame, all U=1.
+    hal.map_ram_identity(root_pt_b, 3, false);
+    let mut ub = 0u32;
+    let step = |vaddr, paddr, len, perm, ub: &mut u32| -> bool {
+        let n = hal.map_range(
+            root_pt_b,
+            vaddr,
+            paddr,
+            len,
+            perm,
+            pool_b + *ub as usize * 4096,
+            8 - *ub as usize,
+        );
+        if n == u32::MAX {
+            false
+        } else {
+            *ub += n;
+            true
+        }
+    };
+    let ok = sa != u32::MAX
+        && step(user.text_vma, user.text_lma, round4k(user.text_len), 1 | 4 | 8, &mut ub)
+        && step(P2_STACK_B_VMA, stack_b, P2_STACK_B_LEN, 1 | 2 | 8, &mut ub)
+        && step(P2_VA_B_CONST, shared, 4096, 1 | 2 | 8, &mut ub);
+    if !ok {
+        klog!("two-process proof: map_range error - single-process path\r\n");
+        return false;
+    }
+
+    let stack_b_top = (P2_STACK_B_VMA + P2_STACK_B_LEN) & !0xF;
+
+    // Process A = the Root Task (already admitted at boot; `init_user_thread`
+    // just seeds its `user_context` and refreshes it `Ready`). Process B =
+    // a fresh TCB bound to space B.
+    let root = state.root_thread;
+    state.init_user_thread(root, user.entry_vma, user_sp_a, root_pt, hal);
+
+    let worker_as = match state.alloc_addr_space(root_pt_b as u64) {
+        Some(a) => a,
+        None => {
+            klog!("two-process proof: no address-space slot - single-process path\r\n");
+            return false;
+        }
+    };
+    let worker_tid = match state.alloc_tcb(state.root_cap_space, worker_as) {
+        Some(t) => t,
+        None => {
+            klog!("two-process proof: no TCB slot - single-process path\r\n");
+            return false;
+        }
+    };
+    state.init_user_thread(
+        worker_tid,
+        user.worker_entry_vma,
+        stack_b_top,
+        root_pt_b,
+        hal,
+    );
+
+    // Make the Root Task the scheduler's running thread, so the first
+    // `preempt_tick` (or cooperative `P2_YIELD`) has it as `outgoing`.
+    let _ = state.sched.dispatch(root, hal.now_ns());
+
+    // SAFETY: single-core boot; written once, before any syscall.
+    unsafe {
+        core::ptr::addr_of_mut!(P2_SHARED_PHYS).write(shared);
+        core::ptr::addr_of_mut!(P2_VA_A).write(P2_VA_A_CONST);
+        core::ptr::addr_of_mut!(P2_VA_B).write(P2_VA_B_CONST);
+    }
+
+    klog!(
+        "--- Sv39 paging active; two isolated U-mode processes (tids {} / {}); shared frame {:#x} at VA {:#x} (A) / {:#x} (B) ---\r\n",
+        root.as_u32(),
+        worker_tid.as_u32(),
+        shared,
+        P2_VA_A_CONST,
+        P2_VA_B_CONST
+    );
+    true
+}
+
+/// Called by the riscv64 syscall handler when a process makes a
+/// `P2_YIELD` `ecall` (the cooperative §8.4 phase, before the timer is
+/// armed). A voluntary yield is just a scheduler tick with no timer
+/// involved: `KernelState::preempt_tick` charges the caller and picks the
+/// other runnable thread. Returns `Some((save, into))` for
+/// `TrapOutcome::SwitchTo`, or `None` (→ `Resume`) if there is no other
+/// thread to run.
+pub fn p2_yield() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    match k.cooperative_yield(hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
+    }
+}
+
+/// `P2_REPORT` from process B: it read `value` through its own mapping of
+/// the shared frame (which A wrote before the first hand-off).
+pub fn p2_report_b(value: usize) {
+    // SAFETY: single-core; `P2_*` set once by `setup_two_process`.
+    let (phys, va_b) = unsafe {
+        (
+            core::ptr::addr_of!(P2_SHARED_PHYS).read(),
+            core::ptr::addr_of!(P2_VA_B).read(),
+        )
+    };
+    // SAFETY: `phys` is identity-mapped U=0 in the live space; single-core.
+    let kernel_view = unsafe { core::ptr::read_volatile(phys as *const u32) as usize };
+    // SAFETY: single-core; only written here, read by `p2_report_a`.
+    unsafe { core::ptr::addr_of_mut!(P2_B_SAW).write(value) };
+    klog!(
+        "process B (space B, VA {:#x}): read {:#x} from the shared frame; kernel sees {:#x} at PA {:#x} ({})\r\n",
+        va_b,
+        value,
+        kernel_view,
+        phys,
+        if value == P2_A_SENTINEL && kernel_view == P2_A_SENTINEL {
+            "A's write crossed the isolation boundary"
+        } else {
+            "MISMATCH"
+        }
+    );
+}
+
+/// `P2_REPORT` from process A after B ran: it re-read `value` through its
+/// own mapping and should now see B's write. Logs the final verdict.
+pub fn p2_report_a(value: usize) {
+    // SAFETY: single-core; `P2_*` set once by `setup_two_process`.
+    let (phys, va_a, b_saw) = unsafe {
+        (
+            core::ptr::addr_of!(P2_SHARED_PHYS).read(),
+            core::ptr::addr_of!(P2_VA_A).read(),
+            core::ptr::addr_of!(P2_B_SAW).read(),
+        )
+    };
+    // SAFETY: `phys` is identity-mapped U=0 in the live space; single-core.
+    let kernel_view = unsafe { core::ptr::read_volatile(phys as *const u32) as usize };
+    let pass = b_saw == P2_A_SENTINEL && value == P2_B_SENTINEL && kernel_view == P2_B_SENTINEL;
+    klog!(
+        "process A (space A, VA {:#x}): re-read {:#x}; kernel sees {:#x} at PA {:#x} -> {}\r\n",
+        va_a,
+        value,
+        kernel_view,
+        phys,
+        if pass {
+            "TWO-PROCESS ZERO-COPY: A->B->A round-trip through one shared frame, no copy, MMU-isolated spaces (02 8.4)"
+        } else {
+            "MISMATCH"
+        }
+    );
+}
+
+/// `P2_PREEMPT_START` from process A: the cooperative §8.4 round-trip is
+/// done; arm the supervisor timer so from here the two processes are
+/// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an explicit
+/// `P2_YIELD`. The worker's `Tcb::user_context` already holds it
+/// suspended just after its own `P2_YIELD` (the head of its counting
+/// loop) and it is `Ready` in `kernel-sched`, so the first tick's
+/// `preempt_tick` switches straight into it.
+pub fn p2_preempt_start() {
+    // SAFETY: single-core; `G_HAL` was set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    // SAFETY: single-core; only reset here, before the first tick.
+    unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(0) };
+    let armed = hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+    klog!(
+        "process A: cooperative round-trip done - arming preemptive timer (quantum {} ns, armed: {}); NO more P2_YIELD from here\r\n",
+        P2_QUANTUM_NS,
+        armed
+    );
+}
+
+/// Preemptive-scheduler tick (registered as the arch `TickHandler`).
+/// Round-robins between the two U-mode processes on every supervisor
+/// timer interrupt, re-arming the next deadline. After `P2_TICK_BUDGET`
+/// ticks it reads both processes' private counters out of the shared
+/// frame, logs the verdict, disarms the timer and stops preempting
+/// (`None`) — the running process then keeps its loop and QEMU stays up
+/// for the smoke grep.
+///
+/// Returns `Some((save, into))` to switch (the trap vector snapshots the
+/// preempted thread into `save` and resumes `into`), or `None` to let it
+/// keep running.
+pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter`; `P2_TICKS` / `P2_*`
+    // touched only from this path and the one-time setup.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let ticks = unsafe { core::ptr::addr_of!(P2_TICKS).read() } + 1;
+    unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(ticks) };
+
+    if ticks >= P2_TICK_BUDGET {
+        hal.cancel_timer();
+        let phys = unsafe { core::ptr::addr_of!(P2_SHARED_PHYS).read() };
+        // SAFETY: `phys` is identity-mapped U=0 in the live space.
+        let (a, b) = unsafe {
+            (
+                core::ptr::read_volatile((phys + P2_COUNTER_A_OFF) as *const u32),
+                core::ptr::read_volatile((phys + P2_COUNTER_B_OFF) as *const u32),
+            )
+        };
+        klog!(
+            "preemption: {} timer ticks, NO P2_YIELD - process A's counter = {}, process B's counter = {} -> {}\r\n",
+            ticks,
+            a,
+            b,
+            if a > 0 && b > 0 {
+                "PREEMPTIVE TWO-PROCESS SCHEDULING (02 4): both ran, timer-driven"
+            } else {
+                "MISMATCH"
+            }
+        );
+        return None;
+    }
+
+    hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+    let k = kstate();
+    match k.preempt_tick(hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
+    }
 }
 
 /// Busy-park forever. The in-kernel demo threads have nothing to return
@@ -204,6 +728,55 @@ pub fn kstate() -> &'static mut KernelState {
 pub fn khal() -> &'static HalInterface {
     // SAFETY: `G_HAL` is set by `enter` before any thread runs.
     unsafe { &*core::ptr::addr_of!(G_HAL).read() }
+}
+
+/// Installs one 4 KiB mapping `vaddr -> paddr` (`perm_bits` = `R1 | W2 |
+/// X4 | U8`) into the Root Task's **live** page table, drawing any missing
+/// intermediate table from the runtime pool `enter` reserved, then flushes
+/// the TLB. Returns `false` if `enter` never ran the paging path, the pool
+/// is exhausted, or `map_range` rejects the request (misaligned, or a
+/// superpage leaf already covers the VA).
+///
+/// The final binary's `Map` syscall arm calls this from the S-mode trap
+/// handler — where every page-table frame it walks is in the identity-
+/// mapped low RAM, so the walk is valid even though paging is now active.
+/// This is the mechanism side of 02-Microkernel-Layer.md §6; the software
+/// `AddressSpace` model is updated separately by the caller so `Translate`
+/// still answers.
+pub fn map_user_page(hal: &HalInterface, vaddr: usize, paddr: usize, perm_bits: usize) -> bool {
+    // SAFETY: single-core; these globals are set once by `enter` before
+    // any syscall can run, and only mutated here (the pool high-water
+    // mark) from that same single-core syscall path.
+    let (root_pt, pool, pool_len, used) = unsafe {
+        (
+            core::ptr::addr_of!(G_ROOT_PT).read(),
+            core::ptr::addr_of!(G_MAP_POOL).read(),
+            core::ptr::addr_of!(G_MAP_POOL_LEN).read(),
+            core::ptr::addr_of!(G_MAP_POOL_USED).read(),
+        )
+    };
+    if root_pt == 0 || used >= pool_len {
+        return false;
+    }
+    let consumed = hal.map_range(
+        root_pt,
+        vaddr,
+        paddr,
+        4096,
+        perm_bits,
+        pool + used * 4096,
+        pool_len - used,
+    );
+    if consumed == u32::MAX {
+        return false;
+    }
+    // SAFETY: see the contract above — single-core advance of a pool
+    // high-water mark only this function touches.
+    unsafe {
+        core::ptr::addr_of_mut!(G_MAP_POOL_USED).write(used + consumed as usize);
+    }
+    hal.flush_tlb();
+    true
 }
 
 /// The in-kernel milestone demo (02-Microkernel-Layer.md §8.1 / §8.2 /
@@ -351,11 +924,81 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
 
     klog!("root task: 8.2 milestone - 2nd thread + synchronous IPC round-trip complete\r\n");
 
-    // 6. Shared-memory groundwork (02-Microkernel-Layer.md §5.2 / §8.4):
+    // 5b. IPC round-trip micro-benchmark (02-Microkernel-Layer.md §8.3
+    //     acceptance harness: "ipc_call fast-path < 500 ns on reference
+    //     hardware"). A dedicated thread 3 sends `IPC_BENCH_ITERATIONS`
+    //     messages, one per round trip; the Root Task times each Recv +
+    //     yield_to(t3) + (t3's Send + yield_to back) cycle via
+    //     `hal.now_ns()`. This measures the CURRENT general dispatch +
+    //     full `context_switch` path — the L4-style register-only fast
+    //     path `kernel_ipc::fastpath` describes needs a HAL primitive
+    //     (partial context switch preserving message registers) that does
+    //     not exist yet, so this is an honest baseline / harness (Phase D6
+    //     of IMPLEMENTATION-PLAN.md), not the tuned <500ns number itself —
+    //     labelled as such in the log line below.
+    let t3_cap = match k.dispatch(
+        root,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::ThreadControlBlock,
+            count: 1,
+        },
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => Some(cap),
+        other => {
+            klog!("root task: bench TCB Retype failed: {:?} - skipping §8.3 benchmark\r\n", other);
+            None
+        }
+    };
+    if let Some(t3_cap) = t3_cap {
+        let t3 = {
+            let cs = k.root_cap_space;
+            let id = k
+                .cap_space(cs)
+                .and_then(|t| t.lookup(t3_cap))
+                .map(|c| c.object.id.as_u32())
+                .expect("bench thread TCB cap resolves");
+            ThreadId::new(id)
+        };
+        let t3_stack_top =
+            (core::ptr::addr_of!(THREAD3_STACK) as usize + THREAD_STACK_SIZE) & !0xF;
+        // SAFETY: single-core; written before `start_thread` makes thread 3
+        // runnable, read only by `bench_thread_main`. G_EP/G_ROOT are
+        // unchanged from thread 2's setup above (same endpoint, same root).
+        unsafe { core::ptr::addr_of_mut!(G_T3).write(t3.as_u32()) };
+        k.start_thread(t3, bench_thread_main as usize, t3_stack_top, hal);
+
+        let (mut min_ns, mut max_ns, mut sum_ns) = (u64::MAX, 0u64, 0u64);
+        for _ in 0..IPC_BENCH_ITERATIONS {
+            let t0 = hal.now_ns();
+            match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }) {
+                Ok(SyscallReturn::Reschedule { next: Some(n) }) => k.yield_to(root, n, hal),
+                other => {
+                    klog!("root task: bench Recv unexpected: {:?}\r\n", other);
+                    break;
+                }
+            }
+            let dt = hal.now_ns().saturating_sub(t0);
+            min_ns = min_ns.min(dt);
+            max_ns = max_ns.max(dt);
+            sum_ns += dt;
+            let _ = k.tcb_mut(root).and_then(|t| t.pending_msg.take());
+        }
+        let avg_ns = sum_ns / IPC_BENCH_ITERATIONS as u64;
+        klog!(
+            "root task: ipc round-trip benchmark (02 8.3, {} iters, general dispatch path - NOT the L4 fast path) - min {} ns, avg {} ns, max {} ns\r\n",
+            IPC_BENCH_ITERATIONS,
+            min_ns,
+            avg_ns,
+            max_ns
+        );
+    }
+
+    // 6. Shared-memory model (02-Microkernel-Layer.md §5.2 / §8.4):
     //    alias ONE physical frame at two virtual addresses in the Root
     //    Task's address space and confirm both translate to it. This is
-    //    the aliasing structure zero-copy shared memory needs; hardware-
-    //    enforced cross-process zero-copy still awaits active page tables.
+    //    the software-model view; step 7 does the same thing in hardware.
     let frame_cap = match k.dispatch(
         root,
         hal.now_ns(),
@@ -397,6 +1040,91 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
             p1.is_some() && p1 == p2
         );
     }
+
+    // 7. The same aliasing, MMU-enforced across TWO separate Sv39 address
+    //    spaces (02-Microkernel-Layer.md §8.4). Build two independent root
+    //    page tables, each with its own low-3 GiB kernel identity map (so
+    //    S-mode keeps executing across the `satp` swaps) plus the shared
+    //    frame at a DIFFERENT virtual address in each. Then: write through
+    //    space A's VA, switch to space B, read it back through B's VA,
+    //    write a new value, switch back to A, read that. If both crossings
+    //    see the other space's write, the frame is genuinely shared with
+    //    no copy. Runs here with paging still off (`satp == 0`), so
+    //    `map_range`'s physical pointers are directly addressable; the
+    //    final `activate_address_space(0)` returns to Bare mode before
+    //    `enter` builds the real Root Task space.
+    //
+    //    This is the kernel-mechanism half of "two processes share memory
+    //    zero-copy"; running two U-mode threads concurrently in spaces A
+    //    and B additionally needs a context-switch primitive that can
+    //    resume a user context (tracked in IMPLEMENTATION-PLAN.md).
+    let two_space = (|| {
+        let uid = || kernel_cap::UntypedId::new(0);
+        let sp_a = k.untyped_mut(uid())?.alloc(4096, 4096).ok()?.as_usize();
+        let sp_b = k.untyped_mut(uid())?.alloc(4096, 4096).ok()?.as_usize();
+        let pool = k.untyped_mut(uid())?.alloc(4096, 4096 * 4).ok()?.as_usize();
+        Some((sp_a, sp_b, pool))
+    })();
+    let (sp_a, sp_b, pool) = match two_space {
+        Some(v) => v,
+        None => {
+            klog!("root task: two-address-space proof skipped (no untyped left)\r\n");
+            return;
+        }
+    };
+    // SAFETY: `pool` is fresh untyped RAM, identity-addressable with
+    // paging off; single-core; `map_range` requires it pre-zeroed.
+    unsafe {
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 4);
+    }
+    let phys = frame_phys.as_usize();
+    let (va_a, va_b) = (0xE000_0000usize, 0xF000_0000usize);
+    hal.map_ram_identity(sp_a, 3, false);
+    hal.map_ram_identity(sp_b, 3, false);
+    let n_a = hal.map_range(sp_a, va_a, phys, 4096, 1 | 2, pool, 4);
+    let n_b = if n_a == u32::MAX {
+        u32::MAX
+    } else {
+        hal.map_range(sp_b, va_b, phys, 4096, 1 | 2, pool + (n_a as usize) * 4096, 4 - n_a as usize)
+    };
+    if n_a == u32::MAX || n_b == u32::MAX {
+        klog!("root task: two-address-space proof skipped (map_range unsupported on this arch)\r\n");
+        return;
+    }
+    // SAFETY: after each `activate_address_space`, `va_a` (in space A) /
+    // `va_b` (in space B) map the shared frame `R+W`; the kernel's own
+    // code/stack stay valid via each table's identity map. Single-core,
+    // no other reference to the frame is live. `flush_tlb` after every
+    // write makes the next crossing observe it.
+    let (seen_in_b, seen_in_a) = unsafe {
+        hal.activate_address_space(sp_a);
+        core::ptr::write_volatile(va_a as *mut u32, 0xA1A1);
+        hal.flush_tlb();
+
+        hal.activate_address_space(sp_b);
+        let b = core::ptr::read_volatile(va_b as *const u32);
+        core::ptr::write_volatile(va_b as *mut u32, 0xB2B2);
+        hal.flush_tlb();
+
+        hal.activate_address_space(sp_a);
+        let a = core::ptr::read_volatile(va_a as *const u32);
+
+        hal.activate_address_space(0); // back to Bare mode for `enter`
+        (b, a)
+    };
+    klog!(
+        "root task: two Sv39 spaces - frame {:#x} at VA {:#x} (A) / {:#x} (B); A wrote 0xa1a1, B read {:#x}, B wrote 0xb2b2, A read {:#x} -> {}\r\n",
+        phys,
+        va_a,
+        va_b,
+        seen_in_b,
+        seen_in_a,
+        if seen_in_b == 0xA1A1 && seen_in_a == 0xB2B2 {
+            "ZERO-COPY ACROSS ISOLATED SPACES"
+        } else {
+            "MISMATCH"
+        }
+    );
 }
 
 /// The second thread's entry point (runs on `THREAD2_STACK`). Sends one
@@ -421,7 +1149,54 @@ extern "C" fn thread2_main() -> ! {
     }
 
     klog!("thread 2: done - handing control back to the Root Task\r\n");
+    // Mark ourselves Exited and drop out of the scheduler BEFORE the final
+    // yield_to. `yield_to` only re-admits an outgoing thread to `Ready` if
+    // the scheduler still finds it `Running` — thread 2 never runs dispatch
+    // again after this point (it just parks), so without this it would sit
+    // forever as a phantom `Ready` entity that a later `pick_next` (e.g.
+    // the §8.3 benchmark below) could select, switching into a thread that
+    // can only spin — hanging the kernel.
+    if let Some(t) = k.tcb_mut(me) {
+        t.state = kernel_core::ThreadState::Exited;
+    }
+    k.sched.remove(me);
     k.yield_to(me, root, hal);
+    park();
+}
+
+/// The `02-Microkernel-Layer.md §8.3` IPC round-trip benchmark's second
+/// thread (runs on `THREAD3_STACK`): sends `IPC_BENCH_ITERATIONS` messages
+/// on the shared endpoint, one per round trip with the Root Task.
+///
+/// The exit-the-scheduler step (same reasoning as `thread2_main`'s tail)
+/// has to happen BEFORE the last iteration's `yield_to`, not after the
+/// loop: once that last `yield_to` runs, this thread's saved context sits
+/// frozen at that exact call site, and the Root Task's own loop below
+/// never switches back in — any code written after the `for` here would
+/// be dead. Folding the removal into the last iteration is what makes it
+/// actually execute.
+extern "C" fn bench_thread_main() -> ! {
+    let k = kstate();
+    let hal = khal();
+    // SAFETY: set by `inkernel_demo` before `start_thread`.
+    let me = ThreadId::new(unsafe { core::ptr::addr_of!(G_T3).read() });
+    let ep = CapId::new(unsafe { core::ptr::addr_of!(G_EP).read() });
+    let root = ThreadId::new(unsafe { core::ptr::addr_of!(G_ROOT).read() });
+
+    for i in 0..IPC_BENCH_ITERATIONS {
+        let msg = SmallMessage::from_words(0xBEEF, &[1, 2]).unwrap_or_else(|_| SmallMessage::new(0xBEEF));
+        match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }) {
+            Ok(SyscallReturn::Delivered { .. }) => {}
+            other => klog!("bench thread: Send unexpected: {:?}\r\n", other),
+        }
+        if i + 1 == IPC_BENCH_ITERATIONS {
+            if let Some(t) = k.tcb_mut(me) {
+                t.state = kernel_core::ThreadState::Exited;
+            }
+            k.sched.remove(me);
+        }
+        k.yield_to(me, root, hal);
+    }
     park();
 }
 

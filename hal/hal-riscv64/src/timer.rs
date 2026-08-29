@@ -232,6 +232,16 @@ impl TimerAbstraction for Timer {
         let deadline_ticks = self.deadline_ns_to_ticks(deadline_ns);
         sbi_set_timer(deadline_ticks);
 
+        // Enable supervisor-timer interrupt delivery (`sie.STIE`). Done
+        // HERE, not at boot: `sbi_set_timer` above has just cleared any
+        // interrupt OpenSBI left pending and set a real future deadline,
+        // so the first delivery happens at `deadline_ns`, not
+        // immediately on the next `sret` to U-mode. Idempotent — every
+        // subsequent `set_oneshot` re-sets an already-set bit.
+        // SAFETY: setting one well-defined `sie` bit; while `sstatus.SIE`
+        // is clear (the caller is in S-mode) it cannot itself trap.
+        unsafe { enable_timer_interrupt() };
+
         Ok(())
     }
 

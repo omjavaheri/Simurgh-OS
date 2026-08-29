@@ -279,13 +279,52 @@ impl TrapFrame {
     const A7: usize = 16; // x17
 }
 
+/// What the trap handler should do after the microkernel's syscall
+/// handler has run.
+///
+/// The `SwitchTo` variant is what makes cooperative *process* hand-off
+/// possible (02-Microkernel-Layer.md §8.4): the handler cannot itself
+/// change which U-mode thread is on the CPU — only the trap vector,
+/// which owns the interrupted register frame, can. So the handler
+/// returns its decision and the trap vector executes it.
+pub enum TrapOutcome {
+    /// Return to the trapping thread, placing `.0` in its `a0`, and
+    /// advance `sepc` past the 4-byte `ecall`. The ordinary syscall
+    /// return.
+    Resume(usize),
+    /// Serialise the trapping thread's full U-mode context (every GPR,
+    /// `sepc` advanced past the `ecall`, `sstatus`, `satp`) into the
+    /// `HAL_USER_CONTEXT_BYTES` blob at `save`, then restore the blob at
+    /// `into` and `sret` into it — a different U-mode thread, in general
+    /// a different address space. Both pointers are kernel-owned,
+    /// 8-byte-aligned `hal_core::UserContext` storage.
+    SwitchTo {
+        /// Where to write the outgoing thread's snapshot.
+        save: *mut u8,
+        /// The incoming thread's context to resume.
+        into: *const u8,
+    },
+}
+
 /// Signature of the S-mode handler the microkernel registers for an
-/// `ecall` from U-mode: raw `(a7, a0, a1, a2, a3, a4)`, returning the
-/// value to place in the caller's `a0`.
-pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> usize;
+/// `ecall` from U-mode: raw `(a7, a0, a1, a2, a3, a4)`, returning a
+/// `TrapOutcome` telling the trap vector how to resume.
+pub type SyscallHandler = fn(usize, usize, usize, usize, usize, usize) -> TrapOutcome;
+
+/// Signature of the handler the microkernel registers for a supervisor
+/// timer interrupt taken **while a U-mode thread was running** — the
+/// preemptive scheduler's entry point (02-Microkernel-Layer.md §4). It
+/// takes no arguments (the trap vector owns the interrupted frame) and
+/// returns a `TrapOutcome`: `Resume` to let the current thread keep its
+/// quantum, or `SwitchTo` to preempt it. The handler is responsible for
+/// re-arming (or cancelling) the timer via `HalInterface`.
+pub type TickHandler = fn() -> TrapOutcome;
 
 #[cfg(target_os = "none")]
 static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
+
+#[cfg(target_os = "none")]
+static mut TICK_HANDLER: Option<TickHandler> = None;
 
 /// Registers the handler `common_trap_entry` calls for an `ecall` from
 /// U-mode. The microkernel calls this once during boot, before it drops
@@ -299,6 +338,21 @@ pub fn set_syscall_handler(handler: SyscallHandler) {
     // can be taken.
     unsafe {
         core::ptr::addr_of_mut!(SYSCALL_HANDLER).write(Some(handler));
+    }
+}
+
+/// Registers the preemptive-scheduler tick handler `common_trap_entry`
+/// calls when a supervisor timer interrupt lands on a running U-mode
+/// thread. Set once during boot. Until it is set (and the kernel arms a
+/// deadline via `HalInterface::arm_timer`), timer interrupts do nothing
+/// beyond the arch-internal dispatch — so `kernel-stub`, which registers
+/// no handler and never enters U-mode, is unaffected.
+#[cfg(target_os = "none")]
+pub fn set_tick_handler(handler: TickHandler) {
+    // SAFETY: single-core boot; set exactly once before the timer is
+    // armed and before any drop to U-mode.
+    unsafe {
+        core::ptr::addr_of_mut!(TICK_HANDLER).write(Some(handler));
     }
 }
 
@@ -319,6 +373,15 @@ extern "C" fn common_trap_entry(_frame: *mut TrapFrame) {
 #[cfg(target_os = "none")]
 const CAUSE_ECALL_FROM_U: usize = 8;
 
+/// RISC-V `scause` interrupt code for the supervisor timer interrupt
+/// (the interrupt bit is already masked off by `common_trap_entry`).
+#[cfg(target_os = "none")]
+const CAUSE_TIMER_INTERRUPT: usize = 5;
+
+/// `sstatus.SPP` — 0 when the trap came from U-mode.
+#[cfg(target_os = "none")]
+const SSTATUS_SPP_BIT: usize = 1 << 8;
+
 #[cfg(target_os = "none")]
 #[no_mangle]
 extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
@@ -338,6 +401,47 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
 
     if is_interrupt {
         crate::interrupt::dispatch_current_interrupt(cause_code as u32);
+
+        // Preemption: a supervisor timer interrupt that landed on a
+        // running U-mode thread is the microkernel's cue to run its
+        // scheduler (02-Microkernel-Layer.md §4). The tick handler
+        // decides; the trap vector (which owns the interrupted frame)
+        // executes the switch, exactly like the `ecall` `SwitchTo` path
+        // — but resuming AT `sepc` (the preempted instruction), not
+        // `sepc + 4`.
+        if cause_code == CAUSE_TIMER_INTERRUPT {
+            let sstatus: usize;
+            // SAFETY: `csrr sstatus` has no preconditions in a trap
+            // handler.
+            unsafe { core::arch::asm!("csrr {}, sstatus", out(reg) sstatus) };
+            let from_user = (sstatus & SSTATUS_SPP_BIT) == 0;
+            if from_user {
+                // SAFETY: single-core; `TICK_HANDLER` is only written by
+                // `set_tick_handler` during boot, before the timer is
+                // armed.
+                let handler = unsafe { core::ptr::addr_of!(TICK_HANDLER).read() };
+                if let Some(h) = handler {
+                    match h() {
+                        TrapOutcome::Resume(_) => return,
+                        TrapOutcome::SwitchTo { save, into } => {
+                            // SAFETY: `save` / `into` are kernel-owned
+                            // aligned `HAL_USER_CONTEXT_BYTES` blobs.
+                            // Snapshot the preempted thread at `sepc`
+                            // exactly, then never return.
+                            let f = unsafe { &mut *frame };
+                            unsafe {
+                                save_trap_frame_as_user_context(
+                                    f,
+                                    sepc,
+                                    save as *mut RiscvUserContext,
+                                );
+                                restore_user_and_sret(into as *const RiscvUserContext);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return;
     }
 
@@ -348,7 +452,7 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
         // SAFETY: single-core; `SYSCALL_HANDLER` is only written by
         // `set_syscall_handler` during boot, before any U-mode `ecall`.
         let handler = unsafe { core::ptr::addr_of!(SYSCALL_HANDLER).read() };
-        let ret = match handler {
+        let outcome = match handler {
             Some(h) => h(
                 f.regs[TrapFrame::A7] as usize,
                 f.regs[TrapFrame::A0] as usize,
@@ -362,11 +466,31 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                 halt_on_unexpected_exception();
             }
         };
-        f.regs[TrapFrame::A0] = ret as u64;
-        // Resume at the instruction after the 4-byte `ecall`.
-        // SAFETY: writing sepc is valid within a trap handler.
-        unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
-        return;
+        match outcome {
+            TrapOutcome::Resume(ret) => {
+                f.regs[TrapFrame::A0] = ret as u64;
+                // Resume at the instruction after the 4-byte `ecall`.
+                // SAFETY: writing sepc is valid within a trap handler.
+                unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
+                return;
+            }
+            TrapOutcome::SwitchTo { save, into } => {
+                // SAFETY: `save` / `into` are kernel-owned, 8-byte-
+                // aligned `HAL_USER_CONTEXT_BYTES` blobs (the trampoline
+                // / `UserContext` contract). Snapshot the outgoing
+                // thread — resuming AFTER its `ecall` — then never
+                // return: `restore_user_and_sret` abandons this trap
+                // frame's stack and `sret`s into the incoming thread.
+                unsafe {
+                    save_trap_frame_as_user_context(
+                        f,
+                        sepc + 4,
+                        save as *mut RiscvUserContext,
+                    );
+                    restore_user_and_sret(into as *const RiscvUserContext);
+                }
+            }
+        }
     }
 
     trap_diag(cause_code, sepc, stval);
@@ -484,6 +608,157 @@ struct Riscv64Context {
 const _: () = {
     assert!(size_of::<Riscv64Context>() == RISCV64_CONTEXT_BYTES);
 };
+
+// ============================================================================
+// Saved U-mode context layout (matches hal_core::HAL_USER_CONTEXT_BYTES = 320)
+//
+// Unlike `Riscv64Context` (callee-saved only, resumed with `jr` for the
+// kernel-to-kernel cooperative path), a suspended U-mode thread is
+// snapshotted from an arbitrary trap point, so every integer register has
+// to survive the round trip, plus the CSRs `sret` consumes: `sepc` (where
+// to resume), `sstatus` (SPP/SPIE — privilege + interrupt-enable to
+// restore), and `satp` (which address space the thread runs in). This is
+// the concrete form behind `hal_core::UserContext`.
+// ============================================================================
+
+/// `regs[i]` holds `x(i+1)` (x0 is hardwired zero, never stored): `regs[0]`
+/// = `x1`/`ra`, `regs[1]` = `x2`/`sp`, `regs[9]` = `x10`/`a0`, `regs[16]` =
+/// `x17`/`a7`, `regs[30]` = `x31`/`t6`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RiscvUserContext {
+    /// x1..x31, in order.
+    regs: [u64; 31],
+    /// Resume program counter in U-mode.
+    sepc: u64,
+    /// Privilege / interrupt-enable snapshot (`sret` restores SIE from
+    /// SPIE and the privilege level from SPP).
+    sstatus: u64,
+    /// Address-space root (`satp`) the thread executes under.
+    satp: u64,
+    /// Padding to `HAL_USER_CONTEXT_BYTES`: 34 live u64 = 272, + 6 = 320.
+    _reserved: [u64; 6],
+}
+
+const _: () = {
+    assert!(size_of::<RiscvUserContext>() == hal_core::HAL_USER_CONTEXT_BYTES);
+};
+
+/// SPP is `sstatus` bit 8 (Supervisor Previous Privilege): 0 = the trap
+/// that will be returned from via `sret` came from U-mode, so `sret`
+/// drops to U-mode. Only consumed on the bare-metal target (the host
+/// `init_user_context` path takes a fixed `sstatus`).
+#[cfg_attr(not(target_os = "none"), allow(dead_code))]
+const SSTATUS_SPP: u64 = 1 << 8;
+/// SPIE is `sstatus` bit 5 (Supervisor Previous Interrupt Enable): `sret`
+/// copies it back into SIE. Set it so the resumed thread runs with
+/// S-mode interrupt delivery in the state it should be (harmless today —
+/// nothing is routed to S-mode yet).
+const SSTATUS_SPIE: u64 = 1 << 5;
+
+/// Restores a full `RiscvUserContext` and `sret`s into U-mode. Never
+/// returns. Shared by `resume_user` (first entry, from an
+/// `init_user_context` blob) and the trap handler's process hand-off
+/// path (from a blob it just serialised out of a trap frame).
+///
+/// # Safety
+/// `blob` must point at a valid, resumable `RiscvUserContext` whose
+/// `satp` names an address space that maps this core's trap vector and
+/// the identity-mapped low RAM `blob` itself lives in. Interrupts must be
+/// masked. Never returns, so it does not restore the caller's frame — a
+/// non-hand-off caller's stack frame is simply abandoned.
+#[cfg(target_os = "none")]
+unsafe fn restore_user_and_sret(blob: *const RiscvUserContext) -> ! {
+    // SAFETY: contract above. `t6` carries the blob base for the whole
+    // sequence; CSRs are written first (using `t5` as scratch, which is
+    // then given its real value by the GPR restore), then x1..x30, then
+    // `t6`/x31 loads its own final value from its slot last, then `sret`.
+    unsafe {
+        core::arch::asm!(
+            "ld  t5, 256(t6)",   // sstatus
+            "csrw sstatus, t5",
+            "ld  t5, 248(t6)",   // sepc
+            "csrw sepc, t5",
+            "ld  t5, 264(t6)",   // satp
+            "csrw satp, t5",
+            "sfence.vma",
+            "ld  x1,  0(t6)",
+            "ld  x2,  8(t6)",
+            "ld  x3,  16(t6)",
+            "ld  x4,  24(t6)",
+            "ld  x5,  32(t6)",
+            "ld  x6,  40(t6)",
+            "ld  x7,  48(t6)",
+            "ld  x8,  56(t6)",
+            "ld  x9,  64(t6)",
+            "ld  x10, 72(t6)",
+            "ld  x11, 80(t6)",
+            "ld  x12, 88(t6)",
+            "ld  x13, 96(t6)",
+            "ld  x14, 104(t6)",
+            "ld  x15, 112(t6)",
+            "ld  x16, 120(t6)",
+            "ld  x17, 128(t6)",
+            "ld  x18, 136(t6)",
+            "ld  x19, 144(t6)",
+            "ld  x20, 152(t6)",
+            "ld  x21, 160(t6)",
+            "ld  x22, 168(t6)",
+            "ld  x23, 176(t6)",
+            "ld  x24, 184(t6)",
+            "ld  x25, 192(t6)",
+            "ld  x26, 200(t6)",
+            "ld  x27, 208(t6)",
+            "ld  x28, 216(t6)",
+            "ld  x29, 224(t6)",
+            "ld  x30, 232(t6)",
+            "ld  x31, 240(t6)",
+            "sret",
+            in("t6") blob,
+            options(noreturn),
+        );
+    }
+}
+
+/// Serialises an interrupted U-mode trap frame into a `RiscvUserContext`
+/// so it can be `restore_user_and_sret`'d later. `resume_sepc` is where
+/// the thread should continue (the trap handler passes `sepc + 4` so a
+/// suspended `ecall` does not re-execute). Captures the *live* `sstatus`
+/// and `satp`, which for a trap taken from U-mode already describe the
+/// thread's own privilege state and address space.
+///
+/// # Safety
+/// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
+/// 8-byte-aligned storage.
+#[cfg(target_os = "none")]
+unsafe fn save_trap_frame_as_user_context(
+    frame: &TrapFrame,
+    resume_sepc: usize,
+    dst: *mut RiscvUserContext,
+) {
+    let (sstatus, satp): (u64, u64);
+    // SAFETY: reading sstatus/satp has no preconditions in S-mode.
+    unsafe {
+        core::arch::asm!("csrr {}, sstatus", out(reg) sstatus);
+        core::arch::asm!("csrr {}, satp", out(reg) satp);
+    }
+    // SAFETY: `dst` is valid writable storage of the matching size /
+    // alignment per this function's contract.
+    unsafe {
+        (*dst).regs = frame.regs; // regs[i] == x(i+1) in both layouts
+        // `trap_entry` saves x2 (sp) into the frame AFTER `addi sp, sp,
+        // -248`, so `frame.regs[1]` is 248 bytes below the thread's real
+        // stack pointer. The pre-trap sp is exactly one `TrapFrame`
+        // above `frame` itself — restore THAT, or the resumed thread's
+        // stack-relative accesses land in the abandoned trap frame.
+        (*dst).regs[1] =
+            frame as *const TrapFrame as u64 + core::mem::size_of::<TrapFrame>() as u64;
+        (*dst).sepc = resume_sepc as u64;
+        (*dst).sstatus = sstatus;
+        (*dst).satp = satp;
+        (*dst)._reserved = [0; 6];
+    }
+}
 
 // ============================================================================
 // Cpu — CpuAbstraction<RISCV64_CONTEXT_BYTES> implementation
@@ -655,6 +930,89 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
     }
 
     #[cfg(target_os = "none")]
+    fn map_ram_identity(&self, root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        let root = root_frame as *mut u64;
+        // SAFETY: `root_frame` is a caller-guaranteed page-aligned,
+        // writable physical frame; paging is still off (satp == 0). Zero
+        // the root, then install one 1 GiB identity LEAF per GiB (root
+        // index == VA[38:30] == the GiB number). `map_range` can add finer
+        // mappings only for a VA whose GiB slot is still empty (not a
+        // gigapage leaf) — callers put per-process pages in a GiB above
+        // `bytes_gib`.
+        unsafe {
+            for i in 0..512 {
+                root.add(i).write_volatile(0);
+            }
+            let mut flags = riscv_sv39::V | riscv_sv39::R | riscv_sv39::W
+                | riscv_sv39::X | riscv_sv39::A | riscv_sv39::D;
+            if user_accessible {
+                flags |= riscv_sv39::U;
+            }
+            for gib in 0..bytes_gib.min(512) {
+                // ppn = (gib * 1 GiB) >> 12 == gib << 18; pte = ppn << 10 | flags.
+                root.add(gib).write_volatile(((gib as u64) << 28) | flags);
+            }
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn activate_address_space(&self, root_frame: usize) {
+        // satp (Sv39): mode = 8 in bits [63:60], ASID = 0, PPN = root >> 12.
+        // `root_frame == 0` is the sentinel for "disable paging" (satp = 0,
+        // Bare mode) — used to return to flat physical addressing.
+        let satp = if root_frame == 0 {
+            0u64
+        } else {
+            (8u64 << 60) | ((root_frame as u64) >> 12)
+        };
+        // SAFETY: `root_frame` is a caller-guaranteed valid Sv39 root that
+        // maps at least all memory this core executes from and touches
+        // next. `sfence.vma` around the `satp` write flushes stale
+        // entries; `csrs sstatus, SUM` lets S-mode reach U=1 pages (needed
+        // once the kernel dereferences user pointers from a trap).
+        unsafe {
+            core::arch::asm!(
+                "sfence.vma",
+                "csrw satp, {satp}",
+                "sfence.vma",
+                "li   {t}, 1 << 18",   // sstatus.SUM
+                "csrs sstatus, {t}",
+                satp = in(reg) satp,
+                t = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn flush_tlb(&self) {
+        // SAFETY: `sfence.vma` with no rs1/rs2 (x0, x0) flushes every
+        // address-translation cache entry for the current ASID space on
+        // this hart. It has no preconditions in S-mode and no effect
+        // beyond the flush — the microkernel issues it after `map_range`
+        // has walked new leaves into the active Sv39 table so a
+        // subsequent access (or the U-mode task's first touch of the new
+        // page) does not hit a stale negative entry.
+        unsafe {
+            core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn map_range(
+        &self,
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        riscv_sv39::map_range(root_frame, vaddr, paddr, len, perm_bits, pool_base, pool_len)
+    }
+
+    #[cfg(target_os = "none")]
     fn enter_user(&self, entry: usize, stack_top: usize) -> ! {
         // The sstatus bit masks are passed as inputs (not built with `li`
         // into a scratch register) because `options(noreturn)` forbids
@@ -682,6 +1040,74 @@ impl CpuAbstraction<{ crate::RISCV64_CONTEXT_BYTES }> for Cpu {
                 options(noreturn),
             );
         }
+    }
+
+    fn init_user_context(
+        &self,
+        context: &mut hal_core::UserContext,
+        entry: usize,
+        stack_top: usize,
+        root_frame: usize,
+    ) {
+        // SAFETY: `hal_core::UserContext` is `#[repr(C, align(8))]` over
+        // exactly `[u8; HAL_USER_CONTEXT_BYTES]` and `RiscvUserContext`
+        // is `#[repr(C)]` of that same asserted size — so the buffer IS
+        // a valid `RiscvUserContext`.
+        let ctx = unsafe {
+            &mut *(context.as_bytes_mut().as_mut_ptr() as *mut RiscvUserContext)
+        };
+        *ctx = RiscvUserContext::default();
+        ctx.regs[1] = stack_top as u64; // x2 = sp
+        ctx.sepc = entry as u64;
+
+        // satp: Sv39 mode 8, ASID 0, PPN = root_frame >> 12. `root_frame
+        // == 0` means "keep whatever is active" — read it back so the
+        // first `resume_user` does not clobber the live translation.
+        ctx.satp = if root_frame != 0 {
+            (8u64 << 60) | ((root_frame as u64) >> 12)
+        } else {
+            #[cfg(target_os = "none")]
+            {
+                let satp: u64;
+                // SAFETY: `csrr satp` is always valid in S-mode.
+                unsafe { core::arch::asm!("csrr {0}, satp", out(reg) satp) };
+                satp
+            }
+            #[cfg(not(target_os = "none"))]
+            {
+                0
+            }
+        };
+
+        // sstatus for a fresh U-mode entry: start from the live value so
+        // fields like SUM are preserved, then force SPP = 0 (so `sret`
+        // targets U-mode) and SPIE = 1.
+        #[cfg(target_os = "none")]
+        {
+            let sstatus: u64;
+            // SAFETY: `csrr sstatus` is always valid in S-mode.
+            unsafe { core::arch::asm!("csrr {0}, sstatus", out(reg) sstatus) };
+            ctx.sstatus = (sstatus & !SSTATUS_SPP) | SSTATUS_SPIE;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ctx.sstatus = SSTATUS_SPIE;
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    unsafe fn resume_user(&self, context: &hal_core::UserContext) -> ! {
+        // SAFETY: the buffer is a valid `RiscvUserContext` (see
+        // `init_user_context`); the resumable-context + interrupts-masked
+        // obligations are this method's documented caller contract.
+        let blob = context.as_bytes().as_ptr() as *const RiscvUserContext;
+        unsafe { restore_user_and_sret(blob) }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    unsafe fn resume_user(&self, context: &hal_core::UserContext) -> ! {
+        let _ = context;
+        unreachable!("resume_user is bare-metal only (host test build)");
     }
 
     fn set_privilege_level(&self, level: PrivilegeLevel) -> Result<(), HalError> {
@@ -749,5 +1175,120 @@ mod tests {
         let scause: usize = (1 << (usize::BITS - 1)) | 5;
         let cause_code = scause & !(1 << (usize::BITS - 1));
         assert_eq!(cause_code, 5);
+    }
+}
+// ============================================================================
+// Sv39 page-table helpers
+//
+// Bare-metal only. `map_ram_identity` / `activate_address_space` (above) plus
+// `map_range` here are the whole page-table surface the microkernel drives
+// through `hal_core::HalInterface`. Sv39 (RISC-V privileged spec section 4.4):
+// three 9-bit VPN levels, 4 KiB pages, 2 MiB / 1 GiB superpages when the leaf
+// sits at level 1 / level 0.
+// ============================================================================
+#[cfg(target_os = "none")]
+pub(crate) mod riscv_sv39 {
+    /// PTE valid bit.
+    pub const V: u64 = 1 << 0;
+    /// PTE readable bit.
+    pub const R: u64 = 1 << 1;
+    /// PTE writable bit.
+    pub const W: u64 = 1 << 2;
+    /// PTE executable bit.
+    pub const X: u64 = 1 << 3;
+    /// PTE user-accessible bit.
+    pub const U: u64 = 1 << 4;
+    /// PTE accessed bit (pre-set so no hardware A/D fault is taken).
+    pub const A: u64 = 1 << 6;
+    /// PTE dirty bit (pre-set — see `A`).
+    pub const D: u64 = 1 << 7;
+
+    /// Maps `[vaddr, vaddr + len)` -> `[paddr, ...)` at 4 KiB granularity in
+    /// the Sv39 table rooted at `root_frame`, allocating any missing L1 / L0
+    /// tables from the pre-zeroed frame pool at `[pool_base, pool_base +
+    /// pool_len * 4096)`. `perm_bits` is `R=1 | W=2 | X=4 | U=8`.
+    ///
+    /// Returns the number of pool frames consumed, or `u32::MAX` on error
+    /// (misaligned args, a superpage leaf already covering the range, or the
+    /// pool running out).
+    ///
+    /// # Preconditions
+    /// Paging is off (`satp == 0`) so every physical address here is directly
+    /// addressable; the pool frames are zeroed; single core.
+    pub fn map_range(
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        if root_frame == 0 || len == 0 || ((vaddr | paddr | len) & 0xFFF) != 0 {
+            return u32::MAX;
+        }
+        let leaf = V | A | D
+            | if perm_bits & 1 != 0 { R } else { 0 }
+            | if perm_bits & 2 != 0 { W } else { 0 }
+            | if perm_bits & 4 != 0 { X } else { 0 }
+            | if perm_bits & 8 != 0 { U } else { 0 };
+
+        let mut used = 0usize;
+        let pages = len / 4096;
+        for p in 0..pages {
+            let va = vaddr + p * 4096;
+            let pa = paddr + p * 4096;
+            let (vpn2, vpn1, vpn0) = ((va >> 30) & 0x1FF, (va >> 21) & 0x1FF, (va >> 12) & 0x1FF);
+
+            // Descend / build L1.
+            // SAFETY: precondition — `root_frame` points at a writable,
+            // page-aligned frame; paging is off.
+            let l1 = unsafe {
+                let slot = (root_frame as *mut u64).add(vpn2);
+                let e = slot.read_volatile();
+                if e & V == 0 {
+                    if used >= pool_len {
+                        return u32::MAX;
+                    }
+                    let t = pool_base + used * 4096;
+                    used += 1;
+                    slot.write_volatile(((t as u64 >> 12) << 10) | V);
+                    t
+                } else if e & (R | W | X) != 0 {
+                    return u32::MAX; // a 1 GiB leaf already covers this VA
+                } else {
+                    (((e >> 10) & ((1 << 44) - 1)) << 12) as usize
+                }
+            };
+
+            // Descend / build L0.
+            // SAFETY: `l1` is a valid page-table frame just resolved above.
+            let l0 = unsafe {
+                let slot = (l1 as *mut u64).add(vpn1);
+                let e = slot.read_volatile();
+                if e & V == 0 {
+                    if used >= pool_len {
+                        return u32::MAX;
+                    }
+                    let t = pool_base + used * 4096;
+                    used += 1;
+                    slot.write_volatile(((t as u64 >> 12) << 10) | V);
+                    t
+                } else if e & (R | W | X) != 0 {
+                    return u32::MAX; // a 2 MiB leaf already covers this VA
+                } else {
+                    (((e >> 10) & ((1 << 44) - 1)) << 12) as usize
+                }
+            };
+
+            // Install the 4 KiB leaf.
+            // SAFETY: `l0` is a valid page-table frame just resolved above.
+            unsafe {
+                (l0 as *mut u64)
+                    .add(vpn0)
+                    .write_volatile(((pa as u64 >> 12) << 10) | leaf);
+            }
+        }
+        used as u32
     }
 }

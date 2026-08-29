@@ -203,20 +203,67 @@ mod sys {
     /// Retype one `Endpoint` from the Root Task's first `UntypedMemory`
     /// capability; returns the new capability slot.
     pub const RETYPE_ENDPOINT: usize = 1;
-    /// Map one page: `a0` = virtual address, `a1` = physical address, RW.
-    /// Records the mapping in the Root Task's address space. Returns 0 on
-    /// success, `usize::MAX` on error.
+    /// Map one fresh page at `a0` = virtual address. The kernel allocates
+    /// a real physical frame from the Root Task's `UntypedMemory`, walks a
+    /// genuine Sv39 leaf (`R+W+U`) for it into the Root Task's **live**
+    /// page table, records it in the software `AddressSpace` model too,
+    /// and returns the physical address it chose (`usize::MAX` on error).
     ///
-    /// MVP: operates on the Root Task's address space directly (not yet
-    /// capability-gated per `02-Microkernel-Layer.md §6`), and the
-    /// address space is still a software model — no Sv39 page-table
-    /// entries are written and `satp` stays 0. This exercises the
-    /// syscall -> `AddressSpace::map` path; real PTEs + a capability
-    /// argument are the follow-up.
+    /// MVP: still not capability-gated per `02-Microkernel-Layer.md §6`
+    /// (a real `Map` takes a `Frame` + `PageTable` capability); the frame
+    /// is picked by the kernel rather than named by the caller. What is
+    /// now real: the hardware mapping and `satp`.
     pub const MAP_PAGE: usize = 2;
     /// Translate `a0` = virtual address through the Root Task's address
-    /// space; returns the physical address, or `usize::MAX` if unmapped.
+    /// space (software model); returns the physical address, or
+    /// `usize::MAX` if unmapped.
     pub const TRANSLATE: usize = 3;
+    /// Map a second virtual address `a0` onto the SAME physical frame the
+    /// most recent `MAP_PAGE` returned — an intra-address-space alias, the
+    /// zero-copy shared-memory primitive of `02-Microkernel-Layer.md
+    /// §5.2 / §8.4`. Real Sv39 leaf + model update. Returns 0 /
+    /// `usize::MAX`. `a1` is ignored (the frame is kernel-tracked so a
+    /// bogus physical address cannot be smuggled in).
+    pub const MAP_ALIAS: usize = 4;
+    /// No arguments — the kernel logs a fixed "Root Task alive under
+    /// paging" line. Used by the isolated U-mode entry, which carries no
+    /// string literals of its own.
+    pub const ALIVE: usize = 9;
+    /// `a0` = a value the kernel should echo into the log (used to report
+    /// a `TRANSLATE` result from code that cannot format it itself).
+    pub const REPORT: usize = 10;
+    /// Cross-check a shared frame: `a0` = the physical address `MAP_PAGE`
+    /// returned, `a1` = the value the Root Task read back through the
+    /// alias VA. The kernel reads the SAME physical frame through its own
+    /// identity map and logs whether all three views agree — the
+    /// hardware-level proof behind `02-Microkernel-Layer.md §8.4`
+    /// (zero-copy shared memory).
+    pub const XCHECK: usize = 11;
+
+    // -- Two-process zero-copy proof (02-Microkernel-Layer.md §8.4) --
+    //
+    // Cooperative hand-off between two U-mode threads living in two
+    // MMU-isolated Sv39 address spaces that share exactly one physical
+    // frame (mapped at a different VA in each). The kernel side is
+    // `kernel_arch_glue::{p2_yield, p2_report_a, p2_report_b}`.
+
+    /// No arguments. The calling U-mode thread is suspended (full context
+    /// saved) and the *other* process is resumed in its own address
+    /// space — `TrapOutcome::SwitchTo`. First `P2_YIELD` runs process A
+    /// -> B; the second (from B) runs B -> A.
+    pub const P2_YIELD: usize = 20;
+    /// `a0` = the value process A re-read through its VA of the shared
+    /// frame after process B ran. The kernel logs the final A->B->A
+    /// round-trip verdict.
+    pub const P2_REPORT_A: usize = 21;
+    /// `a0` = the value process B read through its VA of the shared frame
+    /// (which process A wrote before the first hand-off).
+    pub const P2_REPORT_B: usize = 22;
+    /// No arguments. The cooperative §8.4 round-trip is done — the kernel
+    /// arms the supervisor timer so from here the two processes are
+    /// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an
+    /// explicit `P2_YIELD`. Both then run unbounded counting loops.
+    pub const P2_PREEMPT_START: usize = 23;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -237,41 +284,161 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     ret
 }
 
-/// The user-space Root Task entry (runs in U-mode on `kernel-arch-glue`'s
-/// `ROOT_STACK`). Reaches the kernel only via `raw_syscall` / `ecall`.
+/// The user-space Root Task entry. Linked into `.user_text` (its own
+/// U=1 R+X pages at VMA 0xC000_0000, per hal-riscv64's linker.ld) and run
+/// in U-mode under Sv39 paging by `kernel-arch-glue::enter`.
+///
+/// Deliberately self-contained — every arg is an immediate or comes back
+/// in a register — so the code is correct at its linked VA no matter
+/// where the loader placed the LMA copy, and `.user_text` carries no
+/// relocations to data in kernel `.rodata`. Any human-readable output is
+/// produced by the kernel (`sys::ALIVE`, `sys::REPORT`).
 #[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
 extern "C" fn umode_root() -> ! {
-    let hello = b"root task (U-mode): hello via ecall\r\n";
-    // SAFETY: syscall ABI; the kernel reads [ptr, ptr+len) from our
-    // (shared, satp=0) address space.
-    unsafe { raw_syscall(sys::DEBUG_LOG, hello.as_ptr() as usize, hello.len()) };
+    // SAFETY: `ecall` from U-mode traps to our S-mode handler, which
+    // preserves every register except a0. The two direct memory accesses
+    // below go through pages the kernel maps `U=1 R+W` in response to our
+    // `MAP_PAGE` / `MAP_ALIAS` calls; they are written as inline `sw`/`lw`
+    // so `.user_text` stays free of calls into kernel `.text` and of any
+    // relocation.
+    unsafe {
+        raw_syscall(sys::ALIVE, 0, 0);
+        let _cap = raw_syscall(sys::RETYPE_ENDPOINT, 0, 0);
 
-    // SAFETY: same.
-    let cap = unsafe { raw_syscall(sys::RETYPE_ENDPOINT, 0, 0) };
-    let done: &[u8] = if cap != usize::MAX {
-        b"root task (U-mode): ecall Retype returned a capability - syscall boundary works\r\n"
-    } else {
-        b"root task (U-mode): ecall Retype FAILED\r\n"
-    };
-    // SAFETY: same.
-    unsafe { raw_syscall(sys::DEBUG_LOG, done.as_ptr() as usize, done.len()) };
+        // 1. Ask the kernel to back VA 0xD000_0000 with a real frame
+        //    (genuine Sv39 leaf, U=1 R+W). `pa` is the physical address it
+        //    picked.
+        let pa = raw_syscall(sys::MAP_PAGE, 0xD000_0000, 0);
 
-    // Map a page in our address space and translate it back.
-    let (va, pa) = (0x4000_0000usize, 0x8800_0000usize);
-    // SAFETY: same.
-    let mapped = unsafe { raw_syscall(sys::MAP_PAGE, va, pa) };
-    // SAFETY: same.
-    let back = unsafe { raw_syscall(sys::TRANSLATE, va + 0x40, 0) };
-    let map_line: &[u8] = if mapped == 0 && back == pa + 0x40 {
-        b"root task (U-mode): ecall Map + Translate round-trip OK (va+0x40 -> pa+0x40)\r\n"
-    } else {
-        b"root task (U-mode): ecall Map/Translate FAILED\r\n"
-    };
-    // SAFETY: same.
-    unsafe { raw_syscall(sys::DEBUG_LOG, map_line.as_ptr() as usize, map_line.len()) };
+        // 2. Store a sentinel THROUGH the virtual address. This completes
+        //    only if the PTE is real and user-writable; otherwise it
+        //    faults into the kernel trap handler.
+        core::arch::asm!(
+            "li {t}, 0x5eed",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xD000_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
 
-    loop {
-        core::hint::spin_loop();
+        // 3. Map a SECOND VA onto the same physical frame and read the
+        //    sentinel back through it — zero-copy aliasing, MMU-enforced.
+        raw_syscall(sys::MAP_ALIAS, 0xD000_1000, 0);
+        let via_alias: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xD000_1000usize,
+            out = out(reg) via_alias,
+            options(nostack, readonly),
+        );
+
+        // 4. Have the kernel read the frame directly and confirm all
+        //    three views agree.
+        raw_syscall(sys::XCHECK, pa, via_alias);
+
+        // 5. Two-process zero-copy proof (02-Microkernel-Layer.md §8.4).
+        //    `kernel-arch-glue::enter` has already mapped ONE physical
+        //    frame into BOTH this address space (at 0xC004_0000) and the
+        //    isolated space B (at a different VA). Write a sentinel
+        //    through our VA, then `P2_YIELD` — the kernel snapshots this
+        //    thread and resumes process B in space B.
+        core::arch::asm!(
+            "li {t}, 0xC0DE",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xC004_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
+        raw_syscall(sys::P2_YIELD, 0, 0);
+
+        // 6. Resumed here after process B ran. Re-read our VA: process B
+        //    wrote 0xB00B through ITS mapping of the same frame, in a
+        //    different address space, with no copy.
+        let after: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xC004_0000usize,
+            out = out(reg) after,
+            options(nostack, readonly),
+        );
+        raw_syscall(sys::P2_REPORT_A, after, 0);
+
+        // 7. Preemption phase (02-Microkernel-Layer.md §4). Ask the
+        //    kernel to arm the supervisor timer, then loop forever
+        //    bumping this process's private counter word in the shared
+        //    frame (offset +8). From here NO `P2_YIELD` is issued — the
+        //    timer interrupt alone switches between this process and the
+        //    worker. Hand-written `lw`/`addi`/`sw` (NOT
+        //    `core::ptr::*_volatile`, which a debug build compiles to a
+        //    call into kernel `.text` that U-mode cannot execute) so
+        //    `.user_text` stays call- and relocation-free.
+        raw_syscall(sys::P2_PREEMPT_START, 0, 0);
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC004_0008usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// The SECOND user-space process (02-Microkernel-Layer.md §8.4). Linked
+/// into the same `.user_text` pages as `umode_root` but run in its OWN
+/// isolated Sv39 address space (space B) on its own stack by
+/// `kernel-arch-glue::enter`. Reads the shared frame through space B's VA
+/// (0xC020_0000), reports what it saw, writes its own sentinel back, and
+/// hands the core to process A. Self-contained: immediates only, no
+/// relocations, any human-readable output produced by the kernel.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_worker() -> ! {
+    // SAFETY: `ecall` traps to our S-mode handler; the `lw`/`sw` go
+    // through 0xC020_0000, which `enter` mapped `U=1 R+W` onto the shared
+    // physical frame in space B's page table.
+    unsafe {
+        // 1. Read what process A wrote (0xC0DE) through space A's VA —
+        //    seen here via space B's independent mapping of the frame.
+        let seen: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xC020_0000usize,
+            out = out(reg) seen,
+            options(nostack, readonly),
+        );
+        raw_syscall(sys::P2_REPORT_B, seen, 0);
+
+        // 2. Write our own sentinel back through space B's VA.
+        core::arch::asm!(
+            "li {t}, 0xB00B",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xC020_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
+
+        // 3. Hand the core back to process A for its final §8.4 check.
+        raw_syscall(sys::P2_YIELD, 0, 0);
+
+        // 4. Resumed here (either by that hand-off's partner, or — once
+        //    process A calls P2_PREEMPT_START — by a timer tick). Loop
+        //    forever bumping this process's private counter word in the
+        //    shared frame (offset +12), issuing NO `P2_YIELD`. If the
+        //    kernel's tick handler is switching us in and out this
+        //    counter climbs; if it were not, it would stay 0. Inline
+        //    `lw`/`addi`/`sw` for the same reason as `umode_root`'s loop.
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC020_000Cusize,
+            options(noreturn),
+        );
     }
 }
 
@@ -282,6 +449,43 @@ extern "C" fn umode_root() -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Physical address of the frame the most recent `MAP_PAGE` handed the
+/// Root Task. `MAP_ALIAS` maps a second VA onto exactly this frame, so a
+/// caller can never smuggle in an arbitrary physical address to alias.
+#[cfg(target_arch = "riscv64")]
+static mut LAST_MAPPED_FRAME: usize = 0;
+
+/// Retypes one page-sized `Untyped` object from the Root Task's first
+/// `UntypedMemory` capability and returns its physical base, or `None` if
+/// the retype or the cap lookup fails.
+#[cfg(target_arch = "riscv64")]
+fn alloc_root_frame(
+    k: &mut kernel_core::KernelState,
+    hal: &hal_core::HalInterface,
+) -> Option<usize> {
+    use kernel_core::{SyscallOp, SyscallReturn};
+    use kernel_mm::KernelObjectType;
+
+    let cap = match k.dispatch(
+        k.root_thread,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: kernel_cap::CapId::new(0),
+            target_type: KernelObjectType::Untyped,
+            count: 1,
+        },
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    let uid = kernel_cap::UntypedId::new(
+        k.cap_space(k.root_cap_space)
+            .and_then(|t| t.lookup(cap))
+            .map(|c| c.object.id.as_u32())?,
+    );
+    Some(k.untyped_mut(uid)?.base().as_usize())
 }
 
 /// The syscall handler the HAL trap vector calls for an `ecall` from
@@ -295,15 +499,40 @@ fn simurgh_syscall(
     _a2: usize,
     _a3: usize,
     _a4: usize,
-) -> usize {
+) -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
     use kernel_core::{SyscallOp, SyscallReturn};
     use kernel_mm::KernelObjectType;
+
+    // Two-process hand-off / reporting arms resolve to a non-`Resume`
+    // outcome or run before the object-model borrow below.
+    match a7 {
+        sys::P2_YIELD => {
+            return match kernel_arch_glue::p2_yield() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_REPORT_A => {
+            kernel_arch_glue::p2_report_a(a0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::P2_REPORT_B => {
+            kernel_arch_glue::p2_report_b(a0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::P2_PREEMPT_START => {
+            kernel_arch_glue::p2_preempt_start();
+            return TrapOutcome::Resume(0);
+        }
+        _ => {}
+    }
 
     let k = kernel_arch_glue::kstate();
     let hal = kernel_arch_glue::khal();
     let root = k.root_thread;
 
-    match a7 {
+    let ret: usize = match a7 {
         sys::DEBUG_LOG => {
             // SAFETY: MVP single-address-space (satp=0). `a0..a0+a1` is a
             // byte range in the shared address space; treat invalid UTF-8
@@ -329,19 +558,43 @@ fn simurgh_syscall(
             }
         }
         sys::MAP_PAGE => {
-            let space = match k.addr_space_mut(k.root_addr_space) {
-                Some(s) => s,
-                None => return usize::MAX,
+            // Allocate a real frame, walk a genuine Sv39 leaf for it into
+            // the LIVE page table (R|W|U = 1|2|8), then mirror it in the
+            // software model so TRANSLATE still answers.
+            let frame = match alloc_root_frame(k, hal) {
+                Some(f) => f,
+                None => return TrapOutcome::Resume(usize::MAX),
             };
-            match space.map(
-                hal_core::VirtAddr::new(a0),
-                hal_core::PhysAddr::new(a1),
-                kernel_mm::PAGE_SIZE,
-                hal_core::MapPermissions::KERNEL_DATA,
-            ) {
-                Ok(()) => 0,
-                Err(_) => usize::MAX,
+            if !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
+                return TrapOutcome::Resume(usize::MAX);
             }
+            if let Some(space) = k.addr_space_mut(k.root_addr_space) {
+                let _ = space.map(
+                    hal_core::VirtAddr::new(a0),
+                    hal_core::PhysAddr::new(frame),
+                    kernel_mm::PAGE_SIZE,
+                    hal_core::MapPermissions::KERNEL_DATA,
+                );
+            }
+            // SAFETY: single-core syscall path; only written here.
+            unsafe { core::ptr::addr_of_mut!(LAST_MAPPED_FRAME).write(frame) };
+            frame
+        }
+        sys::MAP_ALIAS => {
+            // SAFETY: single-core; set by the last MAP_PAGE.
+            let frame = unsafe { core::ptr::addr_of!(LAST_MAPPED_FRAME).read() };
+            if frame == 0 || !kernel_arch_glue::map_user_page(hal, a0, frame, 1 | 2 | 8) {
+                return TrapOutcome::Resume(usize::MAX);
+            }
+            if let Some(space) = k.addr_space_mut(k.root_addr_space) {
+                let _ = space.map(
+                    hal_core::VirtAddr::new(a0),
+                    hal_core::PhysAddr::new(frame),
+                    kernel_mm::PAGE_SIZE,
+                    hal_core::MapPermissions::KERNEL_DATA,
+                );
+            }
+            0
         }
         sys::TRANSLATE => match k
             .addr_space_mut(k.root_addr_space)
@@ -350,7 +603,91 @@ fn simurgh_syscall(
             Some((pa, _perms)) => pa.as_usize(),
             None => usize::MAX,
         },
+        sys::ALIVE => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, ISOLATED under Sv39): alive, made an ecall from U=1 pages\r\n"
+            ));
+            0
+        }
+        sys::REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode): ecall result = {:#x}\r\n",
+                a0
+            ));
+            0
+        }
+        sys::XCHECK => {
+            // `a0` = the physical frame MAP_PAGE returned; `a1` = the u32
+            // the Root Task read back through the alias VA. Read the same
+            // frame through the kernel's own identity map and report
+            // whether the U-mode write, the alias read, and the kernel
+            // view all agree.
+            // SAFETY: `a0` is a frame the kernel just allocated from
+            // untyped and identity-maps `U=0` in the active table; a u32
+            // read from it is valid and non-aliasing here.
+            let at_phys = unsafe { core::ptr::read_volatile(a0 as *const u32) } as usize;
+            let expected = unsafe { core::ptr::addr_of!(LAST_MAPPED_FRAME).read() };
+            let ok = at_phys == a1 && a1 == 0x5EED && a0 == expected;
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode): zero-copy proof - U-mode wrote {:#x} at VA 0xd0000000, read {:#x} at alias VA 0xd0001000; kernel reads {:#x} at PA {:#x} -> {}\r\n",
+                0x5EED_usize,
+                a1,
+                at_phys,
+                a0,
+                if ok { "ALL THREE AGREE" } else { "MISMATCH" }
+            ));
+            0
+        }
         _ => usize::MAX,
+    };
+    TrapOutcome::Resume(ret)
+}
+
+/// The preemptive-scheduler tick handler the HAL trap vector calls for a
+/// supervisor timer interrupt taken on a running U-mode thread
+/// (registered via `hal_riscv64::cpu::set_tick_handler`). Delegates the
+/// round-robin decision to `kernel-arch-glue`; `Some((save, into))`
+/// preempts, `None` lets the current thread keep running.
+#[cfg(target_arch = "riscv64")]
+fn simurgh_tick() -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_tick() {
+        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+// Linker symbols for the user (layer-3) Root Task image — see
+// hal-riscv64/src/linker.ld's `.user_text` / `.user_stack` sections.
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" {
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_text_lma: u8;
+    static __user_stack_start: u8;
+    static __user_stack_end: u8;
+    static __user_stack_lma: u8;
+}
+
+/// Reads the `.user_*` linker symbols into the descriptor `enter` needs to
+/// map the Root Task's pages `U=1` before dropping to U-mode.
+#[cfg(target_arch = "riscv64")]
+fn user_image() -> kernel_arch_glue::UserImage {
+    let sym = |s: &u8| s as *const u8 as usize;
+    // SAFETY: these are linker-defined addresses, taken by reference only,
+    // never dereferenced — the standard idiom for consuming linker script
+    // symbols.
+    unsafe {
+        kernel_arch_glue::UserImage {
+            text_vma: sym(&__user_text_start),
+            text_lma: sym(&__user_text_lma),
+            text_len: sym(&__user_text_end) - sym(&__user_text_start),
+            stack_vma: sym(&__user_stack_start),
+            stack_lma: sym(&__user_stack_lma),
+            stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
+            entry_vma: umode_root as usize,
+            worker_entry_vma: umode_worker as usize,
+        }
     }
 }
 
@@ -384,12 +721,23 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             let _ = writeln!(s, "----------------------------------------------------------------------");
             let _ = writeln!(s, "handing control to the Root Task...");
             // Register the S-mode syscall handler the HAL trap vector
-            // invokes for an `ecall` from U-mode.
+            // invokes for an `ecall` from U-mode, and the tick handler it
+            // invokes for a supervisor timer interrupt on a U-mode thread.
             #[cfg(target_arch = "riscv64")]
             hal_riscv64::cpu::set_syscall_handler(simurgh_syscall);
-            // Never returns: runs the in-kernel demo, then drops the Root
-            // Task to U-mode at `umode_root`.
-            kernel_arch_glue::enter(&hal, state, umode_root as usize)
+            #[cfg(target_arch = "riscv64")]
+            hal_riscv64::cpu::set_tick_handler(simurgh_tick);
+            // Never returns: runs the in-kernel demo, then (riscv64) maps
+            // the user image U=1, activates Sv39 paging, and drops the
+            // Root Task to U-mode isolated.
+            #[cfg(target_arch = "riscv64")]
+            {
+                kernel_arch_glue::enter(&hal, state, user_image())
+            }
+            #[cfg(not(target_arch = "riscv64"))]
+            {
+                kernel_arch_glue::enter(&hal, state, kernel_arch_glue::UserImage::EMPTY)
+            }
         }
         Err(e) => {
             let _ = writeln!(s, "kernel bring-up FAILED: {e:?}");
