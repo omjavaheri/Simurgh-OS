@@ -81,7 +81,12 @@ x86_64 | aarch64)
 		BOOT_NAME="BOOTAA64.EFI"
 		CODE="${OVMF_CODE:-$OVMF_CODE_DEFAULT_aarch64}"
 		VARS="${OVMF_VARS:-$OVMF_VARS_DEFAULT_aarch64}"
-		QEMU=(qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 256M)
+		# gic-version=3 explicit: harmless for kernel-stub (which never
+		# touches the GIC), but matches the `.cargo/config.toml` runner's
+		# own fix — see that file's comment on why QEMU's own default
+		# isn't reliable across versions, in case this script is ever
+		# pointed at the real `kernel` binary via SIMURGH_UEFI_KERNEL_BIN.
+		QEMU=(qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 256M)
 	fi
 
 	if [[ ! -f "$CODE" ]]; then

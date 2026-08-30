@@ -251,6 +251,37 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
         });
         &*core::ptr::addr_of!(HAL_STORAGE).cast::<Arm64Hal>()
     };
+
+    // PRE-EXISTING GAP found while bringing up this session's preemptive-
+    // scheduler work (same class of gap as `Cpu::bootstrap_current_core`'s
+    // own, found+fixed in a prior session): `InterruptCtrl::
+    // bootstrap_current_core` (interrupt.rs) — which enables the GICv3 CPU
+    // interface and the timer PPI at the distributor — and `interrupt::
+    // set_global_controller`/`set_global_timer` (which `dispatch_current_
+    // irq` needs to have any effect at all — it no-ops while its stored
+    // pointer is still null) were never called anywhere in this crate.
+    // Without them, the timer PPI this session's `cpu::irq_el0_entry`
+    // exists to handle would never even reach the core in the first
+    // place. `hal.interrupt.gicd_base()` is accessed here via a plain
+    // physical write (see `bootstrap_current_core`'s own SAFETY
+    // contract) — sound at this point in boot exactly like every other
+    // fixed-physical-address MMIO poke this crate already makes before
+    // paging activates (e.g. `trap_diag`'s PL011 writes), since the MMU
+    // is off and QEMU's `virt` machine places the GICD at a fixed
+    // physical address requiring no translation.
+    //
+    // SAFETY: called exactly once, after `Cpu::bootstrap_current_core`
+    // (VBAR_EL1 already loaded above) and before any interrupt can
+    // legitimately be taken (boot.S never unmasks DAIF before this
+    // function returns via `kernel_main`, which does so only once
+    // dropping to EL0).
+    if unsafe { hal.interrupt.bootstrap_current_core() }.is_err() {
+        // Nothing sensible to do this early; same fallback as the CPU
+        // bootstrap call above.
+    }
+    interrupt::set_global_controller(&hal.interrupt);
+    interrupt::set_global_timer(&hal.timer);
+
     // ------------------------------------------------------------------
     // Step 5: assemble BootInfo (hal-core/src/boot.rs) from everything
     // discovered above, using the linker-provided image/stack bounds

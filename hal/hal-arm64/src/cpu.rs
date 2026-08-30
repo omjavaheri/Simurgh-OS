@@ -188,13 +188,18 @@ core::arch::global_asm!(
     // support — the ACTIVE group once `enter_user`/`resume_user` below
     // drop this core to EL0. Synchronous is where `svc` (this project's
     // syscall boundary, analogous to x86_64's `int 0x80` / riscv64's
-    // `ecall`) lands; IRQ/FIQ/SError from EL0 stay minimal trap-halts for
-    // this milestone (no preemption/fault-isolation handler yet — same
-    // scope decision hal-x86_64's own U-mode+syscall milestone made).
+    // `ecall`) and per-process fault isolation both land (03-Kernel-
+    // Subsystems-Layer.md §2.1/§5.2); IRQ is where the timer PPI lands
+    // for preemptive scheduling (02-Microkernel-Layer.md §4) once a
+    // running U-mode thread is interrupted — `irq_el0_entry` mirrors
+    // `sync_el0_entry`'s own save/dispatch/restore shape exactly, just
+    // keyed off a registered `TickHandler` instead of `SyscallHandler`/
+    // `FaultHandler`. FIQ/SError from EL0 stay minimal trap-halts — this
+    // project never legitimately takes either.
     .align 7
     b sync_el0_entry
     .align 7
-    b generic_trap_halt
+    b irq_el0_entry
     .align 7
     b generic_trap_halt
     .align 7
@@ -314,6 +319,62 @@ core::arch::global_asm!(
 
         mov x0, sp
         bl common_sync_entry
+
+        ldp x0, x1,   [sp, #0]
+        ldp x2, x3,   [sp, #16]
+        ldp x4, x5,   [sp, #32]
+        ldp x6, x7,   [sp, #48]
+        ldp x8, x9,   [sp, #64]
+        ldp x10, x11, [sp, #80]
+        ldp x12, x13, [sp, #96]
+        ldp x14, x15, [sp, #112]
+        ldp x16, x17, [sp, #128]
+        ldp x18, x19, [sp, #144]
+        ldp x20, x21, [sp, #160]
+        ldp x22, x23, [sp, #176]
+        ldp x24, x25, [sp, #192]
+        ldp x26, x27, [sp, #208]
+        ldp x28, x29, [sp, #224]
+        ldr x30,      [sp, #240]
+        add sp, sp, #256
+        eret
+
+    irq_el0_entry:
+        // The EL0 (U-mode) IRQ trampoline — where the timer PPI lands
+        // once `enter_user`/`resume_user` has dropped this core to EL0
+        // and `HalInterface::arm_timer` has armed a deadline
+        // (02-Microkernel-Layer.md §4's preemptive scheduler). Saves ALL
+        // 31 GPRs, identically to `sync_el0_entry` above (same reasoning:
+        // `common_irq_el0_entry` needs the full frame to seed a resumable
+        // `Aarch64UserContext` for the `SwitchTo`/`Terminate` outcomes —
+        // no sp-offset correction needed here either, for the same
+        // "SP_EL0/SP_EL1 banked separately" reason `sync_el0_entry`'s own
+        // doc comment gives).
+        //
+        // A `SwitchTo`/`Terminate` outcome diverges the SAME way
+        // `sync_el0_entry`'s own does — see `restore_user_and_eret`'s
+        // doc comment for the stack-reset mechanism that makes this
+        // safe regardless of which trampoline reaches it.
+        sub sp, sp, #256
+        stp x0, x1,   [sp, #0]
+        stp x2, x3,   [sp, #16]
+        stp x4, x5,   [sp, #32]
+        stp x6, x7,   [sp, #48]
+        stp x8, x9,   [sp, #64]
+        stp x10, x11, [sp, #80]
+        stp x12, x13, [sp, #96]
+        stp x14, x15, [sp, #112]
+        stp x16, x17, [sp, #128]
+        stp x18, x19, [sp, #144]
+        stp x20, x21, [sp, #160]
+        stp x22, x23, [sp, #176]
+        stp x24, x25, [sp, #192]
+        stp x26, x27, [sp, #208]
+        stp x28, x29, [sp, #224]
+        str x30,      [sp, #240]
+
+        mov x0, sp
+        bl common_irq_el0_entry
 
         ldp x0, x1,   [sp, #0]
         ldp x2, x3,   [sp, #16]
@@ -911,6 +972,37 @@ pub fn set_syscall_handler(handler: SyscallHandler) {
     }
 }
 
+/// Signature of the handler the microkernel registers for a supervisor
+/// timer interrupt (the timer PPI) taken **while a U-mode thread was
+/// running** — the preemptive scheduler's entry point
+/// (02-Microkernel-Layer.md §4). Takes no arguments (`irq_el0_entry`
+/// owns the interrupted frame) and returns a `TrapOutcome`: `Resume` to
+/// let the current thread keep its quantum, or `SwitchTo` to preempt
+/// it. The handler is responsible for re-arming (or cancelling) the
+/// timer via `HalInterface`. Mirrors hal-riscv64's `TickHandler`
+/// exactly.
+pub type TickHandler = fn() -> TrapOutcome;
+
+#[cfg(target_os = "none")]
+static mut TICK_HANDLER: Option<TickHandler> = None;
+
+/// Registers the preemptive-scheduler tick handler `common_irq_el0_
+/// entry` calls when the timer PPI lands on a running U-mode thread.
+/// Set once during boot. Until it is set (and the kernel arms a
+/// deadline via `HalInterface::arm_timer`), the timer PPI still fires
+/// and gets acknowledged/EOI'd by `interrupt::dispatch_current_irq`
+/// (matching `on_timer_interrupt`'s existing callback mechanism) but
+/// triggers no thread switch — so `kernel-stub`, which registers no
+/// handler and never enters U-mode, is unaffected.
+#[cfg(target_os = "none")]
+pub fn set_tick_handler(handler: TickHandler) {
+    // SAFETY: single-core boot; set exactly once before the timer is
+    // armed and before any drop to EL0.
+    unsafe {
+        core::ptr::addr_of_mut!(TICK_HANDLER).write(Some(handler));
+    }
+}
+
 /// `ESR_EL1.EC` = 0x00, "Unknown reason" per the ARM Architecture
 /// Reference Manual — the class every genuinely undefined A64 encoding
 /// traps as, including `udf #0` (Permanently Undefined): this project's
@@ -1110,6 +1202,78 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
 
     trap_diag(ec, elr, far);
     halt_on_unexpected_exception();
+}
+
+/// Host (`cargo test`) stub — reached only from the bare-metal
+/// `irq_el0_entry`'s `bl common_irq_el0_entry` above, which (being part
+/// of a `global_asm!` block) is not itself `#[cfg(target_os = "none")]`-
+/// gated at the assembler level — exists purely so the host build
+/// fails to LINK (an unresolved `common_irq_el0_entry` symbol) rather
+/// than silently miscompiling if this file's own `#[cfg]` gating on the
+/// Rust side ever drifted from the assembly's.
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_irq_el0_entry(_frame: *mut SyncFrame) {}
+
+/// Called from `irq_el0_entry` with a pointer to the saved `SyncFrame`
+/// — the timer PPI (or, in principle, any other GIC interrupt) landing
+/// while a U-mode thread was running. Dispatches it exactly like the
+/// EL1-native IRQ path (`interrupt::dispatch_current_irq` — GIC IAR
+/// read, timer callback if it was the timer PPI, EOI), then — ONLY if
+/// it WAS the timer PPI and a `TickHandler` is registered — asks the
+/// preemptive scheduler what to do next (02-Microkernel-Layer.md §4).
+/// Any other INTID (or no registered handler) simply returns: the
+/// trampoline's own epilogue resumes the interrupted thread at the SAME
+/// `elr` unchanged — an IRQ, unlike `svc`, never "completes" an
+/// instruction, so there is nothing to advance past (mirrors
+/// hal-riscv64's `common_trap_entry`'s own tick-interrupt `Resume` arm,
+/// which likewise does not touch `sepc`).
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_irq_el0_entry(frame: *mut SyncFrame) {
+    let elr: u64;
+    // SAFETY: reading ELR_EL1 has no preconditions inside an exception
+    // handler, which `irq_el0_entry` guarantees this runs inside of.
+    unsafe { core::arch::asm!("mrs {0}, elr_el1", out(reg) elr) };
+
+    let intid = crate::interrupt::dispatch_current_irq();
+    if intid != crate::interrupt::TIMER_PPI_INTID {
+        return;
+    }
+
+    // SAFETY: single-core; `TICK_HANDLER` is only written by
+    // `set_tick_handler` during boot, before the timer is armed.
+    let handler = unsafe { core::ptr::addr_of!(TICK_HANDLER).read() };
+    let Some(h) = handler else {
+        return;
+    };
+    match h() {
+        TrapOutcome::Resume(_) => {}
+        TrapOutcome::SwitchTo { save, into } => {
+            // SAFETY: `frame` is the on-stack register file `irq_el0_
+            // entry` just saved, valid for this call with no other live
+            // reference; `save`/`into` are kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blobs. Never returns:
+            // `restore_user_and_eret` abandons this exception frame's
+            // stack and `eret`s into the incoming thread — see its own
+            // doc comment for why that is safe.
+            let f = unsafe { &mut *frame };
+            unsafe {
+                save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                restore_user_and_eret(into as *const Aarch64UserContext);
+            }
+        }
+        TrapOutcome::Terminate { into } => {
+            // Not the expected outcome for a plain preemption tick (the
+            // preempted thread is still perfectly resumable), but the
+            // type is shared with the syscall/fault paths, so this arm
+            // must exist — same as hal-riscv64's own tick-handler
+            // `Terminate` arm.
+            // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blob.
+            unsafe { restore_user_and_eret(into as *const Aarch64UserContext) };
+        }
+    }
 }
 
 /// Minimal MMIO dump of an unexpected EL0 exception over QEMU virt's

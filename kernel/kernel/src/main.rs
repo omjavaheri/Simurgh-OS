@@ -1080,9 +1080,29 @@ extern "C" fn umode_root_aarch64() -> ! {
             options(nostack, readonly),
         );
         raw_syscall_aarch64(sys::P2_REPORT_A, after, 0);
-    }
-    loop {
-        core::hint::spin_loop();
+
+        // 7. Preemption phase (02-Microkernel-Layer.md §4). Ask the
+        //    kernel to arm the timer PPI, then loop forever bumping this
+        //    process's private counter word in the shared frame (offset
+        //    +8). From here NO `P2_YIELD` is issued — the timer
+        //    interrupt alone switches between this process and the
+        //    worker. In practice `kernel_arch_glue::p2_preempt_start`
+        //    always switches AWAY to a fresh thread sharing this same
+        //    address space before this `svc` ever returns (see its own
+        //    doc comment on why root's own vruntime-loaded TCB is
+        //    retired rather than reused) — this loop is the fallback
+        //    for the rare case that spawn fails, mirroring `umode_root_
+        //    x86`'s own identical tail exactly.
+        raw_syscall_aarch64(sys::P2_PREEMPT_START, 0, 0);
+        core::arch::asm!(
+            "2:",
+            "ldr w9, [{va}]",
+            "add w9, w9, #1",
+            "str w9, [{va}]",
+            "b 2b",
+            va = in(reg) 0xC004_0008u64,
+            options(noreturn),
+        );
     }
 }
 
@@ -1090,7 +1110,7 @@ extern "C" fn umode_root_aarch64() -> ! {
 /// into the same `.user_text` pages as `umode_root_aarch64` but run in
 /// its OWN isolated address space (space B) on its own stack by
 /// `kernel-arch-glue::setup_two_process`. Mirrors `umode_worker_x86`'s
-/// steps 1-3 exactly (no counting-loop tail — see its own doc comment).
+/// steps 1-4 exactly, including the preemptive-phase counting-loop tail.
 #[cfg(target_arch = "aarch64")]
 #[link_section = ".user_text"]
 extern "C" fn umode_worker_aarch64() -> ! {
@@ -1115,10 +1135,77 @@ extern "C" fn umode_worker_aarch64() -> ! {
             options(nostack),
         );
 
+        // 3. Hand the core back to process A for its final §8.4 check.
         raw_syscall_aarch64(sys::P2_YIELD, 0, 0);
+
+        // 4. Resumed here (either by that hand-off's partner, or — once
+        //    process A calls P2_PREEMPT_START — by a timer tick). Loop
+        //    forever bumping this process's private counter word in the
+        //    shared frame (offset +12), issuing NO further `P2_YIELD`.
+        core::arch::asm!(
+            "2:",
+            "ldr w9, [{va}]",
+            "add w9, w9, #1",
+            "str w9, [{va}]",
+            "b 2b",
+            va = in(reg) 0xC020_000Cu64,
+            options(noreturn),
+        );
     }
-    loop {
-        core::hint::spin_loop();
+}
+
+/// A THIRD user-space process, spawned via `kernel_arch_glue::
+/// spawn_process` (the generic path, not `umode_root_aarch64`/
+/// `umode_worker_aarch64`'s hand-written A/B setup) into its OWN
+/// isolated address space AND its OWN capability space — proof that
+/// process creation generalizes beyond the fixed two-process §8.4
+/// proof. Mirrors `umode_subsystem`/`umode_subsystem_x86` exactly:
+/// bumps a private counter word at a fixed low address inside its OWN
+/// stack region (safe because this loop pushes no stack frame — pure
+/// register ops).
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_subsystem_aarch64() -> ! {
+    // SAFETY: the address is the low end of this process's own `AP_USER
+    // R+W` stack mapping (`kernel_arch_glue::spawn_process` set it up);
+    // pure register ops, no stack frame, no relocation.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "ldr w9, [{va}]",
+            "add w9, w9, #1",
+            "str w9, [{va}]",
+            "b 2b",
+            va = in(reg) 0xC030_0000u64,
+            options(noreturn),
+        );
+    }
+}
+
+/// Process A's preemptive-phase counting loop, run by a FRESH thread
+/// `kernel_arch_glue::p2_preempt_start` spawns to share root's own
+/// address space (not `umode_root_aarch64` continuing to run itself —
+/// see that function's doc comment on why root's own vruntime-loaded
+/// TCB is retired instead of reused). Bumps the SAME counter word
+/// `umode_root_aarch64` would have (`P2_VA_A_CONST + 8`), since it runs
+/// in the SAME space A. Mirrors `umode_a_loop`/`umode_a_loop_x86`
+/// exactly.
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_a_loop_aarch64() -> ! {
+    // SAFETY: the address is mapped `AP_USER R+W` in space A by `enter`/
+    // `umode_root_aarch64`'s own setup; pure register ops, no stack
+    // frame.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "ldr w9, [{va}]",
+            "add w9, w9, #1",
+            "str w9, [{va}]",
+            "b 2b",
+            va = in(reg) 0xC004_0008u64,
+            options(noreturn),
+        );
     }
 }
 
@@ -1164,17 +1251,24 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::P2_REPORT_A => {
             kernel_arch_glue::p2_report_a(x0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::P2_PREEMPT_START => {
             // The cooperative §8.4 round-trip is done; spawn the fault-
-            // isolation demo (03-Kernel-Subsystems-Layer.md §5.2) right
-            // here — same reasoning as `simurgh_syscall_x86`'s own
-            // `P2_REPORT_A` arm (no preemption loop on aarch64 yet for
-            // these to "join").
+            // isolation demo (03-Kernel-Subsystems-Layer.md §5.2) and
+            // arm the preemptive scheduler (02-Microkernel-Layer.md §4)
+            // together, right here — mirrors `simurgh_syscall`
+            // (riscv64)'s own `P2_PREEMPT_START` arm exactly: device-
+            // manager and the faulty driver simply join the SAME
+            // timer-driven round-robin `p2_preempt_start`/`p2_tick`
+            // establish for A/B/C, rather than needing an explicit
+            // hand-off — `p2_fault`'s existing unconditional hand-off-
+            // to-`DM_TID` logic (already proven on riscv64 AND aarch64)
+            // takes over the instant the driver is scheduled and faults.
             spawn_device_manager_aarch64(kernel_arch_glue::khal());
-            return match spawn_faulty_driver_aarch64(kernel_arch_glue::khal()) {
-                Some(driver_tid) => match kernel_arch_glue::p2_dm_handoff_to_driver(driver_tid) {
-                    Some((save, into)) => TrapOutcome::SwitchTo { save, into },
-                    None => TrapOutcome::Resume(0),
-                },
+            let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
+            return match kernel_arch_glue::p2_preempt_start() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
             };
         }
@@ -1245,6 +1339,22 @@ fn simurgh_fault_aarch64(ec: usize, elr: usize, _far: usize) -> hal_arm64::cpu::
     use hal_arm64::cpu::TrapOutcome;
     match kernel_arch_glue::p2_fault(ec, elr, 0) {
         Some(into) => TrapOutcome::Terminate { into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+/// The preemptive-scheduler tick handler `hal_arm64::cpu`'s shared EL0
+/// IRQ vector calls for the timer PPI landing on a running U-mode
+/// thread (registered via `hal_arm64::cpu::set_tick_handler`) —
+/// 02-Microkernel-Layer.md §4. Delegates the round-robin decision to
+/// `kernel-arch-glue`; `Some((save, into))` preempts, `None` lets the
+/// current thread keep running. Mirrors `simurgh_tick` (riscv64)
+/// exactly.
+#[cfg(target_arch = "aarch64")]
+fn simurgh_tick_aarch64() -> hal_arm64::cpu::TrapOutcome {
+    use hal_arm64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_tick() {
+        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
         None => TrapOutcome::Resume(0),
     }
 }
@@ -1368,11 +1478,8 @@ fn user_image() -> kernel_arch_glue::UserImage {
             stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
             entry_vma: umode_root_aarch64 as usize,
             worker_entry_vma: umode_worker_aarch64 as usize,
-            // Three-process preemption (process C + `umode_a_loop`) is
-            // deliberately NOT implemented for aarch64 this milestone —
-            // see this crate's own IMPLEMENTATION-PLAN.md entry.
-            subsystem_entry_vma: 0,
-            a_loop_entry_vma: 0,
+            subsystem_entry_vma: umode_subsystem_aarch64 as usize,
+            a_loop_entry_vma: umode_a_loop_aarch64 as usize,
         }
     }
 }
@@ -2045,6 +2152,11 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             // a `svc` (03-Kernel-Subsystems-Layer.md §2.1/§5.2).
             #[cfg(target_arch = "aarch64")]
             hal_arm64::cpu::set_fault_handler(simurgh_fault_aarch64);
+            // Register the preemptive-scheduler tick handler the SAME
+            // shared EL0 IRQ vector calls for the timer PPI landing on a
+            // running U-mode thread (02-Microkernel-Layer.md §4).
+            #[cfg(target_arch = "aarch64")]
+            hal_arm64::cpu::set_tick_handler(simurgh_tick_aarch64);
             // Never returns: runs the in-kernel demo, then (riscv64/
             // x86_64/aarch64) maps the user image U=1/AP_USER, activates
             // paging, and drops the Root Task to U-mode/EL0 isolated.

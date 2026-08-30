@@ -62,7 +62,15 @@ rustflags = [
 ]
 
 [target.aarch64-hal]
-runner = "qemu-system-aarch64 -M virt -cpu cortex-a72 -serial stdio -display none -kernel"
+# `gic-version=3` is explicit, not left to QEMU's own default: this
+# project's `hal-arm64::interrupt` bootstrap (GICv3 system-register CPU
+# interface bring-up, ICC_SRE_EL1/ICC_PMR_EL1/ICC_IGRPEN1_EL1) hangs
+# silently — a synchronous exception with no EL2 handler, vectoring
+# through this crate's own EL1 halt-and-spin path — if the emulated GIC
+# isn't actually GICv3, since QEMU's `virt` machine does not reliably
+# default to it on every QEMU version (confirmed via QEMU 11.1.0, whose
+# unqualified default was NOT GICv3 for this machine/CPU combination).
+runner = "qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -serial stdio -display none -kernel"
 rustflags = [
     "-C", "relocation-model=static",
 ]
