@@ -1371,6 +1371,18 @@ pub enum TrapOutcome {
     /// Return to the trapping thread with `.0` in `rax`, `rip` advanced
     /// past the 2-byte `int 0x80`. The ordinary syscall return.
     Resume(usize),
+    /// Same as `Resume`, but also places `.1` in `rsi` — for a syscall
+    /// whose result genuinely does not fit in one register (e.g. `Recv`
+    /// returning both the sender's `ThreadId` and the message label —
+    /// see `kernel/src/main.rs`'s `IPC_RECV` demo opcode, and hal-
+    /// riscv64's own identical `Resume2`). `rsi` (this project's own
+    /// `a1` register — see `SyscallHandler`'s doc comment) is reused
+    /// for the second value, same "same register both directions"
+    /// convention riscv64's own `a1`/`x11` uses. A separate variant
+    /// rather than widening `Resume` itself: every OTHER existing
+    /// caller only ever has one value to return, and this keeps them
+    /// untouched.
+    Resume2(usize, usize),
     /// Serialise the trapping thread's full context into the
     /// `HAL_USER_CONTEXT_BYTES` blob at `save`, then restore `into` and
     /// `iretq` into it. Both pointers are kernel-owned, 8-byte-aligned
@@ -1379,6 +1391,22 @@ pub enum TrapOutcome {
         /// Where to write the outgoing thread's snapshot.
         save: *mut u8,
         /// The incoming thread's context to resume.
+        into: *const u8,
+    },
+    /// Like `SwitchTo`, but only the L4-style IPC fast path's minimal
+    /// register set is saved/restored (SysV's own callee-saved set —
+    /// `rbx`/`rbp`/`r12`-`r15` — plus this project's own message
+    /// registers `rdi`/`rsi`, plus the always-mandatory `rip`/`cs`/
+    /// `rflags`/`rsp`/`ss`/`cr3` — see `save_ipc_fast_context`'s own
+    /// doc comment for exactly which and why), not every GPR. Used
+    /// ONLY by `kernel/src/main.rs`'s real `IPC_CALL`/`IPC_RECV`/
+    /// `IPC_REPLY` opcodes — every OTHER switch in this codebase keeps
+    /// using plain `SwitchTo`'s full, unconditional guarantee. Mirrors
+    /// hal-riscv64's own identical `SwitchToFast`.
+    SwitchToFast {
+        /// Where to write the outgoing thread's fast-path snapshot.
+        save: *mut u8,
+        /// The incoming thread's fast-path context to resume.
         into: *const u8,
     },
     /// The trapping thread has been TERMINATED — no save (a terminated
@@ -1528,6 +1556,10 @@ extern "C" fn common_syscall_entry(frame: *mut SyscallFrame) {
             // next instruction exactly — proving the hardware advance
             // alone is correct and any further `+=` is the bug).
         }
+        TrapOutcome::Resume2(a0, a1) => {
+            f.rax = a0 as u64;
+            f.rsi = a1 as u64;
+        }
         TrapOutcome::SwitchTo { save, into } => {
             // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
             // `HAL_USER_CONTEXT_BYTES` blobs (the trampoline/
@@ -1546,6 +1578,15 @@ extern "C" fn common_syscall_entry(frame: *mut SyscallFrame) {
                     save as *mut X8664UserContext,
                 );
                 restore_user_and_iretq(into as *const X8664UserContext);
+            }
+        }
+        TrapOutcome::SwitchToFast { save, into } => {
+            // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blobs, same contract as `SwitchTo`.
+            // `f.rip` unchanged — same reasoning as `SwitchTo` above.
+            unsafe {
+                save_ipc_fast_context(f, f.rip, save as *mut X8664UserContext);
+                restore_ipc_fast_context(into as *const X8664UserContext);
             }
         }
         TrapOutcome::Terminate { into } => {
@@ -1650,6 +1691,175 @@ unsafe fn restore_user_and_iretq(blob: *const X8664UserContext) -> ! {
             in("r15") blob,
             options(noreturn),
         );
+    }
+}
+
+/// Serialises only the L4-style IPC fast path's minimal register set —
+/// SysV's own callee-saved GPRs (`rbx`/`rbp`/`r12`-`r15`) plus this
+/// project's own message/return registers (`rdi`=a0 input, `rsi`=a1
+/// input-and-Resume2-output, `rax`=Resume/Resume2's own return-value
+/// register — see `SyscallHandler`'s and `poke_saved_a0_a1`'s own doc
+/// comments for why `rax` is here despite being SysV CALLER-saved: this
+/// project's convention puts the syscall's RETURN value in `rax`
+/// specifically so it must survive an IPC fast-path switch the same way
+/// riscv64's `a0` does, even though on x86_64 `rax` and the message
+/// INPUT registers are physically different from each other), plus the
+/// always-mandatory resume state (`rip`/`cs`/`rflags`/`rsp`/`ss`/`cr3`).
+/// Deliberately narrower than `save_syscall_frame_as_user_context`: the
+/// REMAINING SysV caller-saved registers (`rcx`/`rdx`/`r8`-`r11`) are
+/// scratch across a call boundary by the ABI's own contract, and an IPC
+/// `int 0x80` is treated as exactly that boundary — same reasoning as
+/// hal-riscv64's identical `save_ipc_fast_context`, just with x86_64's
+/// own SysV register split (widened by one register, `rax`, for the
+/// reason above) instead of RISC-V's calling convention. Every field NOT
+/// written here is left at whatever `dst` already held — callers must
+/// pass a blob this function fully owns (never a stale general-purpose
+/// snapshot), exactly as `restore_ipc_fast_context` only ever reads the
+/// fields this function writes.
+///
+/// # Safety
+/// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
+/// 8-byte-aligned storage.
+#[cfg(target_os = "none")]
+unsafe fn save_ipc_fast_context(frame: &SyscallFrame, resume_rip: u64, dst: *mut X8664UserContext) {
+    let cr3: u64;
+    // SAFETY: reading CR3 has no preconditions in a trap handler.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: `dst` is valid writable storage per this function's
+    // contract; each field write is in-bounds of `X8664UserContext`.
+    unsafe {
+        (*dst).rax = frame.rax;
+        (*dst).rbx = frame.rbx;
+        (*dst).rbp = frame.rbp;
+        (*dst).r12 = frame.r12;
+        (*dst).r13 = frame.r13;
+        (*dst).r14 = frame.r14;
+        (*dst).r15 = frame.r15;
+        (*dst).rdi = frame.rdi;
+        (*dst).rsi = frame.rsi;
+        (*dst).rip = resume_rip;
+        (*dst).cs = frame.cs;
+        (*dst).rflags = frame.rflags;
+        (*dst).rsp = frame.rsp;
+        (*dst).ss = frame.ss;
+        (*dst).cr3 = cr3;
+    }
+}
+
+/// Restores the fast-path register set `save_ipc_fast_context` wrote and
+/// `iretq`s into U-mode. The remaining SysV CALLER-saved GPRs
+/// (`rcx`/`rdx`/`r8`-`r11` — NOT `rax`, which `save_ipc_fast_context`'s
+/// own doc comment explains is deliberately preserved rather than
+/// treated as scratch) are explicitly ZEROED rather than left with
+/// whatever the previous occupant of this CPU's registers held — the
+/// same deliberate cross-thread information-disclosure fix
+/// hal-riscv64's `restore_ipc_fast_context` documents for its own
+/// caller-saved set (`t0`-`t6`,`a2`-`a7`): "don't touch" would leak the
+/// PREVIOUS thread's register contents into the incoming one.
+///
+/// # Safety
+/// Same contract as `restore_user_and_iretq`: `blob` must point at a
+/// valid, resumable fast-path `X8664UserContext` (as produced by
+/// `save_ipc_fast_context`) whose `cr3` names an address space that maps
+/// this core's IDT/GDT/TSS targets and the identity-mapped low RAM
+/// `blob` itself lives in.
+#[cfg(target_os = "none")]
+unsafe fn restore_ipc_fast_context(blob: *const X8664UserContext) -> ! {
+    // SAFETY: contract above. `r15` carries the blob base throughout,
+    // loaded from its OWN saved slot dead last — same "one restored
+    // register doubles as the pointer" trick `restore_user_and_iretq`
+    // uses, for the same reason (x86_64 has no spare GPR). `rax` is used
+    // as scratch while shuttling the IRETQ frame onto the stack; its
+    // scratch value there is irrelevant — it gets OVERWRITTEN below,
+    // before `iretq`, with its real preserved value loaded from the
+    // blob (see `save_ipc_fast_context`'s doc comment on why `rax` is
+    // preserved here rather than zeroed like the rest of SysV's
+    // caller-saved set), so nothing of that scratch use survives into
+    // the resumed thread.
+    unsafe {
+        core::arch::asm!(
+            "mov rax, [r15 + 160]", // cr3
+            "mov cr3, rax",
+            "mov rax, [r15 + 152]", // ss
+            "push rax",
+            "mov rax, [r15 + 144]", // rsp
+            "push rax",
+            "mov rax, [r15 + 136]", // rflags
+            "push rax",
+            "mov rax, [r15 + 128]", // cs
+            "push rax",
+            "mov rax, [r15 + 120]", // rip
+            "push rax",
+            "mov rbx, [r15 + 8]",   // preserved (SysV callee-saved)
+            "xor rcx, rcx",         // zeroed (SysV caller-saved)
+            "xor rdx, rdx",         // zeroed (SysV caller-saved)
+            "mov rsi, [r15 + 32]",  // preserved (message register a1)
+            "mov rdi, [r15 + 40]",  // preserved (message register a0)
+            "mov rbp, [r15 + 48]",  // preserved (SysV callee-saved)
+            "xor r8,  r8",          // zeroed (SysV caller-saved)
+            "xor r9,  r9",          // zeroed (SysV caller-saved)
+            "xor r10, r10",         // zeroed (SysV caller-saved)
+            "xor r11, r11",         // zeroed (SysV caller-saved)
+            "mov r12, [r15 + 88]",  // preserved (SysV callee-saved)
+            "mov r13, [r15 + 96]",  // preserved (SysV callee-saved)
+            "mov r14, [r15 + 104]", // preserved (SysV callee-saved)
+            "mov rax, [r15 + 0]",   // preserved (return-value register —
+                                     // see save_ipc_fast_context's doc
+                                     // comment) — after rax's scratch
+                                     // use above is done
+            "mov r15, [r15 + 112]", // preserved — MUST be last: every
+                                     // prior line still dereferences r15
+            "iretq",
+            in("r15") blob,
+            options(noreturn),
+        );
+    }
+}
+
+/// Writes `a0`/`a1` directly into a saved `X8664UserContext`'s
+/// **return-value** registers — used by `kernel/src/main.rs`'s IPC
+/// syscall handlers to deliver a message INTO a thread that is being
+/// woken via a direct hand-off (a `SwitchToFast`/`SwitchTo` target that
+/// never itself re-enters `common_syscall_entry` to pick up a `Resume`/
+/// `Resume2` return value the normal way — see `kernel_arch_glue`'s
+/// `IpcSwitch::poke` field doc comment).
+///
+/// Deliberately `rax`/`rsi`, NOT `rdi`/`rsi`: unlike hal-riscv64 (whose
+/// `ecall` convention reuses the SAME register, `a0`/x10, for both the
+/// syscall's input argument and its return value, so poking `a0`/`a1`
+/// there is automatically also "poking the return value"), this
+/// project's own x86_64 convention deliberately keeps the two separate
+/// — `rdi`/`rsi` are the INPUT message registers (`SyscallHandler`'s
+/// own doc comment), but `rax`/`rsi` are what `Resume`/`Resume2` write
+/// a result into (mirroring the real Linux `int 0x80` ABI, where `rax`
+/// is always the return register). Since this function's whole point is
+/// delivering a value the resuming thread reads as its syscall's
+/// RETURN, it must target the SAME registers `Resume2` does, not the
+/// input ones — **real bug found via QEMU** (this session's x86_64 IPC
+/// fast-path fan-out): an earlier draft wrote `rdi`/`rsi` here (copying
+/// hal-riscv64's field names literally rather than its actual "return
+/// register" semantics), which compiled and ran but silently delivered
+/// `Reply`'s value into the WRONG registers — the resuming `IPC_CALL`
+/// caller read its reply back from `rax` (per `raw_syscall_x86`'s own
+/// `inlateout("rax")` convention) and always saw `0`, confirmed via a
+/// QEMU serial capture showing `root task (U-mode, x86_64): syscall
+/// result = 0x0` where `0xc0ffef` (`0xC0FFEE + 1`, `umode_ipc_server_
+/// x86`'s reply) was expected.
+///
+/// # Safety
+/// `ctx` must point at a valid, exclusively-owned `X8664UserContext`
+/// (the same blob a `SwitchTo`/`SwitchToFast` `save`/`into` pointer
+/// names) — not currently being read or written by anything else.
+#[cfg(target_os = "none")]
+pub unsafe fn poke_saved_a0_a1(ctx: *mut u8, a0: usize, a1: usize) {
+    // SAFETY: contract above; `X8664UserContext` is `#[repr(C)]` and
+    // `ctx` is required to point at one.
+    unsafe {
+        let c = &mut *(ctx as *mut X8664UserContext);
+        c.rax = a0 as u64;
+        c.rsi = a1 as u64;
     }
 }
 
@@ -1780,11 +1990,44 @@ extern "C" fn common_fault_entry(frame: *mut SyscallFrame) {
                     f.rax = ret as u64;
                     return;
                 }
+                TrapOutcome::Resume2(a0, a1) => {
+                    // Not a real handler outcome for a fatal exception —
+                    // no `FaultHandler` implementation returns this
+                    // today — but `TrapOutcome` is shared with the IPC
+                    // syscall path, so this arm must exist for
+                    // exhaustiveness. Deliver both values the same way
+                    // `Resume` does and return.
+                    f.rax = a0 as u64;
+                    f.rsi = a1 as u64;
+                    return;
+                }
                 TrapOutcome::SwitchTo { save, into } => {
                     // SAFETY: `save`/`into` are kernel-owned, 8-byte-
                     // aligned `HAL_USER_CONTEXT_BYTES` blobs. Resume
                     // point is `f.rip` unchanged (the faulting
                     // instruction never legitimately completes).
+                    unsafe {
+                        save_syscall_frame_as_user_context(
+                            f,
+                            f.rip,
+                            save as *mut X8664UserContext,
+                        );
+                        restore_user_and_iretq(into as *const X8664UserContext);
+                    }
+                }
+                TrapOutcome::SwitchToFast { save, into } => {
+                    // Unreachable in practice — no `FaultHandler`
+                    // implementation returns this — but falls back to a
+                    // FULL save/restore rather than the narrower fast-
+                    // path one: a fault handler has no basis for
+                    // assuming the L4 IPC fast path's register-set
+                    // narrowing is safe here, so this deliberately does
+                    // NOT call `save_ipc_fast_context`/
+                    // `restore_ipc_fast_context`. Same choice hal-
+                    // riscv64's own fault handler makes for its
+                    // `SwitchToFast` arm.
+                    // SAFETY: `save`/`into` are kernel-owned, 8-byte-
+                    // aligned `HAL_USER_CONTEXT_BYTES` blobs.
                     unsafe {
                         save_syscall_frame_as_user_context(
                             f,
@@ -1954,11 +2197,32 @@ extern "C" fn common_timer_entry(frame: *mut SyscallFrame) {
     };
     match h() {
         TrapOutcome::Resume(_) => {}
+        TrapOutcome::Resume2(..) => {
+            // Not a real `TickHandler` outcome (no implementation
+            // returns this) — exists only for `TrapOutcome`
+            // exhaustiveness, same as hal-riscv64's own tick-handler
+            // `Resume2` arm. Both values would be meaningless here (a
+            // preemption tick returns no message registers), so this is
+            // treated identically to `Resume`.
+        }
         TrapOutcome::SwitchTo { save, into } => {
             // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
             // `HAL_USER_CONTEXT_BYTES` blobs. Never returns:
             // `restore_user_and_iretq` abandons this trap frame's stack
             // and `iretq`s into the incoming thread.
+            unsafe {
+                save_syscall_frame_as_user_context(f, f.rip, save as *mut X8664UserContext);
+                restore_user_and_iretq(into as *const X8664UserContext);
+            }
+        }
+        TrapOutcome::SwitchToFast { save, into } => {
+            // Unreachable in practice (no `TickHandler` implementation
+            // returns this), but falls back to a FULL save/restore for
+            // the same reason `common_fault_entry`'s own `SwitchToFast`
+            // arm does — a preemption tick has no basis for assuming
+            // the fast path's narrower register set is safe.
+            // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blobs.
             unsafe {
                 save_syscall_frame_as_user_context(f, f.rip, save as *mut X8664UserContext);
                 restore_user_and_iretq(into as *const X8664UserContext);
