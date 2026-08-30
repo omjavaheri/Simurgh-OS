@@ -381,6 +381,40 @@ mod sys {
     /// `p2_watch_driver` on its new `ThreadId` (a respawned driver is a
     /// brand-new thread, not the dead one coming back).
     pub const DM_RESPAWN_DRIVER: usize = 33;
+
+    // -- Real U-mode Call/Recv/Reply demo (02-Microkernel-Layer.md
+    //    §5.1/§8.2) — unlike EVERY opcode above, these route through the
+    //    REAL `kernel_core::SyscallOp::{Call,Recv,Reply}` IPC surface
+    //    (`kernel_arch_glue::{p2_ipc_demo_start,p2_ipc_call,p2_ipc_recv,
+    //    p2_ipc_reply}`), not ad-hoc kernel-side bookkeeping — the
+    //    concrete thing the still-pending register-only IPC fast path
+    //    (`kernel_ipc::fastpath`'s own doc comment) needs a genuine trap
+    //    boundary to attach to and be verified against. --
+
+    /// No arguments. Creates the demo's shared endpoint and spawns the
+    /// SERVER thread (`umode_ipc_server`), then switches straight to it.
+    /// The value this returns in `a0` once the caller resumes (later,
+    /// after the server's own first `IPC_RECV` switches back) is
+    /// meaningless — follow up with `IPC_ENDPOINT_CAP`.
+    pub const IPC_DEMO_START: usize = 40;
+    /// No arguments. Returns the demo endpoint's capability slot (set by
+    /// `IPC_DEMO_START`) — both the client and the server call this to
+    /// learn it independently; a fresh thread has no other way to learn
+    /// a value computed during someone ELSE's own execution.
+    pub const IPC_ENDPOINT_CAP: usize = 41;
+    /// `a0` = endpoint capability slot, `a1` = request label. A REAL
+    /// `SyscallOp::Call` — always blocks (per that op's own semantics)
+    /// until replied to, then returns the reply label in `a0`.
+    pub const IPC_CALL: usize = 42;
+    /// `a0` = endpoint capability slot. A REAL `SyscallOp::Recv` —
+    /// returns `(from_thread_id, label)` in `(a0, a1)` (needs
+    /// `raw_syscall2`, not the ordinary single-value `raw_syscall`).
+    pub const IPC_RECV: usize = 43;
+    /// `a0` = the `ThreadId` `IPC_RECV` returned as `from`, `a1` = reply
+    /// label. A REAL `SyscallOp::Reply` — always switches away (per that
+    /// op's own semantics); the value in `a0` if this ever DID return
+    /// (an error case only) is meaningless.
+    pub const IPC_REPLY: usize = 44;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -400,6 +434,40 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     }
     ret
 }
+
+/// Like `raw_syscall`, but also reads back `a1` — for `IPC_RECV`, the
+/// ONE opcode whose result genuinely does not fit in a single register
+/// (see `TrapOutcome::Resume2`'s own doc comment). Every OTHER opcode's
+/// single-value convention is `raw_syscall`'s exact `in("a1") a1`
+/// (write-only from this function's perspective, discarding whatever
+/// ends up there) — this is a narrow exception, not a change to the
+/// general syscall ABI.
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1);
+    // SAFETY: same contract as `raw_syscall` — `ecall` preserves every
+    // register except a0/a1 for this opcode specifically.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") a7,
+            inlateout("a0") a0 => r0,
+            inlateout("a1") a1 => r1,
+            options(nostack),
+        );
+    }
+    (r0, r1)
+}
+
+/// The real Call/Recv/Reply demo's endpoint capability slot, set once by
+/// `IPC_DEMO_START`'s handler and read by `IPC_ENDPOINT_CAP` — both the
+/// client (`umode_root`) and the server (`umode_ipc_server`) call the
+/// latter to learn it independently, since the server (a fresh thread)
+/// has no other way to learn a value computed during the client's own
+/// earlier execution.
+#[cfg(target_arch = "riscv64")]
+static mut G_IPC_EP: u32 = 0;
 
 /// The user-space Root Task entry. Linked into `.user_text` (its own
 /// U=1 R+X pages at VMA 0xC000_0000, per hal-riscv64's linker.ld) and run
@@ -481,7 +549,24 @@ extern "C" fn umode_root() -> ! {
         );
         raw_syscall(sys::P2_REPORT_A, after, 0);
 
-        // 7. Preemption phase (02-Microkernel-Layer.md §4). Ask the
+        // 7. Real Call/Recv/Reply demo (02-Microkernel-Layer.md
+        //    §5.1/§8.2) — unlike everything above (all ad-hoc raw
+        //    opcodes), this exercises the REAL `kernel_core::SyscallOp`
+        //    IPC surface through a genuine trap boundary (see
+        //    `sys::IPC_DEMO_START`'s own doc comment: the concrete thing
+        //    the still-pending register-only IPC fast path needs to
+        //    attach to). `IPC_DEMO_START` spawns the server
+        //    (`umode_ipc_server`) and switches straight to it; we resume
+        //    here once the server's own first `IPC_RECV` finds nothing
+        //    queued yet and switches back — exactly like step 5's
+        //    `P2_YIELD` above, just through the real IPC opcodes instead
+        //    of the demo-specific ones.
+        raw_syscall(sys::IPC_DEMO_START, 0, 0);
+        let ipc_ep = raw_syscall(sys::IPC_ENDPOINT_CAP, 0, 0);
+        let ipc_reply = raw_syscall(sys::IPC_CALL, ipc_ep, 0xC0FFEE);
+        raw_syscall(sys::REPORT, ipc_reply, 0);
+
+        // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
         //    bumping this process's private counter word in the shared
         //    frame (offset +8). From here NO `P2_YIELD` is issued — the
@@ -589,6 +674,35 @@ extern "C" fn umode_subsystem() -> ! {
             in("t1") 0xC030_0000usize,
             options(noreturn),
         );
+    }
+}
+
+/// The real Call/Recv/Reply demo's SERVER (02-Microkernel-Layer.md
+/// §5.1/§8.2 — see `sys::IPC_DEMO_START`'s own doc comment). Spawned by
+/// `kernel_arch_glue::p2_ipc_demo_start`, sharing `umode_root`'s OWN
+/// address space (not a separate isolated one — this demo is about the
+/// IPC mechanism itself, not process isolation, which is already proven
+/// elsewhere by process B / process C / device-manager). Blocks in
+/// `IPC_RECV`, replies with `label + 1` once a request arrives, then
+/// parks — its one job is done (a single round trip is enough to prove
+/// the real trap boundary works; looping this into a timed benchmark
+/// the way §8.3's in-kernel one already does is a natural follow-up,
+/// not attempted here).
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_ipc_server() -> ! {
+    // SAFETY: `ecall` traps to our S-mode handler; pure register ops, no
+    // stack frame, no relocation — same convention every other
+    // `.user_text` function here follows.
+    unsafe {
+        let ep = raw_syscall(sys::IPC_ENDPOINT_CAP, 0, 0);
+        let (from, label) = raw_syscall2(sys::IPC_RECV, ep, 0);
+        raw_syscall(sys::IPC_REPLY, from, label.wrapping_add(1));
+        // `IPC_REPLY` always switches away on success (see its own doc
+        // comment) — unreachable in that case; this is the fallback for
+        // the error case (a malformed `from`, say), so this thread
+        // parks instead of running off the end of the function.
+        core::arch::asm!("2:", "j 2b", options(noreturn));
     }
 }
 
@@ -1858,6 +1972,90 @@ fn simurgh_syscall(
                     Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                     None => TrapOutcome::Resume(0),
                 },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        // Real Call/Recv/Reply demo (see `sys::IPC_DEMO_START`'s own doc
+        // comment) — every arm here calls `kernel_arch_glue::kstate().
+        // sched.running()` for "who trapped", not the hardcoded `root`
+        // every OTHER opcode above uses: those are only ever called BY
+        // root in this demo, but IPC_RECV/IPC_REPLY are called by the
+        // SERVER thread too.
+        sys::IPC_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_demo_start(hal, caller, umode_ipc_server as usize) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes G_IPC_EP,
+                    // before either the client or the server can read it.
+                    unsafe { core::ptr::addr_of_mut!(G_IPC_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::IPC_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by IPC_DEMO_START before
+            // either caller of this opcode can run.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_IPC_EP).read() } as usize);
+        }
+        sys::IPC_CALL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_call(hal, caller, a0 as u32, a1 as u64) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `p2_ipc_call`'s own contract.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_recv(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // `poke` is always `None` here — WE are the one
+                    // blocking (nothing to poke into our own trap; the
+                    // ordinary `Resume`/`Resume2` path handles that),
+                    // not being woken via a direct hand-off.
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::IPC_REPLY => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_reply(hal, caller, a0 as u32, a1 as u64) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: same contract as IPC_CALL's own poke
+                        // above.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
                 None => TrapOutcome::Resume(0),
             };
         }

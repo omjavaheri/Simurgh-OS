@@ -292,6 +292,14 @@ pub enum TrapOutcome {
     /// advance `sepc` past the 4-byte `ecall`. The ordinary syscall
     /// return.
     Resume(usize),
+    /// Same as `Resume`, but also places `.1` in `a1` — for a syscall
+    /// whose result genuinely does not fit in one register (e.g. `Recv`
+    /// returning both the sender's `ThreadId` and the message label —
+    /// see `kernel/src/main.rs`'s `IPC_RECV` demo opcode). A separate
+    /// variant rather than widening `Resume` itself: every OTHER
+    /// existing caller only ever has one value to return, and this
+    /// keeps them untouched.
+    Resume2(usize, usize),
     /// Serialise the trapping thread's full U-mode context (every GPR,
     /// `sepc` advanced past the `ecall`, `sstatus`, `satp`) into the
     /// `HAL_USER_CONTEXT_BYTES` blob at `save`, then restore the blob at
@@ -465,7 +473,7 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                 let handler = unsafe { core::ptr::addr_of!(TICK_HANDLER).read() };
                 if let Some(h) = handler {
                     match h() {
-                        TrapOutcome::Resume(_) => return,
+                        TrapOutcome::Resume(_) | TrapOutcome::Resume2(_, _) => return,
                         TrapOutcome::SwitchTo { save, into } => {
                             // SAFETY: `save` / `into` are kernel-owned
                             // aligned `HAL_USER_CONTEXT_BYTES` blobs.
@@ -527,6 +535,13 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                 unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
                 return;
             }
+            TrapOutcome::Resume2(a0, a1) => {
+                f.regs[TrapFrame::A0] = a0 as u64;
+                f.regs[TrapFrame::A0 + 1] = a1 as u64;
+                // SAFETY: writing sepc is valid within a trap handler.
+                unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
+                return;
+            }
             TrapOutcome::SwitchTo { save, into } => {
                 // SAFETY: `save` / `into` are kernel-owned, 8-byte-
                 // aligned `HAL_USER_CONTEXT_BYTES` blobs (the trampoline
@@ -576,7 +591,7 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
         let handler = unsafe { core::ptr::addr_of!(FAULT_HANDLER).read() };
         if let Some(h) = handler {
             match h(cause_code, sepc, stval) {
-                TrapOutcome::Resume(_) => return,
+                TrapOutcome::Resume(_) | TrapOutcome::Resume2(_, _) => return,
                 TrapOutcome::SwitchTo { save, into } => {
                     // SAFETY: `frame` is the on-stack register file
                     // `trap_entry` just saved; valid here, no other live
@@ -750,6 +765,37 @@ struct RiscvUserContext {
 const _: () = {
     assert!(size_of::<RiscvUserContext>() == hal_core::HAL_USER_CONTEXT_BYTES);
 };
+
+/// Overwrites a SAVED (not currently executing) `UserContext` blob's
+/// `a0`/`a1` fields directly — for a thread being woken via a direct
+/// `TrapOutcome::SwitchTo` hand-off (not its own trap resuming, which
+/// goes through `Resume`/`Resume2` above instead): the target's a0/a1
+/// still hold whatever it originally trapped in WITH (its OWN syscall's
+/// input arguments), and the kernel-core-level delivery it is being
+/// woken for (e.g. `kernel_core::syscall::do_send`'s `Call` fast path
+/// delivering into an already-blocked `Recv`er) needs its RESULT
+/// placed there instead before the switch runs — mirrors `kernel/src/
+/// main.rs`'s own `IPC_RECV` demo opcode, which is the reason this
+/// exists.
+///
+/// # Safety
+/// `ctx` must point at a valid, currently-not-executing
+/// `HAL_USER_CONTEXT_BYTES` blob (the same contract `TrapOutcome::
+/// SwitchTo`'s `into` pointer carries) — typically a TCB's own
+/// `user_context` storage, reached BEFORE the actual switch into it.
+pub unsafe fn poke_saved_a0_a1(ctx: *mut u8, a0: usize, a1: usize) {
+    // SAFETY: forwarded from this function's own contract; `ctx` is
+    // `HAL_USER_CONTEXT_BYTES`-sized and 8-byte-aligned per that
+    // contract, matching `RiscvUserContext`'s own size/alignment (see
+    // the `const _` assertion just above).
+    let c = unsafe { &mut *(ctx as *mut RiscvUserContext) };
+    // `regs[9]`/`regs[10]` = `x10`/`x11` = `a0`/`a1` — see
+    // `RiscvUserContext`'s own doc comment (not `TrapFrame::A0`, which
+    // is only defined `#[cfg(target_os = "none")]` and this function
+    // must compile on host too, for `hal-riscv64`'s own test suite).
+    c.regs[9] = a0 as u64;
+    c.regs[10] = a1 as u64;
+}
 
 /// SPP is `sstatus` bit 8 (Supervisor Previous Privilege): 0 = the trap
 /// that will be returned from via `sret` came from U-mode, so `sret`

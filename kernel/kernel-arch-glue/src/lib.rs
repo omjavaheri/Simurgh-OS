@@ -61,6 +61,11 @@ struct Aligned([u8; THREAD_STACK_SIZE]);
 // `.user_stack` in the final binary, not here — see `UserImage`.)
 static mut THREAD2_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut THREAD3_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
+/// The real-trap-boundary IPC demo's SERVER thread (`p2_ipc_demo_start`,
+/// `IPC_DEMO_START` — a genuine U-mode `Call`/`Recv`/`Reply` round trip,
+/// unlike every OTHER demo process, which uses ad-hoc raw opcodes, not
+/// the real `kernel_core::SyscallOp` IPC surface).
+static mut THREAD_IPC_SERVER_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
 static mut G_STATE: *mut KernelState = core::ptr::null_mut();
 static mut G_HAL: *const HalInterface = core::ptr::null();
 /// How many GiB `map_ram_identity` covers for the kernel's OWN image —
@@ -1436,6 +1441,230 @@ pub fn p2_poll_crash() -> usize {
     // SAFETY: single-core; only this function clears `PENDING_CRASH`.
     let pending = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(PENDING_CRASH), None) };
     pending.map(|(cause, _, _)| cause).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Real U-mode Call/Recv/Reply demo (02-Microkernel-Layer.md §5.1/§8.2 —
+// IMPLEMENTATION-PLAN.md's own follow-up: everything ELSE in this file's
+// U-mode demo machinery uses ad-hoc raw opcodes over `ecall`
+// [`P2_YIELD`, `ALIVE`, `DM_REPORT`, ...], never `kernel_core::SyscallOp`'s
+// REAL `Call`/`Recv`/`Reply` IPC surface through a genuine trap. This is
+// the first — and, deliberately, only — demo to actually exercise that
+// surface end to end, as the concrete thing the register-only IPC fast
+// path (still pending — see `kernel_ipc::fastpath`'s own doc comment)
+// needs to attach to and be verified against.
+//
+// `p2_ipc_call`/`p2_ipc_recv`/`p2_ipc_reply` stay entirely architecture-
+// erased (no `cfg(target_arch)`, same as everything else in this crate):
+// each returns a plain `IpcSwitch`/`Option<...>` describing what the
+// ARCHITECTURE-SPECIFIC caller (`kernel/src/main.rs`'s `simurgh_syscall`)
+// must do — including, when `poke` is `Some`, an (a0, a1) pair the
+// caller must write into the target's SAVED context via its own
+// `hal_<arch>::cpu::poke_saved_a0_a1`-style primitive BEFORE performing
+// the actual switch. This function cannot do that poke itself: it would
+// need to know the concrete `UserContext` layout, which is exactly the
+// architecture knowledge this crate must not have.
+// ---------------------------------------------------------------------------
+
+/// What the architecture-specific caller must do to complete an
+/// `IpcCall`/`IpcRecv`/`IpcReply` demo opcode that needs a real switch.
+pub struct IpcSwitch {
+    /// Where to write the outgoing (calling) thread's snapshot.
+    pub save: *mut u8,
+    /// The incoming thread's context to resume.
+    pub into: *const u8,
+    /// If `Some((a0, a1))`, the caller must poke `into`'s SAVED a0/a1
+    /// registers with these values BEFORE performing the switch — `into`
+    /// is being woken via a direct kernel-core delivery (`do_send`'s
+    /// `Call` fast path, or `do_reply`), not resuming its own trap, so
+    /// its saved context still holds whatever it originally trapped in
+    /// WITH and needs the delivery's actual result written in instead.
+    pub poke: Option<(usize, usize)>,
+}
+
+/// `IPC_CALL` demo opcode: `SyscallOp::Call` with a label-only
+/// `SmallMessage` (no data words — this demo only needs to prove the
+/// mechanism, not carry a real payload). Always either switches away
+/// (a `Call` always blocks its caller pending the reply — see `do_send`'s
+/// own doc comment) or fails outright; there is no "resume immediately"
+/// case for `Call` the way there is for `Recv`.
+pub fn p2_ipc_call(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32, label: u64) -> Option<IpcSwitch> {
+    let k = kstate();
+    let msg = SmallMessage::new(label);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: kernel_cap::CapId::new(endpoint_raw), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            // `do_send`/`do_recv`/`do_reply` only ever call `note_ready`/
+            // `note_blocked` on the entities they touch, never `dispatch`
+            // — `Scheduler::dispatch` is the ONE call that both marks an
+            // entity `Running` AND updates `self.running`, and skipping
+            // it here would leave kernel-sched's own bookkeeping
+            // pointing at `caller` even after the switch below actually
+            // moves execution to `n` — corrupting a LATER `account()`/
+            // `pick_next()`'s idea of who is really running. Matches
+            // `p2_ipc_demo_start`'s own explicit `dispatch` call (itself
+            // modeled on `p2_preempt_start`'s precedent) for the exact
+            // same reason.
+            let _ = k.sched.dispatch(n, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+            // `n` is the receiver `do_send`'s fast path just delivered
+            // to directly (see that function's own doc comment) exactly
+            // when both fields below are present — the general
+            // (non-fast-path) case picks some other, unrelated `Ready`
+            // thread via `pick_next`, which never had these set, so
+            // `poke` correctly comes back `None` for it.
+            let poke = k
+                .tcb_mut(n)
+                .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                .map(|(from, m)| (from.as_u32() as usize, m.label as usize));
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `IPC_RECV` demo opcode: `SyscallOp::Recv`. Unlike `Call`, this CAN
+/// resume immediately (a sender was already queued) — the caller must
+/// then place `(from, label)` in its OWN `a0`/`a1` (`TrapOutcome::
+/// Resume2`), not perform any switch at all.
+pub enum IpcRecvOutcome {
+    /// Resume the calling thread's own trap with `(from, label)`.
+    Immediate { from: usize, label: usize },
+    /// Block — perform this switch.
+    Switch(IpcSwitch),
+}
+
+pub fn p2_ipc_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Recv { endpoint: kernel_cap::CapId::new(endpoint_raw) }, hal) {
+        Ok(SyscallReturn::Message { from, msg }) => {
+            Some(IpcRecvOutcome::Immediate { from: from.as_u32() as usize, label: msg.label as usize })
+        }
+        Ok(SyscallReturn::Reschedule { next: Some(_) }) => {
+            // **Real bug found via QEMU**: `do_recv`'s own `next` here
+            // is `pick_next`'s GENERAL fairness answer — correct for
+            // the general syscall surface, but wrong for THIS demo's
+            // one-shot RPC shape, which for the whole rest of the boot
+            // sequence up to this point had never once actually
+            // consulted `pick_next` while process B (tid 3, `§8.4`'s own
+            // worker) sat `Ready`-but-idle (finished its own role,
+            // genuinely eligible, LOWER vruntime than root's — root has
+            // been doing real ecall work this entire demo). The first
+            // time anything DOES call `pick_next` here, it correctly-
+            // by-its-own-rules preferred process B over `root` — NOT a
+            // scheduler bug, but wrong for a deterministic 2-party
+            // RPC's assumption "whoever blocked in `Recv` resumes
+            // whoever `Call`s it next". Same fix `p2_fault`'s own
+            // "unconditional hand-off to `DM_TID` — direct, not generic
+            // fairness" already established for exactly this class of
+            // problem: bypass `pick_next` and switch straight to the
+            // ONE thread this scoped, one-shot demo ever expects to
+            // interact with the server (`root`), rather than trusting
+            // general fairness to guess correctly.
+            // See `p2_ipc_call`'s own comment on why `dispatch` (not
+            // just `user_ctx_switch_ptrs`) is needed here.
+            let _ = k.sched.dispatch(k.root_thread, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, k.root_thread)?;
+            Some(IpcRecvOutcome::Switch(IpcSwitch { save, into, poke: None }))
+        }
+        _ => None,
+    }
+}
+
+/// `IPC_REPLY` demo opcode: `SyscallOp::Reply`. Like `Call`, always a
+/// switch (`do_reply` never returns a `Resume`-worthy outcome to the
+/// replying thread itself — see that function's own doc comment).
+pub fn p2_ipc_reply(hal: &HalInterface, caller: ThreadId, to_raw: u32, label: u64) -> Option<IpcSwitch> {
+    let k = kstate();
+    let to = ThreadId::new(to_raw);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Reply { to, msg: SmallMessage::new(label) }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            // See `p2_ipc_call`'s own comment on why `dispatch` (not
+            // just `user_ctx_switch_ptrs`) is needed here.
+            let _ = k.sched.dispatch(n, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+            // `do_reply` only ever sets `pending_msg` (never
+            // `pending_from` — the woken caller already knows who it
+            // `Call`ed, unlike a receiver waking to a fresh `Call`).
+            let poke = k
+                .tcb_mut(n)
+                .and_then(|t| t.pending_msg.take())
+                .map(|m| (m.label as usize, 0usize));
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `IPC_DEMO_START` demo opcode: creates the endpoint this whole demo
+/// runs on and spawns the SERVER thread (`server_entry_vma`, sharing the
+/// caller's OWN address + capability space — like `p2_preempt_start`'s
+/// own fresh a_loop thread — so the same `CapId` resolves to the same
+/// endpoint for both without needing a `CapGrant`), then switches
+/// straight to it. The server's `IPC_RECV` runs a moment later, on its
+/// OWN trap, and (per that opcode's own doc comment) switches back here
+/// once it finds nothing queued — resuming the ORIGINAL `IPC_DEMO_START`
+/// caller right after this same switch, per `TrapOutcome::SwitchTo`'s
+/// own contract.
+pub fn p2_ipc_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    server_entry_vma: usize,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: kernel_cap::CapId::new(0),
+            target_type: kernel_mm::KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    let server = k.alloc_tcb(k.root_cap_space, k.root_addr_space)?;
+    // `root_frame = 0`: share the caller's OWN (already-active) address
+    // space — same convention `p2_preempt_start`'s own fresh thread uses.
+    // Stack: reuse `G_A_STACK_TOP` (root's own U-mode stack top, already
+    // `U=1 R+W` mapped in this shared address space) — same convention
+    // `p2_preempt_start`'s own fresh a_loop thread uses, for the same
+    // reason: this server's code is pure register ops around `ecall`,
+    // never pushes a frame, so nothing about the stack's prior contents
+    // matters, and it never runs concurrently with whatever else might
+    // also be using that VA (single-core, cooperative hand-off only).
+    // SAFETY: single-core; `G_A_STACK_TOP` is written once by `enter`,
+    // before any syscall (including this one) can run.
+    let server_stack_top = unsafe { core::ptr::addr_of!(G_A_STACK_TOP).read() };
+    k.init_user_thread(server, server_entry_vma, server_stack_top, 0, hal);
+    // **Real bug found via QEMU**: `caller` (the client, e.g. `root`)
+    // stays `Running` in the scheduler's own bookkeeping — `dispatch()`
+    // below only ever updates the INCOMING thread, never the outgoing
+    // one (see its own doc comment: "commits `thread` as the running
+    // thread"). Every OTHER direct hand-off in this crate either
+    // retires the outgoing thread first (`p2_preempt_start`'s
+    // `sched.remove(root)`) or goes through `yield_to`, which re-readies
+    // the outgoing thread ITSELF ("if `from` is still `Running`, mark it
+    // `Ready`" — see `run.rs`'s own `yield_to`). This function does
+    // neither: it hands off directly WITHOUT retiring `caller` (unlike
+    // `p2_preempt_start` — `caller` must still be schedulable, it will
+    // resume once `Reply` wakes it later). Without this line, `caller`
+    // stays (incorrectly) `Running` forever after this switch, so the
+    // FIRST `pick_next` call afterward (the server's own `IPC_RECV`,
+    // when it finds nothing queued and blocks) cannot find `caller` at
+    // all — it silently picked a completely unrelated `Ready` thread
+    // instead (process B, left `Ready` from the earlier §8.4 demo,
+    // still waiting for `P2_PREEMPT_START` to arm the timer), switching
+    // the CPU to code that never returns here — an unexplained, totally
+    // silent hang with no crash or diagnostic at all.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    // Bypass `pick_next` — we are about to switch straight to `server`
+    // unconditionally, so tell the scheduler that directly (same
+    // reasoning as `p2_preempt_start`'s own explicit `dispatch` call).
+    let _ = k.sched.dispatch(server, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, server)?;
+    Some((ep_cap.as_u32(), save, into))
 }
 
 /// Busy-park forever. The in-kernel demo threads have nothing to return

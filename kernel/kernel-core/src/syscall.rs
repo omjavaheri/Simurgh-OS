@@ -720,13 +720,27 @@ impl KernelState {
             t.state = ThreadState::Runnable;
         }
         self.sched.note_ready(to, now_ns)?;
-        // The replier itself is not blocking — `dispatch`'s caller
-        // (`kernel-core::run::yield_to` for the in-kernel demo, or the
-        // arch trap vector's own `TrapOutcome::SwitchTo` machinery for
-        // a real U-mode process) re-readies whichever thread is still
-        // `Running` at the point it actually performs the switch, the
-        // same as every other `Reschedule` outcome here — nothing
-        // `do_reply` itself needs to do for `caller`.
+        // The replier itself is not blocking, so it must become `Ready`
+        // too, not stay whatever `Scheduler::dispatch` last set it to —
+        // `dispatch` only ever updates the INCOMING thread's own state,
+        // never the outgoing one's (see its own doc comment), so
+        // without this a direct-switch consumer's replier is left
+        // (incorrectly) `Running` forever, invisible to a LATER
+        // `pick_next` even though it is genuinely schedulable again.
+        // **Real bug found via QEMU** (this session's real U-mode Call/
+        // Recv/Reply demo — see `kernel_arch_glue::p2_ipc_demo_start`'s
+        // own "Real bug found via QEMU" doc comment for the sibling bug
+        // that surfaced it): an earlier version of this comment claimed
+        // "the caller of `dispatch` always re-readies the outgoing
+        // thread" — true for `kernel-core::run::yield_to` (the in-kernel
+        // demo's own consumer, which DOES re-ready its outgoing thread),
+        // but NOT for a direct `TrapOutcome::SwitchTo` consumer (a real
+        // U-mode trap boundary), which has no such step at all. Calling
+        // `note_ready` here, unconditionally, fixes it at the source for
+        // EVERY consumer rather than requiring each one to remember to —
+        // idempotent for `yield_to`'s own redundant call (harmless: it
+        // would just re-set the same state/timestamp again).
+        self.sched.note_ready(caller, now_ns)?;
         Ok(SyscallReturn::Reschedule { next: Some(to) })
     }
 }
