@@ -1242,35 +1242,73 @@ unsafe fn restore_user_and_eret(blob: *const Aarch64UserContext) -> ! {
     // `0 - 24` in unsigned 64-bit wraparound, matching the Root Task's
     // own stack-relative store at `sp - 24` with `sp` genuinely 0.
     //
-    // **A second real issue found via QEMU, NOT fixed here — flagged
-    // instead of guessed at further**: this function diverges straight
-    // into `eret` and never runs `sync_el0_entry`'s own
-    // `add sp, sp, #256` epilogue — so the 256 bytes that trampoline's
-    // prologue reserved stays PERMANENTLY consumed every single time a
-    // `SwitchTo`/`Terminate` fires (unlike hal-x86_64, whose hardware
+    // **A second real issue found via QEMU, FIXED this session**: this
+    // function diverges straight into `eret` and never runs `sync_el0_
+    // entry`'s own `add sp, sp, #256` epilogue — so the 256+ bytes that
+    // trampoline's prologue (plus every enclosing Rust call frame)
+    // reserved stayed PERMANENTLY consumed every single time a
+    // `SwitchTo`/`Terminate` fired (unlike hal-x86_64, whose hardware
     // TSS.rsp0 mechanism reloads a FIXED SP on every Ring3->Ring0
     // transition regardless of what the previous handler left RSP as —
-    // AArch64 has no such automatic reset). This accumulates, unbounded,
-    // across repeated process switches until SP_EL1 runs off the bottom
-    // of the boot stack and the CPU executes garbage (observed: an
-    // `Undefined Instruction` fetched from deep inside `.rodata`, after
-    // enough restart cycles). TWO attempts at an in-place reset (one in
-    // `sync_el0_entry`'s own prologue using `x28`/`x9` across the `bl
-    // common_sync_entry` call; one right here, resetting `sp` via `x9`
-    // before it is loaded from `blob`) each independently broke the
-    // cooperative two-process `SwitchTo` round-trip in ways not fully
-    // root-caused before this session's own time budget for it ran out
-    // (confirmed via A/B testing each time: reverting the specific
-    // change alone restored the round-trip). Given two real regressions
-    // from two different fix attempts, this was deliberately NOT
-    // fixed a third time under continued guessing — instead,
-    // `hal-arm64/src/linker.ld`'s boot stack was generously enlarged
-    // (see that file's own doc comment) purely as a stopgap so this
-    // session's own BOUNDED demo (a fixed ~6 restart cycles) comfortably
-    // survives the leak without hitting the ceiling; the leak itself
-    // remains a real, open, flagged bug — a genuine fix (very likely
-    // resetting `sp` to a fixed baseline SOMEWHERE in this path) is a
-    // tracked follow-up, not a solved problem.
+    // AArch64 has no such automatic reset). Measured leak: 608 bytes
+    // per call (confirmed via instrumented QEMU runs, constant across
+    // calls) — accumulating, unbounded, across repeated process
+    // switches until SP_EL1 ran off the bottom of the boot stack and
+    // the CPU executed garbage.
+    //
+    // Fixed by resetting SP_EL1 to the fixed `__boot_stack_top`
+    // baseline right here, mirroring x86_64's TSS.rsp0 semantics:
+    // unconditionally safe, since every enclosing frame between here
+    // and the original `sync_el0_entry`/cold-boot entry is about to be
+    // abandoned by `eret` below regardless (nothing at EL1 needs THIS
+    // frame's stack contents again), and the NEXT exception into EL1
+    // starts fresh from `sync_el0_entry`'s own `sub sp, sp, #256` off
+    // this same baseline, exactly as it did on the very first exception
+    // after boot. Addressed via `sym` (compiler-verified, distance-
+    // independent `adrp`+`:lo12:`) rather than hand-written `adr` —
+    // `_start` hit a real `adr`-range link error addressing this SAME
+    // symbol from `boot.S` (see `lib.rs`'s own `_start` doc comment).
+    //
+    // TWO earlier attempts at an in-place reset (one in `sync_el0_
+    // entry`'s own prologue; one right here) each independently broke
+    // the cooperative two-process `SwitchTo` round-trip in ways not
+    // root-caused at the time. This session's own attempt hit the SAME
+    // regression — but root-caused it via bisection (instrumented
+    // builds narrowing the hang to a single call, `kernel_main`'s own
+    // `hal.now_ns()`) down to REAL, SEPARATE, pre-existing bugs this
+    // reset merely exposed rather than caused, at TWO layers: (1)
+    // `kernel_main` (`kernel/kernel/src/main.rs`) received `hal:
+    // hal_core::HalInterface` BY VALUE (living in `kernel_main`'s OWN
+    // stack frame, which never returns) and passed `&hal` down into
+    // `kernel_arch_glue::enter`, which stashed that pointer in a static
+    // (`G_HAL`) for the life of the system; (2) ONE LAYER DEEPER, this
+    // crate's own `hal_arm64_rust_entry` (`lib.rs`) built `Arm64Hal`
+    // (holding `cpu`/`timer`/etc.) as a plain local too, and `build_
+    // interface` baked raw pointers into ITS fields (`HalInterface`'s
+    // opaque `cpu_state`/`timer_state`) — copying the `HalInterface`
+    // struct by value into `kernel_main` does not change what those
+    // pointers point AT. Both were silently safe under the ORIGINAL
+    // leaking design (SP only ever descended, so stack memory above the
+    // current frame was never reused) and under riscv64/x86_64 (same
+    // shared `kernel_main`/pattern, but neither resets its own kernel-
+    // mode SP the way this fix does for aarch64) — but once aarch64's
+    // OWN SP_EL1 resets to a fixed top on every switch, LATER exception
+    // handling reuses and overwrites the exact memory this data lived
+    // in, corrupting it the moment a deep-enough call chain reached it
+    // (confirmed via bisection: `G_HAL`'s own stored POINTER survived,
+    // since it is itself a separate, genuinely-static 8-byte slot, but
+    // dereferencing THROUGH it — `hal.now_ns()`'s indirect call via a
+    // function-pointer field — silently jumped to garbage; fixing layer
+    // (1) alone then surfaced layer (2) as a "divide by zero" panic in
+    // `Timer::now_ns` reading a clobbered `frequency_hz`). Fixed at
+    // both sources: `hal` is moved into `.bss` static storage in
+    // `kernel_main` before its first use, and `Arm64Hal` likewise in
+    // `hal_arm64_rust_entry` before `build_interface` ever borrows from
+    // it — both mirror `KernelState::init_global`'s own "no stack
+    // temporary" rationale, making this reset safe regardless of what
+    // any architecture's own SP does afterward. (`boot_info: &BootInfo`
+    // is NOT similarly hazardous — `enter` only reads through it
+    // locally, never storing the pointer past its own call.)
     unsafe {
         core::arch::asm!(
             "ldr x9, [x30, #248]",   // sp_el0 (offset 31*8 = 248)
@@ -1285,6 +1323,16 @@ unsafe fn restore_user_and_eret(blob: *const Aarch64UserContext) -> ! {
             "tlbi vmalle1",
             "dsb nsh",
             "isb",
+            // Reset SP_EL1 to the fixed boot-stack baseline — see this
+            // function's own doc comment above for the full story.
+            // `x9` is reused as scratch (free at this point — its last
+            // use above, the ttbr0_el1 load, is already committed via
+            // `msr`) and clobbered again immediately below by the `ldp
+            // x8, x9, [x30, #64]` GPR restore, so nothing here leaks
+            // into the resumed thread's own register state.
+            "adrp x9, {boot_stack_top}",
+            "add x9, x9, :lo12:{boot_stack_top}",
+            "mov sp, x9",
             "ldp x0, x1,   [x30, #0]",
             "ldp x2, x3,   [x30, #16]",
             "ldp x4, x5,   [x30, #32]",
@@ -1303,6 +1351,7 @@ unsafe fn restore_user_and_eret(blob: *const Aarch64UserContext) -> ! {
             "ldr x30,      [x30, #240]",
             "eret",
             in("x30") blob,
+            boot_stack_top = sym crate::__boot_stack_top,
             options(noreturn),
         );
     }

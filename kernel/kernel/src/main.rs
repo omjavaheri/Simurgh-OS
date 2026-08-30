@@ -1949,6 +1949,40 @@ fn spawn_faulty_driver(hal: &hal_core::HalInterface) -> Option<kernel_cap::Threa
 
 #[no_mangle]
 pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInfo) -> ! {
+    // `hal` arrives BY VALUE, so it would otherwise live in THIS
+    // function's own stack frame for the rest of boot — `kernel_main`
+    // never returns, so every downstream `&hal` reference (`enter`'s own
+    // `G_HAL` included) stays validly pointing at it for as long as
+    // nothing EVER writes back over that stack region. That held for
+    // riscv64/x86_64 (SP only ever descends further) and for aarch64
+    // before `hal_arm64::cpu::restore_user_and_eret`'s own SP-reset fix
+    // (see its doc comment for the full story) — but once a `SwitchTo`/
+    // `Terminate` there resets SP_EL1 to a fixed top-of-stack baseline
+    // on every process switch, LATER exception handling reuses and
+    // overwrites this exact memory, corrupting `hal`'s own bytes the
+    // moment a deep-enough call chain reaches them (root-caused via
+    // bisection: `G_HAL`'s own stored POINTER survives, since it is
+    // itself a separate, genuinely-static 8-byte slot, but
+    // dereferencing THROUGH it — e.g. `hal.now_ns()`'s indirect call
+    // via a function-pointer field of the now-corrupted `HalInterface`
+    // bytes — silently jumps to garbage). Moving `hal` into `.bss` here
+    // (mirrors `KernelState::init_global`'s own "no stack temporary"
+    // rationale) makes it immune regardless of what any architecture's
+    // own SP does afterward. (`boot_info: &BootInfo` is NOT similarly
+    // hazardous — `enter` only reads through it locally, never storing
+    // the pointer past its own call.)
+    static mut HAL_STORAGE: core::mem::MaybeUninit<hal_core::HalInterface> =
+        core::mem::MaybeUninit::uninit();
+    // SAFETY: single-core boot, `kernel_main` runs exactly once, before
+    // this static is read anywhere else. `addr_of_mut!`/`addr_of!` avoid
+    // forming an intermediate `&mut`/`&` to the `static mut` itself,
+    // matching `KernelState::init_global`'s own idiom.
+    let hal: &'static hal_core::HalInterface = unsafe {
+        core::ptr::addr_of_mut!(HAL_STORAGE)
+            .cast::<hal_core::HalInterface>()
+            .write(hal);
+        &*core::ptr::addr_of!(HAL_STORAGE).cast::<hal_core::HalInterface>()
+    };
     SerialWriter::init();
     let mut s = SerialWriter;
 
@@ -1956,7 +1990,7 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
     let _ = writeln!(s, "|   Simurgh Operating System - Microkernel (Phase 2)  v0.1.0            |");
     let _ = writeln!(s, "|======================================================================|");
 
-    match kernel_arch_glue::build(&hal, &boot_info, serial_log) {
+    match kernel_arch_glue::build(hal, &boot_info, serial_log) {
         Ok((report, state)) => {
             let _ = writeln!(s, "boot protocol            : {:?}", report.protocol);
             let _ = writeln!(s, "cpu cores (HalInterface) : {}", report.cpu_cores);
@@ -1992,7 +2026,7 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             // paging itself or the U-mode/syscall boundary specifically
             // is at fault.
             #[cfg(target_arch = "x86_64")]
-            x86_64_paging_selftest(&hal, state);
+            x86_64_paging_selftest(hal, state);
             // Register the syscall handler `hal_x86_64::cpu`'s
             // dedicated `int 0x80` (DPL 3) trampoline calls.
             #[cfg(target_arch = "x86_64")]
@@ -2016,15 +2050,15 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             // paging, and drops the Root Task to U-mode/EL0 isolated.
             #[cfg(target_arch = "riscv64")]
             {
-                kernel_arch_glue::enter(&hal, state, user_image(), &boot_info)
+                kernel_arch_glue::enter(hal, state, user_image(), &boot_info)
             }
             #[cfg(target_arch = "x86_64")]
             {
-                kernel_arch_glue::enter(&hal, state, user_image(), &boot_info)
+                kernel_arch_glue::enter(hal, state, user_image(), &boot_info)
             }
             #[cfg(target_arch = "aarch64")]
             {
-                kernel_arch_glue::enter(&hal, state, user_image(), &boot_info)
+                kernel_arch_glue::enter(hal, state, user_image(), &boot_info)
             }
             #[cfg(not(any(
                 target_arch = "riscv64",
@@ -2032,7 +2066,7 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
                 target_arch = "aarch64"
             )))]
             {
-                kernel_arch_glue::enter(&hal, state, kernel_arch_glue::UserImage::EMPTY, &boot_info)
+                kernel_arch_glue::enter(hal, state, kernel_arch_glue::UserImage::EMPTY, &boot_info)
             }
         }
         Err(e) => {

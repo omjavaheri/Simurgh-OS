@@ -221,13 +221,35 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
     let compute = compute::ComputeDiscovery::new(QEMU_VIRT_DEFAULT_ECAM_BASE);
     let power = power::PowerThermalImpl::new(&compute);
 
-    let hal = Arm64Hal {
-        cpu,
-        memory,
-        timer,
-        interrupt,
-        compute,
-        power,
+    // Built into `.bss` static storage, NOT a plain local: `build_interface`
+    // below bakes raw pointers into `hal.cpu`/`hal.timer` (via `HalInterface`'s
+    // opaque `*const ()` state fields) that must stay valid for the life of
+    // the system — `kernel_main` never returns, and per-process `SwitchTo`/
+    // `Terminate` handling in `cpu::restore_user_and_eret` resets SP_EL1 to a
+    // fixed boot-stack baseline on every process switch (see that function's
+    // own doc comment), reusing and overwriting stack memory above the
+    // current frame. A genuinely-stack-resident `Arm64Hal` here was a REAL,
+    // exposed bug this session: `hal.timer`'s bytes got corrupted the moment
+    // enough post-switch stack depth was used, surfacing as a "divide by
+    // zero" panic in `Timer::now_ns` reading a clobbered `frequency_hz`
+    // through `HalInterface`'s `timer_state` pointer. Mirrors `kernel_main`'s
+    // own identical fix for `HalInterface` itself (`kernel/kernel/src/
+    // main.rs`) and `KernelState::init_global`'s "no stack temporary"
+    // rationale.
+    static mut HAL_STORAGE: core::mem::MaybeUninit<Arm64Hal> = core::mem::MaybeUninit::uninit();
+    // SAFETY: single-core boot, this function runs exactly once, before
+    // this static is read anywhere else. `addr_of_mut!`/`addr_of!` avoid
+    // forming an intermediate `&mut`/`&` to the `static mut` itself.
+    let hal: &'static Arm64Hal = unsafe {
+        core::ptr::addr_of_mut!(HAL_STORAGE).cast::<Arm64Hal>().write(Arm64Hal {
+            cpu,
+            memory,
+            timer,
+            interrupt,
+            compute,
+            power,
+        });
+        &*core::ptr::addr_of!(HAL_STORAGE).cast::<Arm64Hal>()
     };
     // ------------------------------------------------------------------
     // Step 5: assemble BootInfo (hal-core/src/boot.rs) from everything
