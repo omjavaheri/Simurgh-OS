@@ -29,6 +29,7 @@ use kernel_cap::{
     CapId, CapTableError, Capability, CapabilityRights, KernelObjectKind, ObjectId, ObjectRef,
     PageTableId, ThreadId, UntypedId,
 };
+use kernel_ipc::fastpath::{fast_path_eligible, FastPathDecision};
 use kernel_ipc::{EndpointError, IpcError, RecvOutcome, SendOutcome, SmallMessage};
 use kernel_mm::{KernelObjectType, MmError, PAGE_SIZE};
 use kernel_sched::SchedError;
@@ -542,6 +543,23 @@ impl KernelState {
             CapabilityRights::WRITE,
         )?;
         let eid = kernel_cap::EndpointId::new(ep_cap.object.id.as_u32());
+
+        // L4-style IPC fast path (02-Microkernel-Layer.md §5.3/§8.3):
+        // predict, via the tested pure predicate in `kernel_ipc::
+        // fastpath`, whether this call is about to synchronously
+        // rendezvous with an ALREADY-blocked receiver — `try_send` below
+        // independently re-derives the identical condition a moment
+        // later via `SendOutcome::DeliveredTo`. Only `is_call` can ever
+        // take the fast branch: a plain `Send`'s own `DeliveredTo` case
+        // (below) already returns immediately without touching the
+        // scheduler's `pick_next` at all, so there is nothing to skip.
+        let fast_path = is_call
+            && matches!(
+                self.endpoint_mut(eid)
+                    .map(|ep| fast_path_eligible(ep, &msg, is_call)),
+                Some(FastPathDecision::Take { .. })
+            );
+
         let outcome = {
             let ep = self.endpoint_mut(eid).ok_or(SyscallError::BadCap)?;
             ep.try_send(caller, msg, true)?
@@ -564,7 +582,26 @@ impl KernelState {
                         t.state = ThreadState::BlockedOnReply;
                     }
                     self.sched.note_blocked(caller)?;
-                    let next = self.sched.pick_next(now_ns);
+                    let next = if fast_path {
+                        // FAST PATH: `rx` is a confirmed, already-blocked
+                        // receiver taking THIS message right now — hand
+                        // the CPU to it directly instead of re-deriving
+                        // the same answer via `pick_next`'s O(n) scan
+                        // over every `Ready` thread. This is the SAME
+                        // "direct named-thread handoff, not general
+                        // fairness" pattern this crate's own `preempt`
+                        // module already establishes for the fault-
+                        // isolation demo (`terminate_thread_and_handoff`/
+                        // `yield_to_thread`) — not a correctness
+                        // compromise: an IPC rendezvous transfers control
+                        // to the specific party being communicated with
+                        // BY DEFINITION, in every L4-family kernel (the
+                        // fast path is never subject to the general
+                        // scheduler's fairness in the first place).
+                        Some(rx)
+                    } else {
+                        self.sched.pick_next(now_ns)
+                    };
                     return Ok(SyscallReturn::Reschedule { next });
                 }
                 Ok(SyscallReturn::Delivered { woke: rx })
@@ -886,5 +923,121 @@ mod tests {
             .unwrap()
             .translate(VirtAddr::new(0x5000_0000))
             .is_none());
+    }
+
+    /// The L4-style fast path (02-Microkernel-Layer.md §5.3/§8.3): a
+    /// `Call` that rendezvouses with an already-blocked receiver must
+    /// hand the CPU DIRECTLY to that receiver, bypassing `pick_next`'s
+    /// fairness scan entirely — proven here by making `pick_next` WANT
+    /// to pick a different (`decoy`) thread and confirming the actual
+    /// `Reschedule { next }` names the receiver instead.
+    #[test]
+    fn call_fast_path_hands_off_directly_bypassing_pick_next() {
+        use kernel_sched::{SchedulerMode, MAX_PRIORITY};
+
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
+
+        let ep_cap = match k
+            .dispatch(
+                root,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // `rx` blocks in Recv first, becoming the endpoint's queued
+        // receiver — the precondition `fast_path_eligible` checks for.
+        let rx = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(rx, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+        let r = k
+            .dispatch(rx, 0, SyscallOp::Recv { endpoint: ep_cap }, &hal)
+            .unwrap();
+        assert!(matches!(r, SyscallReturn::Reschedule { .. }));
+        assert_eq!(k.tcb(rx).unwrap().state, ThreadState::BlockedOnRecv);
+
+        // `decoy` is Ready — `pick_next`, consulted with `root` about to
+        // block, would return `decoy` (the only OTHER Ready thread; `rx`
+        // itself is `BlockedOnRecv`, never `Ready`, so `pick_next` could
+        // never legitimately return it at all).
+        let decoy = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(decoy, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+        k.sched.note_ready(decoy, 0).unwrap();
+
+        // `root` calls — synchronously rendezvouses with `rx`. The fast
+        // path must switch straight to `rx`: NOT `decoy` (what a
+        // `pick_next`-driven slow path would pick instead), and NOT
+        // anything `pick_next` could have produced at all, since `rx`
+        // is `BlockedOnRecv` rather than `Ready`.
+        let msg = SmallMessage::from_words(0xCAFE, &[7]).unwrap();
+        let r = k
+            .dispatch(root, 0, SyscallOp::Call { endpoint: ep_cap, msg }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Reschedule { next: Some(rx) });
+        // `decoy` was never dispatched by the fast path — still `Ready`
+        // in the scheduler, not `Running`.
+        assert_ne!(k.sched.running(), Some(decoy));
+
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::BlockedOnReply);
+        let delivered = k.tcb(rx).unwrap().pending_msg.expect("message delivered to rx");
+        assert_eq!(delivered.label, 0xCAFE);
+    }
+
+    /// A plain (non-`Call`) `Send` that rendezvouses immediately never
+    /// touches the scheduler at all — there is nothing for the fast
+    /// path to skip, and the caller keeps running (no `Reschedule`).
+    #[test]
+    fn plain_send_does_not_take_the_call_fast_path() {
+        use kernel_sched::{SchedulerMode, MAX_PRIORITY};
+
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
+
+        let ep_cap = match k
+            .dispatch(
+                root,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let rx = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(rx, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+        k.dispatch(rx, 0, SyscallOp::Recv { endpoint: ep_cap }, &hal)
+            .unwrap();
+
+        let msg = SmallMessage::new(0xF00D);
+        let r = k
+            .dispatch(root, 0, SyscallOp::Send { endpoint: ep_cap, msg }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Delivered { woke: rx });
     }
 }

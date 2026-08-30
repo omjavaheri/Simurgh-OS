@@ -1,21 +1,30 @@
 //! ============================================================================
 //! fastpath.rs
 //!
-//! Purpose: the hook point for the L4-style IPC fast path
-//! (02-Microkernel-Layer.md §5.3): for a hot `Call` on an endpoint where a
-//! receiver is already blocked waiting, skip the full syscall/scheduler
-//! machinery and switch straight to the receiver with the message left in
-//! registers — taking `ipc_call` from ~microseconds to ~hundreds of
-//! nanoseconds, and forming part of the MVP acceptance benchmark (§8.3:
-//! `ipc_call` fast path < 500 ns on reference hardware).
+//! Purpose: the L4-style IPC fast path (02-Microkernel-Layer.md §5.3):
+//! for a hot `Call` on an endpoint where a receiver is already blocked
+//! waiting, skip the general scheduler's fairness search and switch
+//! straight to that receiver — forming part of the MVP acceptance
+//! benchmark (§8.3: `ipc_call` fast path < 500 ns on reference
+//! hardware). This module is the pure ELIGIBILITY predicate only; see
+//! this file's "Position in the system" below for what actually
+//! consumes it and exactly which overhead is (and is not yet) skipped.
 //!
 //! Architecture reference: 02-Microkernel-Layer.md §5.3, §8.3.
 //!
-//! Position in the system: `kernel-core`'s syscall entry checks
-//! `fast_path_eligible` before falling through to the general `dispatch`
-//! path. The actual register-to-register handoff needs an architecture
-//! primitive (a partial context switch that preserves the message
-//! registers) that today's `hal_core::HalInterface` does not expose.
+//! Position in the system: `kernel-core::syscall::KernelState::do_send`
+//! checks `fast_path_eligible` before delivering a `Call`. When eligible,
+//! it skips `kernel-sched::Scheduler::pick_next`'s O(n) fairness scan
+//! entirely — the receiver is already known, so there is nothing to
+//! search for — and switches straight to it (the same "direct named-
+//! thread handoff, not general fairness" pattern `kernel-core::preempt`'s
+//! `terminate_thread_and_handoff`/`yield_to_thread` already established
+//! for the fault-isolation demo). This is the scheduler-bookkeeping half
+//! of the fast path. A FURTHER optimization — a true register-only
+//! partial context switch, skipping the full GPR save/restore
+//! `TrapOutcome::SwitchTo` performs today — needs an architecture
+//! primitive `hal_core::HalInterface` does not expose yet; not done
+//! here, tracked as a follow-up.
 //!
 //! Safety/invariants: `fast_path_eligible` is a pure predicate with no
 //! side effects; taking the fast path must produce exactly the same
