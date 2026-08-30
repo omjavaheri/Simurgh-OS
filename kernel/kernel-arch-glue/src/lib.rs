@@ -1613,16 +1613,34 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
 
     // 5b. IPC round-trip micro-benchmark (02-Microkernel-Layer.md §8.3
     //     acceptance harness: "ipc_call fast-path < 500 ns on reference
-    //     hardware"). A dedicated thread 3 sends `IPC_BENCH_ITERATIONS`
-    //     messages, one per round trip; the Root Task times each Recv +
-    //     yield_to(t3) + (t3's Send + yield_to back) cycle via
-    //     `hal.now_ns()`. This measures the CURRENT general dispatch +
-    //     full `context_switch` path — the L4-style register-only fast
-    //     path `kernel_ipc::fastpath` describes needs a HAL primitive
-    //     (partial context switch preserving message registers) that does
-    //     not exist yet, so this is an honest baseline / harness (Phase D6
-    //     of IMPLEMENTATION-PLAN.md), not the tuned <500ns number itself —
-    //     labelled as such in the log line below.
+    //     hardware"). A dedicated thread 3 acts as an RPC SERVER: loops
+    //     Recv -> Reply, `IPC_BENCH_ITERATIONS` times (`bench_server_
+    //     main`). The Root Task acts as the CLIENT: times each `Call`
+    //     (-> `yield_to` the server, which `Reply`s -> `yield_to` back)
+    //     round trip via `hal.now_ns()`.
+    //
+    //     Every one of these `Call`s hits `kernel-core::syscall::
+    //     do_send`'s REAL L4-style fast path (`kernel_ipc::fastpath::
+    //     fast_path_eligible` wired in for real, plus the `Reply`
+    //     syscall completing the round trip — both this project's own
+    //     prior session): the server is always already blocked in
+    //     `Recv` by the time the client's next `Call` lands, so
+    //     `pick_next`'s fairness scan is skipped both directions. This
+    //     is the tuned-fast-path number §8.3 actually asks for — NOT
+    //     the general-dispatch baseline earlier sessions measured
+    //     (that baseline used plain `Send`/`Recv`, which never took
+    //     this branch at all; still true today for `Send`, see
+    //     `plain_send_does_not_take_the_call_fast_path`).
+    //
+    //     What is NOT yet real: the register-only PARTIAL context
+    //     switch `kernel_ipc::fastpath`'s own doc comment describes —
+    //     `yield_to` below still performs `hal_core::HalInterface::
+    //     context_switch`'s FULL GPR save/restore every time, so
+    //     QEMU/TCG wall-clock numbers stay far from the literal
+    //     <500ns target for that reason alone — same honestly-
+    //     documented emulation gap every other timing-sensitive
+    //     benchmark in this project reports, not a flaw in the fast
+    //     path itself.
     let t3_cap = match k.dispatch(
         root,
         hal.now_ns(),
@@ -1655,15 +1673,24 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
         // runnable, read only by `bench_thread_main`. G_EP/G_ROOT are
         // unchanged from thread 2's setup above (same endpoint, same root).
         unsafe { core::ptr::addr_of_mut!(G_T3).write(t3.as_u32()) };
-        k.start_thread(t3, bench_thread_main as usize, t3_stack_top, hal);
+        k.start_thread(t3, bench_server_main as usize, t3_stack_top, hal);
+
+        // Kick the server once so it reaches its own first `Recv` and
+        // blocks — otherwise the Root Task's first `Call` below would
+        // find no receiver queued yet (`SenderQueued`, the general
+        // path) instead of the fast path `fast_path_eligible` needs an
+        // ALREADY-blocked receiver for.
+        k.yield_to(root, t3, hal);
 
         let (mut min_ns, mut max_ns, mut sum_ns) = (u64::MAX, 0u64, 0u64);
-        for _ in 0..IPC_BENCH_ITERATIONS {
+        for i in 0..IPC_BENCH_ITERATIONS {
+            let req = SmallMessage::from_words(0xCA11, &[i as u64])
+                .unwrap_or_else(|_| SmallMessage::new(0xCA11));
             let t0 = hal.now_ns();
-            match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }, hal) {
+            match k.dispatch(root, hal.now_ns(), SyscallOp::Call { endpoint: ep_cap, msg: req }, hal) {
                 Ok(SyscallReturn::Reschedule { next: Some(n) }) => k.yield_to(root, n, hal),
                 other => {
-                    klog!("root task: bench Recv unexpected: {:?}\r\n", other);
+                    klog!("root task: bench Call unexpected: {:?}\r\n", other);
                     break;
                 }
             }
@@ -1675,7 +1702,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
         }
         let avg_ns = sum_ns / IPC_BENCH_ITERATIONS as u64;
         klog!(
-            "root task: ipc round-trip benchmark (02 8.3, {} iters, general dispatch path - NOT the L4 fast path) - min {} ns, avg {} ns, max {} ns\r\n",
+            "root task: ipc round-trip benchmark (02 8.3, {} iters, REAL Call+Reply fast path - do_send/do_reply skip pick_next; register-only HAL primitive still pending) - min {} ns, avg {} ns, max {} ns\r\n",
             IPC_BENCH_ITERATIONS,
             min_ns,
             avg_ns,
@@ -1867,38 +1894,84 @@ extern "C" fn thread2_main() -> ! {
     park();
 }
 
-/// The `02-Microkernel-Layer.md §8.3` IPC round-trip benchmark's second
-/// thread (runs on `THREAD3_STACK`): sends `IPC_BENCH_ITERATIONS` messages
-/// on the shared endpoint, one per round trip with the Root Task.
+/// The `02-Microkernel-Layer.md §8.3` IPC round-trip benchmark's RPC
+/// SERVER (runs on `THREAD3_STACK`): `Recv`s a request, `Reply`s to it,
+/// `IPC_BENCH_ITERATIONS` times — the Root Task (the CLIENT) drives the
+/// round trip with `Call`, timing each one.
 ///
-/// The exit-the-scheduler step (same reasoning as `thread2_main`'s tail)
-/// has to happen BEFORE the last iteration's `yield_to`, not after the
-/// loop: once that last `yield_to` runs, this thread's saved context sits
-/// frozen at that exact call site, and the Root Task's own loop below
-/// never switches back in — any code written after the `for` here would
-/// be dead. Folding the removal into the last iteration is what makes it
-/// actually execute.
-extern "C" fn bench_thread_main() -> ! {
+/// Every `Recv`/`Reply` here is deliberately queued via `dispatch`
+/// BEFORE the one real `yield_to` that actually switches away — never
+/// "Reply, then immediately switch, then re-`Recv` after switching
+/// back": `dispatch` on its own never performs a context switch (this
+/// crate's own established contract), so calling `Reply` then `Recv`
+/// back-to-back, and only THEN switching once, means this server is
+/// ALREADY re-registered as the endpoint's blocked receiver by the time
+/// control reaches the Root Task — exactly the precondition `kernel_
+/// ipc::fastpath::fast_path_eligible` needs for the Root Task's NEXT
+/// `Call` to hit the fast path too. Get this ordering wrong (switch
+/// away first, `Recv` again after) and every `Call` after the first
+/// would fall back to the general `SenderQueued` path instead.
+///
+/// The exit-the-scheduler step (same reasoning as `thread2_main`'s
+/// tail) has to happen on the LAST iteration, right before that
+/// iteration's own final switch (straight back to `from`, skipping the
+/// "queue a `Recv` nobody will ever answer" step entirely) — once that
+/// switch runs, this thread's saved context sits frozen there, and the
+/// Root Task's own loop below never switches back in.
+extern "C" fn bench_server_main() -> ! {
     let k = kstate();
     let hal = khal();
     // SAFETY: set by `inkernel_demo` before `start_thread`.
     let me = ThreadId::new(unsafe { core::ptr::addr_of!(G_T3).read() });
     let ep = CapId::new(unsafe { core::ptr::addr_of!(G_EP).read() });
-    let root = ThreadId::new(unsafe { core::ptr::addr_of!(G_ROOT).read() });
+
+    // Prime: block for the FIRST request. `inkernel_demo`'s own
+    // `k.yield_to(root, t3, hal)` "kick" (right after `start_thread`)
+    // is what runs this thread for the very first time, landing here.
+    if let Ok(SyscallReturn::Reschedule { next: Some(n) }) =
+        k.dispatch(me, hal.now_ns(), SyscallOp::Recv { endpoint: ep }, hal)
+    {
+        k.yield_to(me, n, hal);
+    }
+    // Resumed here (or fell straight through, if `Recv` somehow
+    // delivered synchronously): the Root Task's first `Call` has
+    // delivered its request directly into `pending_msg`/`pending_from`.
 
     for i in 0..IPC_BENCH_ITERATIONS {
-        let msg = SmallMessage::from_words(0xBEEF, &[1, 2]).unwrap_or_else(|_| SmallMessage::new(0xBEEF));
-        match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }, hal) {
-            Ok(SyscallReturn::Delivered { .. }) => {}
-            other => klog!("bench thread: Send unexpected: {:?}\r\n", other),
+        let from = k.tcb_mut(me).and_then(|t| t.pending_from.take());
+        let _req = k.tcb_mut(me).and_then(|t| t.pending_msg.take());
+        let Some(from) = from else {
+            klog!("bench server: woke with no pending_from - stopping\r\n");
+            break;
+        };
+        let reply = SmallMessage::from_words(0xF00D, &[i as u64])
+            .unwrap_or_else(|_| SmallMessage::new(0xF00D));
+
+        if let Err(e) = k.dispatch(me, hal.now_ns(), SyscallOp::Reply { to: from, msg: reply }, hal) {
+            klog!("bench server: Reply failed: {:?}\r\n", e);
+            break;
         }
+
         if i + 1 == IPC_BENCH_ITERATIONS {
             if let Some(t) = k.tcb_mut(me) {
                 t.state = kernel_core::ThreadState::Exited;
             }
             k.sched.remove(me);
+            k.yield_to(me, from, hal);
+            break;
         }
-        k.yield_to(me, root, hal);
+
+        // Re-register as the blocked receiver for the NEXT request
+        // BEFORE the real switch below — see this function's own doc
+        // comment on why the ordering matters.
+        match k.dispatch(me, hal.now_ns(), SyscallOp::Recv { endpoint: ep }, hal) {
+            Ok(SyscallReturn::Reschedule { next: Some(n) }) => k.yield_to(me, n, hal),
+            other => {
+                klog!("bench server: Recv unexpected: {:?}\r\n", other);
+                break;
+            }
+        }
+        // Resumed here once the Root Task's NEXT `Call` delivers.
     }
     park();
 }

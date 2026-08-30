@@ -63,6 +63,25 @@ pub enum SyscallOp {
         /// The request message.
         msg: SmallMessage,
     },
+    /// Wakes `to` (which must currently be `BlockedOnReply` — the
+    /// caller of a prior `Call`) with `msg` as its reply, and hands the
+    /// CPU straight to it. `to` is a raw `ThreadId`, not a capability:
+    /// a receiver already learns it as `Recv`'s own `from` field with
+    /// no separate grant needed, per the deliberate MVP simplification
+    /// this crate's `doc/IMPLEMENTATION-PLAN.md` records ("direct
+    /// `ThreadId` reply", not a seL4-style one-shot reply capability —
+    /// flagged there as an accepted gap: nothing stops a thread that
+    /// merely GUESSES another thread's id from replying to a call it
+    /// never received; closing that needs the capability version this
+    /// MVP explicitly deferred). The one enforced invariant is `to`'s
+    /// `ThreadState` — you cannot "reply" to a thread that both is not
+    /// and was never blocked awaiting exactly this.
+    Reply {
+        /// The `Call`er to wake.
+        to: ThreadId,
+        /// The reply message.
+        msg: SmallMessage,
+    },
     /// Voluntarily yield the CPU. Always succeeds.
     Yield,
     /// Copy capability `cap` (narrowed to `rights`) into the capability
@@ -186,6 +205,9 @@ pub enum SyscallError {
     Ipc(IpcError),
     /// A scheduler operation failed.
     Sched(SchedError),
+    /// `Reply { to, .. }` named a thread that is not (or is no longer)
+    /// `BlockedOnReply` — nothing to wake.
+    NotBlockedOnReply,
     /// The requested operation is not implemented in this MVP.
     Unsupported,
 }
@@ -307,6 +329,7 @@ impl KernelState {
             SyscallOp::Send { endpoint, msg } => self.do_send(caller, endpoint, msg, false, now_ns),
             SyscallOp::Call { endpoint, msg } => self.do_send(caller, endpoint, msg, true, now_ns),
             SyscallOp::Recv { endpoint } => self.do_recv(caller, endpoint, now_ns),
+            SyscallOp::Reply { to, msg } => self.do_reply(caller, to, msg, now_ns),
         }
     }
 
@@ -572,6 +595,14 @@ impl KernelState {
                 if let Some((rx2, m)) = delivered {
                     if let Some(t) = self.tcb_mut(rx2) {
                         t.pending_msg = Some(m);
+                        // `rx2` was already blocked in `Recv` (that is
+                        // exactly why delivery was synchronous) and is
+                        // about to be switched straight back in, not
+                        // returned to via `Recv`'s own synchronous
+                        // `Message { from, .. }` — record `caller` so a
+                        // later `Reply { to: caller, .. }` is possible
+                        // (see `Tcb::pending_from`'s own doc comment).
+                        t.pending_from = Some(caller);
                         t.state = ThreadState::Runnable;
                     }
                     self.sched.note_ready(rx2, now_ns)?;
@@ -658,6 +689,45 @@ impl KernelState {
             }
             RecvOutcome::WouldBlock => Ok(SyscallReturn::Blocked),
         }
+    }
+
+    /// `Reply { to, msg }` — see `SyscallOp::Reply`'s own doc comment
+    /// for the accepted MVP simplification (raw `ThreadId`, no reply
+    /// capability) this implements. Always a direct, unconditional
+    /// handoff: unlike `Call`'s fast path (which only sometimes finds
+    /// an already-blocked receiver), `Reply` NAMES its target — there
+    /// is never a "no receiver, fall back to the general path" case, so
+    /// this always skips `pick_next` and switches straight to `to`.
+    fn do_reply(
+        &mut self,
+        caller: ThreadId,
+        to: ThreadId,
+        msg: SmallMessage,
+        now_ns: u64,
+    ) -> Result<SyscallReturn, SyscallError> {
+        if caller == to {
+            return Err(SyscallError::NotBlockedOnReply);
+        }
+        let target_ok = self
+            .tcb(to)
+            .map(|t| t.state == ThreadState::BlockedOnReply)
+            .unwrap_or(false);
+        if !target_ok {
+            return Err(SyscallError::NotBlockedOnReply);
+        }
+        if let Some(t) = self.tcb_mut(to) {
+            t.pending_msg = Some(msg);
+            t.state = ThreadState::Runnable;
+        }
+        self.sched.note_ready(to, now_ns)?;
+        // The replier itself is not blocking — `dispatch`'s caller
+        // (`kernel-core::run::yield_to` for the in-kernel demo, or the
+        // arch trap vector's own `TrapOutcome::SwitchTo` machinery for
+        // a real U-mode process) re-readies whichever thread is still
+        // `Running` at the point it actually performs the switch, the
+        // same as every other `Reschedule` outcome here — nothing
+        // `do_reply` itself needs to do for `caller`.
+        Ok(SyscallReturn::Reschedule { next: Some(to) })
     }
 }
 
@@ -1039,5 +1109,96 @@ mod tests {
             .dispatch(root, 0, SyscallOp::Send { endpoint: ep_cap, msg }, &hal)
             .unwrap();
         assert_eq!(r, SyscallReturn::Delivered { woke: rx });
+    }
+
+    /// The full round trip `Call` was missing until this session: a
+    /// `Call`er blocks (`BlockedOnReply`); the receiver later `Reply`s
+    /// directly to it (by the `ThreadId` it already learned from its
+    /// own `Recv`); the caller wakes with the reply message. Also
+    /// confirms `Reply` is itself an unconditional direct handoff (no
+    /// `decoy` needed here — `Reply` never has a `pick_next` fallback
+    /// case at all, unlike `Call`'s fast path).
+    #[test]
+    fn call_then_reply_completes_the_round_trip() {
+        use kernel_sched::{SchedulerMode, MAX_PRIORITY};
+
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
+
+        let ep_cap = match k
+            .dispatch(
+                root,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // `server` blocks in Recv first.
+        let server = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(server, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+        k.dispatch(server, 0, SyscallOp::Recv { endpoint: ep_cap }, &hal)
+            .unwrap();
+
+        // `root` Calls — rendezvouses immediately (the fast path from
+        // the previous test), becomes `BlockedOnReply`.
+        let request = SmallMessage::from_words(0x1, &[10]).unwrap();
+        let r = k
+            .dispatch(root, 0, SyscallOp::Call { endpoint: ep_cap, msg: request }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Reschedule { next: Some(server) });
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::BlockedOnReply);
+
+        // `server` "processes" the request (it already has it via its
+        // own `Recv`'s `pending_msg`) and replies directly to `root`.
+        let reply_msg = SmallMessage::from_words(0x2, &[20]).unwrap();
+        let r = k
+            .dispatch(server, 0, SyscallOp::Reply { to: root, msg: reply_msg }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Reschedule { next: Some(root) });
+
+        // `root` is runnable again with the reply message waiting.
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::Runnable);
+        let delivered = k.tcb(root).unwrap().pending_msg.expect("reply delivered to root");
+        assert_eq!(delivered.label, 0x2);
+        assert_eq!(delivered.words(), &[20]);
+    }
+
+    /// `Reply` to a thread that is not (or is no longer) `BlockedOnReply`
+    /// is rejected — this is the ONE enforced invariant standing in for
+    /// the reply-capability check this MVP deliberately does not build
+    /// (see `SyscallOp::Reply`'s own doc comment).
+    #[test]
+    fn reply_to_non_blocked_thread_is_rejected() {
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
+
+        // `bystander` was never Called nor is it BlockedOnReply.
+        let bystander = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let r = k.dispatch(
+            root,
+            0,
+            SyscallOp::Reply { to: bystander, msg: SmallMessage::new(0) },
+            &hal,
+        );
+        assert_eq!(r, Err(SyscallError::NotBlockedOnReply));
+
+        // Replying to yourself is rejected too (never a sensible target).
+        let r = k.dispatch(root, 0, SyscallOp::Reply { to: root, msg: SmallMessage::new(0) }, &hal);
+        assert_eq!(r, Err(SyscallError::NotBlockedOnReply));
     }
 }

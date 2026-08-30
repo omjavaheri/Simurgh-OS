@@ -104,6 +104,16 @@ pub struct Tcb {
     /// `context`; this field is the MVP stand-in until `HalInterface`
     /// grows a context-write primitive.
     pub pending_msg: Option<SmallMessage>,
+    /// Who sent `pending_msg`, when it was delivered asynchronously (the
+    /// receiving thread was already blocked in `Recv` and got switched
+    /// straight back in — `SyscallOp::Send`/`Call`'s fast-delivery path
+    /// in `do_send` — rather than receiving it as `Recv`'s own
+    /// synchronous `SyscallReturn::Message { from, .. }`, which already
+    /// carries `from` with no need to persist it here). Needed for
+    /// `SyscallOp::Reply { to, .. }`: without this, a receiver woken
+    /// this way would have the request message but no way to learn
+    /// which caller to reply to.
+    pub pending_from: Option<ThreadId>,
 }
 
 impl Tcb {
@@ -125,6 +135,7 @@ impl Tcb {
             entry: VirtAddr::new(0),
             state: ThreadState::Inactive,
             pending_msg: None,
+            pending_from: None,
         }
     }
 }

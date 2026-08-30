@@ -193,11 +193,11 @@ fn random_message(rng: &mut Rng) -> SmallMessage {
     SmallMessage::from_words(label, &words[..n]).unwrap_or_else(|_| SmallMessage::new(label))
 }
 
-/// One pseudo-random `SyscallOp`, uniformly over all eight variants, with
+/// One pseudo-random `SyscallOp`, uniformly over all nine variants, with
 /// every field independently adversarial (see the field-level helpers
 /// above) — exactly the shape an untrusted layer-3 process controls.
-fn random_op(rng: &mut Rng) -> SyscallOp {
-    match rng.next_range(8) {
+fn random_op(rng: &mut Rng, root: ThreadId) -> SyscallOp {
+    match rng.next_range(9) {
         0 => SyscallOp::Send {
             endpoint: random_cap_id(rng),
             msg: random_message(rng),
@@ -209,16 +209,25 @@ fn random_op(rng: &mut Rng) -> SyscallOp {
             endpoint: random_cap_id(rng),
             msg: random_message(rng),
         },
-        3 => SyscallOp::Yield,
-        4 => SyscallOp::CapGrant {
+        // `to` skewed the same way every other thread-id field is
+        // (including `root` itself and near-boundary values) — `Reply`
+        // is new attack surface (a raw `ThreadId`, not a capability;
+        // see `SyscallOp::Reply`'s own doc comment on why), exactly
+        // the kind of thing this harness exists to stress.
+        3 => SyscallOp::Reply {
+            to: random_thread_id(rng, root),
+            msg: random_message(rng),
+        },
+        4 => SyscallOp::Yield,
+        5 => SyscallOp::CapGrant {
             target_thread: random_cap_id(rng),
             cap: random_cap_id(rng),
             rights: CapabilityRights::from_bits_truncate(rng.next_u32()),
         },
-        5 => SyscallOp::CapRevoke {
+        6 => SyscallOp::CapRevoke {
             cap: random_cap_id(rng),
         },
-        6 => SyscallOp::Retype {
+        7 => SyscallOp::Retype {
             untyped: random_cap_id(rng),
             target_type: random_object_type(rng),
             // Zero, one, a plausible handful, and near-`u32::MAX` — the
@@ -277,7 +286,7 @@ fn syscall_dispatch_survives_random_malformed_input() {
             } else {
                 root
             };
-            let op = random_op(&mut rng);
+            let op = random_op(&mut rng, root);
             let now_ns = i as u64 * 1_000;
 
             // The property under test: dispatch always RETURNS — Ok or a
