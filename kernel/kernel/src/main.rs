@@ -2016,7 +2016,12 @@ fn simurgh_syscall(
                         // `p2_ipc_call`'s own contract.
                         unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
                     }
-                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                    // The L4-style register-only fast path
+                    // (02-Microkernel-Layer.md §5.3/§8.3) — see
+                    // `hal_riscv64::cpu::TrapOutcome::SwitchToFast`'s own
+                    // doc comment for exactly which registers this skips
+                    // and why it is safe to.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume(0),
             };
@@ -2036,7 +2041,12 @@ fn simurgh_syscall(
                     // blocking (nothing to poke into our own trap; the
                     // ordinary `Resume`/`Resume2` path handles that),
                     // not being woken via a direct hand-off.
-                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                    // The L4-style register-only fast path
+                    // (02-Microkernel-Layer.md §5.3/§8.3) — see
+                    // `hal_riscv64::cpu::TrapOutcome::SwitchToFast`'s own
+                    // doc comment for exactly which registers this skips
+                    // and why it is safe to.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume2(0, 0),
             };
@@ -2054,7 +2064,12 @@ fn simurgh_syscall(
                         // above.
                         unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
                     }
-                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                    // The L4-style register-only fast path
+                    // (02-Microkernel-Layer.md §5.3/§8.3) — see
+                    // `hal_riscv64::cpu::TrapOutcome::SwitchToFast`'s own
+                    // doc comment for exactly which registers this skips
+                    // and why it is safe to.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume(0),
             };
