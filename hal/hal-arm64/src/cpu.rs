@@ -930,6 +930,21 @@ pub enum TrapOutcome {
     /// `ecall`, which happens to match here). The ordinary syscall
     /// return.
     Resume(usize),
+    /// Same as `Resume`, but also places `.1` in `x1` — for a syscall
+    /// whose result genuinely does not fit in one register (e.g. `Recv`
+    /// returning both the sender's `ThreadId` and the message label —
+    /// see `kernel/src/main.rs`'s `IPC_RECV` demo opcode, and hal-
+    /// riscv64's/hal-x86_64's own identical `Resume2`). Unlike
+    /// hal-x86_64 (whose `int 0x80` convention splits the message-input
+    /// register from the return-value one), AAPCS64's `x0` is ALREADY
+    /// both at once — the same "one register, both directions" shape
+    /// riscv64's `a0`/`x10` has — so `x1` (this project's own `a1`
+    /// register) is simply reused for the second value, no register-
+    /// remapping needed the way hal-x86_64's port required. A separate
+    /// variant rather than widening `Resume` itself: every OTHER
+    /// existing caller only ever has one value to return, and this
+    /// keeps them untouched.
+    Resume2(usize, usize),
     /// Serialise the trapping thread's full context into the
     /// `HAL_USER_CONTEXT_BYTES` blob at `save`, then restore `into` and
     /// `eret` into it. Both pointers are kernel-owned, 8-byte-aligned
@@ -938,6 +953,22 @@ pub enum TrapOutcome {
         /// Where to write the outgoing thread's snapshot.
         save: *mut u8,
         /// The incoming thread's context to resume.
+        into: *const u8,
+    },
+    /// Like `SwitchTo`, but only the L4-style IPC fast path's minimal
+    /// register set is saved/restored (AAPCS64's own callee-saved set —
+    /// `x19`-`x28`, `x29`/FP, `x30`/LR — plus this project's own message
+    /// registers `x0`=a0, `x1`=a1, plus the always-mandatory `elr_el1`/
+    /// `spsr_el1`/`sp_el0`/`ttbr0_el1` — see `save_ipc_fast_context`'s
+    /// own doc comment for exactly which and why), not every GPR. Used
+    /// ONLY by `kernel/src/main.rs`'s real `IPC_CALL`/`IPC_RECV`/
+    /// `IPC_REPLY` opcodes — every OTHER switch in this codebase keeps
+    /// using plain `SwitchTo`'s full, unconditional guarantee. Mirrors
+    /// hal-riscv64's/hal-x86_64's identical `SwitchToFast`.
+    SwitchToFast {
+        /// Where to write the outgoing thread's fast-path snapshot.
+        save: *mut u8,
+        /// The incoming thread's fast-path context to resume.
         into: *const u8,
     },
     /// The trapping thread has been TERMINATED — no save (a terminated
@@ -1131,6 +1162,13 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
                 // handler.
                 unsafe { core::arch::asm!("msr elr_el1, {0}", in(reg) elr) };
             }
+            TrapOutcome::Resume2(a0, a1) => {
+                f.regs[SyncFrame::X0] = a0 as u64;
+                f.regs[SyncFrame::X0 + 1] = a1 as u64;
+                // SAFETY: writing ELR_EL1 is valid within an exception
+                // handler. `elr` unchanged — same reasoning as `Resume`.
+                unsafe { core::arch::asm!("msr elr_el1, {0}", in(reg) elr) };
+            }
             TrapOutcome::SwitchTo { save, into } => {
                 // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
                 // `HAL_USER_CONTEXT_BYTES` blobs (the trampoline/
@@ -1145,6 +1183,16 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
                 unsafe {
                     save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
                     restore_user_and_eret(into as *const Aarch64UserContext);
+                }
+            }
+            TrapOutcome::SwitchToFast { save, into } => {
+                // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
+                // `HAL_USER_CONTEXT_BYTES` blobs, same contract as
+                // `SwitchTo`. `elr` unchanged — same reasoning as
+                // `SwitchTo` above.
+                unsafe {
+                    save_ipc_fast_context(f, elr, save as *mut Aarch64UserContext);
+                    restore_ipc_fast_context(into as *const Aarch64UserContext);
                 }
             }
             TrapOutcome::Terminate { into } => {
@@ -1178,11 +1226,38 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
                     f.regs[SyncFrame::X0] = ret as u64;
                     return;
                 }
+                TrapOutcome::Resume2(a0, a1) => {
+                    // Not a real handler outcome for a fatal exception —
+                    // no `FaultHandler` implementation returns this
+                    // today — but `TrapOutcome` is shared with the IPC
+                    // syscall path, so this arm must exist for
+                    // exhaustiveness. Deliver both values the same way
+                    // `Resume` does and return.
+                    f.regs[SyncFrame::X0] = a0 as u64;
+                    f.regs[SyncFrame::X0 + 1] = a1 as u64;
+                    return;
+                }
                 TrapOutcome::SwitchTo { save, into } => {
                     // SAFETY: `save`/`into` are kernel-owned, 8-byte-
                     // aligned `HAL_USER_CONTEXT_BYTES` blobs. Resume
                     // point is `elr` unchanged (the faulting instruction
                     // never legitimately completes).
+                    unsafe {
+                        save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                        restore_user_and_eret(into as *const Aarch64UserContext);
+                    }
+                }
+                TrapOutcome::SwitchToFast { save, into } => {
+                    // Unreachable in practice — no `FaultHandler`
+                    // implementation returns this — but falls back to a
+                    // FULL save/restore rather than the narrower fast-
+                    // path one, same choice hal-riscv64's/hal-x86_64's
+                    // own fault handlers make for their `SwitchToFast`
+                    // arms: a fault handler has no basis for assuming
+                    // the L4 IPC fast path's register-set narrowing is
+                    // safe here.
+                    // SAFETY: `save`/`into` are kernel-owned, 8-byte-
+                    // aligned `HAL_USER_CONTEXT_BYTES` blobs.
                     unsafe {
                         save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
                         restore_user_and_eret(into as *const Aarch64UserContext);
@@ -1249,6 +1324,14 @@ extern "C" fn common_irq_el0_entry(frame: *mut SyncFrame) {
     };
     match h() {
         TrapOutcome::Resume(_) => {}
+        TrapOutcome::Resume2(..) => {
+            // Not a real `TickHandler` outcome (no implementation
+            // returns this) — exists only for `TrapOutcome`
+            // exhaustiveness, same as hal-riscv64's/hal-x86_64's own
+            // tick-handler `Resume2` arms. Both values would be
+            // meaningless here (a preemption tick returns no message
+            // registers), so this is treated identically to `Resume`.
+        }
         TrapOutcome::SwitchTo { save, into } => {
             // SAFETY: `frame` is the on-stack register file `irq_el0_
             // entry` just saved, valid for this call with no other live
@@ -1257,6 +1340,20 @@ extern "C" fn common_irq_el0_entry(frame: *mut SyncFrame) {
             // `restore_user_and_eret` abandons this exception frame's
             // stack and `eret`s into the incoming thread — see its own
             // doc comment for why that is safe.
+            let f = unsafe { &mut *frame };
+            unsafe {
+                save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                restore_user_and_eret(into as *const Aarch64UserContext);
+            }
+        }
+        TrapOutcome::SwitchToFast { save, into } => {
+            // Unreachable in practice (no `TickHandler` implementation
+            // returns this), but falls back to a FULL save/restore for
+            // the same reason `common_sync_entry`'s own fault-branch
+            // `SwitchToFast` arm does — a preemption tick has no basis
+            // for assuming the fast path's narrower register set is
+            // safe.
+            // SAFETY: same as the `SwitchTo` arm just above.
             let f = unsafe { &mut *frame };
             unsafe {
                 save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
@@ -1518,6 +1615,174 @@ unsafe fn restore_user_and_eret(blob: *const Aarch64UserContext) -> ! {
             boot_stack_top = sym crate::__boot_stack_top,
             options(noreturn),
         );
+    }
+}
+
+/// Serialises only the L4-style IPC fast path's minimal register set —
+/// AAPCS64's own callee-saved GPRs (`x19`-`x28`, `x29`/FP, `x30`/LR)
+/// plus this project's own message registers (`x0`=a0, `x1`=a1 — see
+/// `SyscallHandler`'s doc comment), plus the always-mandatory resume
+/// state (`sp_el0`/`elr_el1`/`spsr_el1`/`ttbr0_el1`). Deliberately
+/// narrower than `save_frame_as_user_context`: AAPCS64's CALLER-saved
+/// registers (`x2`-`x18`) are scratch across a call boundary by the
+/// ABI's own contract, and an IPC `svc` is treated as exactly that
+/// boundary — same reasoning as hal-riscv64's/hal-x86_64's identical
+/// `save_ipc_fast_context`, just with AAPCS64's own register split.
+/// Unlike hal-x86_64's port (whose message-input and return-value
+/// registers are physically DIFFERENT, `rdi`/`rsi` vs. `rax` — a real
+/// bug there, see that crate's own doc comment), AAPCS64's `x0`/`x1`
+/// serve as BOTH input and output already, the same shape riscv64's
+/// `a0`/`a1` have — so, unlike x86_64, no extra register beyond the
+/// standard callee-saved set needs to be added to this preserved list
+/// for `poke_saved_a0_a1`/`Resume2` to work correctly. Every field NOT
+/// written here is left at whatever `dst` already held — callers must
+/// pass a blob this function fully owns (never a stale general-purpose
+/// snapshot), exactly as `restore_ipc_fast_context` only ever reads the
+/// fields this function writes.
+///
+/// # Safety
+/// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
+/// 8-byte-aligned storage.
+#[cfg(target_os = "none")]
+unsafe fn save_ipc_fast_context(frame: &SyncFrame, resume_elr: u64, dst: *mut Aarch64UserContext) {
+    let (sp_el0, spsr, ttbr0): (u64, u64, u64);
+    // SAFETY: reading SP_EL0/SPSR_EL1/TTBR0_EL1 has no preconditions in
+    // an exception handler.
+    unsafe {
+        core::arch::asm!("mrs {0}, sp_el0", out(reg) sp_el0);
+        core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr);
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0);
+    }
+    // SAFETY: `dst` is valid writable storage of the matching size /
+    // alignment per this function's contract; each slice write is
+    // in-bounds of `regs: [u64; 31]`.
+    unsafe {
+        (*dst).regs[0] = frame.regs[0];
+        (*dst).regs[1] = frame.regs[1];
+        (*dst).regs[19..29].copy_from_slice(&frame.regs[19..29]);
+        (*dst).regs[29] = frame.regs[29];
+        (*dst).regs[30] = frame.regs[30];
+        (*dst).sp_el0 = sp_el0;
+        (*dst).elr_el1 = resume_elr;
+        (*dst).spsr_el1 = spsr;
+        (*dst).ttbr0_el1 = ttbr0;
+    }
+}
+
+/// Restores the fast-path register set `save_ipc_fast_context` wrote
+/// and `eret`s into EL0. AAPCS64's own CALLER-saved GPRs (`x2`-`x18`)
+/// are explicitly ZEROED rather than left with whatever the previous
+/// occupant of this CPU's registers held — the same deliberate cross-
+/// thread information-disclosure fix hal-riscv64's/hal-x86_64's
+/// `restore_ipc_fast_context` document for their own caller-saved sets:
+/// "don't touch" would leak the PREVIOUS thread's register contents
+/// into the incoming one.
+///
+/// Resets `SP_EL1` to the fixed boot-stack baseline exactly like
+/// `restore_user_and_eret` does, for the identical reason documented on
+/// that function: AArch64 has no hardware mechanism (unlike x86_64's
+/// `TSS.rsp0`) that reloads a fixed kernel-mode stack pointer on every
+/// EL0->EL1 transition, so skipping this reset here would reopen the
+/// SAME unbounded per-switch stack leak that function's own doc comment
+/// describes — this fast path is just as much a "switch" as `SwitchTo`
+/// is, from `SP_EL1`'s point of view.
+///
+/// # Safety
+/// Same contract as `restore_user_and_eret`: `blob` must point at a
+/// valid, resumable fast-path `Aarch64UserContext` (as produced by
+/// `save_ipc_fast_context`) whose `ttbr0_el1` names an address space
+/// that maps this core's exception vector table and the identity-mapped
+/// low RAM `blob` itself lives in.
+#[cfg(target_os = "none")]
+unsafe fn restore_ipc_fast_context(blob: *const Aarch64UserContext) -> ! {
+    // SAFETY: contract above. `x30` carries the blob base throughout,
+    // loaded from its OWN saved slot dead last — same "one restored
+    // register doubles as the pointer" trick `restore_user_and_eret`
+    // uses, for the same reason (AArch64 has no spare GPR). `x9` is
+    // used as PURE SCRATCH while computing `boot_stack_top` (its value
+    // there is irrelevant — it gets explicitly zeroed below, as part of
+    // the `x2`-`x18` caller-saved sweep, so nothing of that scratch use
+    // survives into the resumed thread).
+    unsafe {
+        core::arch::asm!(
+            "ldr x9, [x30, #248]",   // sp_el0
+            "msr sp_el0, x9",
+            "ldr x9, [x30, #256]",   // elr_el1
+            "msr elr_el1, x9",
+            "ldr x9, [x30, #264]",   // spsr_el1
+            "msr spsr_el1, x9",
+            "ldr x9, [x30, #272]",   // ttbr0_el1
+            "msr ttbr0_el1, x9",
+            "isb",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            // Reset SP_EL1 to the fixed boot-stack baseline — see this
+            // function's own doc comment above.
+            "adrp x9, {boot_stack_top}",
+            "add x9, x9, :lo12:{boot_stack_top}",
+            "mov sp, x9",
+            "ldp x0, x1,   [x30, #0]",  // preserved (message registers)
+            "mov x2,  xzr",             // zeroed (AAPCS64 caller-saved)
+            "mov x3,  xzr",
+            "mov x4,  xzr",
+            "mov x5,  xzr",
+            "mov x6,  xzr",
+            "mov x7,  xzr",
+            "mov x8,  xzr",
+            "mov x9,  xzr",
+            "mov x10, xzr",
+            "mov x11, xzr",
+            "mov x12, xzr",
+            "mov x13, xzr",
+            "mov x14, xzr",
+            "mov x15, xzr",
+            "mov x16, xzr",
+            "mov x17, xzr",
+            "mov x18, xzr",
+            "ldp x19, x20, [x30, #152]", // preserved (AAPCS64 callee-saved)
+            "ldp x21, x22, [x30, #168]",
+            "ldp x23, x24, [x30, #184]",
+            "ldp x25, x26, [x30, #200]",
+            "ldp x27, x28, [x30, #216]",
+            "ldr x29,      [x30, #232]", // preserved (FP)
+            "ldr x30,      [x30, #240]", // preserved (LR) — MUST be
+                                          // last: every prior line still
+                                          // dereferences x30
+            "eret",
+            in("x30") blob,
+            boot_stack_top = sym crate::__boot_stack_top,
+            options(noreturn),
+        );
+    }
+}
+
+/// Writes `a0`/`a1` directly into a saved `Aarch64UserContext`'s
+/// `x0`/`x1` fields — used by `kernel/src/main.rs`'s IPC syscall
+/// handlers to deliver a message INTO a thread that is being woken via
+/// a direct hand-off (a `SwitchToFast`/`SwitchTo` target that never
+/// itself re-enters `common_sync_entry` to pick up a `Resume`/`Resume2`
+/// return value the normal way — see `kernel_arch_glue`'s
+/// `IpcSwitch::poke` field doc comment). `x0`/`x1` are correct here for
+/// the SAME reason `Resume`/`Resume2` write into them: AAPCS64's `x0`
+/// is both the message-input AND the return-value register (unlike
+/// hal-x86_64's port, where the equivalent function must target `rax`,
+/// NOT the message-input `rdi` — see that crate's own doc comment for
+/// the bug this distinction fixes). Mirrors hal-riscv64's identical
+/// `poke_saved_a0_a1`.
+///
+/// # Safety
+/// `ctx` must point at a valid, exclusively-owned `Aarch64UserContext`
+/// (the same blob a `SwitchTo`/`SwitchToFast` `save`/`into` pointer
+/// names) — not currently being read or written by anything else.
+#[cfg(target_os = "none")]
+pub unsafe fn poke_saved_a0_a1(ctx: *mut u8, a0: usize, a1: usize) {
+    // SAFETY: contract above; `Aarch64UserContext` is `#[repr(C)]` and
+    // `ctx` is required to point at one.
+    unsafe {
+        let c = &mut *(ctx as *mut Aarch64UserContext);
+        c.regs[0] = a0 as u64;
+        c.regs[1] = a1 as u64;
     }
 }
 
