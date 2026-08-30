@@ -38,20 +38,27 @@ kernel-core      = { path = "../kernel-core" }
 kernel-cap       = { path = "../kernel-cap" }
 kernel-mm        = { path = "../kernel-mm" }
 kernel-arch-glue = { path = "../kernel-arch-glue" }
+elf-loader       = { path = "../../elf-loader" }
 # Layer-3 (subsystems as processes, IMPLEMENTATION-PLAN.md follow-up):
 # `root-task` decides WHAT to launch (`plan_boot`); `device-manager` is
-# the first real subsystem process launched. Both `#![no_std]`,
-# arch-agnostic — `device-manager`'s process entry point is itself
-# riscv64-gated internally, so this compiles cleanly (as a no-op
-# inclusion) on x86_64/aarch64 too, ahead of their own real-kernel boot.
+# the first real subsystem process launched.
 root-task        = { path = "../../subsystems/root-task" }
-device-manager   = { path = "../../subsystems/device-manager" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 hal-x86_64 = { path = "../../hal/hal-x86_64" }
+# x86_64/aarch64 still spawn device-manager the OLD way (its code
+# linked directly into THIS binary's own `.user_text` — see
+# `spawn_process`'s doc comment) — riscv64 is the only architecture
+# migrated to the real separate-ELF path (`spawn_process_from_elf`,
+# `device-manager-bin`) so far; see subsystem-bin-riscv64.ld's own doc
+# comment on why the other two need their own linker-script variant
+# first. Once all three migrate, this dependency goes away entirely —
+# riscv64's own kernel binary already links ZERO device-manager code.
+device-manager = { path = "../../subsystems/device-manager" }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 hal-arm64 = { path = "../../hal/hal-arm64" }
+device-manager = { path = "../../subsystems/device-manager" }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 hal-riscv64 = { path = "../../hal/hal-riscv64" }

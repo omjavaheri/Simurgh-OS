@@ -110,6 +110,18 @@ use hal_riscv64 as _;
 #[cfg(target_arch = "x86_64")]
 use hal_x86_64 as _;
 
+/// `device-manager-bin`'s separately-built, statically-linked ELF image
+/// (see that crate's own doc comment — "subsystems as processes"
+/// packaging, IMPLEMENTATION-PLAN.md follow-up), baked into THIS
+/// binary's own `.rodata` at compile time. `DEVICE_MANAGER_ELF_PATH` is
+/// set by `build.rs` after locating the file built via
+/// `cargo xbuild-subsystem-device-manager-riscv64` — same pattern
+/// `uefi-bootloader/src/main.rs` already uses for its own embedded
+/// kernel image. riscv64-only for now; `spawn_device_manager` (the only
+/// reader) is itself `#[cfg(target_arch = "riscv64")]`.
+#[cfg(target_arch = "riscv64")]
+static DEVICE_MANAGER_ELF: &[u8] = include_bytes!(env!("DEVICE_MANAGER_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -2107,10 +2119,12 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
         }
     }
 
-    // Device Manager is BOOT_ORDER[0] — launch it for real, sharing the
-    // Root Task's own `.user_text` mapping (see `spawn_process`'s doc
-    // comment) but on its OWN fresh stack/address space/capability space.
-    let user = user_image();
+    // Device Manager is BOOT_ORDER[0] — launch it for real, from its OWN
+    // separately-built ELF image (`device-manager-bin`, embedded via
+    // `DEVICE_MANAGER_ELF` below — see `spawn_process_from_elf`'s doc
+    // comment for how this differs from `spawn_process`'s "shares the
+    // kernel's own `.user_text`" approach every other demo process here
+    // still uses) on its OWN fresh stack/address space/capability space.
     const DM_STACK_VMA: usize = 0xC040_0000;
     // 64 KiB, not the 16 KiB every other spawned demo process uses:
     // device-manager's own ecall handlers (`DM_RESPAWN_DRIVER`) now call
@@ -2127,20 +2141,18 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
     // `trap_entry`'s first instruction, `tval` walking down from just
     // below `DM_STACK_VMA` in exact `sizeof(TrapFrame)`=248-byte steps).
     const DM_STACK_LEN: usize = 4096 * 16;
-    match kernel_arch_glue::spawn_process(
+    match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
-        user.text_vma,
-        user.text_lma,
-        user.text_len,
+        DEVICE_MANAGER_ELF,
+        elf_loader::machine::EM_RISCV,
         DM_STACK_VMA,
         DM_STACK_LEN,
-        device_manager::subsystem_entry::subsystem_main as usize,
     ) {
         Some((tid, _cap_space, _stack_phys)) => {
             kernel_arch_glue::p2_register_device_manager(tid);
             kernel_arch_glue::log(format_args!(
-                "root task: spawned device-manager (tid {}) via the generic path, joining the preemption loop\r\n",
+                "root task: spawned device-manager (tid {}) from its OWN separately-built ELF image, joining the preemption loop\r\n",
                 tid.as_u32()
             ));
         }

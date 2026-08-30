@@ -130,6 +130,18 @@ xrun-microkernel-aarch64 = "run -p kernel --target targets/aarch64-hal.json -Z b
 xrun-microkernel-riscv64 = "run -p kernel --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
+# Subsystem process-image build aliases ("subsystems as processes"
+# packaging, 03-Kernel-Subsystems-Layer.md). Builds a subsystem's OWN
+# `[[bin]]` as a genuinely separate, statically-linked ELF — NOT linked
+# into the `kernel`/`kernel-stub` image — which `kernel-arch-glue::
+# spawn_process_from_elf` loads at spawn time via an `include_bytes!`
+# embed (see `kernel/kernel/build.rs`). riscv64-only for now (this
+# crate's own `subsystem-bin-riscv64.ld` doc comment explains why
+# x86_64/aarch64 need their own base-address variant first).
+# ----------------------------------------------------------------------------
+xbuild-subsystem-device-manager-riscv64 = "build -p device-manager --bin device-manager-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+# ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)
 #
 # Intentionally left with no [build] table / no default target override:

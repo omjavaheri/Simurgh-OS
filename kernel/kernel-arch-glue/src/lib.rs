@@ -833,6 +833,156 @@ pub fn spawn_process(
     Some((tid, cap_space, stack_phys))
 }
 
+/// The "subsystems as processes" packaging follow-up (IMPLEMENTATION-
+/// PLAN.md — 03-Kernel-Subsystems-Layer.md's folder structure implies a
+/// genuinely separate program per subsystem, not a function pointer
+/// into the kernel's own image). `spawn_process` above loads a process
+/// whose code is ALREADY part of this binary's own linked `.user_text`
+/// (`entry_vma`/`text_lma` name addresses inside the CALLING kernel
+/// image itself); this function instead takes a whole separately-built,
+/// `include_bytes!`-embedded ELF (see `device-manager-bin`'s own doc
+/// comment for how one gets built) and loads its `PT_LOAD` segments
+/// into FRESH untyped memory, each with its own permissions taken from
+/// the ELF's own `p_flags` (unlike `spawn_process`'s one blanket R+X+U
+/// for the whole shared `.user_text` range).
+///
+/// `elf_bytes` is trusted, kernel-embedded input (built by this same
+/// workspace, not adversarial), but every offset/size from it is still
+/// bounds-checked before use — the same defensive posture as every
+/// other place in this kernel that walks caller-provided-shaped data
+/// (`kernel-core::fuzz`'s own adversarial-syscall harness set that
+/// precedent).
+///
+/// Returns `None` (and logs) on a malformed ELF or any allocation
+/// failure, exactly like `spawn_process`.
+pub fn spawn_process_from_elf(
+    hal: &HalInterface,
+    state: &mut KernelState,
+    elf_bytes: &[u8],
+    expected_machine: u16,
+    stack_vma: usize,
+    stack_len: usize,
+) -> Option<(ThreadId, kernel_cap::CapSpaceId, usize)> {
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let carve = |st: &mut KernelState, bytes: u64| {
+        st.untyped_mut(kernel_cap::UntypedId::new(0))
+            .and_then(|u| u.alloc(4096, bytes).ok())
+            .map(|p| p.as_usize())
+    };
+
+    let (entry, segments) =
+        match elf_loader::parse_and_collect_load_segments(elf_bytes, expected_machine) {
+            Ok(v) => v,
+            Err(_) => {
+                klog!("spawn_process_from_elf: malformed ELF\r\n");
+                return None;
+            }
+        };
+
+    // 3 pages, not 1 — see `enter`'s own `root_pt` carve for why.
+    let root_pt = carve(state, 4096 * 3)?;
+    let pool = carve(state, 4096 * 8)?;
+    let stack_phys = carve(state, round4k(stack_len) as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable (paging is not yet
+    // active on this new space); single-core. `map_range` needs the pool
+    // pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 8) };
+
+    // SAFETY: single-core; only written once, by `enter`, before any
+    // process (including this generic-spawn path) can run.
+    let bytes_gib = unsafe { core::ptr::addr_of!(G_BYTES_GIB).read() };
+    hal.map_ram_identity(root_pt, bytes_gib, false);
+    let mut used = 0u32;
+    let mut step = |vaddr: usize, paddr: usize, len: usize, perm: usize| -> bool {
+        let n = hal.map_range(
+            root_pt,
+            vaddr,
+            paddr,
+            len,
+            perm,
+            pool + used as usize * 4096,
+            8 - used as usize,
+        );
+        if n == u32::MAX {
+            false
+        } else {
+            used += n;
+            true
+        }
+    };
+
+    for seg in segments {
+        let mem_size4k = round4k(seg.mem_size as usize);
+        if mem_size4k == 0 {
+            continue;
+        }
+        // Bounds-check the file-data range this segment claims BEFORE
+        // any pointer arithmetic touches it (see this function's own
+        // doc comment on why: `elf_bytes` is trusted-but-still-checked).
+        let file_offset = seg.file_offset as usize;
+        let file_size = seg.file_size as usize;
+        let Some(file_end) = file_offset.checked_add(file_size) else {
+            klog!("spawn_process_from_elf: segment file range overflows\r\n");
+            return None;
+        };
+        if file_size > seg.mem_size as usize || file_end > elf_bytes.len() {
+            klog!("spawn_process_from_elf: segment file range out of bounds\r\n");
+            return None;
+        }
+
+        let seg_phys = carve(state, mem_size4k as u64)?;
+        // SAFETY: `seg_phys` is fresh untyped RAM, identity-addressable,
+        // `mem_size4k` bytes long. `elf_bytes[file_offset..file_end]` was
+        // just bounds-checked above. Zeroing first then copying only
+        // `file_size` bytes reproduces the ELF spec's standard
+        // ".bss inside PT_LOAD" convention (mem_size > file_size is
+        // zero-filled) — the same handling `elf-loader`'s own doc
+        // comment describes for `uefi-bootloader`'s use of this shape.
+        unsafe {
+            core::ptr::write_bytes(seg_phys as *mut u8, 0, mem_size4k);
+            core::ptr::copy_nonoverlapping(
+                elf_bytes.as_ptr().add(file_offset),
+                seg_phys as *mut u8,
+                file_size,
+            );
+        }
+
+        // Per-segment permissions from the ELF's own p_flags, translated
+        // to this workspace's R(1)/W(2)/X(4)/U(8) `map_range` bit
+        // encoding — tighter than `spawn_process`'s one blanket R+X+U
+        // for the whole shared `.user_text` range (e.g. this process's
+        // .rodata segment lands R-only, no X or W).
+        let mut perm = 8usize; // U — every segment of a U-mode process image is user-accessible
+        if seg.flags & elf_loader::PF_R != 0 {
+            perm |= 1;
+        }
+        if seg.flags & elf_loader::PF_W != 0 {
+            perm |= 2;
+        }
+        if seg.flags & elf_loader::PF_X != 0 {
+            perm |= 4;
+        }
+
+        if !step(seg.vaddr as usize, seg_phys, mem_size4k, perm) {
+            klog!("spawn_process_from_elf: map_range error (PT_LOAD segment)\r\n");
+            return None;
+        }
+    }
+
+    if !step(stack_vma, stack_phys, round4k(stack_len), 1 | 2 | 8) {
+        // R+W+U
+        klog!("spawn_process_from_elf: map_range error (stack)\r\n");
+        return None;
+    }
+
+    let addr_space = state.alloc_addr_space(root_pt as u64)?;
+    let cap_space = state.alloc_cap_space()?;
+    let tid = state.alloc_tcb(cap_space, addr_space)?;
+    let stack_top = (stack_vma + stack_len) & !0xF;
+    state.init_user_thread(tid, entry as usize, stack_top, root_pt, hal);
+    Some((tid, cap_space, stack_phys))
+}
+
 /// Called by the riscv64 syscall handler when a process makes a
 /// `P2_YIELD` `ecall` (the cooperative §8.4 phase, before the timer is
 /// armed). A voluntary yield is just a scheduler tick with no timer

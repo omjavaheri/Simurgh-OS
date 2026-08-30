@@ -1,0 +1,26 @@
+# ============================================================================
+# elf-loader
+#
+# A minimal, hand-written 64-bit ELF parser shared by every place in this
+# workspace that needs to load a separately-built, statically-linked
+# executable image: `uefi-bootloader` (the kernel image itself) and
+# `kernel-arch-glue` (subsystem process images, 03-Kernel-Subsystems-
+# Layer.md's "subsystems as processes" packaging). Extracted from
+# `uefi-bootloader`'s own original `src/elf.rs` once a second caller
+# needed the identical logic.
+#
+# `#![no_std]`, architecture-independent, pure logic (no unsafe beyond a
+# few byte-slice reads) — host-testable, per this workspace's convention
+# of putting architecture-independent crates in `default-members`.
+# ============================================================================
+[package]
+name        = "elf-loader"
+description = "Minimal 64-bit ELF (ET_EXEC, static) parser shared by uefi-bootloader and kernel-arch-glue"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]

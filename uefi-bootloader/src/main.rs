@@ -22,7 +22,18 @@ use uefi::mem::memory_map::MemoryMap;
 use uefi::prelude::*;
 use uefi::table::cfg::ACPI2_GUID;
 
-mod elf;
+/// This bootloader's own target architecture, as an `elf-loader::machine`
+/// constant — selects which `e_machine` the embedded kernel ELF must
+/// declare. `main.rs` is a top-level, non-layered binary (not under
+/// `hal/`/`kernel/`), so a `cfg(target_arch)` here is fine — unlike
+/// those crates, this one has no "no cfg(target_arch) above the HAL"
+/// invariant to preserve.
+#[cfg(target_arch = "x86_64")]
+const KERNEL_ELF_MACHINE: u16 = elf_loader::machine::EM_X86_64;
+#[cfg(target_arch = "aarch64")]
+const KERNEL_ELF_MACHINE: u16 = elf_loader::machine::EM_AARCH64;
+#[cfg(target_arch = "riscv64")]
+const KERNEL_ELF_MACHINE: u16 = elf_loader::machine::EM_RISCV;
 
 /// Minimal panic handler for this skeleton stage. `uefi::helpers::init()`
 /// does not itself register one (that behavior lives behind a separate
@@ -54,10 +65,11 @@ fn panic(_info: &PanicInfo) -> ! {
 /// after locating the file built via `cargo xbuild-kernel-x86_64`.
 static KERNEL_ELF: &[u8] = include_bytes!(env!("KERNEL_STUB_PATH"));
 /// Parses `elf_data` (the embedded kernel-stub image) and loads every
-/// PT_LOAD segment into memory at its required physical address,
-/// per `elf::LoadSegment::phys_addr` — see elf.rs's module docs on why
-/// p_paddr (not p_vaddr) is the correct target at this pre-paging
-/// bootloader stage.
+/// PT_LOAD segment into memory at its required physical address, per
+/// `elf_loader::LoadSegment::paddr` — this project's own linker scripts
+/// use `AT()` directives to split VMA/LMA for a higher-half kernel
+/// image, so `paddr` (not `vaddr`) is the correct target at this
+/// pre-paging bootloader stage.
 ///
 /// Returns the kernel's entry point address on success.
 fn load_kernel_segments(elf_data: &[u8]) -> Result<u64, &'static str> {
@@ -65,7 +77,10 @@ fn load_kernel_segments(elf_data: &[u8]) -> Result<u64, &'static str> {
     uefi::println!("    [OK] File size: {} bytes", elf_data.len());
     uefi::println!("    [..] parse and collect load_segments");
 
-    let (entry, segments) = match elf::parse_and_collect_load_segments(elf_data) {
+    let (entry, segments) = match elf_loader::parse_and_collect_load_segments(
+        elf_data,
+        KERNEL_ELF_MACHINE,
+    ) {
         Ok((entry, segments)) => {
             uefi::println!("      [OK] ELF header validated");
             uefi::println!("      [OK] Magic number: 0x7F 'E' 'L' 'F'");
@@ -86,7 +101,7 @@ fn load_kernel_segments(elf_data: &[u8]) -> Result<u64, &'static str> {
     for segment in segments {
         segment_count += 1;
         uefi::println!("      [OK] Processing PT_LOAD segment #{}", segment_count);
-        uefi::println!("      [OK] Physical address: {:#x}", segment.phys_addr);
+        uefi::println!("      [OK] Physical address: {:#x}", segment.paddr);
         uefi::println!("      [OK] File size:        {:#x} bytes", segment.file_size);
         uefi::println!("      [OK] Memory size:      {:#x} bytes", segment.mem_size);
 
@@ -96,7 +111,7 @@ fn load_kernel_segments(elf_data: &[u8]) -> Result<u64, &'static str> {
 
         // SAFETY: allocating physical memory at a fixed address via
         // UEFI's AllocatePages(AllocateAddress, ...) — the address
-        // itself (segment.phys_addr) comes from this project's own
+        // itself (segment.paddr) comes from this project's own
         // linker.ld (KERNEL_LMA_BASE and onward), a region UEFI's own
         // firmware/bootloader code does not occupy (it lives at low
         // addresses reserved separately, per the UEFI memory map's own
@@ -106,7 +121,7 @@ fn load_kernel_segments(elf_data: &[u8]) -> Result<u64, &'static str> {
         // Services chapter.
         uefi::println!("      [OK] Allocating physical memory...");
         let allocated_ptr = uefi::boot::allocate_pages(
-            uefi::boot::AllocateType::Address(segment.phys_addr),
+            uefi::boot::AllocateType::Address(segment.paddr),
             uefi::boot::MemoryType::LOADER_DATA,
             page_count,
         )
@@ -114,7 +129,7 @@ fn load_kernel_segments(elf_data: &[u8]) -> Result<u64, &'static str> {
         uefi::println!("      [OK] Memory allocated at: {:#x}", allocated_ptr.as_ptr() as u64);
         // SAFETY: `allocated_ptr` was just returned by AllocatePages
         // above as a fresh, exclusively-owned allocation of at least
-        // `page_count * 0x1000` bytes starting at `segment.phys_addr`
+        // `page_count * 0x1000` bytes starting at `segment.paddr`
         // — writing within that range, and only within it (bounded by
         // `segment.mem_size`), is sound.
         unsafe {
@@ -564,7 +579,7 @@ fn efi_main() -> Status {
     uefi::println!("  RSDP Address:    {:#018x}", rsdp_addr);
     uefi::println!("");
     
-    // SAFETY: `entry_point` was validated by elf::parse_and_collect_load_segments
+    // SAFETY: `entry_point` was validated by elf_loader::parse_and_collect_load_segments
     // to be the ELF's own e_entry field, and every PT_LOAD segment
     // (including the one containing this address, per linker.ld's
     // .boot section placement at KERNEL_LMA_BASE) was already copied

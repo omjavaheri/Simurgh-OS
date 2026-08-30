@@ -29,3 +29,7 @@ kernel-cap  = { path = "../kernel-cap" }
 kernel-mm   = { path = "../kernel-mm" }
 kernel-ipc  = { path = "../kernel-ipc" }
 hal-core    = { path = "../../hal/hal-core" }
+# `spawn_process_from_elf`'s loader (subsystems-as-processes packaging) —
+# architecture-independent pure logic, no violation of this crate's own
+# "no architecture crate name" rule above.
+elf-loader  = { path = "../../elf-loader" }

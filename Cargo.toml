@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "elf-loader",
     "hal/hal-manifest",
     "hal/hal-core",
     "hal/hal-direct",
@@ -42,6 +43,7 @@ members = [
 # kernel-arch-glue / kernel / subsystems/* که به target سفارشی یا فقط لینک
 # نهایی نیاز دارند، عمداً بیرون‌اند.
 default-members = [
+    "elf-loader",
     "hal/hal-manifest",
     "hal/hal-core",
     "hal/hal-direct",
