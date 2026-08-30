@@ -708,9 +708,54 @@ extern "C" fn umode_root_x86() -> ! {
             options(nostack, readonly),
         );
         raw_syscall_x86(sys::P2_REPORT_A, after, 0);
-    }
-    loop {
-        core::hint::spin_loop();
+
+        // 7. Preemption phase (02-Microkernel-Layer.md §4). Ask the
+        //    kernel to arm the LAPIC timer, then loop forever bumping
+        //    this process's private counter word in the shared frame
+        //    (offset +8). From here NO `P2_YIELD` is issued — the timer
+        //    interrupt alone switches between this process and the
+        //    worker. In practice `kernel_arch_glue::p2_preempt_start`
+        //    always switches AWAY to a fresh thread sharing this same
+        //    address space before this `int 0x80` ever returns (see its
+        //    own doc comment on why root's own vruntime-loaded TCB is
+        //    retired rather than reused) — this loop is the fallback
+        //    for the rare case that spawn fails, mirroring riscv64's/
+        //    aarch64's own identical tail exactly.
+        raw_syscall_x86(sys::P2_PREEMPT_START, 0, 0);
+        // Address in a HARDCODED `ecx` (loaded once, up front), data in
+        // hardcoded `eax` — two DISTINCT physical registers, neither
+        // left to the compiler's own choice. **Two real bugs found via
+        // QEMU** (this session's x86_64 preemption work), in order:
+        // 1. The original `va = in(reg) ...` let the compiler pick ANY
+        //    register for `{va}`, with nothing reserving `eax` (already
+        //    hardcoded as the DATA register in `add eax, 1`) against
+        //    being that same choice — it picked `rax`, so `mov eax,
+        //    [{va}]` clobbered the address with the just-loaded data
+        //    before `mov [{va}], eax` ran, writing the counter's VALUE
+        //    to whatever address that value looked like (Ring-3 `#PF`,
+        //    error_code=0x7, cr2=0x1, on this loop's very first
+        //    iteration — deterministic, not QEMU-timing luck).
+        // 2. Switching to `va = const` (substituting the address
+        //    directly as a `[disp32]` memory operand, no register at
+        //    all) traded that for a SECOND bug: x86-64's base-less
+        //    `[disp32]` addressing form SIGN-EXTENDS the 32-bit
+        //    displacement to 64 bits, and `0xC0040008`'s high bit is
+        //    set — the CPU actually faulted on `0xffffffffC0040008`
+        //    (confirmed via this session's own `cr2` exception dump).
+        //    Loading the same immediate into a register with `mov
+        //    ecx, imm32` instead ZERO-extends (every 32-bit `mov` into
+        //    a GPR clears the upper 32 bits on x86-64), giving the
+        //    correct unsigned address with no sign-extension trap.
+        core::arch::asm!(
+            "mov ecx, {va}",
+            "2:",
+            "mov eax, dword ptr [rcx]",
+            "add eax, 1",
+            "mov dword ptr [rcx], eax",
+            "jmp 2b",
+            va = const 0xC004_0008u32,
+            options(noreturn),
+        );
     }
 }
 
@@ -718,9 +763,8 @@ extern "C" fn umode_root_x86() -> ! {
 /// into the same `.user_text` pages as `umode_root_x86` but run in its
 /// OWN isolated address space (space B) on its own stack by
 /// `kernel-arch-glue::setup_two_process`. Mirrors hal-riscv64's
-/// `umode_worker` steps 1-3 exactly (step 4 there — the counting loop —
-/// is preemption-phase machinery this milestone does not implement for
-/// x86_64 yet; see the crate's own IMPLEMENTATION-PLAN.md entry).
+/// `umode_worker` steps 1-4 exactly, including the preemptive-phase
+/// counting-loop tail.
 #[cfg(target_arch = "x86_64")]
 #[link_section = ".user_text"]
 extern "C" fn umode_worker_x86() -> ! {
@@ -744,10 +788,87 @@ extern "C" fn umode_worker_x86() -> ! {
             options(nostack),
         );
 
+        // 3. Hand the core back to process A for its final §8.4 check.
         raw_syscall_x86(sys::P2_YIELD, 0, 0);
+
+        // 4. Resumed here (either by that hand-off's partner, or — once
+        //    process A calls P2_PREEMPT_START — by a timer tick). Loop
+        //    forever bumping this process's private counter word in the
+        //    shared frame (offset +12), issuing NO further `P2_YIELD`.
+        // Hardcoded `ecx` (address) + `eax` (data) — see `umode_root_x86`'s
+        // tail loop for the two register/sign-extension bugs this avoids.
+        core::arch::asm!(
+            "mov ecx, {va}",
+            "2:",
+            "mov eax, dword ptr [rcx]",
+            "add eax, 1",
+            "mov dword ptr [rcx], eax",
+            "jmp 2b",
+            va = const 0xC020_000Cu32,
+            options(noreturn),
+        );
     }
-    loop {
-        core::hint::spin_loop();
+}
+
+/// A THIRD user-space process, spawned via `kernel_arch_glue::
+/// spawn_process` (the generic path, not `umode_root_x86`/`umode_
+/// worker_x86`'s hand-written A/B setup) into its OWN isolated address
+/// space AND its OWN capability space — proof that process creation
+/// generalizes beyond the fixed two-process §8.4 proof. Mirrors
+/// riscv64's `umode_subsystem`/aarch64's `umode_subsystem_aarch64`
+/// exactly: bumps a private counter word at a fixed low address inside
+/// its OWN stack region (safe because this loop pushes no stack frame —
+/// pure register ops).
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_subsystem_x86() -> ! {
+    // SAFETY: the address is the low end of this process's own `U=1
+    // R+W` stack mapping (`kernel_arch_glue::spawn_process` set it up);
+    // pure register ops, no stack frame, no relocation.
+    unsafe {
+        // Hardcoded `ecx` (address) + `eax` (data) — see `umode_root_x86`'s
+        // tail loop for the two register/sign-extension bugs this avoids.
+        core::arch::asm!(
+            "mov ecx, {va}",
+            "2:",
+            "mov eax, dword ptr [rcx]",
+            "add eax, 1",
+            "mov dword ptr [rcx], eax",
+            "jmp 2b",
+            va = const 0xC030_0000u32,
+            options(noreturn),
+        );
+    }
+}
+
+/// Process A's preemptive-phase counting loop, run by a FRESH thread
+/// `kernel_arch_glue::p2_preempt_start` spawns to share root's own
+/// address space (not `umode_root_x86` continuing to run itself — see
+/// that function's doc comment on why root's own vruntime-loaded TCB is
+/// retired instead of reused). Bumps the SAME counter word `umode_
+/// root_x86` would have (`P2_VA_A_CONST + 8`), since it runs in the
+/// SAME space A. Mirrors riscv64's `umode_a_loop`/aarch64's `umode_
+/// a_loop_aarch64` exactly.
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_a_loop_x86() -> ! {
+    // SAFETY: the address is mapped `U=1 R+W` in space A by `enter`/
+    // `umode_root_x86`'s own setup; pure register ops, no stack frame.
+    unsafe {
+        // Hardcoded `ecx` (address) + `eax` (data) — see `umode_root_x86`'s
+        // tail loop for the two register/sign-extension bugs this avoids
+        // (this exact function is where the first of the two was
+        // originally found, via QEMU).
+        core::arch::asm!(
+            "mov ecx, {va}",
+            "2:",
+            "mov eax, dword ptr [rcx]",
+            "add eax, 1",
+            "mov dword ptr [rcx], eax",
+            "jmp 2b",
+            va = const 0xC004_0008u32,
+            options(noreturn),
+        );
     }
 }
 
@@ -792,26 +913,25 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         }
         sys::P2_REPORT_A => {
             kernel_arch_glue::p2_report_a(a0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::P2_PREEMPT_START => {
             // The cooperative §8.4 round-trip is done; spawn the fault-
-            // isolation demo (03-Kernel-Subsystems-Layer.md §5.2) right
-            // here — there is no preemption loop on x86_64 yet for
-            // these to "join" (see this crate's own IMPLEMENTATION-
-            // PLAN.md entry), so hand off to the faulty driver
-            // EXPLICITLY: it faults on its very first instruction,
-            // `simurgh_fault_x86` -> `kernel_arch_glue::p2_fault` sees
-            // it is the watched driver and hands off UNCONDITIONALLY to
-            // device-manager's own registered tid (already spawned, so
-            // already registered) — the same `p2_dm_handoff_to_driver`
-            // helper riscv64 uses for ITS OWN respawn direction serves
-            // equally well for this initial hand-off; it is a plain
-            // "yield from whoever is running to this named target",
-            // not driver-respawn-specific in what it actually does.
+            // isolation demo (03-Kernel-Subsystems-Layer.md §5.2) and
+            // arm the preemptive scheduler (02-Microkernel-Layer.md §4)
+            // together, right here — mirrors `simurgh_syscall`
+            // (riscv64)'s and `simurgh_syscall_aarch64`'s own
+            // `P2_PREEMPT_START` arms exactly: device-manager and the
+            // faulty driver simply join the SAME timer-driven round-
+            // robin `p2_preempt_start`/`p2_tick` establish for A/B/C,
+            // rather than needing an explicit hand-off — `p2_fault`'s
+            // existing unconditional hand-off-to-`DM_TID` logic
+            // (already proven on riscv64 AND aarch64) takes over the
+            // instant the driver is scheduled and faults.
             spawn_device_manager_x86(kernel_arch_glue::khal());
-            return match spawn_faulty_driver_x86(kernel_arch_glue::khal()) {
-                Some(driver_tid) => match kernel_arch_glue::p2_dm_handoff_to_driver(driver_tid) {
-                    Some((save, into)) => TrapOutcome::SwitchTo { save, into },
-                    None => TrapOutcome::Resume(0),
-                },
+            let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
+            return match kernel_arch_glue::p2_preempt_start() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
             };
         }
@@ -885,6 +1005,22 @@ fn simurgh_fault_x86(vector: usize, rip: usize, _reserved: usize) -> hal_x86_64:
     }
 }
 
+/// The preemptive-scheduler tick handler `hal_x86_64::cpu`'s dedicated
+/// LAPIC-timer trampoline calls for the timer interrupt landing on a
+/// running Ring-3 thread (registered via `hal_x86_64::cpu::
+/// set_tick_handler`) — 02-Microkernel-Layer.md §4. Delegates the
+/// round-robin decision to `kernel-arch-glue`; `Some((save, into))`
+/// preempts, `None` lets the current thread keep running. Mirrors
+/// `simurgh_tick` (riscv64) / `simurgh_tick_aarch64` exactly.
+#[cfg(target_arch = "x86_64")]
+fn simurgh_tick_x86() -> hal_x86_64::cpu::TrapOutcome {
+    use hal_x86_64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_tick() {
+        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
 // Linker symbols for the x86_64 user (layer-3) Root Task image — see
 // hal-x86_64/src/linker.ld's `.user_text` / `.user_stack` sections.
 #[cfg(target_arch = "x86_64")]
@@ -915,11 +1051,8 @@ fn user_image() -> kernel_arch_glue::UserImage {
             stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
             entry_vma: umode_root_x86 as usize,
             worker_entry_vma: umode_worker_x86 as usize,
-            // Three-process preemption (process C + `umode_a_loop`) is
-            // deliberately NOT implemented for x86_64 this milestone —
-            // see this crate's own IMPLEMENTATION-PLAN.md entry.
-            subsystem_entry_vma: 0,
-            a_loop_entry_vma: 0,
+            subsystem_entry_vma: umode_subsystem_x86 as usize,
+            a_loop_entry_vma: umode_a_loop_x86 as usize,
         }
     }
 }
@@ -1562,13 +1695,20 @@ fn x86_64_paging_selftest(hal: &hal_core::HalInterface, k: &mut kernel_core::Ker
             .map(|p| p.as_usize())
     };
 
-    // `root_pt`: 2 CONTIGUOUS pages — PML4 then its companion PDPT (see
-    // `hal_x86_64::cpu::x86_64_paging`'s module doc comment on why
-    // x86_64 needs a second page every other architecture's `root_frame`
-    // convention doesn't). `pool`: PD/PT levels `map_range` builds below
-    // that PDPT — one of each is enough for a single 4 KiB test page.
+    // `root_pt`: 3 CONTIGUOUS pages — PML4, its companion PDPT, and a
+    // dedicated PD table for the Local APIC's own identity leaf (see
+    // `hal_x86_64::cpu::x86_64_paging`'s module doc comment, `map_ram_
+    // identity`'s own, on why every `root_frame` needs this THIRD page
+    // now — this call site was a REAL, QEMU-confirmed gap this
+    // session's preemption work found: still carving only 2 pages here
+    // after `map_ram_identity` grew a third-page precondition silently
+    // corrupted `pool` below, the exact "sp_b overwritten while building
+    // sp_a's table" class of bug this file's own `two_space` comment
+    // already documents for a DIFFERENT call site). `pool`: PD/PT
+    // levels `map_range` builds below that PDPT — one of each is enough
+    // for a single 4 KiB test page.
     let (Some(root_pt), Some(pool), Some(test_phys)) = (
-        carve(k, 4096, 4096 * 2),
+        carve(k, 4096, 4096 * 3),
         carve(k, 4096, 4096 * 2),
         carve(k, 4096, 4096),
     ) else {
@@ -2143,6 +2283,11 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             // (03-Kernel-Subsystems-Layer.md §2.1/§5.2).
             #[cfg(target_arch = "x86_64")]
             hal_x86_64::cpu::set_fault_handler(simurgh_fault_x86);
+            // Register the preemptive-scheduler tick handler
+            // `hal_x86_64::cpu`'s dedicated LAPIC-timer trampoline calls
+            // (02-Microkernel-Layer.md §4).
+            #[cfg(target_arch = "x86_64")]
+            hal_x86_64::cpu::set_tick_handler(simurgh_tick_x86);
             // Register the syscall handler `hal_arm64::cpu`'s shared
             // EL0-synchronous vector calls.
             #[cfg(target_arch = "aarch64")]

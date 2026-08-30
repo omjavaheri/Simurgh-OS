@@ -312,14 +312,66 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     let compute = compute::ComputeDiscovery::new();
     let power = power::PowerThermalImpl::new(&compute);
 
-    let hal = X86_64Hal {
-        cpu,
-        memory,
-        timer,
-        interrupt,
-        compute,
-        power,
+    // Built into `.bss` static storage, NOT a plain local — mirrors
+    // hal-arm64's own identical fix (`hal_arm64_rust_entry`, this
+    // session) and `KernelState::init_global`'s "no stack temporary"
+    // rationale. `build_interface` below bakes raw pointers into
+    // `hal.cpu`/`hal.timer` (via `HalInterface`'s opaque `*const ()`
+    // state fields) that must stay valid for the life of the system.
+    // The comment this replaced argued a plain local was safe because
+    // `hal_x86_64_rust_entry` never returns — true in isolation, but
+    // this project's own aarch64 port hit a REAL corruption from the
+    // identical pattern the moment its own kernel-mode SP got reset to
+    // a fixed baseline on every process switch (see hal-arm64::cpu::
+    // restore_user_and_eret's own doc comment for the full story).
+    // x86_64 has NOT hit this yet — its hardware TSS.rsp0 mechanism
+    // resets Ring0 SP to the SAME fixed value on every Ring3->Ring0
+    // transition already, so the danger zone was always bounded by
+    // ordinary call depth, not a leak — but adding a timer ISR here
+    // (this session's own preemption work) grows that call depth in a
+    // new, not-yet-proven-safe way, and this fix is cheap enough not
+    // to risk finding out the hard way via QEMU.
+    static mut HAL_STORAGE: core::mem::MaybeUninit<X86_64Hal> = core::mem::MaybeUninit::uninit();
+    // SAFETY: single-core boot, this function runs exactly once, before
+    // this static is read anywhere else. `addr_of_mut!`/`addr_of!` avoid
+    // forming an intermediate `&mut`/`&` to the `static mut` itself.
+    let hal: &'static X86_64Hal = unsafe {
+        core::ptr::addr_of_mut!(HAL_STORAGE).cast::<X86_64Hal>().write(X86_64Hal {
+            cpu,
+            memory,
+            timer,
+            interrupt,
+            compute,
+            power,
+        });
+        &*core::ptr::addr_of!(HAL_STORAGE).cast::<X86_64Hal>()
     };
+
+    // PRE-EXISTING GAP found while bringing up this session's
+    // preemptive-scheduler work (same class of gap `Cpu::bootstrap_
+    // current_core`'s own doc comment above already flags for the CPU
+    // side): `InterruptCtrl::bootstrap_current_core` — which enables
+    // the Local APIC and configures its LVT Timer entry for TSC-
+    // deadline mode — and `interrupt::set_global_controller`/
+    // `set_global_timer` (which `dispatch_vector` needs to have any
+    // effect at all) were never called anywhere in this crate
+    // (confirmed via `grep -rn "bootstrap_current_core\|set_global_"`
+    // across this crate turning up only their own definitions). Without
+    // them, the LAPIC timer this session's preemption work depends on
+    // would never even be configured to fire, let alone be dispatched
+    // anywhere once it did.
+    //
+    // SAFETY: called exactly once, after `Cpu::bootstrap_current_core`
+    // (IDT already loaded above) and before any interrupt can
+    // legitimately be taken (boot.S never issues `sti` before this
+    // function returns via `kernel_main`, which does so only once
+    // dropping to Ring 3).
+    if unsafe { hal.interrupt.bootstrap_current_core(hal.timer.tsc_deadline_capable()) }.is_err() {
+        // Nothing sensible to do this early; same fallback as the CPU
+        // bootstrap call above.
+    }
+    interrupt::set_global_controller(&hal.interrupt);
+    interrupt::set_global_timer(&hal.timer);
 
     // ------------------------------------------------------------------
     // Step 5: assemble BootInfo (hal-core/src/boot.rs) from everything
@@ -377,13 +429,13 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
         fn kernel_main(hal: hal_core::HalInterface, boot_info: hal_core::BootInfo) -> !;
     }
 
-    // SAFETY: `hal_interface` borrows `hal.cpu`/`hal.timer`, which
-    // live in this function's own stack frame; since this function
-    // never returns and its only continuation is the equally-
-    // diverging `kernel_main` call, that frame is never popped, so
-    // the borrowed data stays valid as long as `hal_interface` could
-    // be used. `kernel_main`'s signature (hal_core::HalInterface,
-    // architecture-erased) is fixed by this workspace regardless of
+    // SAFETY: `hal_interface` borrows `hal.cpu`/`hal.timer`, which now
+    // live in genuinely `'static` storage (`HAL_STORAGE` above) — safe
+    // regardless of what this function's own stack frame, or any
+    // later kernel-mode stack activity (including this session's own
+    // preemption switches), does to memory below it. `kernel_main`'s
+    // signature (hal_core::HalInterface, architecture-erased) is fixed
+    // by this workspace regardless of
     // which hal-<arch> crate is linked in.
     unsafe { kernel_main(hal_interface, boot_info) }
 }

@@ -485,9 +485,54 @@ unsafe fn load_idt() {
 core::arch::global_asm!(
     r#"
     .altmacro
+    // Intel SDM Vol. 3A Table 6-1: vectors 8 (#DF), 10 (#TS), 11 (#NP),
+    // 12 (#SS), 13 (#GP), 14 (#PF), 17 (#AC) push a 64-bit error code
+    // BEFORE the CPU's own RIP/CS/RFLAGS/RSP/SS frame; every other
+    // vector pushes none. `common_interrupt_entry` needs a stack layout
+    // that is uniform across all 256 stubs (a fixed offset for "the
+    // vector number", "the error code"), so vectors WITHOUT a hardware
+    // error code push a dummy 0 here — matches the standard technique
+    // (e.g. the OSDev wiki's own IDT stub generator). **Real bug found
+    // via QEMU** (this session's x86_64 preemption work): before this
+    // fix every stub pushed only \vector, so for any error-code vector
+    // that actually fired, `isr_common_trampoline`'s `add rsp, 8` popped
+    // ONE slot too few, misaligning `iretq`'s own frame — the CPU would
+    // load the error code as RIP and fault again immediately, with the
+    // generic path's silent EOI-and-resume (see `dispatch_vector`)
+    // turning that into an infinite, silent re-fault loop: no serial
+    // output, no crash, just a permanently stuck core. Never triggered
+    // by this project's own #UD/timer/syscall traps (all three have
+    // DEDICATED gates bypassing this generic path entirely) until a
+    // paging edge case in the P2/device-manager demo's 5th driver
+    // respawn took a real #GP/#PF here for the first time.
     .macro isr_stub vector
     .global isr_stub_\vector
     isr_stub_\vector:
+    .set has_err, 0
+    .if \vector == 8
+    .set has_err, 1
+    .endif
+    .if \vector == 10
+    .set has_err, 1
+    .endif
+    .if \vector == 11
+    .set has_err, 1
+    .endif
+    .if \vector == 12
+    .set has_err, 1
+    .endif
+    .if \vector == 13
+    .set has_err, 1
+    .endif
+    .if \vector == 14
+    .set has_err, 1
+    .endif
+    .if \vector == 17
+    .set has_err, 1
+    .endif
+    .if has_err == 0
+        push 0
+    .endif
         push \vector
         jmp isr_common_trampoline
     .endm
@@ -538,7 +583,7 @@ core::arch::global_asm!(
         pop r14
         pop r15
 
-        add rsp, 8   # discard the pushed vector number
+        add rsp, 16  # discard the pushed vector number + error code (see isr_stub's doc comment)
         iretq
     "#
 );
@@ -559,11 +604,99 @@ core::arch::global_asm!(
 extern "C" fn common_interrupt_entry(saved_regs: *const u64) {
     // SAFETY: `saved_regs` points at the 15-register block the
     // trampoline above just pushed, immediately followed on the stack
-    // by the vector number pushed by `isr_stub_<N>` — both facts hold
-    // by construction of the assembly above, which this function's
-    // only caller.
+    // by [vector][error_code][RIP][CS] — `isr_stub`'s uniform layout
+    // (see its own doc comment) — both facts hold by construction of
+    // the assembly above, which this function's only caller.
     let vector = unsafe { *saved_regs.add(15) } as u8;
+
+    // Vectors 0-31 are CPU exceptions (Intel SDM Vol. 3A Table 6-1).
+    // `#UD` (6) and the LAPIC timer (32, not in this range at all) have
+    // DEDICATED gates that bypass this generic path entirely (see
+    // `hal_x86_64_rust_entry`'s IDT setup), so any exception reaching
+    // HERE is one this project has no handler for — e.g. a `#GP`/`#PF`
+    // from an unexpected paging/permission edge case. `dispatch_vector`
+    // would otherwise just EOI and fall through to `iretq`, silently
+    // RESUMING at the same faulting instruction — for a genuine CPU
+    // exception (not a spurious IRQ) that just re-faults forever with
+    // no diagnostic output at all (the exact silent-hang symptom this
+    // comment's fix addresses — see `isr_stub`'s doc comment for the
+    // stack-imbalance bug found alongside it). Print what we can via
+    // raw port I/O (no dependency on any higher-layer logger — this is
+    // `hal-x86_64`, below `kernel-arch-glue`'s `klog!`) and halt: there
+    // is no recovery path for an exception nothing registered for.
+    if vector < 32 {
+        // SAFETY: `error_code`/`rip` sit at the fixed offsets `isr_stub`'s
+        // uniform per-vector layout guarantees.
+        let error_code = unsafe { *saved_regs.add(16) };
+        let rip = unsafe { *saved_regs.add(17) };
+        let cr3: u64;
+        let cr2: u64;
+        // SAFETY: reading cr2/cr3 has no preconditions in a trap handler.
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+        }
+        diag_print("\r\nUNHANDLED CPU EXCEPTION vector=");
+        diag_print_hex(vector as u64);
+        diag_print(" error_code=");
+        diag_print_hex(error_code);
+        diag_print(" rip=");
+        diag_print_hex(rip);
+        diag_print(" cr3=");
+        diag_print_hex(cr3);
+        diag_print(" cr2(fault_va)=");
+        diag_print_hex(cr2);
+        diag_print("\r\n");
+        loop {
+            // SAFETY: `cli`/`hlt` are the standard side-effect-free halt
+            // sequence — same terminal-state choice as
+            // `halt_on_unexpected_fault` below.
+            unsafe {
+                core::arch::asm!("cli");
+                core::arch::asm!("hlt");
+            }
+        }
+    }
+
     crate::interrupt::dispatch_vector(vector);
+}
+
+/// Raw COM1 (`0x3F8`) byte write — port I/O, so it needs no page-table
+/// mapping regardless of which `cr3` is currently loaded. Used only by
+/// `common_interrupt_entry`'s unhandled-exception diagnostic above,
+/// which by definition cannot assume `kernel-arch-glue`'s `klog!` (or
+/// any other higher-layer logger) is safe to call from this context.
+/// Not `#[cfg(target_os = "none")]`-gated: `common_interrupt_entry`
+/// itself isn't (its `global_asm!` caller is never cfg-gated — see that
+/// function's own doc comment), so this must compile on host too, even
+/// though it is never actually invoked there.
+fn diag_putc(c: u8) {
+    // SAFETY: `out dx, al` to the fixed, standard COM1 I/O port has no
+    // preconditions beyond the port existing (true under QEMU/real
+    // hardware alike; a missing UART just drops the byte).
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x3F8u16,
+            in("al") c,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+fn diag_print(s: &str) {
+    for b in s.bytes() {
+        diag_putc(b);
+    }
+}
+
+fn diag_print_hex(v: u64) {
+    diag_putc(b'0');
+    diag_putc(b'x');
+    for i in (0..16).rev() {
+        let nibble = ((v >> (i * 4)) & 0xF) as u8;
+        diag_putc(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+    }
 }
 
 // ============================================================================
@@ -1066,6 +1199,28 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
             }
             let addr = &isr_fault_trampoline as *const u8 as u64;
             IDT[FAULT_VECTOR_UD as usize] = IdtEntry::gate(addr);
+        }
+
+        // The timer gate: `interrupt::TIMER_VECTOR` (32), same override
+        // pattern as the syscall/fault gates above — points at the
+        // DEDICATED `isr_timer_trampoline` instead of the generic
+        // `isr_stub_32` the loop installed, since only the dedicated one
+        // has TrapOutcome-style switch semantics (02-Microkernel-
+        // Layer.md §4's preemptive scheduler). Stays DPL 0 (the default
+        // `gate()` already installed): the LAPIC timer is hardware-
+        // generated, never raised via a software `int`, so the IDT's DPL
+        // check (which only applies to `int nn`) never blocks it either
+        // way — same reasoning as the fault gate just above.
+        //
+        // SAFETY: `IDT` is written here, on the bootstrap core, before
+        // `load_idt` is called and before interrupts are enabled — no
+        // concurrent access is possible.
+        unsafe {
+            unsafe extern "C" {
+                static isr_timer_trampoline: u8;
+            }
+            let addr = &isr_timer_trampoline as *const u8 as u64;
+            IDT[crate::interrupt::TIMER_VECTOR as usize] = IdtEntry::gate(addr);
         }
 
         // SAFETY: `IDT`/`TSS`/`GDT` are fully populated at this point
@@ -1666,6 +1821,162 @@ fn halt_on_unexpected_fault() -> ! {
     }
 }
 
+// ============================================================================
+// Preemptive scheduling (LAPIC timer, `interrupt::TIMER_VECTOR`, Ring 3
+// -> Ring 0) — 02-Microkernel-Layer.md §4, analogous to hal-riscv64's
+// supervisor-timer-interrupt handling in `common_trap_entry` and hal-
+// arm64's `irq_el0_entry`/`TickHandler`. Routed through a THIRD dedicated
+// trampoline (`isr_timer_trampoline`), for the same reason the syscall
+// and fault boundaries each needed their own: the generic 256-vector ISR
+// path (`isr_common_trampoline`) has no TrapOutcome-style switch
+// semantics — it always resumes exactly where an interrupt landed,
+// correct for an ordinary IRQ handler but not for a tick that may need
+// to switch which thread is running. Reuses `SyscallFrame`'s exact
+// layout: a hardware interrupt (unlike `#GP`/`#PF`) pushes no error
+// code, so the auto-pushed IRETQ frame sits at the same offset the
+// syscall/fault trampolines already expect.
+// ============================================================================
+
+/// Signature of the handler the microkernel registers for the LAPIC
+/// timer interrupt (`interrupt::TIMER_VECTOR`) taken **while a Ring-3
+/// thread was running** — the preemptive scheduler's entry point.
+/// Takes no arguments (`isr_timer_trampoline` owns the interrupted
+/// frame) and returns a `TrapOutcome`: `Resume` to let the current
+/// thread keep its quantum, or `SwitchTo` to preempt it. The handler is
+/// responsible for re-arming (or cancelling) the timer via
+/// `HalInterface`. Mirrors hal-riscv64's `TickHandler` / hal-arm64's
+/// `TickHandler` exactly.
+pub type TickHandler = fn() -> TrapOutcome;
+
+#[cfg(target_os = "none")]
+static mut TICK_HANDLER: Option<TickHandler> = None;
+
+/// Registers the preemptive-scheduler tick handler `common_timer_entry`
+/// calls when the LAPIC timer interrupt lands on a running Ring-3
+/// thread. Set once during boot. Until it is set (and the kernel arms a
+/// deadline via `HalInterface::arm_timer`), the timer interrupt still
+/// fires and gets acknowledged/EOI'd by `interrupt::dispatch_vector`
+/// (matching `on_timer_interrupt`'s existing callback mechanism) but
+/// triggers no thread switch — so `kernel-stub`, which registers no
+/// handler and never enters Ring 3, is unaffected.
+#[cfg(target_os = "none")]
+pub fn set_tick_handler(handler: TickHandler) {
+    // SAFETY: single-core boot; set exactly once before the timer is
+    // armed and before any drop to Ring 3.
+    unsafe {
+        core::ptr::addr_of_mut!(TICK_HANDLER).write(Some(handler));
+    }
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .global isr_timer_trampoline
+    isr_timer_trampoline:
+        push r15
+        push r14
+        push r13
+        push r12
+        push r11
+        push r10
+        push r9
+        push r8
+        push rbp
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push rbx
+        push rax
+
+        mov rdi, rsp
+        call common_timer_entry
+
+        mov rbx, [rsp + 8]
+        mov rcx, [rsp + 16]
+        mov rdx, [rsp + 24]
+        mov rsi, [rsp + 32]
+        mov rdi, [rsp + 40]
+        mov rbp, [rsp + 48]
+        mov r8,  [rsp + 56]
+        mov r9,  [rsp + 64]
+        mov r10, [rsp + 72]
+        mov r11, [rsp + 80]
+        mov r12, [rsp + 88]
+        mov r13, [rsp + 96]
+        mov r14, [rsp + 104]
+        mov r15, [rsp + 112]
+        mov rax, [rsp + 0]
+        add rsp, 120
+        iretq
+    "#
+);
+
+/// Host (`cargo test`) stub — same reason `common_syscall_entry`/
+/// `common_fault_entry` each need one (the `global_asm!` trampoline's
+/// `call` is never cfg-gated).
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_timer_entry(_frame: *mut SyscallFrame) {}
+
+/// Called from `isr_timer_trampoline` with a pointer to the pushed
+/// `SyscallFrame`. Always dispatches through `interrupt::dispatch_
+/// vector` first (GIC-equivalent EOI + the existing `TimerCallback`
+/// mechanism — matches the generic ISR path's own handling of this
+/// vector) — ONLY if the interrupt landed on Ring 3 AND a `TickHandler`
+/// is registered does it also ask the preemptive scheduler what to do
+/// next; a timer tick taken from Ring 0 (kernel-mode work, or before
+/// any thread has dropped to Ring 3 yet) just gets acknowledged and
+/// resumes normally, mirroring `common_fault_entry`'s own Ring 0 vs.
+/// Ring 3 split. Resume point is `f.rip` UNCHANGED either way: unlike
+/// `int 0x80` (a software interrupt whose hardware-saved return address
+/// already points past it), an ordinary hardware interrupt's saved
+/// `rip` points AT the instruction that was about to execute — exactly
+/// where execution should continue.
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_timer_entry(frame: *mut SyscallFrame) {
+    // SAFETY: `frame` points at the 160-byte block `isr_timer_trampoline`
+    // just pushed, this function's only caller.
+    let f = unsafe { &mut *frame };
+
+    crate::interrupt::dispatch_vector(crate::interrupt::TIMER_VECTOR);
+
+    let from_ring3 = (f.cs & 3) == 3;
+    if !from_ring3 {
+        return;
+    }
+    // SAFETY: single-core; `TICK_HANDLER` is only written by
+    // `set_tick_handler` during boot, before the timer is armed.
+    let handler = unsafe { core::ptr::addr_of!(TICK_HANDLER).read() };
+    let Some(h) = handler else {
+        return;
+    };
+    match h() {
+        TrapOutcome::Resume(_) => {}
+        TrapOutcome::SwitchTo { save, into } => {
+            // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blobs. Never returns:
+            // `restore_user_and_iretq` abandons this trap frame's stack
+            // and `iretq`s into the incoming thread.
+            unsafe {
+                save_syscall_frame_as_user_context(f, f.rip, save as *mut X8664UserContext);
+                restore_user_and_iretq(into as *const X8664UserContext);
+            }
+        }
+        TrapOutcome::Terminate { into } => {
+            // Not the expected outcome for a plain preemption tick (the
+            // preempted thread is still perfectly resumable), but the
+            // type is shared with the syscall/fault paths, so this arm
+            // must exist — same as hal-riscv64's/hal-arm64's own tick-
+            // handler `Terminate` arms.
+            // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blob.
+            unsafe { restore_user_and_iretq(into as *const X8664UserContext) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1826,8 +2137,30 @@ pub(crate) mod x86_64_paging {
     /// above).
     const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-    /// Zeroes `root_frame` (the PML4) and `root_frame + 4096` (its
-    /// companion PDPT — see this module's doc comment) and installs
+    /// Reads `IA32_APIC_BASE` (Intel SDM 10.12.1) directly — a small,
+    /// deliberate duplication of `interrupt.rs`'s own identically-named
+    /// concept (`xapic_mmio_base()`): `map_ram_identity` (below) has no
+    /// access to the live `InterruptCtrl` instance at all — `HalInterface`
+    /// never threads it through (`build_interface(&hal.cpu, &hal.timer)`
+    /// only ever exposes CPU/timer state to `kernel_arch_glue`) — so it
+    /// re-derives the SAME physical base independently rather than
+    /// assuming the architectural reset default, correctly handling the
+    /// (rare, not exercised by this project's own QEMU targets, but
+    /// architecturally legal) case of firmware relocating it.
+    fn xapic_mmio_base_masked() -> u64 {
+        let low: u32;
+        let high: u32;
+        // SAFETY: RDMSR on IA32_APIC_BASE (an always-present
+        // architectural MSR) has no preconditions beyond Ring 0
+        // execution, which this crate always runs at.
+        unsafe {
+            core::arch::asm!("rdmsr", in("ecx") 0x1Bu32, out("eax") low, out("edx") high);
+        }
+        (((high as u64) << 32) | low as u64) & 0x000F_FFFF_FFFF_F000
+    }
+
+    /// Zeroes `root_frame` (the PML4), `root_frame + 4096` (its
+    /// companion PDPT — see this module's doc comment), and installs
     /// `bytes_gib` 1 GiB identity leaves (VA == PA) into the PDPT, with
     /// PML4[0] pointing at that PDPT. R+W+X (x86_64 has no separate
     /// "readable" bit — `PRESENT` alone means readable) and, if
@@ -1837,21 +2170,54 @@ pub(crate) mod x86_64_paging {
     /// mapping under this same PML4 entry, e.g. `.user_text` mapped
     /// afterward via `map_range`).
     ///
+    /// ALSO always installs a kernel-only 2 MiB identity leaf covering
+    /// the Local APIC's MMIO region, using `root_frame + 8192` as a
+    /// THIRD scratch page (a dedicated PD table for JUST that leaf) —
+    /// a REAL, QEMU-confirmed gap this session's preemption work found:
+    /// every process's own page table only ever identity-mapped
+    /// `bytes_gib` (1 for x86_64's own small, low-loaded kernel image),
+    /// leaving the xAPIC unreachable the instant paging activated with
+    /// a Ring-3 thread's own CR3 live — invisible until this session's
+    /// own timer ISR became the FIRST code to touch xAPIC MMIO from
+    /// OUTSIDE the original boot-time identity map (confirmed via
+    /// instrumented bisection: the read silently hung with no
+    /// diagnostic — this crate's own generic-ISR path has no `#PF`/
+    /// `#GP` dump the way hal-arm64's `trap_diag` does).
+    ///
+    /// Deliberately a 2 MiB PD-level leaf, NOT a coarser 1 GiB PDPT-
+    /// level one (which a FIRST attempt at this fix used, and which
+    /// genuinely regressed the existing "two isolated Sv39 spaces"/
+    /// two-process demo's own `map_range` calls — QEMU-confirmed via
+    /// `map_range error`): the xAPIC's default base (0xFEE0_0000) falls
+    /// in the SAME 1 GiB PDPT slot (index 3, VA 0xC000_0000..
+    /// 0xFFFF_FFFF) this project's OWN demo machinery already uses
+    /// fine-grained `map_range` calls for (`P2_VA_A_CONST`=0xC0040000,
+    /// the "two Sv39 spaces" proof's 0xE0000000/0xF0000000, process C's
+    /// 0xC0300000, etc.) — a whole-GiB BLOCK there collides with (and
+    /// wins over, per `map_range`'s own "block already covers this"
+    /// rejection) all of them. A 2 MiB leaf at ONLY the xAPIC's own
+    /// sub-range leaves every other address in that GiB's PD table free
+    /// for `map_range` to populate normally afterward — `map_range`'s
+    /// own descent (see its doc comment) finds PDPT[3] is already a
+    /// TABLE pointer (not a block) here and simply continues into it.
+    ///
     /// # Preconditions
-    /// `root_frame` and `root_frame + 4096` are page-aligned, writable
-    /// physical frames; single core; called before
-    /// `activate_address_space` switches CR3 to this table (both frames
-    /// must stay directly addressable via the CURRENTLY active mapping
-    /// while this runs).
+    /// `root_frame`, `root_frame + 4096`, and `root_frame + 8192` are
+    /// page-aligned, writable physical frames; single core; called
+    /// before `activate_address_space` switches CR3 to this table (all
+    /// three frames must stay directly addressable via the CURRENTLY
+    /// active mapping while this runs).
     pub fn map_ram_identity(root_frame: usize, bytes_gib: usize, user_accessible: bool) {
         let pml4 = root_frame as *mut u64;
         let pdpt = (root_frame + 4096) as *mut u64;
-        // SAFETY: precondition above — `pml4`/`pdpt` are two distinct,
-        // writable, page-aligned frames.
+        let xapic_pd = (root_frame + 8192) as *mut u64;
+        // SAFETY: precondition above — `pml4`/`pdpt`/`xapic_pd` are
+        // three distinct, writable, page-aligned frames.
         unsafe {
             for i in 0..512 {
                 pml4.add(i).write_volatile(0);
                 pdpt.add(i).write_volatile(0);
+                xapic_pd.add(i).write_volatile(0);
             }
             let pml4_flags = PRESENT | WRITABLE | USER;
             let mut leaf_flags = PRESENT | WRITABLE | HUGE_PAGE;
@@ -1861,6 +2227,23 @@ pub(crate) mod x86_64_paging {
             pml4.write_volatile((root_frame as u64 + 4096) | pml4_flags);
             for gib in 0..bytes_gib.min(512) {
                 pdpt.add(gib).write_volatile(((gib as u64) << 30) | leaf_flags);
+            }
+
+            let xapic_base = xapic_mmio_base_masked();
+            let xapic_gib = (xapic_base >> 30) as usize;
+            if bytes_gib <= xapic_gib && xapic_gib < 512 {
+                let xapic_pd_index = ((xapic_base >> 21) & 0x1FF) as usize;
+                let xapic_leaf_pa = xapic_base & !0x1F_FFFF; // 2 MiB-align
+                xapic_pd
+                    .add(xapic_pd_index)
+                    .write_volatile(xapic_leaf_pa | PRESENT | WRITABLE | HUGE_PAGE);
+                // PDPT[xapic_gib] points at this PD as a TABLE (bit 7
+                // clear — no HUGE_PAGE here, unlike the `bytes_gib`
+                // block loop above): `map_range`'s own descent (see its
+                // doc comment) relies on distinguishing "block" from
+                // "table" at exactly this bit.
+                pdpt.add(xapic_gib)
+                    .write_volatile((root_frame as u64 + 8192) | PRESENT | WRITABLE | USER);
             }
         }
     }

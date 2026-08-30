@@ -431,13 +431,18 @@ pub fn enter(
     // 2 CONTIGUOUS pages, not 1: some architectures' `root_frame`
     // convention needs more than a single page for their page-table
     // root (x86_64: CR3 always points at a PML4, which needs a
-    // companion PDPT at `root_frame + 4096` — see `hal_x86_64::cpu`'s
-    // `x86_64_paging` module doc comment). Harmless on Sv39/AArch64,
-    // which only ever use the first page — carving uniformly here keeps
-    // this crate free of `#[cfg(target_arch)]`.
+    // companion PDPT at `root_frame + 4096`, PLUS a THIRD page at
+    // `root_frame + 8192` — a dedicated PD table for the Local APIC's
+    // own identity leaf, added this session alongside the preemption
+    // work's timer ISR (see `hal_x86_64::cpu`'s `x86_64_paging` module
+    // doc comment, `map_ram_identity`'s own, for why: every process's
+    // page table needs the xAPIC MMIO region reachable, not just the
+    // low `bytes_gib` range). Harmless on Sv39/AArch64, which only ever
+    // use the first page — carving uniformly here keeps this crate free
+    // of `#[cfg(target_arch)]`.
     let root_pt = state
         .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok());
+        .and_then(|u| u.alloc(4096, 4096 * 3).ok());
     let pool = state
         .untyped_mut(kernel_cap::UntypedId::new(0))
         .and_then(|u| u.alloc(4096, 4096 * POOL_FRAMES as u64).ok());
@@ -586,8 +591,8 @@ fn setup_two_process(
 
     let (shared, root_pt_b, pool_b, stack_b) = match (
         carve(state, 4096),
-        // 2 pages, not 1 — see `enter`'s own `root_pt` carve for why.
-        carve(state, 4096 * 2),
+        // 3 pages, not 1 — see `enter`'s own `root_pt` carve for why.
+        carve(state, 4096 * 3),
         carve(state, 4096 * 8),
         carve(state, P2_STACK_B_LEN as u64),
     ) {
@@ -782,8 +787,8 @@ pub fn spawn_process(
             .map(|p| p.as_usize())
     };
 
-    // 2 pages, not 1 — see `enter`'s own `root_pt` carve for why.
-    let root_pt = carve(state, 4096 * 2)?;
+    // 3 pages, not 1 — see `enter`'s own `root_pt` carve for why.
+    let root_pt = carve(state, 4096 * 3)?;
     let pool = carve(state, 4096 * 8)?;
     let stack_phys = carve(state, round4k(stack_len) as u64)?;
     // SAFETY: fresh untyped RAM, identity-addressable (paging is not yet
@@ -1594,7 +1599,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     //    resume a user context (tracked in IMPLEMENTATION-PLAN.md).
     let two_space = (|| {
         let uid = || kernel_cap::UntypedId::new(0);
-        // 2 pages each, not 1 — see `enter`'s own `root_pt` carve (this
+        // 3 pages each, not 1 — see `enter`'s own `root_pt` carve (this
         // function runs BEFORE `enter`'s own address-space setup, called
         // from inside `enter` itself, but the SAME "some architectures'
         // `root_frame` needs a companion page" reasoning applies here
@@ -1606,8 +1611,8 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
         // executing garbage after `activate_address_space(sp_a)` (no
         // panic, no fault visible in serial output — just silence,
         // confirmed via `-d int`: no further kernel code ever ran).
-        let sp_a = k.untyped_mut(uid())?.alloc(4096, 4096 * 2).ok()?.as_usize();
-        let sp_b = k.untyped_mut(uid())?.alloc(4096, 4096 * 2).ok()?.as_usize();
+        let sp_a = k.untyped_mut(uid())?.alloc(4096, 4096 * 3).ok()?.as_usize();
+        let sp_b = k.untyped_mut(uid())?.alloc(4096, 4096 * 3).ok()?.as_usize();
         let pool = k.untyped_mut(uid())?.alloc(4096, 4096 * 4).ok()?.as_usize();
         Some((sp_a, sp_b, pool))
     })();

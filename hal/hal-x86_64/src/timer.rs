@@ -215,6 +215,11 @@ pub struct Timer {
     hpet_present: bool,
     callback: Cell<Option<TimerCallback>>,
     tickless_enabled: Cell<bool>,
+    /// Lazily-calibrated LAPIC one-shot-count tick rate (Hz), for the
+    /// `!tsc_deadline_capable` fallback path — `None` until the first
+    /// `arm_lapic_count_oneshot` call computes it. See that method's
+    /// own doc comment for the calibration algorithm.
+    lapic_freq_hz: Cell<Option<u64>>,
 }
 
 impl Timer {
@@ -253,7 +258,17 @@ impl Timer {
             hpet_present: hpet.present,
             callback: Cell::new(None),
             tickless_enabled: Cell::new(false),
+            lapic_freq_hz: Cell::new(None),
         }
+    }
+
+    /// Whether this CPU supports TSC-deadline mode (invariant TSC +
+    /// the CPUID leaf-1 ECX bit 24 feature). `hal_x86_64_rust_entry`
+    /// queries this to tell `InterruptCtrl::bootstrap_current_core`
+    /// which LVT Timer mode to configure — see that method's own doc
+    /// comment for why this is no longer assumed unconditionally true.
+    pub(crate) fn tsc_deadline_capable(&self) -> bool {
+        self.tsc_deadline_capable
     }
 
     /// Reports which timer source this manifest entry should describe,
@@ -290,6 +305,76 @@ impl Timer {
         // range deadlines.
         (deadline_ns as u128 * self.frequency_hz as u128 / 1_000_000_000u128) as u64
     }
+
+    /// Fallback for CPUs without TSC-deadline mode (see `set_oneshot`'s
+    /// own doc comment on why this exists at all — a REAL, QEMU-
+    /// confirmed gap, not a hypothetical): arms the LAPIC's one-shot
+    /// COUNT-based timer (`interrupt::InterruptCtrl::write_initial_
+    /// count`, configured for one-shot mode by `bootstrap_current_core`)
+    /// instead of writing an absolute deadline to a dedicated MSR.
+    ///
+    /// Unlike TSC-deadline mode, the LAPIC's own countdown rate is not
+    /// discoverable via CPUID — it depends on the (here, fixed)
+    /// `DIVIDE_CONFIGURATION` value and the underlying bus clock, which
+    /// QEMU/TCG does not report anywhere this project can read. So this
+    /// CALIBRATES it instead, once, lazily, against the TSC (already
+    /// proven usable as a wall clock by `now_ns` — `frequency_hz` itself
+    /// comes from CPUID leaf 0x15, unaffected by the invariant-TSC gap
+    /// that blocks TSC-deadline mode specifically): arm the counter at
+    /// `u32::MAX`, busy-wait a short, known TSC-measured window, then
+    /// read how far it counted down. `Cell` caches the result so this
+    /// ~1ms busy-wait happens at most once per boot, not on every tick.
+    fn arm_lapic_count_oneshot(&self, deadline_ns: u64) -> Result<(), HalError> {
+        let Some(controller) = crate::interrupt::global_controller() else {
+            // Only reachable if this were called before `hal_x86_64_
+            // rust_entry` finished its own boot sequencing (which calls
+            // `interrupt::set_global_controller` before `kernel_main`,
+            // the only caller of anything that could reach here) —
+            // structurally unreachable in practice, but there is no
+            // sound fallback if it ever were, so surface the same
+            // "no oneshot mechanism available" error `set_oneshot`
+            // already uses for other structural gaps.
+            return Err(HalError::TicklessModeUnsupported);
+        };
+
+        let freq_hz = match self.lapic_freq_hz.get() {
+            Some(f) => f,
+            None => {
+                const CALIBRATION_WINDOW_NS: u64 = 1_000_000; // 1 ms
+                // Masked during calibration so a countdown that happens
+                // to hit 0 mid-measurement is never actually TAKEN as
+                // an interrupt (belt-and-suspenders — IF is already
+                // clear throughout syscall handling, where this first
+                // runs, but this does not rely on that).
+                controller.set_lvt_timer_masked(true);
+                controller.write_initial_count(u32::MAX);
+                let start = self.now_ns();
+                while self.now_ns().saturating_sub(start) < CALIBRATION_WINDOW_NS {
+                    core::hint::spin_loop();
+                }
+                let elapsed_ns = self.now_ns().saturating_sub(start).max(1);
+                let remaining = controller.read_current_count();
+                let elapsed_ticks = u32::MAX - remaining;
+                controller.write_initial_count(0); // stop the calibration countdown
+                controller.set_lvt_timer_masked(false);
+
+                let f = (elapsed_ticks as u128 * 1_000_000_000u128 / elapsed_ns as u128) as u64;
+                self.lapic_freq_hz.set(Some(f));
+                f
+            }
+        };
+
+        let relative_ns = deadline_ns.saturating_sub(self.now_ns());
+        // `.max(1)`: a 0 Initial Count is this mechanism's OWN cancel
+        // sentinel (`write_initial_count`'s own doc comment) — a
+        // deadline computing to 0 ticks here (an extremely near-term
+        // one) must still arm a real, if minimal, countdown rather than
+        // silently disarming.
+        let ticks = ((relative_ns as u128 * freq_hz as u128 / 1_000_000_000u128) as u64)
+            .clamp(1, u32::MAX as u64) as u32;
+        controller.write_initial_count(ticks);
+        Ok(())
+    }
 }
 
 impl TimerAbstraction for Timer {
@@ -302,50 +387,61 @@ impl TimerAbstraction for Timer {
         if mode == TimerMode::HighResolutionTickless && !self.tsc_deadline_capable {
             return Err(HalError::TicklessModeUnsupported);
         }
-        if !self.tsc_deadline_capable {
-            // Neither this MVP phase's Interactive-mode periodic-tick
-            // path (which would be driven by the Local APIC's regular
-            // one-shot/periodic initial-count mode, a separate
-            // interrupt.rs-owned configuration not yet implemented —
-            // see interrupt.rs's own module docs) nor tickless mode is
-            // available without TSC-deadline support; surfacing this
-            // as the same error keeps the caller's error handling
-            // uniform rather than needing a third HalError variant for
-            // what is, from the caller's perspective, the same
-            // underlying "no oneshot mechanism available" condition.
-            return Err(HalError::TicklessModeUnsupported);
-        }
 
         if deadline_ns <= self.now_ns() {
             return Err(HalError::InvalidTimerDeadline);
         }
 
-        let deadline_ticks = self.deadline_ns_to_tsc(deadline_ns);
+        if self.tsc_deadline_capable {
+            let deadline_ticks = self.deadline_ns_to_tsc(deadline_ns);
 
-        // SAFETY: writing an absolute TSC value to IA32_TSC_DEADLINE is
-        // always well-defined per the Intel SDM (see `wrmsr`'s own
-        // safety doc comment) — arming a oneshot is exactly this MSR's
-        // purpose. The resulting interrupt is only actually DELIVERED
-        // if the LVT Timer register was previously configured for
-        // TSC-deadline mode, per this struct's `new()` doc comment on
-        // that ordering requirement; if not, this write is harmless
-        // but the interrupt simply never fires — a caller-ordering bug
-        // outside what this function itself can detect or prevent.
-        unsafe {
-            wrmsr(IA32_TSC_DEADLINE_MSR, deadline_ticks);
+            // SAFETY: writing an absolute TSC value to IA32_TSC_DEADLINE
+            // is always well-defined per the Intel SDM (see `wrmsr`'s
+            // own safety doc comment) — arming a oneshot is exactly this
+            // MSR's purpose. The resulting interrupt is only actually
+            // DELIVERED if the LVT Timer register was previously
+            // configured for TSC-deadline mode, per this struct's
+            // `new()` doc comment on that ordering requirement; if not,
+            // this write is harmless but the interrupt simply never
+            // fires — a caller-ordering bug outside what this function
+            // itself can detect or prevent.
+            unsafe {
+                wrmsr(IA32_TSC_DEADLINE_MSR, deadline_ticks);
+            }
+            return Ok(());
         }
 
-        Ok(())
+        // Fallback: calibrated LAPIC one-shot count mode. Only
+        // `TimerMode::Interactive` reaches here — `HighResolutionTickless`
+        // without TSC-deadline support was already rejected above,
+        // matching `TimerInfo::supports_tickless`'s own contract. See
+        // this impl block's own `arm_lapic_count_oneshot` doc comment
+        // for why this exists at all: TCG (this project's only tested
+        // software-emulation accelerator, no KVM/WHPX available in this
+        // session's environment) does not implement TSC-deadline mode
+        // under ANY CPU model.
+        self.arm_lapic_count_oneshot(deadline_ns)
     }
 
     fn cancel_oneshot(&self) {
-        // Writing 0 to IA32_TSC_DEADLINE disarms it (SDM 10.5.4.1: a
-        // value of 0 stops the timer without generating an interrupt).
-        //
-        // SAFETY: same justification as set_oneshot's wrmsr call — 0
-        // is an explicitly well-defined "disarm" value for this MSR.
-        unsafe {
-            wrmsr(IA32_TSC_DEADLINE_MSR, 0);
+        if self.tsc_deadline_capable {
+            // Writing 0 to IA32_TSC_DEADLINE disarms it (SDM 10.5.4.1: a
+            // value of 0 stops the timer without generating an
+            // interrupt).
+            //
+            // SAFETY: same justification as set_oneshot's wrmsr call —
+            // 0 is an explicitly well-defined "disarm" value for this
+            // MSR.
+            unsafe {
+                wrmsr(IA32_TSC_DEADLINE_MSR, 0);
+            }
+            return;
+        }
+        // Fallback path: a 0 Initial Count likewise disarms the LAPIC's
+        // one-shot countdown without it ever reaching 0 "for real" —
+        // see `write_initial_count`'s own doc comment (interrupt.rs).
+        if let Some(controller) = crate::interrupt::global_controller() {
+            controller.write_initial_count(0);
         }
     }
 
@@ -482,6 +578,7 @@ mod tests {
             hpet_present: false,
             callback: Cell::new(None),
             tickless_enabled: Cell::new(false),
+            lapic_freq_hz: Cell::new(None),
         }
     }
 
