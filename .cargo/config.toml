@@ -135,10 +135,10 @@ xrun-microkernel-riscv64 = "run -p kernel --target targets/riscv64gc-hal.json -Z
 # `[[bin]]` as a genuinely separate, statically-linked ELF — NOT linked
 # into the `kernel`/`kernel-stub` image — which `kernel-arch-glue::
 # spawn_process_from_elf` loads at spawn time via an `include_bytes!`
-# embed (see `kernel/kernel/build.rs`). riscv64-only for now (this
-# crate's own `subsystem-bin-riscv64.ld` doc comment explains why
-# x86_64/aarch64 need their own base-address variant first).
+# embed (see `kernel/kernel/build.rs`).
 # ----------------------------------------------------------------------------
+xbuild-subsystem-device-manager-x86_64  = "build -p device-manager --bin device-manager-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-device-manager-aarch64 = "build -p device-manager --bin device-manager-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-device-manager-riscv64 = "build -p device-manager --bin device-manager-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------

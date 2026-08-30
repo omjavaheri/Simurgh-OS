@@ -19,15 +19,11 @@
  *
  * Base address 0xC0000000: the SAME "empty Sv39 GiB slot" convention
  * `hal-riscv64/src/linker.ld` already uses for its own `.user_text` —
- * proven safe for a riscv64 U-mode process image at this base. This is
- * riscv64-ONLY: x86_64's `code-model:"kernel"` target needs a low,
- * sign-extend-32-bit-representable base (0x40000000, per hal-x86_64's
- * own `.user_text` VMA — see that crate's linker.ld doc comment for the
- * `R_X86_64_32S out of range` link error this avoids), and aarch64 uses
- * 0x80000000 (its own `.user_text` convention) — a separate script per
- * architecture is needed once this packaging work extends past riscv64
- * (this session's own scope, matching this project's established
- * one-architecture-at-a-time pace).
+ * proven safe for a riscv64 U-mode process image at this base.
+ * riscv64-only: see `subsystem-bin-x86_64.ld` (0x40000000 — that
+ * target's `code-model:"kernel"` needs a low, sign-extend-32-bit-
+ * representable base) and `subsystem-bin-aarch64.ld` (0x80000000) for
+ * the other two architectures' own variants.
  * ============================================================================ */
 
 ENTRY(_start)

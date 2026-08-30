@@ -10,14 +10,14 @@
 // `hal-<arch>` crate's own `src/` directory; this script only selects
 // which one to pass, keyed on the target architecture being built.
 //
-// ALSO locates `device-manager-bin`'s separately-built ELF (riscv64
-// only, for now — see `subsystem-bin-riscv64.ld`'s own doc comment) and
-// exposes its path via `DEVICE_MANAGER_ELF_PATH`, consumed in
-// `main.rs` through `include_bytes!(env!("DEVICE_MANAGER_ELF_PATH"))` —
-// same pattern as `uefi-bootloader/build.rs`'s `KERNEL_STUB_PATH`. The
-// developer must build it FIRST (`cargo xbuild-subsystem-device-manager-
-// riscv64`); if the expected file is missing, this build script fails
-// with a clear message rather than embedding stale or absent bytes.
+// ALSO locates `device-manager-bin`'s separately-built ELF, for all
+// three architectures, and exposes its path via `DEVICE_MANAGER_ELF_PATH`,
+// consumed in `main.rs` through
+// `include_bytes!(env!("DEVICE_MANAGER_ELF_PATH"))` — same pattern as
+// `uefi-bootloader/build.rs`'s `KERNEL_STUB_PATH`. The developer must
+// build it FIRST (`cargo xbuild-subsystem-device-manager-<arch>`); if
+// the expected file is missing, this build script fails with a clear
+// message rather than embedding stale or absent bytes.
 // ============================================================================
 
 fn main() {
@@ -38,27 +38,37 @@ fn main() {
     println!("cargo:rerun-if-changed={linker_script}");
     println!("cargo:rustc-link-arg-bins=-T{linker_script}");
 
-    if target_arch == "riscv64" {
-        let dm_path = std::path::PathBuf::from(&manifest_dir)
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("riscv64gc-hal")
-            .join("debug")
-            .join("device-manager-bin");
+    // Each `hal-<arch>` crate's own build output directory is named after
+    // ITS custom target file's stem (same mapping `uefi-bootloader/
+    // build.rs` uses) — must stay in sync with `targets/*.json`'s file
+    // names.
+    let dm_target_dir_name = match target_arch.as_str() {
+        "x86_64" => "x86_64-hal",
+        "aarch64" => "aarch64-hal",
+        "riscv64" => "riscv64gc-hal",
+        other => panic!("kernel build.rs: unreachable target_arch `{other}`"),
+    };
+    let build_alias = format!("cargo xbuild-subsystem-device-manager-{target_arch}");
 
-        if !dm_path.exists() {
-            panic!(
-                "kernel build.rs: device-manager-bin binary not found at {}.\n\
-                 Build it first with: cargo xbuild-subsystem-device-manager-riscv64",
-                dm_path.display()
-            );
-        }
+    let dm_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("device-manager-bin");
 
-        println!("cargo:rerun-if-changed={}", dm_path.display());
-        println!(
-            "cargo:rustc-env=DEVICE_MANAGER_ELF_PATH={}",
-            dm_path.canonicalize().unwrap().display()
+    if !dm_path.exists() {
+        panic!(
+            "kernel build.rs: device-manager-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {build_alias}",
+            dm_path.display()
         );
     }
+
+    println!("cargo:rerun-if-changed={}", dm_path.display());
+    println!(
+        "cargo:rustc-env=DEVICE_MANAGER_ELF_PATH={}",
+        dm_path.canonicalize().unwrap().display()
+    );
 }

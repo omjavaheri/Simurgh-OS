@@ -111,15 +111,15 @@ use hal_riscv64 as _;
 use hal_x86_64 as _;
 
 /// `device-manager-bin`'s separately-built, statically-linked ELF image
-/// (see that crate's own doc comment — "subsystems as processes"
-/// packaging, IMPLEMENTATION-PLAN.md follow-up), baked into THIS
-/// binary's own `.rodata` at compile time. `DEVICE_MANAGER_ELF_PATH` is
-/// set by `build.rs` after locating the file built via
-/// `cargo xbuild-subsystem-device-manager-riscv64` — same pattern
-/// `uefi-bootloader/src/main.rs` already uses for its own embedded
-/// kernel image. riscv64-only for now; `spawn_device_manager` (the only
-/// reader) is itself `#[cfg(target_arch = "riscv64")]`.
-#[cfg(target_arch = "riscv64")]
+/// for THIS architecture (see that crate's own doc comment —
+/// "subsystems as processes" packaging, IMPLEMENTATION-PLAN.md
+/// follow-up), baked into THIS binary's own `.rodata` at compile time.
+/// `DEVICE_MANAGER_ELF_PATH` is set by `build.rs` after locating the
+/// file built via `cargo xbuild-subsystem-device-manager-<arch>` —
+/// same pattern `uefi-bootloader/src/main.rs` already uses for its own
+/// embedded kernel image. One `static` for all three architectures:
+/// `build.rs` selects the right pre-built artifact per `target_arch`,
+/// so this line never needs a `cfg`.
 static DEVICE_MANAGER_ELF: &[u8] = include_bytes!(env!("DEVICE_MANAGER_ELF_PATH"));
 
 // ----------------------------------------------------------------------------
@@ -1074,7 +1074,9 @@ fn user_image() -> kernel_arch_glue::UserImage {
 /// architecture-independent and already exercised there — no need to
 /// duplicate proving the SAME in-kernel logic runs correctly twice.
 /// Launches Device Manager — `Service::BOOT_ORDER[0]` — as a genuinely
-/// isolated process via the SAME generic `kernel_arch_glue::spawn_process`
+/// isolated process from its OWN separately-built ELF image
+/// (`kernel_arch_glue::spawn_process_from_elf` — see that function's
+/// and `device-manager-bin`'s own doc comments), the SAME mechanism
 /// riscv64 uses. Called once, right after the cooperative §8.4
 /// round-trip completes (`sys::P2_REPORT_A`) — there is no preemption
 /// loop for it to "join" yet on this architecture, so the caller must
@@ -1099,23 +1101,20 @@ fn spawn_device_manager_x86(hal: &hal_core::HalInterface) {
         }
     }
 
-    let user = user_image();
     const DM_STACK_VMA: usize = 0xC040_0000;
     const DM_STACK_LEN: usize = 4096 * 16;
-    match kernel_arch_glue::spawn_process(
+    match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
-        user.text_vma,
-        user.text_lma,
-        user.text_len,
+        DEVICE_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
         DM_STACK_VMA,
         DM_STACK_LEN,
-        device_manager::subsystem_entry::subsystem_main as usize,
     ) {
         Some((tid, _cap_space, _stack_phys)) => {
             kernel_arch_glue::p2_register_device_manager(tid);
             kernel_arch_glue::log(format_args!(
-                "root task (x86_64): spawned device-manager (tid {}) via the generic path\r\n",
+                "root task (x86_64): spawned device-manager (tid {}) from its OWN separately-built ELF image\r\n",
                 tid.as_u32()
             ));
         }
@@ -1506,8 +1505,9 @@ fn simurgh_tick_aarch64() -> hal_arm64::cpu::TrapOutcome {
 
 /// Mirrors `spawn_device_manager_x86`/riscv64's `spawn_device_manager`
 /// exactly (see either's doc comment). Launches Device Manager —
-/// `Service::BOOT_ORDER[0]` — as a genuinely isolated process via the
-/// SAME generic `kernel_arch_glue::spawn_process` the other two
+/// `Service::BOOT_ORDER[0]` — as a genuinely isolated process from its
+/// OWN separately-built ELF image (`kernel_arch_glue::
+/// spawn_process_from_elf`), the SAME mechanism the other two
 /// architectures use. Called once, right after the cooperative §8.4
 /// round-trip completes (`sys::P2_REPORT_A`).
 #[cfg(target_arch = "aarch64")]
@@ -1530,23 +1530,20 @@ fn spawn_device_manager_aarch64(hal: &hal_core::HalInterface) {
         }
     }
 
-    let user = user_image();
     const DM_STACK_VMA: usize = 0xC040_0000;
     const DM_STACK_LEN: usize = 4096 * 16;
-    match kernel_arch_glue::spawn_process(
+    match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
-        user.text_vma,
-        user.text_lma,
-        user.text_len,
+        DEVICE_MANAGER_ELF,
+        elf_loader::machine::EM_AARCH64,
         DM_STACK_VMA,
         DM_STACK_LEN,
-        device_manager::subsystem_entry::subsystem_main as usize,
     ) {
         Some((tid, _cap_space, _stack_phys)) => {
             kernel_arch_glue::p2_register_device_manager(tid);
             kernel_arch_glue::log(format_args!(
-                "root task (aarch64): spawned device-manager (tid {}) via the generic path\r\n",
+                "root task (aarch64): spawned device-manager (tid {}) from its OWN separately-built ELF image\r\n",
                 tid.as_u32()
             ));
         }
