@@ -69,12 +69,26 @@ _start:
     msr     sctlr_el1, x1
     isb
     // Step 1: establish a known-good stack.
-    adr     x1, __boot_stack_top
+    //
+    // `adrp`+`add :lo12:`, NOT the single-instruction `adr` this used
+    // to be: `adr`'s encoding only reaches ±1 MiB from its OWN address,
+    // and `_start` sits near the very START of the image while
+    // `__boot_stack_top`/`__bss_end` sit AFTER the entire `.bss`
+    // section — a real link error (`relocation ... out of range`) hit
+    // once the boot stack was enlarged past a small size (see
+    // `.bss`'s own doc comment on `__boot_stack_bottom`/`_top` for
+    // why). `adrp`+`add` has no such range limit (reaches anywhere in
+    // a 4 GiB window), matching the idiom this project's own compiled
+    // Rust code already uses for far-symbol addressing.
+    adrp    x1, __boot_stack_top
+    add     x1, x1, :lo12:__boot_stack_top
     mov     sp, x1
 
     // Step 2: zero .bss.
-    adr     x1, __bss_start
-    adr     x2, __bss_end
+    adrp    x1, __bss_start
+    add     x1, x1, :lo12:__bss_start
+    adrp    x2, __bss_end
+    add     x2, x2, :lo12:__bss_end
 2:  cmp     x1, x2
     b.ge    3f
     str     xzr, [x1], #8

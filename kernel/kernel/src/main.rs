@@ -1040,29 +1040,182 @@ unsafe fn raw_syscall_aarch64(opcode: usize, a0: usize, a1: usize) -> usize {
 
 /// The aarch64 Root Task entry. Linked into `.user_text` (its own
 /// `AP_USER` `R+X` pages at the linked VMA, per hal-arm64's linker.ld)
-/// and run at EL0 by `kernel-arch-glue::enter`. Deliberately minimal —
-/// same scope as `umode_root_x86`: the §0 layer-2↔3 boundary proof this
-/// milestone is about is "a real `svc` from EL0 reaches the kernel and
-/// gets a real reply".
+/// and run at EL0 by `kernel-arch-glue::enter`. Extends the original
+/// minimal ALIVE/REPORT proof with the cooperative two-process §8.4
+/// round-trip — mirrors `umode_root_x86`'s own steps 5-6 exactly (see
+/// its doc comment for why riscv64's steps 1-4, MAP_PAGE/MAP_ALIAS/
+/// XCHECK, are skipped here too: real paging correctness was already
+/// proven independently by the aarch64 paging milestone).
 #[cfg(target_arch = "aarch64")]
 #[link_section = ".user_text"]
 extern "C" fn umode_root_aarch64() -> ! {
-    // SAFETY: see `raw_syscall_aarch64`'s own contract.
+    // SAFETY: see `raw_syscall_aarch64`'s own contract. The memory
+    // accesses below go through `P2_VA_A_CONST` (0xC0040000, a
+    // `kernel-arch-glue`-owned constant — see `setup_two_process`),
+    // which `enter` maps `AP_USER R+W` onto the frame shared with
+    // process B.
     unsafe {
         raw_syscall_aarch64(sys::ALIVE, 0, 0);
         raw_syscall_aarch64(sys::REPORT, 0x5eed_5eed, 0);
+
+        // 1. Write a sentinel through OUR mapping of the shared frame,
+        //    then `P2_YIELD` — the kernel snapshots this thread and
+        //    resumes process B in its own isolated space.
+        core::arch::asm!(
+            "str {val:w}, [{va}]",
+            va = in(reg) 0xC004_0000u64,
+            val = in(reg) 0xC0DEu32,
+            options(nostack),
+        );
+        raw_syscall_aarch64(sys::P2_YIELD, 0, 0);
+
+        // 2. Resumed here after process B ran. Re-read our VA: process B
+        //    wrote 0xB00B through ITS OWN mapping of the same frame, in
+        //    a different address space, with no copy.
+        let after: usize;
+        core::arch::asm!(
+            "ldr {out:w}, [{va}]",
+            va = in(reg) 0xC004_0000u64,
+            out = out(reg) after,
+            options(nostack, readonly),
+        );
+        raw_syscall_aarch64(sys::P2_REPORT_A, after, 0);
     }
     loop {
         core::hint::spin_loop();
     }
 }
 
+/// The SECOND user-space process (02-Microkernel-Layer.md §8.4). Linked
+/// into the same `.user_text` pages as `umode_root_aarch64` but run in
+/// its OWN isolated address space (space B) on its own stack by
+/// `kernel-arch-glue::setup_two_process`. Mirrors `umode_worker_x86`'s
+/// steps 1-3 exactly (no counting-loop tail — see its own doc comment).
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_worker_aarch64() -> ! {
+    // SAFETY: `svc #0` traps to the shared EL0-synchronous vector; the
+    // memory accesses go through `P2_VA_B_CONST` (0xC0200000), which
+    // `enter` maps `AP_USER R+W` onto the SAME physical frame as A's own
+    // `P2_VA_A_CONST` mapping, at a different VA in this isolated space.
+    unsafe {
+        let seen: usize;
+        core::arch::asm!(
+            "ldr {out:w}, [{va}]",
+            va = in(reg) 0xC020_0000u64,
+            out = out(reg) seen,
+            options(nostack, readonly),
+        );
+        raw_syscall_aarch64(sys::P2_REPORT_B, seen, 0);
+
+        core::arch::asm!(
+            "str {val:w}, [{va}]",
+            va = in(reg) 0xC020_0000u64,
+            val = in(reg) 0xB00Bu32,
+            options(nostack),
+        );
+
+        raw_syscall_aarch64(sys::P2_YIELD, 0, 0);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
+/// Layer.md §5.2 acceptance-test demo. Executes `udf #0` (Permanently
+/// Undefined) the instant it is scheduled, taking a synchronous EL0
+/// exception (`ESR_EL1.EC` = 0x00, "Unknown reason") that `hal_arm64`'s
+/// shared EL0-synchronous vector routes to the registered
+/// `FaultHandler` (`simurgh_fault_aarch64` -> `kernel_arch_glue::
+/// p2_fault` -> `KernelState::terminate_thread`/
+/// `terminate_thread_and_handoff`) instead of halting the system —
+/// mirrors `umode_faulty_driver_x86` (`ud2`) exactly, just with
+/// aarch64's own ISA-guaranteed-undefined encoding.
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_faulty_driver_aarch64() -> ! {
+    // SAFETY: `udf #0` is not a valid instruction to EXECUTE (it is
+    // reserved specifically as "always undefined") — deliberately
+    // triggers a synchronous exception, the entire point of this
+    // process. `options(noreturn)` is honest: control never falls
+    // through (the thread is terminated by the fault handler and never
+    // resumes).
+    unsafe {
+        core::arch::asm!("udf #0", options(noreturn));
+    }
+}
+
 /// The syscall handler `hal_arm64::cpu`'s shared EL0-synchronous vector
 /// calls for a `svc` from EL0. Runs at EL1.
 #[cfg(target_arch = "aarch64")]
-fn simurgh_syscall_aarch64(x8: usize, x0: usize, _x1: usize) -> hal_arm64::cpu::TrapOutcome {
+fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::TrapOutcome {
     use hal_arm64::cpu::TrapOutcome;
+
+    // Two-process hand-off / device-manager supervision arms resolve to
+    // a non-`Resume` outcome — mirrors `simurgh_syscall_x86`'s own
+    // dispatch order exactly.
     match x8 {
+        sys::P2_YIELD => {
+            return match kernel_arch_glue::p2_yield() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_REPORT_A => {
+            kernel_arch_glue::p2_report_a(x0);
+            // The cooperative §8.4 round-trip is done; spawn the fault-
+            // isolation demo (03-Kernel-Subsystems-Layer.md §5.2) right
+            // here — same reasoning as `simurgh_syscall_x86`'s own
+            // `P2_REPORT_A` arm (no preemption loop on aarch64 yet for
+            // these to "join").
+            spawn_device_manager_aarch64(kernel_arch_glue::khal());
+            return match spawn_faulty_driver_aarch64(kernel_arch_glue::khal()) {
+                Some(driver_tid) => match kernel_arch_glue::p2_dm_handoff_to_driver(driver_tid) {
+                    Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                    None => TrapOutcome::Resume(0),
+                },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_REPORT_B => {
+            kernel_arch_glue::p2_report_b(x0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::DM_REPORT => {
+            let name = match x0 {
+                0 => "Starting",
+                1 => "Running",
+                2 => "Restarting",
+                3 => "Failed",
+                _ => "?",
+            };
+            kernel_arch_glue::log(format_args!(
+                "device-manager (U-mode, isolated subsystem process, aarch64): state={name} restarts_in_window={x1}\r\n"
+            ));
+            if x0 == 3 {
+                kernel_arch_glue::p2_dm_supervision_done();
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::DM_WAIT_CRASH => {
+            return match kernel_arch_glue::p2_dm_wait_crash() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DM_POLL_CRASH => {
+            return TrapOutcome::Resume(kernel_arch_glue::p2_poll_crash());
+        }
+        sys::DM_RESPAWN_DRIVER => {
+            return match spawn_faulty_driver_aarch64(kernel_arch_glue::khal()) {
+                Some(new_tid) => match kernel_arch_glue::p2_dm_handoff_to_driver(new_tid) {
+                    Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                    None => TrapOutcome::Resume(0),
+                },
+                None => TrapOutcome::Resume(0),
+            };
+        }
         sys::ALIVE => {
             kernel_arch_glue::log(format_args!(
                 "root task (U-mode, aarch64, EL0): alive, made a svc syscall from AP_USER pages\r\n"
@@ -1077,6 +1230,112 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, _x1: usize) -> hal_arm64::cpu::
         _ => {}
     }
     TrapOutcome::Resume(0)
+}
+
+/// The per-process fault-isolation handler `hal_arm64::cpu`'s shared
+/// EL0-synchronous vector calls for a fatal EL0 exception that is not a
+/// `svc` (registered via `hal_arm64::cpu::set_fault_handler`) —
+/// 03-Kernel-Subsystems-Layer.md §2.1/§5.2. Mirrors
+/// `simurgh_fault_x86`/riscv64's `simurgh_fault` exactly: delegates to
+/// `kernel-arch-glue`, which terminates the faulting thread (or hands
+/// off directly to device-manager if it was the watched driver) and
+/// picks whatever else is runnable.
+#[cfg(target_arch = "aarch64")]
+fn simurgh_fault_aarch64(ec: usize, elr: usize, _far: usize) -> hal_arm64::cpu::TrapOutcome {
+    use hal_arm64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_fault(ec, elr, 0) {
+        Some(into) => TrapOutcome::Terminate { into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+/// Mirrors `spawn_device_manager_x86`/riscv64's `spawn_device_manager`
+/// exactly (see either's doc comment). Launches Device Manager —
+/// `Service::BOOT_ORDER[0]` — as a genuinely isolated process via the
+/// SAME generic `kernel_arch_glue::spawn_process` the other two
+/// architectures use. Called once, right after the cooperative §8.4
+/// round-trip completes (`sys::P2_REPORT_A`).
+#[cfg(target_arch = "aarch64")]
+fn spawn_device_manager_aarch64(hal: &hal_core::HalInterface) {
+    let k = kernel_arch_glue::kstate();
+    let total = k.total_untyped_bytes();
+    match root_task::plan_boot(total) {
+        Ok(plan) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): plan_boot({} bytes) - root reserve {} bytes, {} service grant(s), {} bytes free\r\n",
+                total, plan.root_reserve_bytes, plan.grants.len(), plan.free_bytes
+            ));
+        }
+        Err(e) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): plan_boot failed: {:?} - device-manager not spawned\r\n",
+                e
+            ));
+            return;
+        }
+    }
+
+    let user = user_image();
+    const DM_STACK_VMA: usize = 0xC040_0000;
+    const DM_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        DM_STACK_VMA,
+        DM_STACK_LEN,
+        device_manager::subsystem_entry::subsystem_main as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_register_device_manager(tid);
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned device-manager (tid {}) via the generic path\r\n",
+                tid.as_u32()
+            ));
+        }
+        None => kernel_arch_glue::log(format_args!(
+            "root task (aarch64): device-manager spawn skipped (out of resources)\r\n"
+        )),
+    }
+}
+
+/// Spawns `umode_faulty_driver_aarch64` (see its doc comment) via the
+/// SAME generic `kernel_arch_glue::spawn_process` path as
+/// device-manager. Mirrors `spawn_faulty_driver_x86`/riscv64's
+/// `spawn_faulty_driver` exactly.
+#[cfg(target_arch = "aarch64")]
+fn spawn_faulty_driver_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+    let user = user_image();
+    const FAULTY_STACK_VMA: usize = 0xC050_0000;
+    const FAULTY_STACK_LEN: usize = 4096 * 4;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        FAULTY_STACK_VMA,
+        FAULTY_STACK_LEN,
+        umode_faulty_driver_aarch64 as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_watch_driver(tid);
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned faulty-driver (tid {}) - it will fault on its first instruction (fault-isolation demo, 03 5.2)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): faulty-driver spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
 }
 
 // Linker symbols for the aarch64 user (layer-3) Root Task image — see
@@ -1108,7 +1367,10 @@ fn user_image() -> kernel_arch_glue::UserImage {
             stack_lma: sym(&__user_stack_lma),
             stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
             entry_vma: umode_root_aarch64 as usize,
-            worker_entry_vma: 0,
+            worker_entry_vma: umode_worker_aarch64 as usize,
+            // Three-process preemption (process C + `umode_a_loop`) is
+            // deliberately NOT implemented for aarch64 this milestone —
+            // see this crate's own IMPLEMENTATION-PLAN.md entry.
             subsystem_entry_vma: 0,
             a_loop_entry_vma: 0,
         }
@@ -1744,6 +2006,11 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
             // EL0-synchronous vector calls.
             #[cfg(target_arch = "aarch64")]
             hal_arm64::cpu::set_syscall_handler(simurgh_syscall_aarch64);
+            // Register the per-process fault-isolation handler the SAME
+            // shared vector calls for a fatal EL0 exception that is not
+            // a `svc` (03-Kernel-Subsystems-Layer.md §2.1/§5.2).
+            #[cfg(target_arch = "aarch64")]
+            hal_arm64::cpu::set_fault_handler(simurgh_fault_aarch64);
             // Never returns: runs the in-kernel demo, then (riscv64/
             // x86_64/aarch64) maps the user image U=1/AP_USER, activates
             // paging, and drops the Root Task to U-mode/EL0 isolated.

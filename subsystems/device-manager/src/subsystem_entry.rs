@@ -1,5 +1,5 @@
 //! ============================================================================
-//! subsystem_entry.rs — riscv64 / x86_64
+//! subsystem_entry.rs — riscv64 / x86_64 / aarch64
 //!
 //! Note on this file's ONE architecture-conditional piece: the crate-
 //! level invariant is "no `#[cfg(target_arch)]` in `kernel/` or
@@ -7,7 +7,7 @@
 //! `hal-<arch>` crates or the final binary), and `raw_syscall` below
 //! is a pre-existing, narrow exception to it — this function's ONLY
 //! job is to issue the raw syscall INSTRUCTION itself (`ecall`/
-//! `int 0x80`/a future `svc`), which is unavoidably an ISA detail no
+//! `int 0x80`/`svc #0`), which is unavoidably an ISA detail no
 //! `hal-core` abstraction covers (it runs entirely in U-mode, on the
 //! OTHER side of the kernel/user boundary those crates model). Kept
 //! to this one function, gated per architecture, with every other
@@ -119,6 +119,28 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
             in("rdi") a0,
             in("rsi") a1,
             options(nostack),
+        );
+    }
+    ret
+}
+
+/// # Safety
+/// `svc #0` from EL0 traps to `hal_arm64::cpu`'s shared EL0-synchronous
+/// vector, which preserves every register except `x0` — this project's
+/// own convention (see `hal_arm64::cpu::SyscallHandler`'s doc comment):
+/// `x8` = opcode (`a7`), `x0` = `a0`, `x1` = `a1`. Same register-only
+/// contract as the riscv64/x86_64 variants above.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") a7,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
         );
     }
     ret

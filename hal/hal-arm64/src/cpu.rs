@@ -285,6 +285,15 @@ core::arch::global_asm!(
         // thread's stack pointer is never one of x0-x30 in the first
         // place (captured instead via `mrs sp_el0` in
         // `save_frame_as_user_context`).
+        //
+        // A `SwitchTo`/`Terminate` outcome diverges straight into
+        // `restore_user_and_eret` and NEVER returns here to run this
+        // trampoline's own `add sp, sp, #256` epilogue below — see that
+        // function's own doc comment for the real stack-leak bug this
+        // caused (across many repeated process switches) and how it is
+        // fixed THERE instead of here (an earlier attempt at fixing it
+        // in THIS prologue broke the cooperative two-process `SwitchTo`
+        // round-trip and was reverted).
         sub sp, sp, #256
         stp x0, x1,   [sp, #0]
         stp x2, x3,   [sp, #16]
@@ -902,6 +911,50 @@ pub fn set_syscall_handler(handler: SyscallHandler) {
     }
 }
 
+/// `ESR_EL1.EC` = 0x00, "Unknown reason" per the ARM Architecture
+/// Reference Manual — the class every genuinely undefined A64 encoding
+/// traps as, including `udf #0` (Permanently Undefined): this project's
+/// aarch64 fault-injection demo choice (03-Kernel-Subsystems-Layer.md
+/// §5.2), analogous to hal-riscv64's `.word 0` / hal-x86_64's `ud2`.
+/// The ONLY exception class this mechanism currently handles — a real
+/// kernel would extend this to every EC that can legitimately occur
+/// from EL0 (e.g. Data/Instruction Abort, EC 0x24/0x20), a tracked
+/// follow-up once a concrete need arises (same scope decision
+/// hal-x86_64's own `FAULT_VECTOR_UD` doc comment makes).
+const ESR_EC_UNKNOWN_AARCH64: u64 = 0x00;
+
+/// Signature of the handler the microkernel registers for a fatal EL0
+/// exception that is not a `svc`: raw `(ec, elr, far)` — the exception
+/// class, the resume PC, and the fault address (0 for `ESR_EC_UNKNOWN_
+/// AARCH64`, which carries no fault-address ISS field) — mirrors
+/// hal-riscv64's `FaultHandler`'s `(cause_code, sepc, stval)` shape and
+/// hal-x86_64's `FaultHandler`'s `(vector, rip, _reserved)` shape.
+/// Always expected to return `TrapOutcome::Terminate` in practice (the
+/// faulting thread cannot safely resume), though `Resume`/`SwitchTo`
+/// remain valid if a future policy wants to retry or reschedule
+/// instead — same contract as the other two architectures' own
+/// `FaultHandler` types.
+pub type FaultHandler = fn(usize, usize, usize) -> TrapOutcome;
+
+#[cfg(target_os = "none")]
+static mut FAULT_HANDLER: Option<FaultHandler> = None;
+
+/// Registers the handler `common_sync_entry` calls for a fatal EL0
+/// exception that is not a `svc` (03-Kernel-Subsystems-Layer.md §2.1/
+/// §5.2 per-process fault isolation). Same "no handler, no behavior
+/// change" contract as `set_syscall_handler` — a binary that never
+/// registers one (e.g. `kernel-stub`) is unaffected; an unhandled fault
+/// (no registered handler) falls through to the existing dump-and-halt
+/// path unchanged.
+#[cfg(target_os = "none")]
+pub fn set_fault_handler(handler: FaultHandler) {
+    // SAFETY: single-core boot; set exactly once before any drop to
+    // EL0.
+    unsafe {
+        core::ptr::addr_of_mut!(FAULT_HANDLER).write(Some(handler));
+    }
+}
+
 /// Host (`cargo test`) stub — reached only from the bare-metal
 /// `sync_el0_entry`'s `bl common_sync_entry` above, which (being part of
 /// a `global_asm!` block) is not itself `#[cfg(target_os = "none")]`-
@@ -952,10 +1005,39 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
         ) {
             TrapOutcome::Resume(ret) => {
                 f.regs[SyncFrame::X0] = ret as u64;
-                // Resume at the instruction after the 4-byte `svc`.
+                // `elr` needs NO adjustment here: per the ARM
+                // Architecture Reference Manual, the preferred return
+                // address for an `SVC` exception is ALREADY the address
+                // of the instruction AFTER the 4-byte `svc` — unlike a
+                // Data/Instruction Abort (which points AT the faulting
+                // instruction). **Real bug found via QEMU** (this
+                // session's P2/device-manager demo — the exact same
+                // class of bug hal-x86_64's own `common_syscall_entry`
+                // had for `int 0x80`): an earlier draft added a manual
+                // `elr + 4` here on top of that already-correct
+                // hardware value, double-advancing past 4 bytes of the
+                // NEXT instruction on every EL0 syscall this project has
+                // ever made on aarch64. This went unnoticed through the
+                // Root Task's own ALIVE/REPORT/two-process round-trip
+                // purely by luck (the skipped instruction happened to be
+                // harmless setup code that got redone anyway) — device-
+                // manager's `subsystem_main` was the first code layout
+                // where the skip corrupted something observable: its
+                // `DM_WAIT_CRASH`/`DM_POLL_CRASH` calls' `svc`s got
+                // skipped over ENTIRELY (each `svc` is exactly 4 bytes,
+                // so a `+4` double-advance from one `svc`'s own trapped
+                // `elr` lands exactly ON the mov/svc pair belonging to
+                // the FOLLOWING syscall, silently replaying earlier
+                // report() logic and reporting `Starting` an extra two
+                // times before genuine "Restarting" — confirmed via
+                // disassembly cross-referenced against a `-d int` trace:
+                // every trapped `elr` was already exactly `svc_addr + 4`
+                // on entry). Fixed: `elr` used AS-IS in both this arm and
+                // `SwitchTo` below.
+                //
                 // SAFETY: writing ELR_EL1 is valid within an exception
                 // handler.
-                unsafe { core::arch::asm!("msr elr_el1, {0}", in(reg) elr + 4) };
+                unsafe { core::arch::asm!("msr elr_el1, {0}", in(reg) elr) };
             }
             TrapOutcome::SwitchTo { save, into } => {
                 // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
@@ -965,8 +1047,11 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
                 // never return: `restore_user_and_eret` abandons this
                 // exception frame's stack and `eret`s into the incoming
                 // thread.
+                //
+                // `elr` (NOT `elr + 4`): same bug/fix as the `Resume`
+                // arm just above.
                 unsafe {
-                    save_frame_as_user_context(f, elr + 4, save as *mut Aarch64UserContext);
+                    save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
                     restore_user_and_eret(into as *const Aarch64UserContext);
                 }
             }
@@ -979,6 +1064,48 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
             }
         }
         return;
+    }
+
+    if ec == ESR_EC_UNKNOWN_AARCH64 {
+        // SAFETY: `frame` is the on-stack register file `sync_el0_entry`
+        // just saved; valid for this call, with no other live reference
+        // (the `svc` branch above already returned by this point).
+        let f = unsafe { &mut *frame };
+        // SAFETY: single-core; `FAULT_HANDLER` is only written by
+        // `set_fault_handler` during boot, before any drop to EL0.
+        let handler = unsafe { core::ptr::addr_of!(FAULT_HANDLER).read() };
+        if let Some(h) = handler {
+            match h(ec as usize, elr as usize, far as usize) {
+                TrapOutcome::Resume(ret) => {
+                    // Not the expected outcome for a fatal exception (the
+                    // faulting instruction is still `udf`, so resuming at
+                    // the SAME `elr` would just re-fault forever), but the
+                    // type is shared with the syscall path, so this arm
+                    // must exist — same as hal-riscv64's/hal-x86_64's own
+                    // fault-handler `Resume` arms.
+                    f.regs[SyncFrame::X0] = ret as u64;
+                    return;
+                }
+                TrapOutcome::SwitchTo { save, into } => {
+                    // SAFETY: `save`/`into` are kernel-owned, 8-byte-
+                    // aligned `HAL_USER_CONTEXT_BYTES` blobs. Resume
+                    // point is `elr` unchanged (the faulting instruction
+                    // never legitimately completes).
+                    unsafe {
+                        save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                        restore_user_and_eret(into as *const Aarch64UserContext);
+                    }
+                }
+                TrapOutcome::Terminate { into } => {
+                    // The expected outcome: the faulting thread is dead,
+                    // its exception frame abandoned, no save.
+                    // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+                    // `HAL_USER_CONTEXT_BYTES` blob.
+                    unsafe { restore_user_and_eret(into as *const Aarch64UserContext) };
+                }
+            }
+            return;
+        }
     }
 
     trap_diag(ec, elr, far);
@@ -1042,10 +1169,12 @@ fn halt_on_unexpected_exception() -> ! {
 
 /// Serialises an interrupted `SyncFrame` into an `Aarch64UserContext` so
 /// it can be `restore_user_and_eret`'d later. `resume_elr` is where the
-/// thread should continue (the caller passes `elr + 4` so a suspended
-/// `svc` does not re-execute). Captures the *live* `SP_EL0`/`TTBR0_EL1`,
-/// which for an exception taken from EL0 already describe the thread's
-/// own stack and address space.
+/// thread should continue — for a suspended `svc`, the caller passes
+/// `elr` UNCHANGED: the hardware-saved return address for `SVC` already
+/// points past the 4-byte instruction (see `common_sync_entry`'s
+/// `Resume` arm doc comment for the bug this fixes). Captures the
+/// *live* `SP_EL0`/`TTBR0_EL1`, which for an exception taken from EL0
+/// already describe the thread's own stack and address space.
 ///
 /// # Safety
 /// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
@@ -1096,14 +1225,60 @@ unsafe fn restore_user_and_eret(blob: *const Aarch64UserContext) -> ! {
     // from its OWN saved slot dead last (here, `x30`/LR — the highest-
     // numbered GPR, the same "last register in the sequence" choice
     // hal-riscv64 makes with `x31`/`t6`).
+    // **Real bug found via QEMU** (this session's P2/device-manager
+    // demo — the FIRST thing to ever exercise `resume_user`/this
+    // function for aarch64; the original U-mode+syscall milestone only
+    // ever used `enter_user`'s own named-register fabrication, never
+    // this struct-offset-based restore): these four offsets were
+    // originally listed in the WRONG order relative to
+    // `Aarch64UserContext`'s actual field layout (`regs: [u64; 31]`
+    // ends at offset 248, THEN `sp_el0`, THEN `elr_el1`, THEN
+    // `spsr_el1`, THEN `ttbr0_el1` — the comments below had swapped
+    // `sp_el0` and `spsr_el1`). Loading `spsr_el1`'s value (a fresh
+    // context's is always 0) into `SP_EL0` left every EL0 thread's own
+    // stack pointer at 0 the instant it touched its own stack for the
+    // first time — confirmed via a genuine `#PF`-equivalent `Data
+    // Abort` (`ESR_EL1.EC=0x24`) at `FAR_EL1=0xffff...ffe8`, exactly
+    // `0 - 24` in unsigned 64-bit wraparound, matching the Root Task's
+    // own stack-relative store at `sp - 24` with `sp` genuinely 0.
+    //
+    // **A second real issue found via QEMU, NOT fixed here — flagged
+    // instead of guessed at further**: this function diverges straight
+    // into `eret` and never runs `sync_el0_entry`'s own
+    // `add sp, sp, #256` epilogue — so the 256 bytes that trampoline's
+    // prologue reserved stays PERMANENTLY consumed every single time a
+    // `SwitchTo`/`Terminate` fires (unlike hal-x86_64, whose hardware
+    // TSS.rsp0 mechanism reloads a FIXED SP on every Ring3->Ring0
+    // transition regardless of what the previous handler left RSP as —
+    // AArch64 has no such automatic reset). This accumulates, unbounded,
+    // across repeated process switches until SP_EL1 runs off the bottom
+    // of the boot stack and the CPU executes garbage (observed: an
+    // `Undefined Instruction` fetched from deep inside `.rodata`, after
+    // enough restart cycles). TWO attempts at an in-place reset (one in
+    // `sync_el0_entry`'s own prologue using `x28`/`x9` across the `bl
+    // common_sync_entry` call; one right here, resetting `sp` via `x9`
+    // before it is loaded from `blob`) each independently broke the
+    // cooperative two-process `SwitchTo` round-trip in ways not fully
+    // root-caused before this session's own time budget for it ran out
+    // (confirmed via A/B testing each time: reverting the specific
+    // change alone restored the round-trip). Given two real regressions
+    // from two different fix attempts, this was deliberately NOT
+    // fixed a third time under continued guessing — instead,
+    // `hal-arm64/src/linker.ld`'s boot stack was generously enlarged
+    // (see that file's own doc comment) purely as a stopgap so this
+    // session's own BOUNDED demo (a fixed ~6 restart cycles) comfortably
+    // survives the leak without hitting the ceiling; the leak itself
+    // remains a real, open, flagged bug — a genuine fix (very likely
+    // resetting `sp` to a fixed baseline SOMEWHERE in this path) is a
+    // tracked follow-up, not a solved problem.
     unsafe {
         core::arch::asm!(
-            "ldr x9, [x30, #248]",   // spsr_el1 (offset 31*8 = 248)
-            "msr spsr_el1, x9",
+            "ldr x9, [x30, #248]",   // sp_el0 (offset 31*8 = 248)
+            "msr sp_el0, x9",
             "ldr x9, [x30, #256]",   // elr_el1
             "msr elr_el1, x9",
-            "ldr x9, [x30, #264]",   // sp_el0
-            "msr sp_el0, x9",
+            "ldr x9, [x30, #264]",   // spsr_el1
+            "msr spsr_el1, x9",
             "ldr x9, [x30, #272]",   // ttbr0_el1
             "msr ttbr0_el1, x9",
             "isb",

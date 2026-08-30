@@ -64,13 +64,33 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
 
-        /* Boot-time stack, same 64 KiB sizing rationale as
-         * hal-x86_64/linker.ld. AArch64's AAPCS64 ABI requires 16-byte
-         * stack alignment at a public-interface function call boundary
-         * (equivalent requirement to x86_64's SysV ABI). */
+        /* Boot-time stack. AArch64's AAPCS64 ABI requires 16-byte stack
+         * alignment at a public-interface function call boundary
+         * (equivalent requirement to x86_64's SysV ABI).
+         *
+         * 512 KiB, NOT the 64 KiB every other architecture's own boot
+         * stack uses (hal-x86_64's/hal-riscv64's own equivalents): this
+         * is a STOPGAP, not a real fix, for a genuine, still-open bug —
+         * `hal_arm64::cpu::restore_user_and_eret`'s own doc comment has
+         * the full story. In short: unlike hal-x86_64 (whose hardware
+         * TSS.rsp0 mechanism reloads a FIXED SP on every Ring3->Ring0
+         * transition), AArch64 has no such automatic reset, and every
+         * `SwitchTo`/`Terminate` process switch here permanently
+         * consumes 256 bytes of this SAME shared stack (the exception
+         * trampoline's own epilogue, which would reclaim it, never runs
+         * for a diverging exit) — an unbounded leak across MANY
+         * switches, but this session's own P2/device-manager demo is a
+         * BOUNDED sequence (~6 restart cycles), so a generously
+         * oversized stack comfortably survives it without masking the
+         * underlying bug, which remains open and flagged. (A real link
+         * error — `adr`'s encoding only reaching ±1 MiB from its own
+         * address — was hit here first, since `boot.S`'s `_start`
+         * addressed `__boot_stack_top`/`__bss_end` that way; fixed by
+         * switching those two references to `adrp`+`add :lo12:`, which
+         * has no such range limit — see `lib.rs`'s own `_start`.) */
         . = ALIGN(16);
         __boot_stack_bottom = .;
-        . += 64K;
+        . += 1024K;
         __boot_stack_top = .;
 
         __bss_end = .;

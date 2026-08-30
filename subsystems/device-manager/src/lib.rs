@@ -38,11 +38,14 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-/// This crate's first real process entry point (riscv64/x86_64 — the
-/// two architectures whose "P2 demo parity" milestone has wired it up
-/// so far; aarch64 stays a tracked follow-up). See the module's own
-/// doc comment.
-#[cfg(any(target_arch = "riscv64", target_arch = "x86_64"))]
+/// This crate's first real process entry point (riscv64/x86_64/
+/// aarch64 — all three architectures now have their "P2 demo parity"
+/// milestone wired up). See the module's own doc comment.
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+))]
 pub mod subsystem_entry;
 
 /// How many times the Device Manager will restart one driver within the
