@@ -113,6 +113,7 @@ pub mod compute;
 pub mod cpu;
 pub mod interrupt;
 pub mod memory;
+pub mod peripheral;
 pub mod power;
 pub mod timer;
 
@@ -220,6 +221,10 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // ------------------------------------------------------------------
     let compute = compute::ComputeDiscovery::new(QEMU_VIRT_DEFAULT_ECAM_BASE);
     let power = power::PowerThermalImpl::new(&compute);
+    // Same `ecam_base`, same "MMU still off, dereferences as a physical
+    // address" contract as `ComputeDiscovery::new` just above — see
+    // this file's own comment on that call.
+    let peripheral = peripheral::PeripheralDiscovery::new(QEMU_VIRT_DEFAULT_ECAM_BASE);
 
     // Built into `.bss` static storage, NOT a plain local: `build_interface`
     // below bakes raw pointers into `hal.cpu`/`hal.timer` (via `HalInterface`'s
@@ -305,6 +310,7 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
         memory::built_hardware_manifest(
             &hal.memory,
             &hal.compute,
+            &peripheral,
             &hal.power,
             &hal.cpu,
             &hal.interrupt,

@@ -42,8 +42,8 @@ mod dynamic {
 
     use crate::raw::{
         ComputeDeviceRaw, ComputeKindRaw, HardwareManifestRaw, InterruptControllerInfoRaw,
-        InterruptControllerKindRaw, MemoryRegionKindRaw, MemoryRegionRaw, PowerDomainRaw,
-        TimerInfoRaw, TimerKindRaw, VendorIdRaw,
+        InterruptControllerKindRaw, MemoryRegionKindRaw, MemoryRegionRaw, PeripheralDeviceRaw,
+        PeripheralKindRaw, PowerDomainRaw, TimerInfoRaw, TimerKindRaw, VendorIdRaw,
     };
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -208,6 +208,62 @@ mod dynamic {
     }
 
     // ------------------------------------------------------------------
+    // Generic MMIO peripheral (dynamic) — see raw.rs's own module
+    // comment on why this is separate from ComputeDevice.
+    // ------------------------------------------------------------------
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PeripheralKind {
+        Unknown,
+        Block,
+        Network,
+        Gpu,
+        Console,
+    }
+
+    impl From<PeripheralKindRaw> for PeripheralKind {
+        fn from(raw: PeripheralKindRaw) -> Self {
+            match raw {
+                PeripheralKindRaw::Unknown => Self::Unknown,
+                PeripheralKindRaw::Block => Self::Block,
+                PeripheralKindRaw::Network => Self::Network,
+                PeripheralKindRaw::Gpu => Self::Gpu,
+                PeripheralKindRaw::Console => Self::Console,
+            }
+        }
+    }
+
+    /// Same `capability_token`/`device_index` contract as `ComputeDevice`
+    /// — see that type's own doc comment.
+    #[derive(Debug, Clone)]
+    pub struct PeripheralDevice<Cap> {
+        pub kind: PeripheralKind,
+        pub mmio_base: u64,
+        pub mmio_size: u64,
+        pub irq: u32,
+        pub device_index: u32,
+        pub capability_token: Option<Cap>,
+    }
+
+    impl<Cap> PeripheralDevice<Cap> {
+        fn from_raw(raw: &PeripheralDeviceRaw) -> Self {
+            Self {
+                kind: raw.kind.into(),
+                mmio_base: raw.mmio_base,
+                mmio_size: raw.mmio_size,
+                irq: raw.irq,
+                device_index: raw.device_index,
+                capability_token: None,
+            }
+        }
+
+        /// Attaches a real Capability token — see `ComputeDevice::
+        /// set_capability_token`'s own doc comment.
+        pub fn set_capability_token(&mut self, token: Cap) {
+            self.capability_token = Some(token);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Interrupt controller / Timer info (dynamic) — no variable-length
     // data, kept as direct mirrors of the raw types for a stable public
     // API surface independent of the raw wire format.
@@ -341,6 +397,7 @@ mod dynamic {
         pub cpu: CpuInfo,
         pub memory_regions: Vec<MemoryRegion>,
         pub compute_devices: Vec<ComputeDevice<Cap>>,
+        pub peripheral_devices: Vec<PeripheralDevice<Cap>>,
         pub interrupt_controller: InterruptControllerInfo,
         pub timer: TimerInfo,
         pub power_domains: Vec<PowerDomain>,
@@ -369,6 +426,12 @@ mod dynamic {
                 .map(ComputeDevice::from_raw)
                 .collect();
 
+            let peripheral_devices = raw
+                .peripheral_devices()
+                .iter()
+                .map(PeripheralDevice::from_raw)
+                .collect();
+
             let power_domains = raw
                 .power_domains()
                 .iter()
@@ -383,6 +446,7 @@ mod dynamic {
                 },
                 memory_regions,
                 compute_devices,
+                peripheral_devices,
                 interrupt_controller: raw.interrupt_controller.into(),
                 timer: raw.timer.into(),
                 power_domains,
@@ -447,6 +511,14 @@ mod tests {
         gpu.short_name_len = name.len() as u8;
         m.push_compute_device(gpu).unwrap();
 
+        m.push_peripheral_device(PeripheralDeviceRaw::new(
+            PeripheralKindRaw::Block,
+            0x1000_1000,
+            0x1000,
+            1,
+        ))
+        .unwrap();
+
         m
     }
 
@@ -467,6 +539,14 @@ mod tests {
         assert!(gpu.unified_memory_capable);
         assert_eq!(gpu.name, "TestGPU");
         assert!(gpu.capability_token.is_none());
+
+        assert_eq!(dyn_manifest.peripheral_devices.len(), 1);
+        let blk = &dyn_manifest.peripheral_devices[0];
+        assert_eq!(blk.kind, PeripheralKind::Block);
+        assert_eq!(blk.mmio_base, 0x1000_1000);
+        assert_eq!(blk.mmio_size, 0x1000);
+        assert_eq!(blk.irq, 1);
+        assert!(blk.capability_token.is_none());
     }
 
     #[test]

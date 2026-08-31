@@ -3353,6 +3353,7 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
                 "total untyped memory     : {} bytes",
                 report.total_untyped_bytes
             );
+            let _ = writeln!(s, "peripheral devices       : {}", report.peripheral_devices);
             let _ = writeln!(s, "root task thread id      : {}", report.root_thread);
             let _ = writeln!(s, "first scheduled thread   : {:?}", report.first_scheduled);
             let _ = writeln!(s, "KernelState built: OK");

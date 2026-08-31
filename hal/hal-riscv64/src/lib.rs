@@ -74,6 +74,7 @@ pub mod compute;
 pub mod cpu;
 pub mod interrupt;
 pub mod memory;
+pub mod peripheral;
 pub mod power;
 pub mod timer;
 
@@ -161,6 +162,10 @@ pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) ->
     let interrupt = interrupt::InterruptCtrl::new(memory.plic_base());
     let compute = compute::ComputeDiscovery::new();
     let power = power::PowerThermalImpl::new(&compute);
+    // SAFETY: `dtb_phys` was validated by this function's own safety
+    // contract above — same DTB blob `memory::Memory::from_device_tree`
+    // already parsed.
+    let peripheral = unsafe { peripheral::PeripheralDiscovery::new(dtb_phys) };
 
     let hal = Riscv64Hal {
         cpu,
@@ -201,6 +206,7 @@ pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) ->
         memory::built_hardware_manifest(
             &hal.memory,
             &hal.compute,
+            &peripheral,
             &hal.power,
             &hal.cpu,
             &hal.interrupt,

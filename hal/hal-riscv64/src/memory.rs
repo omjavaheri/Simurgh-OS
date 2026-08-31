@@ -44,7 +44,7 @@ use crate::timer::Timer;
 const FDT_MAGIC: u32 = 0xd00d_feed;
 
 #[repr(C)]
-struct FdtHeader {
+pub(crate) struct FdtHeader {
     magic: u32,
     totalsize: u32,
     off_dt_struct: u32,
@@ -64,9 +64,10 @@ impl FdtHeader {
     /// wire regardless of host endianness).
     ///
     /// # Safety
-    /// `dtb_phys` must point at a valid FDT blob per this file's only
-    /// caller's contract (`Memory::from_device_tree`).
-    unsafe fn read(dtb_phys: *const u8) -> Option<Self> {
+    /// `dtb_phys` must point at a valid FDT blob per this file's own
+    /// callers' contract (`Memory::from_device_tree`, `peripheral::
+    /// PeripheralDiscovery::new`).
+    pub(crate) unsafe fn read(dtb_phys: *const u8) -> Option<Self> {
         // SAFETY: forwarded from this function's own contract.
         let raw = unsafe { core::ptr::read_unaligned(dtb_phys as *const [u32; 10]) };
         let header = FdtHeader {
@@ -90,11 +91,11 @@ impl FdtHeader {
 }
 
 // FDT structure block tokens, per dtspec section 5.4.
-const FDT_BEGIN_NODE: u32 = 0x0000_0001;
-const FDT_END_NODE: u32 = 0x0000_0002;
-const FDT_PROP: u32 = 0x0000_0003;
-const FDT_NOP: u32 = 0x0000_0004;
-const FDT_END: u32 = 0x0000_0009;
+pub(crate) const FDT_BEGIN_NODE: u32 = 0x0000_0001;
+pub(crate) const FDT_END_NODE: u32 = 0x0000_0002;
+pub(crate) const FDT_PROP: u32 = 0x0000_0003;
+pub(crate) const FDT_NOP: u32 = 0x0000_0004;
+pub(crate) const FDT_END: u32 = 0x0000_0009;
 
 /// A minimal, allocation-free FDT structure-block walker. Tracks
 /// current node path depth only as much as needed to know "am I
@@ -102,20 +103,21 @@ const FDT_END: u32 = 0x0000_0009;
 /// looking for" — this project does not need a full parsed tree, only
 /// the ability to find specific named nodes/properties, mirroring the
 /// x86_64/ARM64 ACPI walkers' "look for one specific table" scope.
-struct FdtWalker<'a> {
-    dtb_base: *const u8,
+pub(crate) struct FdtWalker<'a> {
+    pub(crate) dtb_base: *const u8,
     struct_start: u32,
-    struct_end: u32,
-    strings_start: u32,
-    offset: u32,
+    pub(crate) struct_end: u32,
+    pub(crate) strings_start: u32,
+    pub(crate) offset: u32,
     _marker: core::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> FdtWalker<'a> {
     /// # Safety
     /// `dtb_base` and the header-derived offsets must describe a valid
-    /// FDT blob, per `Memory::from_device_tree`'s own contract.
-    unsafe fn new(dtb_base: *const u8, header: &FdtHeader) -> Self {
+    /// FDT blob, per this file's own callers' contract (see
+    /// `FdtHeader::read`'s own doc comment).
+    pub(crate) unsafe fn new(dtb_base: *const u8, header: &FdtHeader) -> Self {
         Self {
             dtb_base,
             struct_start: header.off_dt_struct,
@@ -129,7 +131,7 @@ impl<'a> FdtWalker<'a> {
     /// # Safety
     /// `self.offset` must be within the valid FDT blob bounds
     /// established at construction.
-    unsafe fn read_u32_at(&self, offset: u32) -> u32 {
+    pub(crate) unsafe fn read_u32_at(&self, offset: u32) -> u32 {
         // SAFETY: forwarded from this function's own contract.
         let raw = unsafe { core::ptr::read_unaligned((self.dtb_base as usize + offset as usize) as *const u32) };
         u32::from_be(raw)
@@ -145,7 +147,7 @@ impl<'a> FdtWalker<'a> {
     /// # Safety
     /// `offset` must point at a valid, NUL-terminated string within
     /// the FDT blob's bounds.
-    unsafe fn read_cstr_at(&self, offset: u32) -> &'a [u8] {
+    pub(crate) unsafe fn read_cstr_at(&self, offset: u32) -> &'a [u8] {
         let start = (self.dtb_base as usize + offset as usize) as *const u8;
         let mut len = 0usize;
         // SAFETY: forwarded from this function's own contract; bounded
@@ -161,7 +163,7 @@ impl<'a> FdtWalker<'a> {
     /// Advances `self.offset` past a `FDT_PROP` token's variable-length
     /// payload (4-byte length + 4-byte name-offset header, then the
     /// property value itself, 4-byte-padded).
-    fn align_offset(&mut self) {
+    pub(crate) fn align_offset(&mut self) {
         self.offset = (self.offset + 3) & !3;
     }
 }
@@ -632,6 +634,7 @@ pub fn current_page_table_phys(_memory: &Memory) -> u64 {
 pub fn built_hardware_manifest(
     memory: &Memory,
     compute: &ComputeDiscovery,
+    peripheral: &crate::peripheral::PeripheralDiscovery,
     power: &PowerThermalImpl,
     cpu: &Cpu,
     interrupt: &InterruptCtrl,
@@ -640,6 +643,7 @@ pub fn built_hardware_manifest(
     use hal_core::compute::ComputeDeviceDiscovery;
     use hal_core::cpu::CpuAbstraction;
     use hal_core::interrupt::InterruptController;
+    use hal_core::peripheral::PeripheralDeviceDiscovery;
     use hal_core::power::PowerThermal;
     use hal_core::timer::TimerAbstraction;
 
@@ -653,6 +657,9 @@ pub fn built_hardware_manifest(
     }
     for device in compute.enumerate_compute_devices() {
         let _ = manifest.push_compute_device(*device);
+    }
+    for device in peripheral.enumerate_peripheral_devices() {
+        let _ = manifest.push_peripheral_device(*device);
     }
     for domain in power.enumerate_power_domains() {
         let _ = manifest.push_power_domain(*domain);

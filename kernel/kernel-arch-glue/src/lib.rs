@@ -254,6 +254,14 @@ pub struct BootReport {
     pub untyped_objects: u32,
     /// Total physical bytes those untyped objects cover.
     pub total_untyped_bytes: u64,
+    /// Number of MMIO peripherals HAL discovered (`hal_core::peripheral`
+    /// — virtio-mmio on riscv64/aarch64 today). Read straight from
+    /// `boot.hardware_manifest`, not `KernelState`: no kernel-core object
+    /// consumes this yet (that arrives with the Device Manager's own
+    /// MMIO-capability-grant path) — this field exists purely as boot-
+    /// time discovery evidence, matching `untyped_objects`' own role for
+    /// memory.
+    pub peripheral_devices: u32,
     /// The Root Task's thread id (raw).
     pub root_thread: u32,
     /// The thread the scheduler would run first (should be the Root Task).
@@ -302,6 +310,7 @@ pub fn build(
         timer_hz: hal.frequency_hz(),
         untyped_objects: state.untyped_count,
         total_untyped_bytes: state.total_untyped_bytes(),
+        peripheral_devices: boot.hardware_manifest.peripheral_device_count,
         root_thread: state.root_thread.as_u32(),
         first_scheduled,
     };

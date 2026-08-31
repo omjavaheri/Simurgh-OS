@@ -41,7 +41,7 @@ use hal_manifest::raw::{ComputeDeviceRaw, ComputeKindRaw, VendorIdRaw, MAX_COMPU
 /// platform that implements ECAM (not an ARM64-specific encoding, just
 /// the mechanism ARM64 exclusively relies on where x86_64 has the
 /// legacy port-based alternative too).
-fn ecam_offset(bus: u8, device: u8, function: u8) -> u64 {
+pub(crate) fn ecam_offset(bus: u8, device: u8, function: u8) -> u64 {
     ((bus as u64) << 20) | ((device as u64) << 15) | ((function as u64) << 12)
 }
 
@@ -56,7 +56,7 @@ fn ecam_offset(bus: u8, device: u8, function: u8) -> u64 {
 /// hal-x86_64/compute.rs's PCI I/O port access requires no equivalent
 /// mapping step at all, since I/O ports are not memory-mapped;  ECAM,
 /// being MMIO, does require it).
-unsafe fn ecam_read_u32(ecam_base: u64, bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+pub(crate) unsafe fn ecam_read_u32(ecam_base: u64, bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     let addr = ecam_base + ecam_offset(bus, device, function) + offset as u64;
     let ptr = addr as *const u32;
     // SAFETY: forwarded from this function's own contract; volatile
@@ -76,17 +76,17 @@ unsafe fn ecam_write_u32(ecam_base: u64, bus: u8, device: u8, function: u8, offs
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PciDeviceHeader {
-    vendor_id: u16,
-    device_id: u16,
-    class_code: u8,
-    subclass: u8,
-    header_type: u8,
+pub(crate) struct PciDeviceHeader {
+    pub(crate) vendor_id: u16,
+    pub(crate) device_id: u16,
+    pub(crate) class_code: u8,
+    pub(crate) subclass: u8,
+    pub(crate) header_type: u8,
 }
 
 /// # Safety
 /// Same contract as `ecam_read_u32`.
-unsafe fn read_pci_header(ecam_base: u64, bus: u8, device: u8, function: u8) -> Option<PciDeviceHeader> {
+pub(crate) unsafe fn read_pci_header(ecam_base: u64, bus: u8, device: u8, function: u8) -> Option<PciDeviceHeader> {
     // SAFETY: forwarded from this function's own contract.
     let dword0 = unsafe { ecam_read_u32(ecam_base, bus, device, function, 0x00) };
     let vendor_id = (dword0 & 0xFFFF) as u16;
