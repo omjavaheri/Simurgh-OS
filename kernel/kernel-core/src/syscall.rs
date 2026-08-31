@@ -395,7 +395,7 @@ impl KernelState {
             SyscallOp::Signal { notification, bits } => {
                 self.do_signal(caller, notification, bits, now_ns)
             }
-            SyscallOp::Wait { notification } => self.do_wait(caller, notification),
+            SyscallOp::Wait { notification } => self.do_wait(caller, notification, now_ns),
             SyscallOp::Poll { notification } => self.do_poll(caller, notification),
             SyscallOp::IrqBind {
                 mmio,
@@ -688,6 +688,7 @@ impl KernelState {
         &mut self,
         caller: ThreadId,
         notification: CapId,
+        now_ns: u64,
     ) -> Result<SyscallReturn, SyscallError> {
         let cap = self.resolve(
             caller,
@@ -702,6 +703,15 @@ impl KernelState {
             return Ok(SyscallReturn::Value(bits));
         }
         notif.wait(caller)?;
+        // The caller is now on the notification's own waiter list, but
+        // that alone does not remove it from the SCHEDULER's own Ready
+        // pool — without this, `pick_next` could re-pick a thread that
+        // is not actually resumable (the same "phantom Ready" bug class
+        // `preempt.rs::block_thread`'s own doc comment already
+        // documents for the IPC-block case; `Signal`'s own `wake_blocked`
+        // call is `note_blocked`'s exact counterpart, undoing this).
+        self.sched.account(now_ns);
+        let _ = self.sched.note_blocked(caller);
         Ok(SyscallReturn::Blocked)
     }
 

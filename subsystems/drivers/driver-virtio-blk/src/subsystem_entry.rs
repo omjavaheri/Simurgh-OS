@@ -44,18 +44,31 @@
 use driver_framework::DeviceDriver;
 use ipc_protocol::codec::{decode_driver_request, encode_driver_response};
 use ipc_protocol::driver::DriverErrorCode;
-use ipc_protocol::DriverResponse;
+use ipc_protocol::{DriverRequest, DriverResponse};
 use kernel_ipc::SmallMessage;
 
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_RECV`.
 const IPC_RECV: usize = 43;
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_REPLY`.
 const IPC_REPLY: usize = 44;
+/// Must stay numerically equal to `kernel/src/main.rs`'s
+/// `sys::DRV_IRQ_WAIT` — the real interrupt-driven wait for a
+/// just-submitted request to complete (see this file's own
+/// `handle_io`).
+const DRV_IRQ_WAIT: usize = 63;
 
 /// The endpoint capability's slot in THIS process's own capability
 /// space — see `fs-native::subsystem_entry::FS_ENDPOINT_CAP`'s own doc
 /// comment on why this is a compile-time constant, not a runtime lookup.
 const DRV_ENDPOINT_CAP: usize = 0;
+
+/// The `Notification` capability's slot in THIS process's own
+/// capability space — the SECOND grant `kernel_arch_glue::spawn_
+/// virtio_blk_driver` makes into this process's fresh cap space (the
+/// endpoint above is the first, at slot 0), already bound to the
+/// device's own IRQ line via `IrqBind` before this process's first
+/// instruction ever runs.
+const DRV_NOTIF_CAP: usize = 1;
 
 /// VA the virtio-mmio transport window is mapped at in THIS process's
 /// own address space — must stay numerically equal to
@@ -218,12 +231,92 @@ fn write_shared_message(msg: &SmallMessage) {
     }
 }
 
+// Same stack-slot-reuse miscompilation `fs-native::subsystem_entry`'s
+// own `zero!()` macro documents in full (this crate's own `[profile.
+// dev.package.driver-virtio-blk] opt-level = 2` override — Cargo.toml
+// — already fixes a CONFIRMED instance of it in `VirtioBlk::wait_for_
+// completion`'s bounded loop; `zero!()` is kept here too, at every
+// `raw_syscall`/`raw_syscall2` call site, as the same defense-in-depth
+// every other subsystem's own entry point already applies for exactly
+// this class of bug). Module-scope (not `subsystem_main`-local) so
+// `handle_io` below can use it too. Every call site is already inside
+// an `unsafe` block (the enclosing `raw_syscall`/`raw_syscall2` call),
+// so — matching `fs-native::subsystem_entry`'s own `zero!()` exactly —
+// this macro does NOT wrap its own `asm!` in a redundant nested
+// `unsafe` block.
+macro_rules! zero {
+    () => {{
+        let mut v: usize = 0;
+        // SAFETY: a no-op asm block (`v` is read back unchanged) — its
+        // only purpose is defeating the stack-slot-reuse miscompilation
+        // above. Forwarded from the enclosing `unsafe` block at every
+        // call site.
+        core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+        v
+    }};
+}
+
+/// Real interrupt-driven wait for a just-submitted request to complete
+/// — issues `DRV_IRQ_WAIT` (`SyscallOp::Wait` on the `Notification`
+/// this process's own `IrqBind` capability grant already bound to the
+/// device's IRQ line). The kernel side (`kernel/src/main.rs`'s own
+/// riscv64 `DRV_IRQ_WAIT` dispatch arm) genuinely idles the core
+/// (`hal_riscv64::cpu::wfi`) until the interrupt fires, so THIS single
+/// ecall only ever returns once completion is real — no polling loop
+/// needed here, unlike `VirtioBlk::wait_for_completion`'s own busy-poll
+/// alternative.
+///
+/// `#[inline(never)]` — same rationale as `raw_syscall`'s own doc
+/// comment.
+#[inline(never)]
+unsafe fn wait_for_irq() -> u64 {
+    // SAFETY: `raw_syscall`'s own contract; the return value here is a
+    // plain `usize` (the notification's signal bits) — `raw_syscall`'s
+    // own `usize` return type already covers the one bit this driver
+    // ever sets (`virtio_blk_irq_trampoline` signals `1`).
+    unsafe { raw_syscall(DRV_IRQ_WAIT, DRV_NOTIF_CAP, zero!()) as u64 }
+}
+
+/// Drives one real `ReadBlocks`/`WriteBlocks` request through the
+/// REAL interrupt-driven completion path — `drv.handle_request` is
+/// deliberately NOT called for these two request kinds (see this
+/// crate's own module doc comment on why: only this file can issue
+/// the actual `Wait` ecall in between submission and completion, so
+/// the orchestration has to live here, not inside `VirtioBlk` itself).
+/// Reuses `VirtioBlk::validate_io`'s own bounds-checking (the SAME
+/// logic `handle_request`'s own arms apply) so the two paths never
+/// drift apart on what counts as a valid request.
+fn handle_io(drv: &mut crate::VirtioBlk, kind: crate::BlkReqType, lba: u64, sector_count: u32) -> DriverResponse {
+    if !drv.is_ready() {
+        return DriverResponse::Failed { code: DriverErrorCode::ProbeFailed };
+    }
+    if let Err(code) = drv.validate_io(sector_count, lba) {
+        return DriverResponse::Failed { code };
+    }
+    // SAFETY: `drv.is_ready()` (checked above) means `probe` already
+    // mapped both regions — `submit_request`'s own contract.
+    unsafe { drv.submit_request(kind, lba, crate::VirtioBlk::SECTOR_SIZE as usize) };
+    // SAFETY: `raw_syscall`'s own contract (forwarded via `wait_for_irq`).
+    unsafe { wait_for_irq() };
+    // SAFETY: same contract as `submit_request` — the real interrupt
+    // already fired (`wait_for_irq` only returns once it has), so a
+    // completion is genuinely ready to read.
+    let status = unsafe { drv.ack_completion() };
+    if status == 0 {
+        DriverResponse::Completed { sectors: 1 }
+    } else {
+        DriverResponse::Failed { code: DriverErrorCode::DeviceIo }
+    }
+}
+
 /// The virtio-blk driver's process entry point. Runs `probe()` exactly
 /// once (`DeviceDriver::probe`'s own doc comment: "Called once, right
 /// after the process starts") against the real, pre-mapped virtio-mmio
 /// window, then serves REAL `DriverRequest`s forever: `Recv` (blocks
 /// until a real `Call` arrives), decode, dispatch to the real
-/// `VirtioBlk`, encode, `Reply`.
+/// `VirtioBlk` (`ReadBlocks`/`WriteBlocks` via `handle_io`'s own real
+/// interrupt-driven path, everything else via `handle_request`
+/// directly), encode, `Reply`.
 ///
 /// If `probe()` fails (e.g. no Block device was actually discovered at
 /// boot — `kernel_arch_glue::spawn_virtio_blk_driver`'s own doc comment
@@ -237,25 +330,17 @@ pub extern "C" fn subsystem_main() -> ! {
     let mut drv = crate::VirtioBlk::new(DRV_MMIO_VA, DRV_QUEUE_VA);
     let _ = drv.probe();
 
-    // Same stack-slot-reuse miscompilation `fs-native::subsystem_entry`'s
-    // own `zero!()` macro documents in full (this loop issues the same
-    // repeated-`raw_syscall`/`raw_syscall2` shape).
-    macro_rules! zero {
-        () => {{
-            let mut v: usize = 0;
-            // SAFETY: a no-op asm block (`v` is read back unchanged) —
-            // its only purpose is defeating the stack-slot-reuse
-            // miscompilation above.
-            core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
-            v
-        }};
-    }
-
     loop {
         // SAFETY: `raw_syscall2`'s own contract.
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, DRV_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();
         let resp = match decode_driver_request(&req_msg) {
+            Ok(DriverRequest::ReadBlocks { lba, sector_count, .. }) => {
+                handle_io(&mut drv, crate::BlkReqType::In, lba, sector_count)
+            }
+            Ok(DriverRequest::WriteBlocks { lba, sector_count, .. }) => {
+                handle_io(&mut drv, crate::BlkReqType::Out, lba, sector_count)
+            }
             Ok(req) => drv.handle_request(req),
             Err(_) => DriverResponse::Failed {
                 code: DriverErrorCode::Unsupported,

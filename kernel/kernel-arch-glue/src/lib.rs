@@ -2440,6 +2440,17 @@ static mut G_DRV_TID: Option<ThreadId> = None;
 /// this driver reuses one region for both purposes.
 static mut G_DRV_QUEUE_PHYS: usize = usize::MAX;
 
+/// Physical base of the virtio-blk device's own MMIO window (`k.mmio_
+/// region(...)`'s own `phys_base`, cached at spawn time) — used ONLY by
+/// `virtio_blk_irq_trampoline` to ack the DEVICE's own `INTERRUPT_
+/// STATUS`/`INTERRUPT_ACK` registers (`driver_virtio_blk::mmio`'s own
+/// fixed offsets, valid for any virtio-mmio device regardless of type)
+/// directly from interrupt context — see that function's own doc
+/// comment for why this ack cannot wait for `VirtioBlk::ack_completion`
+/// (a DIFFERENT process's own private state, unreachable from here) to
+/// run later in the driver process's own time.
+static mut G_DRV_MMIO_PHYS: usize = usize::MAX;
+
 /// VA the virtio-mmio transport window is pre-mapped at in the driver's
 /// own address space — must stay numerically equal to
 /// `driver_virtio_blk::subsystem_entry::DRV_MMIO_VA`.
@@ -2514,20 +2525,91 @@ fn drv_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<Ipc
     }
 }
 
+/// The trampoline `SyscallOp::IrqBind` installs with the platform's
+/// `InterruptController` (via `HalInterface::register_irq`) for the
+/// virtio-blk device's own IRQ line. Runs from interrupt context (the
+/// architecture trap vector's own interrupt branch calls it directly,
+/// exactly like the tick/fault handlers already registered elsewhere
+/// in this file) — its only job is finding which `Notification` is
+/// bound to `irq` and signalling it, waking whatever thread called
+/// `Wait` on it (`kernel_core::state::KernelState::notification_for_
+/// irq`/`wake_blocked`, the SAME primitives `SyscallOp::Signal`'s own
+/// `do_signal` uses for the ordinary syscall-driven case — this is
+/// just the hardware-driven trigger for the identical effect).
+///
+/// A plain function pointer with no captured state, per `hal_core::
+/// interrupt::IrqHandler`'s own doc comment — reaches `KernelState`
+/// through the same global `kstate()`/`khal()` accessors every other
+/// interrupt-context handler in this file already uses.
+pub fn virtio_blk_irq_trampoline(irq: hal_core::interrupt::IrqId) {
+    // Ack the DEVICE's own `INTERRUPT_STATUS`/`INTERRUPT_ACK` registers
+    // (`driver_virtio_blk::mmio`'s own fixed offsets — valid for any
+    // virtio-mmio device regardless of type, not specific to virtio-blk)
+    // FIRST, before signalling anything — **real bug found via QEMU
+    // interrupt tracing**: without this, the device's own interrupt
+    // line stays asserted for the ENTIRE time between this trampoline
+    // running and `VirtioBlk::ack_completion` eventually running (much
+    // later, in the DRIVER process's own time, once `Wait` returns and
+    // it resumes) — the PLIC re-delivers the STILL-pending line the
+    // instant this trap returns, over and over, a genuine hardware
+    // interrupt storm (confirmed via `-d int`: thousands of identical
+    // `s_external` traps at the same `epc`, the core never actually
+    // making forward progress). `VirtioBlk::ack_completion`'s own later
+    // ack becomes a harmless no-op re-read of an already-clear register
+    // once the driver process resumes — this is not a duplicate-ack
+    // correctness issue, just moving the ack earlier to where it is
+    // actually reachable (kernel-arch-glue can reach the device's own
+    // MMIO registers via the identity-mapped physical address cached at
+    // spawn time; a DIFFERENT process's own private `VirtioBlk` state
+    // is not reachable from interrupt context at all).
+    // SAFETY: single-core; `G_DRV_MMIO_PHYS` was written once by
+    // `spawn_virtio_blk_driver`, before `IrqBind` installed this
+    // trampoline; the virtio-mmio window is identity-mapped in the
+    // kernel's own address space (`hal.map_ram_identity`'s own low-GiB
+    // coverage — the same physical range `spawn_virtio_blk_driver`
+    // already reads/writes directly via `core::ptr::write_bytes` etc.).
+    unsafe {
+        let mmio_phys = core::ptr::addr_of!(G_DRV_MMIO_PHYS).read();
+        if mmio_phys != usize::MAX {
+            let status = ((mmio_phys + driver_virtio_blk::mmio::INTERRUPT_STATUS) as *const u32)
+                .read_volatile();
+            ((mmio_phys + driver_virtio_blk::mmio::INTERRUPT_ACK) as *mut u32)
+                .write_volatile(status);
+        }
+    }
+
+    let k = kstate();
+    let hal = khal();
+    let Some(nid) = k.notification_for_irq(irq.as_u32()) else {
+        return;
+    };
+    let Some(notif) = k.notification_mut(nid) else {
+        return;
+    };
+    let woken = notif.signal(1);
+    let now = hal.now_ns();
+    for &tid in woken.as_slice() {
+        k.wake_blocked(tid, now);
+    }
+}
+
 /// Spawns the virtio-blk driver process from its own separately-built
 /// ELF (`drv_elf`), grants it an `Endpoint` (landing at slot 0 — see
-/// `grant_cap_into`'s own doc comment), and pre-maps its virtio-mmio
-/// window plus a freshly retyped virtqueue/data `SharedRegion` directly
-/// into its address space (trusted bootstrap glue — same "carve
-/// untyped, `map_range` directly, no `SyscallOp::Map` ceremony" pattern
-/// `fs_demo_start` already uses for fs-native's own shared pages).
+/// `grant_cap_into`'s own doc comment) and a `Notification` already
+/// bound to the device's own IRQ line (landing at slot 1), and pre-maps
+/// its virtio-mmio window plus a freshly retyped virtqueue/data
+/// `SharedRegion` directly into its address space (trusted bootstrap
+/// glue — same "carve untyped, `map_range` directly, no `SyscallOp::
+/// Map` ceremony" pattern `fs_demo_start` already uses for fs-native's
+/// own shared pages).
 ///
 /// Returns `None` (and logs) if no `Block`-kind peripheral was
 /// discovered at boot (`KernelState::root_mmio_blk_cap` still the
-/// sentinel — `populate_from_boot_info`'s own Step 3c never found one)
-/// or on any allocation failure — this driver process is simply never
-/// spawned in that case, exactly like `spawn_process_from_elf`'s own
-/// existing "no allocation, no process" failure mode.
+/// sentinel — `populate_from_boot_info`'s own Step 3c never found one),
+/// on any allocation failure, or if `IrqBind` itself fails — this
+/// driver process is simply never spawned in that case, exactly like
+/// `spawn_process_from_elf`'s own existing "no allocation, no process"
+/// failure mode.
 pub fn spawn_virtio_blk_driver(
     hal: &HalInterface,
     caller: ThreadId,
@@ -2551,6 +2633,9 @@ pub fn spawn_virtio_blk_driver(
         k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32(),
     );
     let mmio = *k.mmio_region(mmio_id)?;
+    // SAFETY: single-core; written once here, before `IrqBind` below
+    // installs the trampoline that reads it.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_MMIO_PHYS).write(mmio.phys_base as usize) };
 
     let ep_cap = match k.dispatch(
         caller,
@@ -2665,6 +2750,47 @@ pub fn spawn_virtio_blk_driver(
     // `drv_blk_*_call` (reached only after this function returns) can
     // read it.
     unsafe { core::ptr::addr_of_mut!(G_DRV_QUEUE_PHYS).write(region_phys) };
+
+    // Retype a `Notification` and bind the virtio-blk device's own IRQ
+    // line to it — root does the `IrqBind` itself (it already holds
+    // `root_mmio_blk_cap`, which is what authorizes binding exactly
+    // THIS device's own IRQ, per `IrqBind`'s own doc comment), then
+    // grants the ALREADY-BOUND notification into the driver's cap
+    // space (landing at slot 1 — the endpoint above was the first
+    // grant into this fresh cap space, at slot 0; see `grant_cap_
+    // into`'s own doc comment on why that ordering is deterministic).
+    // The driver process never needs to hold `root_mmio_blk_cap`
+    // itself, matching the MMIO-window pre-map above.
+    let notif_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Notification,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::IrqBind {
+            mmio: mmio_cap,
+            notification: notif_cap,
+            handler: virtio_blk_irq_trampoline,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::Done) => {}
+        _ => {
+            klog!("spawn_virtio_blk_driver: IrqBind failed\r\n");
+            return None;
+        }
+    }
+    grant_cap_into(k, src_cs, notif_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
 
     // Switch straight to the driver, exactly like `fs_demo_start` does
     // for fs-native — see that function's own "Real bug found via
@@ -2786,6 +2912,94 @@ pub fn drv_blk_read_result() -> usize {
 /// Fixed demo payload `drv_blk_write_call` writes and `drv_blk_read_
 /// result` verifies — same role as `FS_DEMO_WRITE_DATA`.
 const DRV_DEMO_WRITE_DATA: &[u8] = b"hello from root, virtio-blk demo!";
+
+/// `DRV_IRQ_WAIT` demo opcode's own kernel-side half: issues exactly
+/// ONE `SyscallOp::Wait` on `notif_cap` and reports the outcome —
+/// unlike every other `drv_blk_*`/`fs_*` function in this file,
+/// `caller` here is the virtio-blk driver process itself (issuing its
+/// own ecall), not root driving IPC on its behalf.
+///
+/// `caller` is an explicit PARAMETER, not internally re-discovered via
+/// `sched.running()` on every call — **real bug found via QEMU**: the
+/// obvious "discover it generically, like `IPC_RECV` does" approach
+/// breaks across the SECOND and later calls of this function's own
+/// idle-retry loop (`kernel/src/main.rs`'s own `DRV_IRQ_WAIT` dispatch
+/// arm), because the FIRST call's `Blocked` outcome runs `do_wait`'s
+/// own `note_blocked`, which CLEARS `sched.running()` (by design — see
+/// `kernel_sched::Scheduler::note_blocked`'s own doc comment: "the
+/// caller should then `pick_next`"). A second internal re-discovery via
+/// `sched.running().unwrap_or(root_thread)` then silently falls back to
+/// `root_thread`, which does not hold `notif_cap` at all — `dispatch`
+/// correctly rejects it (`WrongObjectKind`/`BadCap`), `IrqWaitOutcome::
+/// Error` is returned to the driver process with a bogus `bits = 0`,
+/// and (confirmed via a temporary diagnostic print, then a `-d int`
+/// trace of the resulting silent hang) the driver's own request-serving
+/// loop never recovers. The caller (`kernel/src/main.rs`) discovers
+/// `caller` ONCE, before its own retry loop starts, and passes the SAME
+/// value into every `drv_irq_wait_step` call within it.
+///
+/// Deliberately does NOT loop or idle here — see this function's own
+/// caller (`kernel/src/main.rs`'s riscv64 `DRV_IRQ_WAIT` dispatch arm)
+/// for why the actual `wfi`-based idle loop lives THERE instead: this
+/// crate is architecture-erased by design (no `#[cfg(target_arch)]`,
+/// no architecture crate name — this file's own header doc comment),
+/// so it cannot itself call `hal_riscv64::cpu::wfi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrqWaitOutcome {
+    /// Bits were already pending (or just became pending) — no
+    /// blocking needed.
+    Ready(u64),
+    /// The caller is now genuinely `Blocked` (`kernel_core::syscall::
+    /// do_wait`'s own `note_blocked` call already ran) — the caller
+    /// must idle-wait (e.g. `wfi`) for the bound IRQ to fire, then
+    /// call this again.
+    Blocked,
+    /// The capability/dispatch itself failed (bad cap, wrong kind).
+    Error,
+}
+
+/// Issues one `SyscallOp::Wait` on `notif_cap` — see this module's own
+/// `DRV_IRQ_WAIT` doc comment above and `IrqWaitOutcome`'s own doc
+/// comment for the full rationale and calling convention.
+pub fn drv_irq_wait_step(hal: &HalInterface, caller: ThreadId, notif_cap: u32) -> IrqWaitOutcome {
+    let k = kstate();
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Wait { notification: CapId::new(notif_cap) },
+        hal,
+    ) {
+        Ok(SyscallReturn::Value(bits)) => {
+            // **Real bug found via QEMU** (a SECOND instance of the
+            // same root cause `IrqWaitOutcome::Error`'s own doc comment
+            // already found and fixed once — this is the OTHER half of
+            // it): `virtio_blk_irq_trampoline`'s own `wake_blocked` only
+            // marks the caller `Ready` again (matching `wake_blocked`'s
+            // own documented role — see `kernel_sched::Scheduler::
+            // note_ready`'s doc comment), it does NOT mark it `Running`.
+            // Without an explicit `dispatch` here, `sched.running()`
+            // stays `None` (still cleared by the earlier `Blocked`
+            // outcome's own `note_blocked`), so EVERY later generic
+            // caller-discovery in this SAME trap context (`p2_ipc_recv`/
+            // `p2_ipc_reply`, called next by `subsystem_entry.rs`'s own
+            // loop once it resumes) falls back to `root_thread` instead
+            // of the driver's own tid — confirmed via a temporary
+            // diagnostic print showing `IPC_REPLY`/`IPC_RECV` both
+            // dispatching as `ThreadId(0)` (root) against capability
+            // slots that belong to the DRIVER's own cap space, failing
+            // every time (`NotBlockedOnReply`/`WrongObjectKind`) in a
+            // tight, silent, infinite retry loop. `dispatch` is exactly
+            // what every OTHER real switch-back-to-a-woken-thread path
+            // in this file already does before treating it as "the
+            // current thread" (e.g. `fs_ipc_call`'s own `sched.
+            // dispatch(fs_tid, ...)` right before its own switch).
+            let _ = k.sched.dispatch(caller, hal.now_ns());
+            IrqWaitOutcome::Ready(bits)
+        }
+        Ok(SyscallReturn::Blocked) => IrqWaitOutcome::Blocked,
+        _ => IrqWaitOutcome::Error,
+    }
+}
 
 /// Busy-park forever. The in-kernel demo threads have nothing to return
 /// to once their part is done; a real service would loop on `Recv`.

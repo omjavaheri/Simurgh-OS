@@ -859,6 +859,76 @@ pub unsafe fn poke_saved_a0_a1(ctx: *mut u8, a0: usize, a1: usize) {
     c.regs[10] = a1 as u64;
 }
 
+/// Halts the core in S-mode until any interrupt fires — `wfi`, RISC-V
+/// Privileged Spec §3.3.3 (interrupts remain enabled and are taken
+/// normally; the instruction simply lets hardware stop clocking the
+/// core between "now" and "the next interrupt", instead of the caller
+/// hot-spinning). Used by `kernel/src/main.rs`'s own `DRV_IRQ_WAIT`
+/// ecall (03-Kernel-Subsystems-Layer.md §2.1/§5.1): once
+/// `kernel_core::syscall::SyscallOp::Wait` reports nothing pending yet,
+/// this is the genuinely-idle alternative to busy-polling for the
+/// virtio-blk IRQ to land. A spurious or unrelated-interrupt wakeup is
+/// always safe — `wfi` merely resumes to the next instruction the
+/// moment ANY interrupt is taken (this core's own trap vector runs
+/// first, as normal, before control returns here); the caller is
+/// expected to re-check its own actual wait condition in a loop, not
+/// assume this call means that condition is now true.
+///
+/// Not part of `hal_core::CpuAbstraction`/`HalInterface`: this is a
+/// riscv64-only demo primitive (`kernel/main.rs`'s own `#[cfg(target_
+/// arch = "riscv64")]` dispatch section already calls `hal_riscv64::
+/// cpu` items directly — see e.g. `poke_saved_a0_a1`'s x86_64/aarch64
+/// siblings for the same established pattern), not a capability every
+/// architecture's boot/scheduling path needs today; growing the
+/// architecture-erased interface for it would be speculative ahead of
+/// a second caller.
+/// `sstatus` bit 1 (Supervisor Interrupt Enable) — the GLOBAL gate on
+/// whether a pending, `sie`-enabled interrupt is actually TAKEN (traps
+/// into a lower privilege level, e.g. U-mode, are always taken
+/// regardless of this bit — RISC-V Privileged Spec §3.1.6.1 — but a
+/// trap taken while ALREADY executing in S-mode, exactly `wfi`'s own
+/// situation here, is gated by it like any other same-level interrupt).
+/// Every trap entry hardware-clears this automatically on entry (into
+/// `SPIE`, restored by `sret`); this project's prior interrupt model
+/// never needed to set it explicitly because every interrupt it ever
+/// serviced was a U-mode-originated one.
+const SSTATUS_SIE_BIT: u64 = 1 << 1;
+
+/// Halts the core in S-mode until any interrupt fires — `wfi`, RISC-V
+/// Privileged Spec §3.3.3. Temporarily sets `sstatus.SIE` around the
+/// instruction itself (see `SSTATUS_SIE_BIT`'s own doc comment for why
+/// this is required here specifically, unlike every other interrupt
+/// this project has serviced so far) and restores it to clear
+/// afterward — ordinary kernel code between trap entry and `sret`
+/// otherwise always runs with interrupts effectively deferred to
+/// well-known points (this call being the first, deliberate exception),
+/// so leaving `SIE` set past this one instruction would be a real
+/// change to that invariant, not a harmless cleanup left undone.
+#[cfg(target_os = "none")]
+pub fn wfi() {
+    // SAFETY: `csrs`/`csrc sstatus, SSTATUS_SIE_BIT` sets/clears exactly
+    // one well-defined `sstatus` bit around `wfi`, matching the pattern
+    // `InterruptCtrl::bootstrap_current_core`'s own `csrs sie, ...` uses
+    // for `sie`. `wfi` itself has no preconditions beyond "valid to
+    // execute in the current privilege mode" (true in S-mode) and no
+    // side effects requiring justification beyond ordinary instruction
+    // execution — it does not touch memory, does not require draining
+    // pending stores it did not itself issue, and always eventually
+    // resumes (immediately if an interrupt is already pending, or is
+    // taken and returns via the trap vector's own `sret`) rather than
+    // ever deadlocking, so there are no additional caller obligations
+    // to describe here.
+    unsafe {
+        core::arch::asm!(
+            "csrs sstatus, {sie}",
+            "wfi",
+            "csrc sstatus, {sie}",
+            sie = in(reg) SSTATUS_SIE_BIT,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 /// SPP is `sstatus` bit 8 (Supervisor Previous Privilege): 0 = the trap
 /// that will be returned from via `sret` came from U-mode, so `sret`
 /// drops to U-mode. Only consumed on the bare-metal target (the host

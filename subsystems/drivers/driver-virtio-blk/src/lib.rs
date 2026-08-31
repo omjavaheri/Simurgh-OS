@@ -20,16 +20,24 @@
 //! `SharedRegion` capability, also pre-mapped.
 //!
 //! MVP scope: `do_probe` runs the full virtio 1.x device-init handshake
-//! and `submit_request`/`wait_for_completion` drive a real 3-descriptor
+//! and `submit_request`/`ack_completion` drive a real 3-descriptor
 //! split-ring chain (header/data/status) for exactly one request in
-//! flight at a time, one sector per request. Completion is a busy-poll
-//! on the used ring (`wait_for_completion`), not the kernel's
-//! `IrqBind`/`Notification` mechanism — deliberately kept out of this
-//! driver's own critical path so a basic read/write round trip does not
-//! depend on interrupt-delivery timing being exactly right; that
-//! mechanism (`kernel_core::syscall`'s `IrqBind`/`Signal`/`Wait`/`Poll`)
-//! is built and unit-tested independently and is available for a real
-//! interrupt-driven follow-up.
+//! flight at a time, one sector per request. TWO completion strategies
+//! coexist, deliberately kept separate:
+//!   - `wait_for_completion` (private, used by `handle_request`'s own
+//!     `ReadBlocks`/`WriteBlocks` arms): a bounded busy-poll on the
+//!     used ring, host-testable, no ecall access needed. The original
+//!     MVP path; kept as a documented, still-correct alternative (e.g.
+//!     a future platform with no usable IRQ line).
+//!   - The REAL, production path: `subsystem_entry.rs` (which alone can
+//!     issue ecalls) calls `submit_request` directly, then a real
+//!     `SyscallOp::Wait` on the `Notification` its own `IrqBind`
+//!     capability grant bound to the device's IRQ line, genuinely
+//!     idling the core (`hal_riscv64::cpu::wfi`, driven from `kernel/
+//!     src/main.rs`'s own `DRV_IRQ_WAIT` ecall) until the interrupt
+//!     actually fires, then `ack_completion`. `handle_request` is
+//!     bypassed entirely for `ReadBlocks`/`WriteBlocks` in this path —
+//!     see `subsystem_entry.rs`'s own doc comment.
 //!
 //! Safety/invariants: every MMIO/virtqueue-memory access goes through
 //! `read_volatile`/`write_volatile` with a `// SAFETY:` note tying it to
@@ -431,15 +439,22 @@ impl VirtioBlk {
     /// Publishes one request's descriptor chain (header -> data ->
     /// status, spec §5.2.6) and rings the doorbell. MVP scope: always
     /// uses descriptor slots `0,1,2` and avail/used index `self.
-    /// next_idx` — safe because `handle_request` never issues a second
-    /// request before this one's `wait_for_completion` returns (single
-    /// in-flight chain).
+    /// next_idx` — safe because a caller (`handle_request`'s own
+    /// polling path, or `subsystem_entry.rs`'s real interrupt-driven
+    /// one) never issues a second request before this one's completion
+    /// is observed (single in-flight chain).
+    ///
+    /// `pub`: `subsystem_entry.rs` (a different crate — the driver's
+    /// own process entry point) calls this directly for the real
+    /// interrupt-driven I/O path, since only IT can issue the actual
+    /// `Wait` ecall in between submission and completion — see this
+    /// module's own doc comment.
     ///
     /// # Safety
     /// `self.mmio_base`/`self.queue_base` must both be mapped (`probe`
-    /// already succeeded — the only caller, `handle_request`, checks
-    /// `self.ready` first).
-    unsafe fn submit_request(&mut self, req_type: BlkReqType, sector: u64, data_len: usize) {
+    /// already succeeded — every caller checks `self.ready`/`is_ready`
+    /// first).
+    pub unsafe fn submit_request(&mut self, req_type: BlkReqType, sector: u64, data_len: usize) {
         let header = BlkReqHeader {
             req_type: req_type as u32,
             reserved: 0,
@@ -510,13 +525,41 @@ impl VirtioBlk {
         unsafe { self.reg_write(mmio::QUEUE_NOTIFY, REQUEST_QUEUE) };
     }
 
-    /// Busy-polls the used ring until it has a new entry (this driver's
-    /// own choice of completion strategy — see this module's own doc
-    /// comment on why it does not use the kernel's `IrqBind`/
-    /// `Notification` mechanism here), then acknowledges the interrupt
-    /// at the device (so a later request's real IRQ, if anything ever
-    /// binds one, is not left stuck behind a stale, un-acked cause) and
-    /// returns the status byte the device wrote.
+    /// Acknowledges the interrupt at the device and returns the status
+    /// byte it wrote — the tail end of completion handling, common to
+    /// BOTH completion strategies this driver supports (see this
+    /// module's own doc comment): the caller must already know a
+    /// completion is ready (the used ring's `idx` reached `self.
+    /// next_idx`) before calling this — it does not itself wait or
+    /// poll for anything.
+    ///
+    /// `pub`: `subsystem_entry.rs` calls this after its own real
+    /// `Wait` ecall reports completion — see `submit_request`'s own
+    /// doc comment for why that split is necessary.
+    ///
+    /// # Safety
+    /// Same contract as `submit_request`.
+    pub unsafe fn ack_completion(&mut self) -> u8 {
+        // SAFETY: `reg_read`/`reg_write` share `reg_read`'s own
+        // contract (forwarded).
+        unsafe {
+            let cause = self.reg_read(mmio::INTERRUPT_STATUS);
+            self.reg_write(mmio::INTERRUPT_ACK, cause);
+        }
+        // SAFETY: `layout::STATUS_OFFSET` is within the mapped region.
+        unsafe { ((self.queue_base + layout::STATUS_OFFSET) as *const u8).read_volatile() }
+    }
+
+    /// Busy-polls the used ring until it has a new entry, then calls
+    /// `ack_completion`. This driver's ORIGINAL completion strategy —
+    /// still used by `handle_request`'s own `ReadBlocks`/`WriteBlocks`
+    /// arms (host-testable, no ecall access needed) — kept alongside
+    /// the real interrupt-driven path `subsystem_entry.rs` now uses in
+    /// production (`submit_request` + a real `Wait` ecall +
+    /// `ack_completion`, orchestrated there since only that crate can
+    /// issue ecalls) as a documented, still-correct alternative: e.g.
+    /// a future platform without a usable IRQ line, or the reference
+    /// behavior these host tests exercise.
     ///
     /// # Safety
     /// Same contract as `submit_request`.
@@ -538,17 +581,43 @@ impl VirtioBlk {
             }
             core::hint::spin_loop();
         }
-        // SAFETY: `reg_read`/`reg_write` share `reg_read`'s own
-        // contract (forwarded).
-        unsafe {
-            let cause = self.reg_read(mmio::INTERRUPT_STATUS);
-            self.reg_write(mmio::INTERRUPT_ACK, cause);
-        }
         if !completed {
+            // SAFETY: `reg_read`/`reg_write` share `reg_read`'s own
+            // contract (forwarded) — still ack whatever's pending so a
+            // later request is not stuck behind a stale cause.
+            unsafe {
+                let cause = self.reg_read(mmio::INTERRUPT_STATUS);
+                self.reg_write(mmio::INTERRUPT_ACK, cause);
+            }
             return STATUS_TIMEOUT;
         }
-        // SAFETY: `layout::STATUS_OFFSET` is within the mapped region.
-        unsafe { ((self.queue_base + layout::STATUS_OFFSET) as *const u8).read_volatile() }
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { self.ack_completion() }
+    }
+
+    /// Whether `probe` has completed successfully — `subsystem_entry.
+    /// rs`'s own real I/O path checks this itself (mirroring
+    /// `handle_request`'s own `self.ready` check) before ever calling
+    /// `submit_request`.
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    /// Validates a `ReadBlocks`/`WriteBlocks` request's `sector_count`/
+    /// `lba` — the SAME bounds-checking `handle_request`'s own arms
+    /// apply, extracted so `subsystem_entry.rs`'s real I/O path can
+    /// reuse it without duplicating the logic (and so `handle_request`'s
+    /// own arms stay exactly as host-tested).
+    pub fn validate_io(&self, sector_count: u32, lba: u64) -> Result<(), DriverErrorCode> {
+        if sector_count != 1 {
+            // MVP scope: exactly one sector per request (see `layout`'s
+            // own doc comment on the fixed one-sector data buffer).
+            return Err(DriverErrorCode::Unsupported);
+        }
+        if self.capacity_sectors != 0 && lba + 1 > self.capacity_sectors {
+            return Err(DriverErrorCode::OutOfRange);
+        }
+        Ok(())
     }
 }
 
@@ -599,14 +668,8 @@ impl DeviceDriver for VirtioBlk {
             DriverRequest::ReadBlocks {
                 lba, sector_count, ..
             } => {
-                if sector_count != 1 {
-                    // MVP scope: exactly one sector per request (see
-                    // `layout`'s own doc comment on the fixed one-
-                    // sector data buffer).
-                    return DriverResponse::Failed { code: DriverErrorCode::Unsupported };
-                }
-                if self.capacity_sectors != 0 && lba + 1 > self.capacity_sectors {
-                    return DriverResponse::Failed { code: DriverErrorCode::OutOfRange };
+                if let Err(code) = self.validate_io(sector_count, lba) {
+                    return DriverResponse::Failed { code };
                 }
                 // SAFETY: `self.ready` (checked above) means `probe`
                 // already mapped both regions.
@@ -623,11 +686,8 @@ impl DeviceDriver for VirtioBlk {
             DriverRequest::WriteBlocks {
                 lba, sector_count, ..
             } => {
-                if sector_count != 1 {
-                    return DriverResponse::Failed { code: DriverErrorCode::Unsupported };
-                }
-                if self.capacity_sectors != 0 && lba + 1 > self.capacity_sectors {
-                    return DriverResponse::Failed { code: DriverErrorCode::OutOfRange };
+                if let Err(code) = self.validate_io(sector_count, lba) {
+                    return DriverResponse::Failed { code };
                 }
                 // SAFETY: same contract as the `ReadBlocks` arm above.
                 unsafe { self.submit_request(BlkReqType::Out, lba, Self::SECTOR_SIZE as usize) };
@@ -654,6 +714,16 @@ impl DeviceDriver for VirtioBlk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_io_checks_sector_count_then_bounds() {
+        let mut d = VirtioBlk::new(0x1000_0000, 0x2000_0000);
+        d.capacity_sectors = 100;
+        assert_eq!(d.validate_io(1, 0), Ok(()));
+        assert_eq!(d.validate_io(1, 99), Ok(()));
+        assert_eq!(d.validate_io(2, 0), Err(DriverErrorCode::Unsupported));
+        assert_eq!(d.validate_io(1, 100), Err(DriverErrorCode::OutOfRange));
+    }
 
     #[test]
     fn probe_without_mmio_fails() {

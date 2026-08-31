@@ -512,6 +512,18 @@ mod sys {
     /// payload — see `kernel_arch_glue::drv_blk_read_result`'s own doc
     /// comment), or `usize::MAX` on any error.
     pub const DRV_BLK_READ_RESULT: usize = 62;
+
+    /// `a0` = the `Notification` capability slot the calling process's
+    /// own `IrqBind` grant bound to its device's IRQ line. Issues one
+    /// REAL `SyscallOp::Wait` and reports whatever bits are (or become)
+    /// pending in `a0` — riscv64 only for now
+    /// (`driver_virtio_blk::subsystem_entry::wait_for_irq`, the
+    /// virtio-blk driver process's own real interrupt-driven completion
+    /// wait, 03-Kernel-Subsystems-Layer.md §2.1/§5.1). If nothing is
+    /// pending yet, this genuinely idles the core (`hal_riscv64::cpu::
+    /// wfi`) rather than busy-polling — see this opcode's own riscv64
+    /// dispatch arm.
+    pub const DRV_IRQ_WAIT: usize = 63;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3078,6 +3090,51 @@ fn simurgh_syscall(
         }
         sys::DRV_BLK_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
+        }
+        sys::DRV_IRQ_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            // Discovered ONCE, before the retry loop below — see
+            // `kernel_arch_glue::drv_irq_wait_step`'s own doc comment
+            // for why re-discovering it on every iteration (via
+            // `sched.running()`, which the FIRST `Blocked` outcome's
+            // own `note_blocked` call clears) is a real bug, not a
+            // harmless simplification.
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // Real interrupt-driven idle wait (03-Kernel-Subsystems-
+            // Layer.md §2.1/§5.1): `drv_irq_wait_step` issues ONE
+            // `SyscallOp::Wait`. `Blocked` means the caller (the
+            // virtio-blk driver process, via `kernel_core::syscall::
+            // do_wait`'s own `note_blocked` call) is now genuinely off
+            // the scheduler's Ready pool with nothing else runnable at
+            // this point in the boot sequence (the preemptive timer
+            // is not armed yet) — rather than needing a generic
+            // "pick_next / switch to whoever's next, or truly idle"
+            // mechanism nothing else in this codebase has ever needed,
+            // this loop stays in the SAME trap context (no context
+            // switch happens or is needed) and halts the core (`wfi`)
+            // until an interrupt actually fires. The virtio-blk IRQ's
+            // own trampoline (`kernel_arch_glue::virtio_blk_irq_
+            // trampoline`, installed by `IrqBind`) signals the
+            // notification and marks the caller `Ready` again from
+            // INSIDE that interrupt; when `wfi` returns (control
+            // resumes right here — no switch ever happened), the loop
+            // re-issues `Wait`, which now sees the pending bits.
+            loop {
+                match kernel_arch_glue::drv_irq_wait_step(hal, caller, a0 as u32) {
+                    kernel_arch_glue::IrqWaitOutcome::Ready(bits) => {
+                        return TrapOutcome::Resume(bits as usize);
+                    }
+                    kernel_arch_glue::IrqWaitOutcome::Blocked => {
+                        hal_riscv64::cpu::wfi();
+                    }
+                    kernel_arch_glue::IrqWaitOutcome::Error => {
+                        return TrapOutcome::Resume(0);
+                    }
+                }
+            }
         }
         _ => {}
     }

@@ -160,6 +160,27 @@ pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) ->
     // the single point of SBI extension probing (its module docs).
     let timer = timer::Timer::new(cpu.sbi_time_extension_present());
     let interrupt = interrupt::InterruptCtrl::new(memory.plic_base());
+    // SAFETY: called once, this hart, right after `interrupt`'s own
+    // construction (this method's own contract) and after `cpu`'s
+    // `bootstrap_current_core` above (stvec already installed) — the
+    // PLIC MMIO region needs no separate identity-map step at this
+    // point in boot: `satp` is still Bare (paging is not activated
+    // until `kernel-arch-glue::enter`, much later), so physical PLIC
+    // MMIO addresses are already directly accessible, exactly as
+    // `register_irq`'s own later PLIC register writes (reached from a
+    // real `IrqBind` syscall, long after paging IS active and
+    // identity-mapping the same low physical range) already prove
+    // works throughout. Without this call, `sie.SEIE` is never set —
+    // a gap this project's own boot sequence never surfaced until the
+    // first real device-IRQ consumer (virtio-blk's `IrqBind`/`Wait`)
+    // needed it: the PLIC-level unmask `register_irq` performs is a
+    // SEPARATE gate from this CPU-level one, and a `wfi` waiting on a
+    // masked `sie.SEIE` never wakes even once the device genuinely
+    // raises the interrupt at the PLIC.
+    if unsafe { interrupt.bootstrap_current_core() }.is_err() {
+        // Nothing sensible to do this early; fall through and let a
+        // later `register_irq` call surface the failure.
+    }
     let compute = compute::ComputeDiscovery::new();
     let power = power::PowerThermalImpl::new(&compute);
     // SAFETY: `dtb_phys` was validated by this function's own safety
@@ -187,6 +208,25 @@ pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) ->
     // call, which clears any stale pending bit. `kernel-stub` never arms
     // the timer, so it is unaffected either way.
     interrupt::set_global_timer(&hal.timer);
+    // Publish the interrupt controller pointer `dispatch_current_
+    // interrupt`'s own `SCAUSE_SUPERVISOR_EXTERNAL_INTERRUPT` branch
+    // reads (`cpu.rs`'s `common_trap_entry` calls it for every
+    // interrupt cause, not just the timer) — **real bug found via
+    // QEMU interrupt tracing** (the first-ever real exercise of a
+    // genuine device IRQ end to end, virtio-blk's own `IrqBind`/`Wait`):
+    // without this, `GLOBAL_CONTROLLER_PTR` stays the zero sentinel
+    // forever, so that branch always takes its own "unreachable in
+    // practice" early return — NEVER calling `read_claim`/`end_of_
+    // interrupt` — meaning the PLIC's own pending state for a real
+    // external interrupt is NEVER cleared, and the CPU re-takes the
+    // SAME interrupt trap the instant it returns, forever (confirmed
+    // via `-d int`: millions of identical `s_external` traps at one
+    // `epc`, zero forward progress) — no earlier code path in this
+    // project ever surfaced the gap because every interrupt serviced
+    // before this session was the timer, which this same dispatch
+    // function handles in a completely separate branch with no PLIC
+    // involvement at all.
+    interrupt::set_global_controller(&hal.interrupt);
 
     let kernel_image_phys_range = (
         unsafe { linker_symbol_addr(&__kernel_image_phys_start) },
