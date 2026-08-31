@@ -127,6 +127,11 @@ static DEVICE_MANAGER_ELF: &[u8] = include_bytes!(env!("DEVICE_MANAGER_ELF_PATH"
 /// subsystem process (03-Kernel-Subsystems-Layer.md §2.2/§5.3).
 static FS_NATIVE_ELF: &[u8] = include_bytes!(env!("FS_NATIVE_ELF_PATH"));
 
+/// `driver-virtio-blk-bin`'s own separately-built ELF image — same
+/// packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), the
+/// third real subsystem process (03-Kernel-Subsystems-Layer.md §5.1).
+static DRIVER_VIRTIO_BLK_ELF: &[u8] = include_bytes!(env!("DRIVER_VIRTIO_BLK_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -477,6 +482,36 @@ mod sys {
     /// `kernel_arch_glue::fs_read_result`'s own doc comment), or
     /// `usize::MAX` on any error.
     pub const FS_READ_RESULT: usize = 55;
+
+    /// No arguments. Spawns the virtio-blk driver process
+    /// (`kernel_arch_glue::spawn_virtio_blk_driver`) and returns its
+    /// endpoint capability slot in `a0`, or `usize::MAX` if no
+    /// `Block`-kind peripheral was discovered at boot (mirrors
+    /// `FS_DEMO_START`'s own return convention).
+    pub const DRV_BLK_DEMO_START: usize = 56;
+    /// `a0` = the endpoint slot `DRV_BLK_DEMO_START` returned. Builds a
+    /// REAL `DriverRequest::Probe`.
+    pub const DRV_BLK_PROBE: usize = 57;
+    /// No arguments. Returns the REAL sector size in `a0` (`u32::MAX` on
+    /// error) — `kernel_arch_glue::drv_blk_probe_result`'s own `(u32,
+    /// u64)` sector-count half is not surfaced via this raw ecall ABI
+    /// (2 registers), only reported in the boot log by the demo driver
+    /// itself if ever needed.
+    pub const DRV_BLK_PROBE_RESULT: usize = 58;
+    /// `a0` = the endpoint slot. Builds a REAL `DriverRequest::
+    /// WriteBlocks` for one sector at lba 0.
+    pub const DRV_BLK_WRITE: usize = 59;
+    /// No arguments. Returns the REAL sector count written in `a0`, or
+    /// `usize::MAX` on any error.
+    pub const DRV_BLK_WRITE_RESULT: usize = 60;
+    /// `a0` = the endpoint slot. Builds a REAL `DriverRequest::
+    /// ReadBlocks` for one sector at lba 0.
+    pub const DRV_BLK_READ: usize = 61;
+    /// No arguments. Returns the REAL sector count read in `a0` (and
+    /// logs a MATCH/MISMATCH verdict against the `DRV_BLK_WRITE`
+    /// payload — see `kernel_arch_glue::drv_blk_read_result`'s own doc
+    /// comment), or `usize::MAX` on any error.
+    pub const DRV_BLK_READ_RESULT: usize = 62;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -597,6 +632,13 @@ static mut G_IPC_EP: u32 = 0;
 /// something it needs to learn from the caller at all.
 #[cfg(target_arch = "riscv64")]
 static mut G_FS_EP: u32 = 0;
+
+/// The virtio-blk driver's endpoint capability slot IN THE CALLER's
+/// (root's) own capability space, set once by `DRV_BLK_DEMO_START`'s
+/// handler and read by every later `DRV_BLK_PROBE`/`DRV_BLK_WRITE`/
+/// `DRV_BLK_READ` handler — same role as `G_FS_EP`.
+#[cfg(target_arch = "riscv64")]
+static mut G_DRV_EP: u32 = 0;
 
 /// The user-space Root Task entry. Linked into `.user_text` (its own
 /// U=1 R+X pages at VMA 0xC000_0000, per hal-riscv64's linker.ld) and run
@@ -762,6 +804,28 @@ extern "C" fn umode_root() -> ! {
         raw_syscall(sys::FS_CLOSE, fs_handle, zero!());
         let fs_closed = raw_syscall(sys::FS_CLOSE_RESULT, zero!(), zero!());
         raw_syscall(sys::REPORT, fs_closed, zero!());
+
+        // 7b. virtio-blk demo (03-Kernel-Subsystems-Layer.md §5.1): a
+        // real block driver process, real MMIO handshake, real
+        // virtqueue Write->Read round trip. `DRV_BLK_DEMO_START`
+        // reports `usize::MAX` (mirroring `FS_DEMO_START`'s own
+        // convention) if no Block-kind peripheral was discovered at
+        // boot — the rest of this sequence is skipped in that case
+        // rather than driving IPC against a driver that was never
+        // spawned.
+        let drv_ep = raw_syscall(sys::DRV_BLK_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::REPORT, drv_ep, zero!());
+        if drv_ep != usize::MAX {
+            raw_syscall(sys::DRV_BLK_PROBE, zero!(), zero!());
+            let drv_sector_size = raw_syscall(sys::DRV_BLK_PROBE_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, drv_sector_size, zero!());
+            raw_syscall(sys::DRV_BLK_WRITE, zero!(), zero!()); // lba=0
+            let drv_written = raw_syscall(sys::DRV_BLK_WRITE_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, drv_written, zero!());
+            raw_syscall(sys::DRV_BLK_READ, zero!(), zero!()); // lba=0
+            let drv_read = raw_syscall(sys::DRV_BLK_READ_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, drv_read, zero!());
+        }
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
@@ -2956,6 +3020,64 @@ fn simurgh_syscall(
         }
         sys::FS_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
+        }
+        sys::DRV_BLK_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_blk_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_BLK_ELF,
+                elf_loader::machine::EM_RISCV,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_EP, before any later DRV_BLK_* call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::DRV_BLK_PROBE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_BLK_DEMO_START,
+            // before any DRV_BLK_PROBE call.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP).read() };
+            return match kernel_arch_glue::drv_blk_probe_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_PROBE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_probe_result().0 as usize);
+        }
+        sys::DRV_BLK_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP).read() };
+            return match kernel_arch_glue::drv_blk_write_call(hal, caller, ep, a0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_write_result());
+        }
+        sys::DRV_BLK_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP).read() };
+            return match kernel_arch_glue::drv_blk_read_call(hal, caller, ep, a0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
         }
         _ => {}
     }

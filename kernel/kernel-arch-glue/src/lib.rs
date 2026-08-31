@@ -2414,6 +2414,379 @@ pub fn fs_read_result() -> usize {
     bytes
 }
 
+// ============================================================================
+// driver-virtio-blk: real MMIO + virtqueue block driver process (03 §5.1)
+//
+// Mirrors the fs-native section immediately above almost exactly (same
+// "spawn, grant an Endpoint, pre-map a shared page/region, drive it via
+// a dedicated ecall-per-request-type + shared-message-area protocol"
+// shape) — see that section's own doc comments for the parts that
+// repeat verbatim here. Two differences: (1) this driver ALSO needs a
+// virtio-mmio transport window pre-mapped (`DRV_MMIO_VA`, from the
+// boot-seeded `root_mmio_blk_cap` — see `MmioRegionDescriptor`'s own
+// doc comment for why that capability exists at all); (2) its
+// `DriverRequest`/`DriverResponse` message area lives INSIDE the same
+// `SharedRegion` as its virtqueue (`driver_virtio_blk::layout::
+// MESSAGE_OFFSET`), not a second dedicated page — one grant covers
+// both, see `layout`'s own doc comment.
+// ============================================================================
+
+/// This process's own thread id, set once by `spawn_virtio_blk_driver`.
+static mut G_DRV_TID: Option<ThreadId> = None;
+
+/// Physical base of the driver's virtqueue/data `SharedRegion` — same
+/// role as `G_FS_DATA_PHYS`, additionally used to derive the message-
+/// area address (`+ driver_virtio_blk::layout::MESSAGE_OFFSET`) since
+/// this driver reuses one region for both purposes.
+static mut G_DRV_QUEUE_PHYS: usize = usize::MAX;
+
+/// VA the virtio-mmio transport window is pre-mapped at in the driver's
+/// own address space — must stay numerically equal to
+/// `driver_virtio_blk::subsystem_entry::DRV_MMIO_VA`.
+const DRV_MMIO_VA: usize = 0xD820_0000;
+
+/// VA the virtqueue/data `SharedRegion` is pre-mapped at in the driver's
+/// own address space — must stay numerically equal to
+/// `driver_virtio_blk::subsystem_entry::DRV_QUEUE_VA`.
+const DRV_QUEUE_VA: usize = 0xD830_0000;
+
+/// # Safety
+/// `G_DRV_QUEUE_PHYS` must already be a valid, exclusively-owned,
+/// identity-addressable physical page (true from `spawn_virtio_blk_
+/// driver` onward, before any `drv_blk_*_call` can be reached).
+unsafe fn write_shared_drv_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_DRV_QUEUE_PHYS` only written once, before
+    // any `drv_blk_*_call` runs.
+    let base = unsafe {
+        (core::ptr::addr_of!(G_DRV_QUEUE_PHYS).read() + driver_virtio_blk::layout::MESSAGE_OFFSET)
+            as *mut u64
+    };
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as `write_shared_drv_message`.
+unsafe fn read_shared_drv_message() -> SmallMessage {
+    // SAFETY: same contract as `write_shared_drv_message`.
+    let base = unsafe {
+        (core::ptr::addr_of!(G_DRV_QUEUE_PHYS).read() + driver_virtio_blk::layout::MESSAGE_OFFSET)
+            as *const u64
+    };
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// Same shape as `fs_ipc_call`, targeting `G_DRV_TID` instead.
+fn drv_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_DRV_TID` is written once by
+    // `spawn_virtio_blk_driver`, before any `drv_blk_*_call` can run.
+    let drv_tid = unsafe { core::ptr::addr_of!(G_DRV_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(drv_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, drv_tid)?;
+            let poke = if n == drv_tid {
+                k.tcb_mut(drv_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// Spawns the virtio-blk driver process from its own separately-built
+/// ELF (`drv_elf`), grants it an `Endpoint` (landing at slot 0 — see
+/// `grant_cap_into`'s own doc comment), and pre-maps its virtio-mmio
+/// window plus a freshly retyped virtqueue/data `SharedRegion` directly
+/// into its address space (trusted bootstrap glue — same "carve
+/// untyped, `map_range` directly, no `SyscallOp::Map` ceremony" pattern
+/// `fs_demo_start` already uses for fs-native's own shared pages).
+///
+/// Returns `None` (and logs) if no `Block`-kind peripheral was
+/// discovered at boot (`KernelState::root_mmio_blk_cap` still the
+/// sentinel — `populate_from_boot_info`'s own Step 3c never found one)
+/// or on any allocation failure — this driver process is simply never
+/// spawned in that case, exactly like `spawn_process_from_elf`'s own
+/// existing "no allocation, no process" failure mode.
+pub fn spawn_virtio_blk_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let src_cs = k.tcb(caller)?.cap_space;
+    let mmio_cap = k.root_mmio_blk_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_virtio_blk_driver: no Block-kind peripheral was discovered at boot\r\n");
+        return None;
+    }
+    // Resolve the boot-seeded `MmioRegion` capability back to its own
+    // descriptor (mirrors `fs_demo_start`'s own SharedRegion-cap ->
+    // description resolution) — this driver never needs to HOLD an
+    // `MmioRegion` capability itself (the window is pre-mapped for it
+    // below, exactly like `.user_text`/stack need no capability of
+    // their own), only kernel-arch-glue does, to learn where to map.
+    let mmio_id = kernel_cap::MmioRegionId::new(
+        k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32(),
+    );
+    let mmio = *k.mmio_region(mmio_id)?;
+
+    let ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+
+    const DRV_STACK_VMA: usize = 0xC080_0000;
+    const DRV_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_STACK_VMA, DRV_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any `drv_blk_*_call`
+    // (reached only after this function returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_TID).write(Some(drv_tid)) };
+
+    grant_cap_into(k, src_cs, ep_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    // Pre-map the virtio-mmio transport window — real device MMIO, not
+    // RAM, so (unlike every other `map_range` call in this file) there
+    // is nothing to zero or copy into it first.
+    let mmio_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed (same contract every other
+    // pool carve in this file already documents).
+    unsafe { core::ptr::write_bytes(mmio_pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(
+        drv_root_pt,
+        DRV_MMIO_VA,
+        mmio.phys_base as usize,
+        4096,
+        1 | 2 | 8, // R+W+U
+        mmio_pool,
+        2,
+    );
+    if n == u32::MAX {
+        klog!("spawn_virtio_blk_driver: map_range error (mmio window)\r\n");
+        return None;
+    }
+
+    // Retype and pre-map the virtqueue/data `SharedRegion` — a REAL
+    // capability object (proving `Retype` end to end, like fs-native's
+    // own DATA region), even though this driver process is never
+    // granted it directly (kernel-arch-glue's own privileged pre-map
+    // stands in for a `SyscallOp::Map` this trusted glue code has no
+    // need to actually issue).
+    let region_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::SharedRegion,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    let region_id = k.cap_space(src_cs)?.lookup(region_cap)?.object.id;
+    let region_phys = k
+        .shared_region(kernel_cap::SharedRegionId::new(region_id.as_u32()))?
+        .phys_base
+        .as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable,
+    // single-core.
+    unsafe { core::ptr::write_bytes(region_phys as *mut u8, 0, 4096) };
+    // Write the region's OWN physical base into its own header word
+    // (`driver_virtio_blk::layout::PHYS_BASE_OFFSET`) — see that
+    // module's own doc comment on why the driver process has no other
+    // way to learn it (no VA->PA translation syscall exists for a
+    // non-root thread).
+    // SAFETY: `region_phys` is identity-addressable, freshly zeroed
+    // above.
+    unsafe { (region_phys as *mut u64).write_volatile(region_phys as u64) };
+
+    let queue_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(queue_pool as *mut u8, 0, 4096 * 2) };
+    let n2 = hal.map_range(
+        drv_root_pt,
+        DRV_QUEUE_VA,
+        region_phys,
+        4096,
+        1 | 2 | 8, // R+W+U
+        queue_pool,
+        2,
+    );
+    if n2 == u32::MAX {
+        klog!("spawn_virtio_blk_driver: map_range error (queue region)\r\n");
+        return None;
+    }
+
+    // SAFETY: single-core; written exactly once here, before any
+    // `drv_blk_*_call` (reached only after this function returns) can
+    // read it.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_QUEUE_PHYS).write(region_phys) };
+
+    // Switch straight to the driver, exactly like `fs_demo_start` does
+    // for fs-native — see that function's own "Real bug found via
+    // QEMU" comment for the full rationale: without this, `caller`'s
+    // FIRST `DRV_BLK_PROBE` races a receiver that has never yet run at
+    // all, and `do_send`'s fast path (which requires the receiver
+    // already blocked in `Recv`) cannot trigger, silently stranding
+    // both threads forever. Switching here lets the driver run its own
+    // `probe()` and reach its own first `IPC_RECV` before `caller`
+    // resumes and issues `DRV_BLK_PROBE`.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(drv_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, drv_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// `DRV_BLK_PROBE` demo opcode: builds a real `DriverRequest::Probe`.
+pub fn drv_blk_probe_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let msg = ipc_protocol::codec::encode_driver_request(&ipc_protocol::DriverRequest::Probe);
+    // SAFETY: `spawn_virtio_blk_driver` has already run by the time any
+    // `.user_text` code can reach this opcode (it needs `ep_cap`, which
+    // only that function's own return value provides).
+    unsafe { write_shared_drv_message(&msg) };
+    drv_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DriverResponse` for `drv_blk_probe_call`. Returns
+/// `(sector_size, sector_count)`, or `(u32::MAX, u64::MAX)` on any
+/// error/decode failure.
+pub fn drv_blk_probe_result() -> (u32, u64) {
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    let msg = unsafe { read_shared_drv_message() };
+    match ipc_protocol::codec::decode_driver_response(&msg) {
+        Ok(ipc_protocol::DriverResponse::Ready { sector_size, sector_count }) => {
+            (sector_size, sector_count)
+        }
+        _ => (u32::MAX, u64::MAX),
+    }
+}
+
+/// `DRV_BLK_WRITE` demo opcode: builds a real `DriverRequest::WriteBlocks`
+/// for one sector at `lba`, placing `DRV_DEMO_WRITE_DATA` into the
+/// shared region's own data buffer first (mirrors `fs_write_call`'s own
+/// `G_FS_DATA_PHYS` write).
+pub fn drv_blk_write_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, lba: u64) -> Option<IpcSwitch> {
+    // SAFETY: `G_DRV_QUEUE_PHYS` was set once by `spawn_virtio_blk_
+    // driver`, before any `drv_blk_write_call` can be reached; identity-
+    // mapped for kernel-mode access like every other physical cross-
+    // check in this file.
+    unsafe {
+        let base = (core::ptr::addr_of!(G_DRV_QUEUE_PHYS).read()
+            + driver_virtio_blk::layout::DATA_OFFSET) as *mut u8;
+        core::ptr::copy_nonoverlapping(DRV_DEMO_WRITE_DATA.as_ptr(), base, DRV_DEMO_WRITE_DATA.len());
+    }
+    let req = ipc_protocol::DriverRequest::WriteBlocks {
+        lba,
+        sector_count: 1,
+        shared_cap: 0, // unused by this MVP's driver — see driver_virtio_blk's own module doc comment
+    };
+    let msg = ipc_protocol::codec::encode_driver_request(&req);
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    unsafe { write_shared_drv_message(&msg) };
+    drv_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DriverResponse` for `drv_blk_write_call`. Returns the
+/// sector count written, or `usize::MAX` on any error/decode failure.
+pub fn drv_blk_write_result() -> usize {
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    let msg = unsafe { read_shared_drv_message() };
+    match ipc_protocol::codec::decode_driver_response(&msg) {
+        Ok(ipc_protocol::DriverResponse::Completed { sectors }) => sectors as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `DRV_BLK_READ` demo opcode: builds a real `DriverRequest::ReadBlocks`
+/// for one sector at `lba`.
+pub fn drv_blk_read_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, lba: u64) -> Option<IpcSwitch> {
+    let req = ipc_protocol::DriverRequest::ReadBlocks {
+        lba,
+        sector_count: 1,
+        shared_cap: 0,
+    };
+    let msg = ipc_protocol::codec::encode_driver_request(&req);
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    unsafe { write_shared_drv_message(&msg) };
+    drv_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DriverResponse` for `drv_blk_read_call`, and checks
+/// the sector data read back matches `DRV_DEMO_WRITE_DATA` (proving a
+/// real Write->Read round trip through actual virtio-mmio hardware).
+/// Returns the sector count read, or `usize::MAX` on any error/decode
+/// failure.
+pub fn drv_blk_read_result() -> usize {
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    let msg = unsafe { read_shared_drv_message() };
+    let sectors = match ipc_protocol::codec::decode_driver_response(&msg) {
+        Ok(ipc_protocol::DriverResponse::Completed { sectors }) => sectors as usize,
+        _ => return usize::MAX,
+    };
+    // SAFETY: same contract as `drv_blk_write_call`'s own read of
+    // `G_DRV_QUEUE_PHYS`.
+    let matches = unsafe {
+        let base = (core::ptr::addr_of!(G_DRV_QUEUE_PHYS).read()
+            + driver_virtio_blk::layout::DATA_OFFSET) as *const u8;
+        sectors == 1
+            && core::slice::from_raw_parts(base, DRV_DEMO_WRITE_DATA.len()) == DRV_DEMO_WRITE_DATA
+    };
+    klog!(
+        "drv_blk_read_result: real Write->Read round-trip through virtio-blk's own virtqueue (03 5.1) -> {}\r\n",
+        if matches { "MATCH, real MMIO + descriptor ring" } else { "MISMATCH" }
+    );
+    sectors
+}
+
+/// Fixed demo payload `drv_blk_write_call` writes and `drv_blk_read_
+/// result` verifies — same role as `FS_DEMO_WRITE_DATA`.
+const DRV_DEMO_WRITE_DATA: &[u8] = b"hello from root, virtio-blk demo!";
+
 /// Busy-park forever. The in-kernel demo threads have nothing to return
 /// to once their part is done; a real service would loop on `Recv`.
 fn park() -> ! {

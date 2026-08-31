@@ -72,6 +72,17 @@ pub const MAX_NOTIFICATIONS: usize = 48;
 /// Maximum `SharedRegion` objects (§5.2).
 pub const MAX_SHARED_REGIONS: usize = 32;
 
+/// Maximum `MmioRegion` objects (03 §2.1, §5.1). One per device the boot-
+/// time HAL peripheral scan discovers; matches
+/// `hal_manifest::raw::MAX_PERIPHERAL_DEVICES`.
+pub const MAX_MMIO_REGIONS: usize = hal_manifest::raw::MAX_PERIPHERAL_DEVICES;
+
+/// Number of hardware IRQ lines the kernel's IRQ->Notification binding
+/// table can track simultaneously (03 §2.1: one binding per granted
+/// driver). Set well above `MAX_MMIO_REGIONS` since a real platform's IRQ
+/// numbering is sparse, not a dense 0..N matching device count.
+pub const MAX_IRQ_BINDINGS: usize = 64;
+
 /// Blocked-thread queue depth on each endpoint (the `Q` of `Endpoint`).
 pub const ENDPOINT_QUEUE: usize = 8;
 

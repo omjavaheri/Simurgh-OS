@@ -17,10 +17,21 @@ version.workspace    = true
 authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
+build = "build.rs"
 
 [lib]
 crate-type = ["rlib"]
 
+[[bin]]
+name = "driver-virtio-blk-bin"
+path = "src/bin/driver-virtio-blk-bin.rs"
+# Same reasoning as device-manager-bin's own `[[bin]]`: a host `cargo
+# test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
 [dependencies]
 driver-framework = { path = "../driver-framework" }
 ipc-protocol     = { path = "../../../ipc-protocol" }
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly, same reasoning as fs-native's own dependency on it.
+kernel-ipc       = { path = "../../../kernel/kernel-ipc" }

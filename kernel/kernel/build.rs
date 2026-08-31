@@ -96,4 +96,29 @@ fn main() {
         "cargo:rustc-env=FS_NATIVE_ELF_PATH={}",
         fs_path.canonicalize().unwrap().display()
     );
+
+    // Same as above, for `driver-virtio-blk-bin` (03-Kernel-Subsystems-
+    // Layer.md §5.1) — the third real subsystem process.
+    let drv_build_alias = format!("cargo xbuild-subsystem-driver-virtio-blk-{target_arch}");
+    let drv_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("driver-virtio-blk-bin");
+
+    if !drv_path.exists() {
+        panic!(
+            "kernel build.rs: driver-virtio-blk-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {drv_build_alias}",
+            drv_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", drv_path.display());
+    println!(
+        "cargo:rustc-env=DRIVER_VIRTIO_BLK_ELF_PATH={}",
+        drv_path.canonicalize().unwrap().display()
+    );
 }

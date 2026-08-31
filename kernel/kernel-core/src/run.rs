@@ -251,6 +251,34 @@ mod tests {
         }
     }
 
+    struct MockInterrupt;
+    impl hal_core::interrupt::InterruptController for MockInterrupt {
+        fn register_irq(
+            &self,
+            _irq: hal_core::interrupt::IrqId,
+            _handler: hal_core::interrupt::IrqHandler,
+        ) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn unregister_irq(&self, _irq: hal_core::interrupt::IrqId) {}
+        fn mask_irq(&self, _irq: hal_core::interrupt::IrqId) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn unmask_irq(&self, _irq: hal_core::interrupt::IrqId) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn send_ipi(&self, _target_core: usize, _vector: u8) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn irq_line_count(&self) -> u32 {
+            64
+        }
+        fn ipi_target_core_count(&self) -> u32 {
+            1
+        }
+        fn end_of_interrupt(&self, _irq: hal_core::interrupt::IrqId) {}
+    }
+
     fn boot() -> BootInfo {
         let mut m = HardwareManifestRaw::zeroed();
         m.cpu_core_count = 1;
@@ -277,7 +305,8 @@ mod tests {
         let mut k = KernelState::from_boot_info(&boot()).unwrap();
         let cpu = MockCpu { switches: Cell::new(0) };
         let timer = MockTimer { now: Cell::new(1000) };
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let irqc = MockInterrupt;
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
 
         // Root Task exists and is Runnable, but entry == 0 (no image).
         assert_eq!(
@@ -301,7 +330,8 @@ mod tests {
         }
         let cpu = MockCpu { switches: Cell::new(0) };
         let timer = MockTimer { now: Cell::new(2000) };
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let irqc = MockInterrupt;
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
 
         let out = k.schedule_step(&hal);
         assert_eq!(

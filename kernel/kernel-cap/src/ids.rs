@@ -113,3 +113,12 @@ kernel_id! {
     /// (02-Microkernel-Layer.md §4.3).
     ChainGroupId
 }
+
+kernel_id! {
+    /// Id of an `MmioRegion` object — a device's physical MMIO transport
+    /// window plus its IRQ line, granted (not `Retype`d — the physical
+    /// address is a fixed hardware fact, not carved from a pool of
+    /// general `UntypedMemory`) to exactly one driver process
+    /// (03-Kernel-Subsystems-Layer.md §2.1, §5.1).
+    MmioRegionId
+}

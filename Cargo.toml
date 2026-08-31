@@ -90,6 +90,50 @@ panic = "abort"
 [profile.dev.package.device-manager]
 opt-level = 2
 
+# Same rationale class as `device-manager`'s own override above, a
+# DIFFERENT symptom: `kernel`'s own `umode_root` (riscv64) issues MANY
+# sequential `raw_syscall`/`raw_syscall2` calls across one long function
+# body (the whole boot-time demo sequence). At `opt-level = 0`, LLVM's
+# naive one-stack-slot-per-variable allocation can reuse a stale slot
+# across calls that are far apart in the SAME function once enough
+# other code exists in that function — confirmed via a diagnostic print
+# (kernel-arch-glue's `fs_ipc_call`/`fs_open_result`): adding new,
+# LATER `raw_syscall` calls to `umode_root` (03-Kernel-Subsystems-
+# Layer.md §5.1's own virtio-blk demo) silently corrupted the `path_id`
+# argument of an EARLIER `FS_OPEN` call (decoded a real, well-formed
+# `BadPath` response instead of the correct path), even though the new
+# calls are semantically unrelated and conditionally skipped at
+# runtime — the SAME "stack-slot reuse" bug class `raw_syscall`'s own
+# `#[inline(never)]` and the `zero!()` macro already exist to work
+# around for LITERAL arguments, just not fully covered by those alone
+# once the function grows large enough. `opt-level = 2` makes LLVM's
+# real register allocator run (proper liveness tracking, no naive
+# reuse) — `#[inline(never)]`/`#[link_section = ".user_text"]` are
+# explicit annotations LLVM honors at any optimization level, so this
+# does not reintroduce the FAR-CALL-fault class `device-manager`'s own
+# override exists for.
+[profile.dev.package.kernel]
+opt-level = 2
+
+# A separate, confirmed instance of the same "opt-level 0 miscompiles
+# this" class `kernel`'s own override above exists for — different
+# code shape, same root cause. `VirtioBlk::wait_for_completion`'s own
+# busy-poll (`subsystems/drivers/driver-virtio-blk/src/lib.rs`) is a
+# small, genuinely bounded `for _ in 0..MAX_SPINS` loop reading one
+# volatile `u16` through `self.queue_base` each iteration; at `opt-level
+# = 0` it never terminated even with `MAX_SPINS` set as low as 2,000
+# (confirmed by temporarily shrinking the bound and observing no
+# completion within the same wall-clock budget that, at `opt-level = 2`,
+# comfortably completes it) — `opt-level = 2` fixed it. Unrelated to the
+# ACTUAL virtio-mmio bug this driver also needed diagnosed and fixed
+# separately (this host's QEMU defaults `-device virtio-blk-device` to
+# the LEGACY virtio-mmio transport, which this driver's register map
+# does not speak — see `probe`'s own `VIRTIO_MMIO_VERSION_MODERN` check
+# and IMPLEMENTATION-PLAN.md's own note on the `-global virtio-mmio.
+# force-legacy=off` QEMU flag this driver requires).
+[profile.dev.package.driver-virtio-blk]
+opt-level = 2
+
 [profile.release]
 panic         = "abort"
 lto           = true

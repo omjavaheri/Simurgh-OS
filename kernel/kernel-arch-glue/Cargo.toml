@@ -36,3 +36,8 @@ elf-loader   = { path = "../../elf-loader" }
 # The real FsRequest/FsResponse codec (fs-native's own real IPC demo) —
 # `#![no_std]`, no `alloc` (matches this crate's own constraint).
 ipc-protocol = { path = "../../ipc-protocol" }
+# `driver_virtio_blk::layout`'s own offset constants only — pure data,
+# no architecture-specific code path (this crate never references
+# `driver_virtio_blk::subsystem_entry`, the one `#[cfg(target_arch)]`-
+# gated module in that crate).
+driver-virtio-blk = { path = "../../subsystems/drivers/driver-virtio-blk" }

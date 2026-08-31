@@ -26,8 +26,8 @@ use crate::state::KernelState;
 use crate::tcb::ThreadState;
 use hal_core::{HalInterface, MapPermissions, PhysAddr, VirtAddr};
 use kernel_cap::{
-    CapId, CapTableError, Capability, CapabilityRights, KernelObjectKind, ObjectId, ObjectRef,
-    PageTableId, ThreadId, UntypedId,
+    CapId, CapTableError, Capability, CapabilityRights, KernelObjectKind, MmioRegionId,
+    NotificationId, ObjectId, ObjectRef, PageTableId, ThreadId, UntypedId,
 };
 use kernel_ipc::fastpath::{fast_path_eligible, FastPathDecision};
 use kernel_ipc::{EndpointError, IpcError, RecvOutcome, SendOutcome, SharedRegion, SmallMessage};
@@ -118,13 +118,62 @@ pub enum SyscallOp {
     Map {
         /// A `PageTable` (address-space-root) capability.
         page_table: CapId,
-        /// The frame to map (an `UntypedMemory` capability in this MVP
-        /// model — one page of it).
+        /// The frame to map: either an `UntypedMemory` capability (one
+        /// page of RAM, the original MVP model) or an `MmioRegion`
+        /// capability (a device's transport window, 03 §2.1) — resolved
+        /// by the capability's actual stored kind, not by a separate
+        /// flag.
         frame: CapId,
         /// Virtual address to map at (page-aligned).
         vaddr: VirtAddr,
         /// Mapping permissions.
         perms: MapPermissions,
+    },
+    /// Signals `notification`, OR-ing `bits` into its sticky signal word
+    /// and waking every thread currently blocked in `Wait` on it (02
+    /// §5.1). Requires `WRITE`. Always succeeds once the capability
+    /// resolves.
+    Signal {
+        /// A `Notification` capability.
+        notification: CapId,
+        /// Bits to OR into the signal word (badge/IRQ-line encoded by
+        /// the caller — the kernel never interprets them).
+        bits: u64,
+    },
+    /// Consumes and returns the current signal bits if any are pending;
+    /// otherwise blocks the caller until the next `Signal` (02 §5.1).
+    /// Requires `READ`.
+    Wait {
+        /// A `Notification` capability.
+        notification: CapId,
+    },
+    /// Consumes and returns the current signal bits without blocking —
+    /// `0` if nothing is pending (02 §5.1). Requires `READ`.
+    Poll {
+        /// A `Notification` capability.
+        notification: CapId,
+    },
+    /// Binds the IRQ line named by the `MmioRegion` capability `mmio` to
+    /// `notification`, and installs `handler` with the platform's
+    /// `InterruptController` so a real hardware interrupt on that line
+    /// signals it (03 §2.1: "صدور Capability محدود به هر درایور: فقط IRQ
+    /// همان دستگاه" — holding `mmio` is what authorizes binding exactly
+    /// its own IRQ, never an arbitrary line number). Requires `WRITE` on
+    /// both `mmio` and `notification`.
+    IrqBind {
+        /// An `MmioRegion` capability — its own `irq` field is the line
+        /// bound, not a separate caller-supplied number.
+        mmio: CapId,
+        /// A `Notification` capability to signal when the line fires.
+        notification: CapId,
+        /// The trampoline the platform's `InterruptController` invokes
+        /// directly from interrupt context. A plain function pointer
+        /// (no captured state, per `hal_core::interrupt::IrqHandler`'s
+        /// own doc comment) supplied by the caller (`kernel-arch-glue`),
+        /// which is the only layer that knows a concrete trampoline
+        /// address — `kernel-core` must not name one itself (that would
+        /// invert the crate dependency direction).
+        handler: hal_core::interrupt::IrqHandler,
     },
 }
 
@@ -208,6 +257,13 @@ pub enum SyscallError {
     /// `Reply { to, .. }` named a thread that is not (or is no longer)
     /// `BlockedOnReply` — nothing to wake.
     NotBlockedOnReply,
+    /// A `Notification` operation failed (currently only `Wait`'s
+    /// waiter-list-full case).
+    Notify(kernel_ipc::NotificationError),
+    /// `IrqBind`'s `hal.register_irq` call was rejected by the platform
+    /// `InterruptController` (an out-of-range line, or one already
+    /// registered to a different handler).
+    IrqRegistrationFailed,
     /// The requested operation is not implemented in this MVP.
     Unsupported,
 }
@@ -225,6 +281,11 @@ impl From<MmError> for SyscallError {
 impl From<IpcError> for SyscallError {
     fn from(e: IpcError) -> Self {
         SyscallError::Ipc(e)
+    }
+}
+impl From<kernel_ipc::NotificationError> for SyscallError {
+    fn from(e: kernel_ipc::NotificationError) -> Self {
+        SyscallError::Notify(e)
     }
 }
 impl From<EndpointError> for SyscallError {
@@ -330,6 +391,17 @@ impl KernelState {
             SyscallOp::Call { endpoint, msg } => self.do_send(caller, endpoint, msg, true, now_ns),
             SyscallOp::Recv { endpoint } => self.do_recv(caller, endpoint, now_ns),
             SyscallOp::Reply { to, msg } => self.do_reply(caller, to, msg, now_ns),
+
+            SyscallOp::Signal { notification, bits } => {
+                self.do_signal(caller, notification, bits, now_ns)
+            }
+            SyscallOp::Wait { notification } => self.do_wait(caller, notification),
+            SyscallOp::Poll { notification } => self.do_poll(caller, notification),
+            SyscallOp::IrqBind {
+                mmio,
+                notification,
+                handler,
+            } => self.do_irq_bind(caller, mmio, notification, handler, hal),
         }
     }
 
@@ -507,8 +579,15 @@ impl KernelState {
             KernelObjectKind::PageTable,
             CapabilityRights::WRITE,
         )?;
-        // In this MVP model a "frame" is one page of an UntypedMemory
-        // object; require rights on it matching the mapping.
+        // In this MVP model a "frame" is either one page of an
+        // UntypedMemory object (RAM) or an entire MmioRegion (a device's
+        // transport window, 03 §2.1) — resolved by the capability's own
+        // stored kind rather than a separate flag; both currently map as
+        // exactly one PAGE_SIZE region (every MmioRegion this kernel
+        // mints today — virtio-mmio on riscv64 — is itself exactly one
+        // page; a multi-page window would need a real generalization
+        // here, not needed by any MVP driver yet). Require rights on it
+        // matching the mapping.
         let need = if perms.executable {
             CapabilityRights::READ | CapabilityRights::EXECUTE
         } else if perms.writable {
@@ -516,12 +595,25 @@ impl KernelState {
         } else {
             CapabilityRights::READ
         };
-        let fr = self.resolve(caller, frame, KernelObjectKind::UntypedMemory, need)?;
-        let uid = UntypedId::new(fr.object.id.as_u32());
-        let frame_phys = self
-            .untyped_mut(uid)
-            .ok_or(SyscallError::BadCap)?
-            .base();
+        let cs_id = self.tcb(caller).ok_or(SyscallError::NoCaller)?.cap_space;
+        let fr = {
+            let cs = self.cap_space(cs_id).ok_or(SyscallError::NoCaller)?;
+            *cs.lookup(frame).ok_or(SyscallError::BadCap)?
+        };
+        if !fr.allows(need) {
+            return Err(SyscallError::InsufficientRights);
+        }
+        let frame_phys = match fr.object.kind {
+            KernelObjectKind::UntypedMemory => {
+                let uid = UntypedId::new(fr.object.id.as_u32());
+                self.untyped_mut(uid).ok_or(SyscallError::BadCap)?.base()
+            }
+            KernelObjectKind::MmioRegion => {
+                let mid = MmioRegionId::new(fr.object.id.as_u32());
+                PhysAddr::new(self.mmio_region(mid).ok_or(SyscallError::BadCap)?.phys_base as usize)
+            }
+            _ => return Err(SyscallError::WrongObjectKind),
+        };
 
         let as_id = PageTableId::new(pt.object.id.as_u32());
         let root_phys = {
@@ -562,6 +654,102 @@ impl KernelState {
         }
 
         Ok(SyscallReturn::Mapped)
+    }
+
+    /// `SyscallOp::Signal`.
+    fn do_signal(
+        &mut self,
+        caller: ThreadId,
+        notification: CapId,
+        bits: u64,
+        now_ns: u64,
+    ) -> Result<SyscallReturn, SyscallError> {
+        let cap = self.resolve(
+            caller,
+            notification,
+            KernelObjectKind::Notification,
+            CapabilityRights::WRITE,
+        )?;
+        let nid = NotificationId::new(cap.object.id.as_u32());
+        let woken = self
+            .notification_mut(nid)
+            .ok_or(SyscallError::BadCap)?
+            .signal(bits);
+        for &tid in woken.as_slice() {
+            self.wake_blocked(tid, now_ns);
+        }
+        Ok(SyscallReturn::Done)
+    }
+
+    /// `SyscallOp::Wait` — consumes and returns pending bits immediately
+    /// if any are set; otherwise blocks the caller (`Notification::wait`'s
+    /// own contract: only call it when `poll` would return `0`).
+    fn do_wait(
+        &mut self,
+        caller: ThreadId,
+        notification: CapId,
+    ) -> Result<SyscallReturn, SyscallError> {
+        let cap = self.resolve(
+            caller,
+            notification,
+            KernelObjectKind::Notification,
+            CapabilityRights::READ,
+        )?;
+        let nid = NotificationId::new(cap.object.id.as_u32());
+        let notif = self.notification_mut(nid).ok_or(SyscallError::BadCap)?;
+        let bits = notif.poll();
+        if bits != 0 {
+            return Ok(SyscallReturn::Value(bits));
+        }
+        notif.wait(caller)?;
+        Ok(SyscallReturn::Blocked)
+    }
+
+    /// `SyscallOp::Poll` — never blocks.
+    fn do_poll(
+        &mut self,
+        caller: ThreadId,
+        notification: CapId,
+    ) -> Result<SyscallReturn, SyscallError> {
+        let cap = self.resolve(
+            caller,
+            notification,
+            KernelObjectKind::Notification,
+            CapabilityRights::READ,
+        )?;
+        let nid = NotificationId::new(cap.object.id.as_u32());
+        let bits = self.notification_mut(nid).ok_or(SyscallError::BadCap)?.poll();
+        Ok(SyscallReturn::Value(bits))
+    }
+
+    /// `SyscallOp::IrqBind`.
+    fn do_irq_bind(
+        &mut self,
+        caller: ThreadId,
+        mmio: CapId,
+        notification: CapId,
+        handler: hal_core::interrupt::IrqHandler,
+        hal: &HalInterface,
+    ) -> Result<SyscallReturn, SyscallError> {
+        let mmio_cap = self.resolve(caller, mmio, KernelObjectKind::MmioRegion, CapabilityRights::WRITE)?;
+        let mid = MmioRegionId::new(mmio_cap.object.id.as_u32());
+        let irq = self.mmio_region(mid).ok_or(SyscallError::BadCap)?.irq;
+
+        let notif_cap = self.resolve(
+            caller,
+            notification,
+            KernelObjectKind::Notification,
+            CapabilityRights::WRITE,
+        )?;
+        let nid = NotificationId::new(notif_cap.object.id.as_u32());
+
+        if !self.bind_irq(irq, nid) {
+            return Err(SyscallError::ObjectTableFull);
+        }
+        if !hal.register_irq(irq, handler) {
+            return Err(SyscallError::IrqRegistrationFailed);
+        }
+        Ok(SyscallReturn::Done)
     }
 
     fn do_send(
@@ -820,13 +1008,45 @@ mod tests {
         }
     }
 
-    // `build_interface`'s `cpu`/`timer` refs must outlive the
+    /// Always-succeeds `InterruptController` double: no test in this
+    /// module exercises real IRQ delivery hardware, only `IrqBind`'s
+    /// kernel-side bookkeeping (binding table + the `register_irq` call
+    /// itself succeeding).
+    struct MockInterrupt;
+    impl hal_core::interrupt::InterruptController for MockInterrupt {
+        fn register_irq(
+            &self,
+            _irq: hal_core::interrupt::IrqId,
+            _handler: hal_core::interrupt::IrqHandler,
+        ) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn unregister_irq(&self, _irq: hal_core::interrupt::IrqId) {}
+        fn mask_irq(&self, _irq: hal_core::interrupt::IrqId) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn unmask_irq(&self, _irq: hal_core::interrupt::IrqId) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn send_ipi(&self, _target_core: usize, _vector: u8) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn irq_line_count(&self) -> u32 {
+            64
+        }
+        fn ipi_target_core_count(&self) -> u32 {
+            1
+        }
+        fn end_of_interrupt(&self, _irq: hal_core::interrupt::IrqId) {}
+    }
+
+    // `build_interface`'s `cpu`/`timer`/`interrupt` refs must outlive the
     // `HalInterface` it returns, so this returns owned values for each
     // test to bind as locals before building its own `hal` — kernel-core
     // is `#![no_std]` with no `alloc`, so no `Box::leak` shortcut (same
     // pattern `run.rs`'s tests already use).
-    fn mock_hal_pair() -> (MockCpu, MockTimer) {
-        (MockCpu, MockTimer)
+    fn mock_hal_pair() -> (MockCpu, MockTimer, MockInterrupt) {
+        (MockCpu, MockTimer, MockInterrupt)
     }
 
     fn kernel() -> KernelState {
@@ -855,8 +1075,8 @@ mod tests {
     fn retype_untyped_into_endpoint_gives_new_cap() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         // The Root Task's first capability (slot 0) is an UntypedMemory cap.
         let r = k
             .dispatch(
@@ -890,8 +1110,8 @@ mod tests {
     fn retype_untyped_into_shared_region_gives_new_cap() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         let r = k
             .dispatch(
                 caller,
@@ -920,12 +1140,200 @@ mod tests {
         }
     }
 
+    /// Like `kernel()`, but the manifest also reports one `Block`-kind
+    /// peripheral device, so `populate_from_boot_info`'s Step 3c seeds
+    /// `root_mmio_blk_cap` — the boot-time-only path an `MmioRegion`
+    /// capability can come from (never `Retype`, see
+    /// `MmioRegionDescriptor`'s own doc comment).
+    fn kernel_with_mmio_blk() -> KernelState {
+        let mut m = HardwareManifestRaw::zeroed();
+        m.cpu_core_count = 1;
+        m.push_memory_region(MemoryRegionRaw::new(
+            0x100_0000,
+            32 * 1024 * 1024,
+            MemoryRegionKindRaw::Usable,
+            false,
+        ))
+        .unwrap();
+        m.timer = TimerInfoRaw::new(TimerKindRaw::Tsc, 1_000_000_000, false);
+        let _ = m.push_peripheral_device(hal_manifest::raw::PeripheralDeviceRaw::new(
+            hal_manifest::raw::PeripheralKindRaw::Block,
+            0x1000_1000,
+            0x1000,
+            7,
+        ));
+        let boot = BootInfo::new(
+            BootProtocol::Uefi,
+            m,
+            0x1000,
+            (0x10_0000, 0x20_0000),
+            (0x20_0000, 0x21_0000),
+            0,
+        );
+        KernelState::from_boot_info(&boot).unwrap()
+    }
+
+    #[test]
+    fn boot_seeds_mmio_region_cap_for_the_discovered_block_device() {
+        let k = kernel_with_mmio_blk();
+        assert_ne!(k.root_mmio_blk_cap, CapId::new(u32::MAX));
+        let c = k
+            .resolve(
+                k.root_thread,
+                k.root_mmio_blk_cap,
+                KernelObjectKind::MmioRegion,
+                CapabilityRights::READ,
+            )
+            .unwrap();
+        let region = k
+            .mmio_region(kernel_cap::MmioRegionId::new(c.object.id.as_u32()))
+            .unwrap();
+        assert_eq!(region.phys_base, 0x1000_1000);
+        assert_eq!(region.size, 0x1000);
+        assert_eq!(region.irq, 7);
+    }
+
+    #[test]
+    fn map_accepts_an_mmio_region_frame() {
+        let mut k = kernel_with_mmio_blk();
+        let caller = k.root_thread;
+        let mmio_cap = k.root_mmio_blk_cap;
+        let pt_cap = k.root_page_table_cap;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Map {
+                page_table: pt_cap,
+                frame: mmio_cap,
+                vaddr: VirtAddr::new(0x9000_0000),
+                perms: MapPermissions {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                    device_uncached: true,
+                },
+            },
+            &hal,
+        );
+        assert_eq!(r, Ok(SyscallReturn::Mapped));
+    }
+
+    #[test]
+    fn signal_wakes_a_waiting_thread() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let notif_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Notification,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // Nothing pending yet: Wait blocks the caller.
+        let r = k.dispatch(caller, 0, SyscallOp::Wait { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Blocked));
+
+        // Signal wakes it: `wake_blocked` marks `caller` Ready again.
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Signal { notification: notif_cap, bits: 0b101 },
+            &hal,
+        );
+        assert_eq!(r, Ok(SyscallReturn::Done));
+        assert_eq!(
+            k.sched.entity(caller).unwrap().state,
+            kernel_sched::RunState::Ready
+        );
+
+        // Now Poll/Wait see the (sticky) bits without blocking, and
+        // consume them.
+        let r = k.dispatch(caller, 0, SyscallOp::Poll { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Value(0b101)));
+        let r = k.dispatch(caller, 0, SyscallOp::Poll { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Value(0)));
+    }
+
+    #[test]
+    fn irq_bind_requires_mmio_and_notification_caps_and_registers_with_hal() {
+        let mut k = kernel_with_mmio_blk();
+        let caller = k.root_thread;
+        let mmio_cap = k.root_mmio_blk_cap;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let notif_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Notification,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::IrqBind {
+                mmio: mmio_cap,
+                notification: notif_cap,
+                handler: dummy_irq_handler,
+            },
+            &hal,
+        );
+        assert_eq!(r, Ok(SyscallReturn::Done));
+        assert_eq!(k.notification_for_irq(7), Some(kernel_cap::NotificationId::new(
+            k.resolve(caller, notif_cap, KernelObjectKind::Notification, CapabilityRights::READ)
+                .unwrap()
+                .object
+                .id
+                .as_u32(),
+        )));
+
+        // Wrong-kind caps are rejected: naming the notification cap as
+        // `mmio` (or vice versa) must not silently succeed.
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::IrqBind {
+                mmio: notif_cap,
+                notification: notif_cap,
+                handler: dummy_irq_handler,
+            },
+            &hal,
+        );
+        assert_eq!(r, Err(SyscallError::WrongObjectKind));
+    }
+
+    fn dummy_irq_handler(_irq: hal_core::interrupt::IrqId) {}
+
     #[test]
     fn revoke_requires_revoke_right_and_frees_slots() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         // Make an endpoint, then revoke the untyped it came from — the
         // untyped root cap has full rights (incl. REVOKE).
         k.dispatch(
@@ -949,8 +1357,8 @@ mod tests {
     fn bad_cap_is_rejected() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         let e = k.dispatch(caller, 0, SyscallOp::CapRevoke { cap: CapId::new(99) }, &hal);
         assert_eq!(e, Err(SyscallError::BadCap));
     }
@@ -959,8 +1367,8 @@ mod tests {
     fn yield_reports_reschedule() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         // Root task must be dispatched first for account() to have work.
         k.sched.dispatch(caller, 0).unwrap();
         let r = k.dispatch(caller, 1_000_000, SyscallOp::Yield, &hal).unwrap();
@@ -971,8 +1379,8 @@ mod tests {
     fn map_installs_hardware_ptes_when_a_pool_is_present() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
 
         // Retype a PageTable and a frame from the Root Task's first untyped.
         let pt_cap = match k
@@ -1068,8 +1476,8 @@ mod tests {
 
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
 
         let ep_cap = match k
             .dispatch(
@@ -1138,8 +1546,8 @@ mod tests {
 
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
 
         let ep_cap = match k
             .dispatch(
@@ -1185,8 +1593,8 @@ mod tests {
 
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
 
         let ep_cap = match k
             .dispatch(
@@ -1245,8 +1653,8 @@ mod tests {
     fn reply_to_non_blocked_thread_is_rejected() {
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
 
         // `bystander` was never Called nor is it BlockedOnReply.
         let bystander = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();

@@ -1,0 +1,43 @@
+//! ============================================================================
+//! driver-virtio-blk-bin
+//!
+//! Purpose: this crate's REAL, separately-built process image — the
+//! "subsystems as processes" packaging, mirroring `device-manager-bin`/
+//! `fs-native-bin` exactly (see either's own doc comment for the full
+//! rationale). `kernel-arch-glue::spawn_virtio_blk_driver` loads this
+//! ELF into a fresh, isolated process via `spawn_process_from_elf`.
+//!
+//! Architecture reference: 03-Kernel-Subsystems-Layer.md §5.1 (virtio-blk
+//! over MMIO on QEMU is the named acceptance device).
+//!
+//! Position in the system: the ONLY thing this file does is provide the
+//! ELF entry point (`_start`) and this binary's own `#[panic_handler]`.
+//! All real logic stays in `driver_virtio_blk::subsystem_entry::
+//! subsystem_main`. No `alloc`/heap — unlike `fs-native-bin`, this
+//! driver's virtqueue and request state are fixed-size, so it needs no
+//! global allocator (same reasoning as `device-manager-bin`'s own
+//! allocator-free choice).
+//!
+//! Safety/invariants: no stack/`.bss` setup of its own — see
+//! `device-manager-bin`'s own doc comment for why `_start` is reached
+//! with both already valid.
+//! ============================================================================
+#![no_std]
+#![no_main]
+
+/// Entry point named to match this crate's own minimal linker script
+/// (`ENTRY(_start)`, `subsystem-bin-<arch>.ld`).
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    driver_virtio_blk::subsystem_entry::subsystem_main()
+}
+
+/// This binary's own, mandatory panic handler — see `device-manager-
+/// bin`'s own doc comment on why a separately-linked `[[bin]]` needs one
+/// where the library crate's own modules did not.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}

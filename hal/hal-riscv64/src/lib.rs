@@ -223,7 +223,7 @@ pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) ->
         "hal-riscv64 constructed an internally inconsistent BootInfo"
     );
 
-    let hal_interface = hal_core::build_interface(&hal.cpu, &hal.timer);
+    let hal_interface = hal_core::build_interface(&hal.cpu, &hal.timer, &hal.interrupt);
 
     extern "Rust" {
         fn kernel_main(hal: hal_core::HalInterface, boot_info: hal_core::BootInfo) -> !;

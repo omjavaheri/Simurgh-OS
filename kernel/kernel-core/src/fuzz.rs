@@ -99,6 +99,34 @@ impl TimerAbstraction for MockTimer {
     }
 }
 
+struct MockInterrupt;
+impl hal_core::interrupt::InterruptController for MockInterrupt {
+    fn register_irq(
+        &self,
+        _irq: hal_core::interrupt::IrqId,
+        _handler: hal_core::interrupt::IrqHandler,
+    ) -> Result<(), HalError> {
+        Ok(())
+    }
+    fn unregister_irq(&self, _irq: hal_core::interrupt::IrqId) {}
+    fn mask_irq(&self, _irq: hal_core::interrupt::IrqId) -> Result<(), HalError> {
+        Ok(())
+    }
+    fn unmask_irq(&self, _irq: hal_core::interrupt::IrqId) -> Result<(), HalError> {
+        Ok(())
+    }
+    fn send_ipi(&self, _target_core: usize, _vector: u8) -> Result<(), HalError> {
+        Ok(())
+    }
+    fn irq_line_count(&self) -> u32 {
+        64
+    }
+    fn ipi_target_core_count(&self) -> u32 {
+        1
+    }
+    fn end_of_interrupt(&self, _irq: hal_core::interrupt::IrqId) {}
+}
+
 /// splitmix64 — a small, dependency-free, non-cryptographic PRNG. Fast
 /// and spreads bits well enough over many iterations to hit boundary
 /// values (0, near `u32::MAX`) as well as the interior of each range.
@@ -193,11 +221,19 @@ fn random_message(rng: &mut Rng) -> SmallMessage {
     SmallMessage::from_words(label, &words[..n]).unwrap_or_else(|_| SmallMessage::new(label))
 }
 
-/// One pseudo-random `SyscallOp`, uniformly over all nine variants, with
-/// every field independently adversarial (see the field-level helpers
-/// above) — exactly the shape an untrusted layer-3 process controls.
+/// A fixed no-op `IrqHandler` for `random_op`'s `IrqBind` arm — the
+/// adversarial surface `IrqBind` exercises is the capability ids and
+/// the kernel-side binding-table/`register_irq` bookkeeping, not which
+/// code pointer is named (dispatch never calls through it; `MockInterrupt::
+/// register_irq` ignores its `handler` argument entirely).
+fn fuzz_irq_handler(_irq: hal_core::interrupt::IrqId) {}
+
+/// One pseudo-random `SyscallOp`, uniformly over all thirteen variants,
+/// with every field independently adversarial (see the field-level
+/// helpers above) — exactly the shape an untrusted layer-3 process
+/// controls.
 fn random_op(rng: &mut Rng, root: ThreadId) -> SyscallOp {
-    match rng.next_range(9) {
+    match rng.next_range(13) {
         0 => SyscallOp::Send {
             endpoint: random_cap_id(rng),
             msg: random_message(rng),
@@ -241,7 +277,7 @@ fn random_op(rng: &mut Rng, root: ThreadId) -> SyscallOp {
                 _ => u32::MAX - rng.next_range(4),
             },
         },
-        _ => SyscallOp::Map {
+        8 => SyscallOp::Map {
             page_table: random_cap_id(rng),
             frame: random_cap_id(rng),
             vaddr: VirtAddr::new(rng.next_u64() as usize),
@@ -251,6 +287,21 @@ fn random_op(rng: &mut Rng, root: ThreadId) -> SyscallOp {
                 executable: rng.next_bool(),
                 device_uncached: rng.next_bool(),
             },
+        },
+        9 => SyscallOp::Signal {
+            notification: random_cap_id(rng),
+            bits: rng.next_u64(),
+        },
+        10 => SyscallOp::Wait {
+            notification: random_cap_id(rng),
+        },
+        11 => SyscallOp::Poll {
+            notification: random_cap_id(rng),
+        },
+        _ => SyscallOp::IrqBind {
+            mmio: random_cap_id(rng),
+            notification: random_cap_id(rng),
+            handler: fuzz_irq_handler,
         },
     }
 }
@@ -269,8 +320,8 @@ fn syscall_dispatch_survives_random_malformed_input() {
         let root = state.root_thread;
         let root_cs = state.root_cap_space;
         let mut rng = Rng(seed);
-        let (cpu, timer) = (MockCpu, MockTimer);
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = (MockCpu, MockTimer, MockInterrupt);
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         // A fake pool (never dereferenced — `MockCpu`'s default
         // `map_range` ignores its args and always reports failure) so
         // `do_map`'s hardware-walk-then-rollback path actually runs

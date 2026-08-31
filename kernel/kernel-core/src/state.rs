@@ -24,10 +24,10 @@
 use crate::config::*;
 use crate::tcb::{Tcb, ThreadState};
 use hal_core::{BootInfo, VirtAddr};
-use hal_manifest::raw::MemoryRegionKindRaw;
+use hal_manifest::raw::{MemoryRegionKindRaw, PeripheralKindRaw};
 use kernel_cap::{
-    CapId, CapSpaceId, CapTable, Capability, EndpointId, KernelObjectKind, NotificationId,
-    ObjectId, ObjectRef, PageTableId, SharedRegionId, ThreadId, UntypedId,
+    CapId, CapSpaceId, CapTable, Capability, EndpointId, KernelObjectKind, MmioRegionId,
+    NotificationId, ObjectId, ObjectRef, PageTableId, SharedRegionId, ThreadId, UntypedId,
 };
 use kernel_ipc::{Endpoint, Notification, SharedRegion};
 use kernel_mm::{AddressSpace, UntypedMemory};
@@ -58,6 +58,25 @@ type KEndpoint = Endpoint<ENDPOINT_QUEUE>;
 type KNotification = Notification<NOTIF_WAITERS>;
 type KScheduler = Scheduler<MAX_THREADS, MAX_CHAIN_GROUPS>;
 
+/// One device's physical MMIO transport window + IRQ line (03
+/// §2.1, §5.1) — plain data describing an `MmioRegion` object.
+/// Unlike `SharedRegion`, never carved from `UntypedMemory`: `phys_base`
+/// is a fixed hardware fact the boot-time HAL peripheral scan reports
+/// (`hal_manifest::raw::PeripheralDeviceRaw`), not RAM from a general
+/// pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioRegionDescriptor {
+    /// Physical base address of the MMIO window.
+    pub phys_base: u64,
+    /// Size of the window in bytes.
+    pub size: u64,
+    /// The device's IRQ line, in this platform's own `IrqId` numbering
+    /// (as reported by `hal_manifest::raw::PeripheralDeviceRaw::irq` —
+    /// the HAL discovery code, not this crate, is responsible for that
+    /// translation).
+    pub irq: u32,
+}
+
 /// The entire mutable kernel state. One instance for the life of the
 /// system.
 pub struct KernelState {
@@ -67,6 +86,12 @@ pub struct KernelState {
     endpoints: [Option<KEndpoint>; MAX_ENDPOINTS],
     notifications: [Option<KNotification>; MAX_NOTIFICATIONS],
     shared_regions: [Option<SharedRegion>; MAX_SHARED_REGIONS],
+    mmio_regions: [Option<MmioRegionDescriptor>; MAX_MMIO_REGIONS],
+    /// IRQ line -> bound `Notification` (03 §2.1). Sparse, linear-scanned
+    /// (`MAX_IRQ_BINDINGS` is small): a hardware interrupt firing looks
+    /// up its bound notification here and signals it — see
+    /// `notification_for_irq` / `bind_irq`.
+    irq_bindings: [Option<(u32, NotificationId)>; MAX_IRQ_BINDINGS],
     tcbs: [Option<Tcb>; MAX_THREADS],
     /// The scheduler.
     pub sched: KScheduler,
@@ -85,6 +110,15 @@ pub struct KernelState {
     /// own space then always fails with `BadCap`, matching what an
     /// absent capability should do.
     pub root_page_table_cap: CapId,
+    /// The capability, in the Root Task's own cap space, naming the
+    /// FIRST `Block`-kind `MmioRegion` the boot-time HAL peripheral scan
+    /// discovered (`populate_from_boot_info`'s Step 3c) — MVP scope: this
+    /// project's only driver so far is virtio-blk, so only the block
+    /// device gets a boot-seeded capability; other kinds sit in the
+    /// manifest unused until a driver for them exists.
+    /// `CapId::new(u32::MAX)` if none was found or the cap space was
+    /// full, exactly mirroring `root_page_table_cap`'s own sentinel.
+    pub root_mmio_blk_cap: CapId,
     /// How many `UntypedMemory` objects the boot path created.
     pub untyped_count: u32,
 
@@ -171,6 +205,51 @@ impl KernelState {
         Some(SharedRegionId::new(i as u32))
     }
 
+    /// Directly seeds an `MmioRegion` object describing `descriptor`,
+    /// returning its id. Not a `Retype` target (see `MmioRegionDescriptor`'s
+    /// own doc comment) — called only from `populate_from_boot_info`'s
+    /// Step 3c, exactly as `root_addr_space` is `alloc_addr_space`d
+    /// directly rather than retyped.
+    pub fn alloc_mmio_region_direct(
+        &mut self,
+        descriptor: MmioRegionDescriptor,
+    ) -> Option<MmioRegionId> {
+        let i = self.mmio_regions.iter().position(|s| s.is_none())?;
+        self.mmio_regions[i] = Some(descriptor);
+        Some(MmioRegionId::new(i as u32))
+    }
+
+    /// Binds hardware `irq` to `notification` — a hardware interrupt on
+    /// this line signals that `Notification` object (03 §2.1). Called by
+    /// `SyscallOp::IrqBind`. Overwrites an existing binding for the same
+    /// `irq` (re-binding is the caller's choice to make, not an error
+    /// this table enforces — `hal_core::interrupt::InterruptController::
+    /// register_irq`'s own `IrqAlreadyRegistered` is the actual
+    /// one-handler-per-line enforcement point). Returns `false` if the
+    /// table is full and `irq` is not already bound.
+    pub fn bind_irq(&mut self, irq: u32, notification: NotificationId) -> bool {
+        if let Some(slot) = self.irq_bindings.iter_mut().find(|s| matches!(s, Some((i, _)) if *i == irq)) {
+            *slot = Some((irq, notification));
+            return true;
+        }
+        match self.irq_bindings.iter().position(|s| s.is_none()) {
+            Some(i) => {
+                self.irq_bindings[i] = Some((irq, notification));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The `Notification` bound to hardware `irq`, if any. Called from
+    /// the kernel-arch-glue-level IRQ trampoline registered via
+    /// `HalInterface::register_irq` to find who to `signal()`.
+    pub fn notification_for_irq(&self, irq: u32) -> Option<NotificationId> {
+        self.irq_bindings
+            .iter()
+            .find_map(|s| s.and_then(|(i, nid)| (i == irq).then_some(nid)))
+    }
+
     // ---- table accessors (used by syscall::dispatch) -------------
 
     /// Borrows a capability space.
@@ -208,6 +287,11 @@ impl KernelState {
     /// Borrows a `SharedRegion` object.
     pub fn shared_region(&self, id: SharedRegionId) -> Option<&SharedRegion> {
         self.shared_regions.get(id.as_usize()).and_then(|s| s.as_ref())
+    }
+
+    /// Borrows an `MmioRegion` descriptor.
+    pub fn mmio_region(&self, id: MmioRegionId) -> Option<&MmioRegionDescriptor> {
+        self.mmio_regions.get(id.as_usize()).and_then(|s| s.as_ref())
     }
 
     /// Borrows a TCB mutably.
@@ -271,12 +355,15 @@ impl KernelState {
         endpoints: [const { None }; MAX_ENDPOINTS],
         notifications: [const { None }; MAX_NOTIFICATIONS],
         shared_regions: [const { None }; MAX_SHARED_REGIONS],
+        mmio_regions: [const { None }; MAX_MMIO_REGIONS],
+        irq_bindings: [const { None }; MAX_IRQ_BINDINGS],
         tcbs: [const { None }; MAX_THREADS],
         sched: Scheduler::new(INTERACTIVE_QUANTUM_NS),
         root_thread: ThreadId::new(0),
         root_cap_space: CapSpaceId::new(0),
         root_addr_space: PageTableId::new(0),
         root_page_table_cap: CapId::new(u32::MAX),
+        root_mmio_blk_cap: CapId::new(u32::MAX),
         untyped_count: 0,
         map_pool_base: 0,
         map_pool_len: 0,
@@ -421,6 +508,39 @@ impl KernelState {
             .insert_root(pt_cap)
             .unwrap_or(CapId::new(u32::MAX));
 
+        // Step 3c: mint an `MmioRegion` capability for the first
+        // `Block`-kind device the boot-time HAL peripheral scan
+        // discovered (`hardware_manifest.peripheral_devices()` — see
+        // `MmioRegionDescriptor`'s own doc comment for why this bypasses
+        // `Retype` exactly like Step 3b's `PageTable` capability does).
+        // MVP scope: only the first Block device, matching this
+        // project's only driver (virtio-blk) so far; best-effort, same
+        // as Step 3b — a full cap space or no Block device present is
+        // not fatal to boot.
+        let root_mmio_blk_cap = boot
+            .hardware_manifest
+            .peripheral_devices()
+            .iter()
+            .find(|d| d.kind == PeripheralKindRaw::Block)
+            .and_then(|d| {
+                self.alloc_mmio_region_direct(MmioRegionDescriptor {
+                    phys_base: d.mmio_base,
+                    size: d.mmio_size,
+                    irq: d.irq,
+                })
+            })
+            .and_then(|mmio_id| {
+                let cap = Capability::full(ObjectRef::new(
+                    KernelObjectKind::MmioRegion,
+                    ObjectId::new(mmio_id.as_u32()),
+                ));
+                self.cap_space_mut(root_cs)
+                    .expect("root cap space exists")
+                    .insert_root(cap)
+                    .ok()
+            })
+            .unwrap_or(CapId::new(u32::MAX));
+
         // Step 4: schedule the Root Task.
         self.sched
             .admit(root_tid, SchedulerMode::Interactive, kernel_sched::MAX_PRIORITY, None)
@@ -437,6 +557,7 @@ impl KernelState {
         self.root_cap_space = root_cs;
         self.root_addr_space = root_as;
         self.root_page_table_cap = root_page_table_cap;
+        self.root_mmio_blk_cap = root_mmio_blk_cap;
         self.untyped_count = untyped_made;
         Ok(())
     }

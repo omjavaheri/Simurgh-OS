@@ -423,7 +423,7 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // separate `kernel-stub` crate's linked-in symbol until the real
     // microkernel (layer 2) is implemented.
     // ------------------------------------------------------------------
-    let hal_interface = hal_core::build_interface(&hal.cpu, &hal.timer);
+    let hal_interface = hal_core::build_interface(&hal.cpu, &hal.timer, &hal.interrupt);
 
     extern "Rust" {
         fn kernel_main(hal: hal_core::HalInterface, boot_info: hal_core::BootInfo) -> !;

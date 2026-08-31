@@ -58,10 +58,23 @@
 //!     branch that runs the scheduler on a tick) is arch-internal — the
 //!     kernel only registers a tick handler with the arch crate, exactly
 //!     as it registers a syscall handler.
+//!   - v6 (microkernel, 03-Kernel-Subsystems-Layer.md §5.1): `register_irq`
+//!     added, wrapping `hal_core::interrupt::InterruptController` (APIC/
+//!     GICv3/PLIC, already implemented per-arch, but never reachable from
+//!     architecture-generic kernel code until now). A device driver
+//!     process's IRQ capability (03 §2.1: "صدور Capability محدود به هر
+//!     درایور: فقط IRQ همان دستگاه") is bound to a `Notification` object
+//!     at grant time; this method is how the kernel installs the one
+//!     hardware-facing trampoline that turns a real interrupt into that
+//!     Notification's `signal()`. `unmask_irq`/`mask_irq`/
+//!     `unregister_irq`/`send_ipi` are NOT added — `register_irq` already
+//!     unmasks per its own contract, and this MVP never revokes an IRQ
+//!     grant or targets a second core.
 //! ============================================================================
 
 use crate::cpu::CpuAbstraction;
 use crate::cpu::HAL_USER_CONTEXT_BYTES;
+use crate::interrupt::{InterruptController, IrqHandler, IrqId};
 use crate::timer::{TimerAbstraction, TimerMode};
 
 /// The single saved-register-context width the architecture-erased
@@ -241,6 +254,17 @@ unsafe fn trampoline_frequency_hz<T: TimerAbstraction>(state: *const ()) -> u64 
     timer.frequency_hz()
 }
 
+unsafe fn trampoline_register_irq<I: InterruptController>(
+    state: *const (),
+    irq: u32,
+    handler: IrqHandler,
+) -> bool {
+    // SAFETY: `state` was produced by `build_interface` from a `&I` and
+    // remains valid per that function's safety contract.
+    let ctrl = unsafe { &*(state as *const I) };
+    ctrl.register_irq(IrqId::new(irq), handler).is_ok()
+}
+
 /// Architecture-erased handle to a subset of hal-core's capabilities.
 /// `#[repr(C)]` for a stable layout across the `extern "Rust"`
 /// declaration/definition boundary, matching this project's other
@@ -249,6 +273,7 @@ unsafe fn trampoline_frequency_hz<T: TimerAbstraction>(state: *const ()) -> u64 
 pub struct HalInterface {
     cpu_state: *const (),
     timer_state: *const (),
+    interrupt_state: *const (),
     cpu_core_count: unsafe fn(*const ()) -> usize,
     cpu_current_core_id: unsafe fn(*const ()) -> usize,
     cpu_feature_flags_bits: unsafe fn(*const ()) -> u64,
@@ -265,6 +290,7 @@ pub struct HalInterface {
     timer_frequency_hz: unsafe fn(*const ()) -> u64,
     timer_arm: unsafe fn(*const (), u64) -> bool,
     timer_cancel: unsafe fn(*const ()),
+    interrupt_register_irq: unsafe fn(*const (), u32, IrqHandler) -> bool,
 }
 
 impl HalInterface {
@@ -471,6 +497,24 @@ impl HalInterface {
         // SAFETY: same contract as `arm_timer`.
         unsafe { (self.timer_cancel)(self.timer_state) }
     }
+
+    /// Registers `handler` to run whenever hardware `irq` fires, and
+    /// unmasks the line. Returns `false` if the underlying
+    /// `InterruptController` rejected it (`InvalidIrqId` — out of range
+    /// for this platform — or `IrqAlreadyRegistered` — a second grant
+    /// for a line already bound). See
+    /// `hal_core::interrupt::InterruptController::register_irq`.
+    ///
+    /// `handler` is a plain function pointer (no captured state, per
+    /// `IrqHandler`'s own doc comment) — the kernel-side callback must
+    /// reach whatever state it needs (e.g. `KernelState`'s IRQ→
+    /// Notification binding table) through its own global, exactly as
+    /// the existing tick/syscall/fault handlers already do.
+    pub fn register_irq(&self, irq: u32, handler: IrqHandler) -> bool {
+        // SAFETY: `interrupt_state`/`interrupt_register_irq` were
+        // produced together by `build_interface`.
+        unsafe { (self.interrupt_register_irq)(self.interrupt_state, irq, handler) }
+    }
 }
 
 /// Builds a `HalInterface` from a concrete CPU/timer implementation.
@@ -483,21 +527,23 @@ impl HalInterface {
 /// `*_CONTEXT_BYTES` alias, all set to 160).
 ///
 /// # Safety
-/// The caller must ensure `cpu`/`timer` remain valid (not moved, not
-/// dropped) for as long as the returned `HalInterface` might be used.
-/// In this project's call sites, both are locals inside a `-> !`
-/// entry function whose only continuation is passing this same
-/// `HalInterface` into an equally diverging `kernel_main` — that stack
-/// frame is never popped, so this holds for the remainder of
-/// execution.
-pub fn build_interface<C, T>(cpu: &C, timer: &T) -> HalInterface
+/// The caller must ensure `cpu`/`timer`/`interrupt` remain valid (not
+/// moved, not dropped) for as long as the returned `HalInterface` might
+/// be used. In this project's call sites, all three are locals (or
+/// fields of a `.bss`-static `Hal` struct) inside a `-> !` entry
+/// function whose only continuation is passing this same `HalInterface`
+/// into an equally diverging `kernel_main` — that stack frame is never
+/// popped, so this holds for the remainder of execution.
+pub fn build_interface<C, T, I>(cpu: &C, timer: &T, interrupt: &I) -> HalInterface
 where
     C: CpuAbstraction<HAL_CONTEXT_BYTES>,
     T: TimerAbstraction,
+    I: InterruptController,
 {
     HalInterface {
         cpu_state: cpu as *const C as *const (),
         timer_state: timer as *const T as *const (),
+        interrupt_state: interrupt as *const I as *const (),
         cpu_core_count: trampoline_core_count::<C>,
         cpu_current_core_id: trampoline_current_core_id::<C>,
         cpu_feature_flags_bits: trampoline_feature_flags_bits::<C>,
@@ -514,6 +560,7 @@ where
         timer_frequency_hz: trampoline_frequency_hz::<T>,
         timer_arm: trampoline_arm_timer::<T>,
         timer_cancel: trampoline_cancel_timer::<T>,
+        interrupt_register_irq: trampoline_register_irq::<I>,
     }
 }
 
@@ -577,10 +624,46 @@ mod tests {
         }
     }
 
+    struct MockInterrupt {
+        registered: Cell<Option<u32>>,
+    }
+    impl InterruptController for MockInterrupt {
+        fn register_irq(&self, irq: IrqId, _handler: IrqHandler) -> Result<(), HalError> {
+            if irq.as_u32() == 0 {
+                return Err(HalError::InvalidIrqId);
+            }
+            self.registered.set(Some(irq.as_u32()));
+            Ok(())
+        }
+        fn unregister_irq(&self, _irq: IrqId) {}
+        fn mask_irq(&self, _irq: IrqId) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn unmask_irq(&self, _irq: IrqId) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn send_ipi(&self, _target_core: usize, _vector: u8) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn irq_line_count(&self) -> u32 {
+            64
+        }
+        fn ipi_target_core_count(&self) -> u32 {
+            1
+        }
+        fn end_of_interrupt(&self, _irq: IrqId) {}
+    }
+
+    fn dummy_irq_handler(_irq: IrqId) {}
+
     #[test]
     fn interface_forwards_cpu_calls() {
-        let (cpu, timer) = (MockCpu { switches: Cell::new(0) }, MockTimer);
-        let iface = build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = (
+            MockCpu { switches: Cell::new(0) },
+            MockTimer,
+            MockInterrupt { registered: Cell::new(None) },
+        );
+        let iface = build_interface(&cpu, &timer, &irqc);
         assert_eq!(iface.core_count(), 4);
         assert_eq!(iface.current_core_id(), 2);
         assert_eq!(iface.cpu_feature_flags_bits(), CpuFeatureFlags::SIMD_128.bits());
@@ -588,8 +671,12 @@ mod tests {
 
     #[test]
     fn interface_forwards_timer_calls() {
-        let (cpu, timer) = (MockCpu { switches: Cell::new(0) }, MockTimer);
-        let iface = build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = (
+            MockCpu { switches: Cell::new(0) },
+            MockTimer,
+            MockInterrupt { registered: Cell::new(None) },
+        );
+        let iface = build_interface(&cpu, &timer, &irqc);
         assert_eq!(iface.now_ns(), 123_456);
         assert_eq!(iface.frequency_hz(), 1_000_000_000);
     }
@@ -598,7 +685,8 @@ mod tests {
     fn interface_forwards_context_switch() {
         let cpu = MockCpu { switches: Cell::new(0) };
         let timer = MockTimer;
-        let iface = build_interface(&cpu, &timer);
+        let irqc = MockInterrupt { registered: Cell::new(None) };
+        let iface = build_interface(&cpu, &timer, &irqc);
         let mut from = [0u8; HAL_CONTEXT_BYTES];
         let mut to = [0u8; HAL_CONTEXT_BYTES];
         to[0] = 0xAB;
@@ -607,5 +695,16 @@ mod tests {
         unsafe { iface.context_switch(&mut from, &to) };
         assert_eq!(from[0], 0xAB);
         assert_eq!(cpu.switches.get(), 1);
+    }
+
+    #[test]
+    fn interface_forwards_register_irq() {
+        let cpu = MockCpu { switches: Cell::new(0) };
+        let timer = MockTimer;
+        let irqc = MockInterrupt { registered: Cell::new(None) };
+        let iface = build_interface(&cpu, &timer, &irqc);
+        assert!(iface.register_irq(7, dummy_irq_handler));
+        assert_eq!(irqc.registered.get(), Some(7));
+        assert!(!iface.register_irq(0, dummy_irq_handler));
     }
 }
