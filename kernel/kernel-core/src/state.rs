@@ -27,9 +27,9 @@ use hal_core::{BootInfo, VirtAddr};
 use hal_manifest::raw::MemoryRegionKindRaw;
 use kernel_cap::{
     CapId, CapSpaceId, CapTable, Capability, EndpointId, KernelObjectKind, NotificationId,
-    ObjectId, ObjectRef, PageTableId, ThreadId, UntypedId,
+    ObjectId, ObjectRef, PageTableId, SharedRegionId, ThreadId, UntypedId,
 };
-use kernel_ipc::{Endpoint, Notification};
+use kernel_ipc::{Endpoint, Notification, SharedRegion};
 use kernel_mm::{AddressSpace, UntypedMemory};
 use kernel_sched::{Scheduler, SchedulerMode};
 
@@ -66,6 +66,7 @@ pub struct KernelState {
     addr_spaces: [Option<RootAddressSpace>; MAX_ADDR_SPACES],
     endpoints: [Option<KEndpoint>; MAX_ENDPOINTS],
     notifications: [Option<KNotification>; MAX_NOTIFICATIONS],
+    shared_regions: [Option<SharedRegion>; MAX_SHARED_REGIONS],
     tcbs: [Option<Tcb>; MAX_THREADS],
     /// The scheduler.
     pub sched: KScheduler,
@@ -162,6 +163,14 @@ impl KernelState {
         Some(NotificationId::new(i as u32))
     }
 
+    /// Allocates a `SharedRegion` object describing `region`, returning
+    /// its id.
+    pub fn alloc_shared_region(&mut self, region: SharedRegion) -> Option<SharedRegionId> {
+        let i = self.shared_regions.iter().position(|s| s.is_none())?;
+        self.shared_regions[i] = Some(region);
+        Some(SharedRegionId::new(i as u32))
+    }
+
     // ---- table accessors (used by syscall::dispatch) -------------
 
     /// Borrows a capability space.
@@ -194,6 +203,11 @@ impl KernelState {
         self.notifications
             .get_mut(id.as_usize())
             .and_then(|s| s.as_mut())
+    }
+
+    /// Borrows a `SharedRegion` object.
+    pub fn shared_region(&self, id: SharedRegionId) -> Option<&SharedRegion> {
+        self.shared_regions.get(id.as_usize()).and_then(|s| s.as_ref())
     }
 
     /// Borrows a TCB mutably.
@@ -256,6 +270,7 @@ impl KernelState {
         addr_spaces: [const { None }; MAX_ADDR_SPACES],
         endpoints: [const { None }; MAX_ENDPOINTS],
         notifications: [const { None }; MAX_NOTIFICATIONS],
+        shared_regions: [const { None }; MAX_SHARED_REGIONS],
         tcbs: [const { None }; MAX_THREADS],
         sched: Scheduler::new(INTERACTIVE_QUANTUM_NS),
         root_thread: ThreadId::new(0),

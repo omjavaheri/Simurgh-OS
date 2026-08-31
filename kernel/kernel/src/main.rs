@@ -122,6 +122,11 @@ use hal_x86_64 as _;
 /// so this line never needs a `cfg`.
 static DEVICE_MANAGER_ELF: &[u8] = include_bytes!(env!("DEVICE_MANAGER_ELF_PATH"));
 
+/// `fs-native-bin`'s own separately-built ELF image — same packaging as
+/// `DEVICE_MANAGER_ELF` (see its own doc comment), the second real
+/// subsystem process (03-Kernel-Subsystems-Layer.md §2.2/§5.3).
+static FS_NATIVE_ELF: &[u8] = include_bytes!(env!("FS_NATIVE_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -415,23 +420,126 @@ mod sys {
     /// op's own semantics); the value in `a0` if this ever DID return
     /// (an error case only) is meaningless.
     pub const IPC_REPLY: usize = 44;
+
+    // -- fs-native: the REAL FsRequest/FsResponse wire protocol over the
+    //    REAL Call/Recv/Reply mechanism above (03-Kernel-Subsystems-
+    //    Layer.md §2.2/§5.3) — unlike every opcode above, `.user_text`
+    //    code passes only plain integers here; the real `ipc_protocol`
+    //    encoding/decoding happens kernel-side, in `kernel_arch_glue`
+    //    (see its own module-level doc comment on why calling
+    //    `ipc_protocol::codec` directly from `.user_text` would be
+    //    unsafe). --
+
+    /// No arguments. Spawns fs-native as a genuinely isolated process
+    /// (its own address + capability space, own separately-built ELF —
+    /// unlike the demo IPC server's `IPC_DEMO_START`, which shares the
+    /// caller's own spaces) and grants it a capability to a fresh
+    /// endpoint. Returns the endpoint's capability slot IN THE CALLER's
+    /// own capability space (fs-native's own copy always lands at slot
+    /// 0 in ITS space — see `kernel_arch_glue::grant_cap_into`'s own
+    /// doc comment for why that is deterministic, so fs-native needs no
+    /// equivalent of `IPC_ENDPOINT_CAP` to discover it).
+    pub const FS_DEMO_START: usize = 45;
+    /// `a0` = a registered `PathId` (this MVP demo only ever registers
+    /// `PathId(0)` = `/greeting`, pre-seeded by fs-native at boot),
+    /// `a1` = `ipc_protocol::fs::OpenFlags` bits. Builds a REAL
+    /// `FsRequest::Open`, marshals it through the shared fs page, and
+    /// issues a REAL `Call` — always blocks until fs-native replies.
+    pub const FS_OPEN: usize = 46;
+    /// No arguments. Reads back the REAL `FsResponse` fs-native's
+    /// `Reply` just wrote into the shared fs page (call this AFTER
+    /// `FS_OPEN` returns, i.e. after being woken by the reply). Returns
+    /// the new handle in `a0`, or `usize::MAX` on any error.
+    pub const FS_OPEN_RESULT: usize = 47;
+    /// `a0` = a registered `PathId`. Builds a REAL `FsRequest::Stat`.
+    pub const FS_STAT: usize = 48;
+    /// No arguments. Returns the file's REAL size in `a0`, or
+    /// `usize::MAX` on any error.
+    pub const FS_STAT_RESULT: usize = 49;
+    /// `a0` = a handle `FS_OPEN_RESULT` returned. Builds a REAL
+    /// `FsRequest::Close`.
+    pub const FS_CLOSE: usize = 50;
+    /// No arguments. Returns `1` in `a0` for a real `Closed`, `0`
+    /// otherwise.
+    pub const FS_CLOSE_RESULT: usize = 51;
+    /// `a0` = a handle `FS_OPEN_RESULT` returned. Writes a fixed MVP test
+    /// payload (`kernel_arch_glue::FS_DEMO_WRITE_DATA`) into the shared
+    /// data region, then builds a REAL `FsRequest::Write` at offset 0.
+    pub const FS_WRITE: usize = 52;
+    /// No arguments. Returns the REAL byte count written in `a0`, or
+    /// `usize::MAX` on any error.
+    pub const FS_WRITE_RESULT: usize = 53;
+    /// `a0` = a handle, `a1` = length to read. Builds a REAL
+    /// `FsRequest::Read` at offset 0.
+    pub const FS_READ: usize = 54;
+    /// No arguments. Returns the REAL byte count read in `a0` (and logs
+    /// a MATCH/MISMATCH verdict against the `FS_WRITE` payload — see
+    /// `kernel_arch_glue::fs_read_result`'s own doc comment), or
+    /// `usize::MAX` on any error.
+    pub const FS_READ_RESULT: usize = 55;
 }
 
 #[cfg(target_arch = "riscv64")]
-#[inline(always)]
+#[inline(never)]
+#[link_section = ".user_text"]
 unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     let ret;
-    // SAFETY: `ecall` from U-mode traps to our S-mode handler, which
-    // saves and restores every register except a0 (the return value).
+    // SAFETY: `ecall` from U-mode traps to our S-mode handler. For an
+    // ORDINARY (non-switching) opcode this preserves every register
+    // except a0.
+    //
+    // **Real, deep bug found via QEMU** (this session's fs-native demo
+    // — the FIRST code to ever issue multiple `raw_syscall`s in a row
+    // after a SWITCHING opcode, e.g. right after `IPC_CALL`): a
+    // sequence like `raw_syscall(sys::IPC_CALL, ep, 0xC0FFEE);
+    // raw_syscall(sys::FS_DEMO_START, 0, 0);` kept observing a1 = a
+    // STALE value (the earlier call's own delivered reply data, then —
+    // after various fix attempts — other garbage, including what looked
+    // like a raw `satp` value) instead of the literal `0` the SECOND
+    // call actually passed, for EVERY later `raw_syscall` in the same
+    // function, not just the one right after the switch. Two things
+    // were tried and did NOT fully fix it on their own: (1) declaring
+    // `a1` `inlateout` instead of a plain `in()` operand (correct in
+    // principle — it tells the compiler the asm may change `a1`, so it
+    // should stop assuming a cached value survives across the ecall —
+    // but the observed garbage value changed shape with each variant of
+    // this fix rather than disappearing, meaning something deeper was
+    // wrong); (2) explicitly re-verified `TrapFrame::A0` extraction and
+    // the fast-path restore's own register offsets in `hal-riscv64`
+    // (both correct, matching `RiscvUserContext`'s real field layout —
+    // ruled out as the cause). What actually fixed it: `#[inline(never)]`
+    // (plus `#[link_section = ".user_text"]`, mandatory once NOT
+    // inlined, so this function stays in the U=1-mapped range rather
+    // than landing in ordinary U=0 kernel `.text` — see `spawn_process`'s
+    // own doc comment on why a call from `.user_text` into anything
+    // else would fault). With `#[inline(always)]` (this function's
+    // original attribute, used successfully by every OTHER opcode in
+    // this project until now), LLVM under this project's pinned nightly
+    // (`nightly-2025-01-15`) was producing genuinely incorrect codegen
+    // for the specific combination of "inline asm with an `ecall` that
+    // can switch threads" + "multiple sequential calls to the SAME
+    // `#[inline(always)]` function within one large, deeply-nested
+    // caller (`umode_root`)" — forcibly inlining every call site let
+    // some value-tracking optimization conflate `a1`'s value ACROSS
+    // call sites that must be treated as fully opaque (since the asm's
+    // OWN visible side effect — a full thread switch — can change
+    // ANY register the compiler didn't explicitly account for). A real
+    // function call boundary (this fix) uses RISC-V's own standard
+    // calling convention instead, which the compiler already treats as
+    // fully clobbering `a0`-`a7` — sidestepping the bug entirely rather
+    // than trying to out-annotate it. `inlateout("a1")` is kept below
+    // anyway (harmless, and correct in its own right).
+    let mut a1 = a1;
     unsafe {
         core::arch::asm!(
             "ecall",
             in("a7") a7,
             inlateout("a0") a0 => ret,
-            in("a1") a1,
+            inlateout("a1") a1,
             options(nostack),
         );
     }
+    let _ = a1;
     ret
 }
 
@@ -442,8 +550,19 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
 /// (write-only from this function's perspective, discarding whatever
 /// ends up there) — this is a narrow exception, not a change to the
 /// general syscall ABI.
+///
+/// `#[inline(never)]` for the SAME reason as `raw_syscall` — see that
+/// function's own extensive doc comment on the real, QEMU-found
+/// miscompilation this avoids. This function's own `a1` was ALREADY
+/// `inlateout` (needed for its real second return value), so it was
+/// never directly OBSERVED to exhibit the bug — but the same "multiple
+/// `#[inline(always)]` calls to an asm-with-a-switch function in one
+/// large caller" shape applies here too, so it gets the identical fix
+/// for consistency and defense-in-depth, not because it was proven
+/// broken on its own.
 #[cfg(target_arch = "riscv64")]
-#[inline(always)]
+#[inline(never)]
+#[link_section = ".user_text"]
 unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
     let (r0, r1);
     // SAFETY: same contract as `raw_syscall` — `ecall` preserves every
@@ -468,6 +587,16 @@ unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
 /// earlier execution.
 #[cfg(target_arch = "riscv64")]
 static mut G_IPC_EP: u32 = 0;
+
+/// fs-native's endpoint capability slot IN THE CALLER's (root's) own
+/// capability space, set once by `FS_DEMO_START`'s handler and read by
+/// every later `FS_OPEN`/`FS_STAT`/`FS_CLOSE` handler — kept server-
+/// side (unlike `G_IPC_EP`, which BOTH client and server independently
+/// discover) since fs-native's own copy is a fixed, hardcoded constant
+/// in its own process (`FS_ENDPOINT_CAP` in `subsystem_entry.rs`), not
+/// something it needs to learn from the caller at all.
+#[cfg(target_arch = "riscv64")]
+static mut G_FS_EP: u32 = 0;
 
 /// The user-space Root Task entry. Linked into `.user_text` (its own
 /// U=1 R+X pages at VMA 0xC000_0000, per hal-riscv64's linker.ld) and run
@@ -565,6 +694,74 @@ extern "C" fn umode_root() -> ! {
         let ipc_ep = raw_syscall(sys::IPC_ENDPOINT_CAP, 0, 0);
         let ipc_reply = raw_syscall(sys::IPC_CALL, ipc_ep, 0xC0FFEE);
         raw_syscall(sys::REPORT, ipc_reply, 0);
+
+        // 7b. fs-native: the REAL FsRequest/FsResponse wire protocol,
+        //     over the SAME real Call/Recv/Reply mechanism, driving a
+        //     REAL isolated process's REAL MemFs (03-Kernel-Subsystems-
+        //     Layer.md §2.2/§5.3) — the first time this project's IPC
+        //     fast path drives a genuine subsystem's own logic, not
+        //     just a demo payload. Open the pre-seeded `/greeting`
+        //     (PathId 0), Stat it (confirms real content-length),
+        //     Close it — all three round-trip through fs-native's own
+        //     isolated process and back.
+        // `zero()` forces a FRESH materialization of the literal `0` at
+        // every call site — **real, deep bug found via QEMU** (this
+        // session's fs-native demo): LLVM's own stack-slot allocation
+        // for this function, at `-O0` under this project's pinned
+        // nightly, was reusing ONE stack slot across TWO logically-
+        // different values — the literal `0` many `raw_syscall` calls
+        // pass as an argument, AND `ipc_reply`'s own computed value
+        // (`0xc0ffef`) a few lines above — apparently believing
+        // (incorrectly) that once `ipc_reply`'s own live range ended,
+        // the slot could be reused for later "0" arguments WITHOUT
+        // actually re-writing it, leaving `ipc_reply`'s stale value in
+        // place. Confirmed via disassembly: the `FS_OPEN` call site
+        // loaded its own "0" argument via `ld a2, 0x30(sp); mv a1, a2`
+        // from the EXACT same stack offset several EARLIER "0"
+        // arguments also used — `#[inline(never)]` (kept anyway, for
+        // the separate class of bug it fixes — see `raw_syscall`'s own
+        // doc comment) did NOT prevent this, since the miscompilation
+        // is entirely within `umode_root`'s OWN stack-slot allocation,
+        // independent of whether `raw_syscall` itself is inlined. TWO
+        // OTHER fixes were tried and BOTH made things WORSE in the same
+        // new way: `core::hint::black_box` and `core::ptr::
+        // read_volatile` are both real, un-inlined function calls under
+        // this `-O0` build (`read_volatile` even includes a UB-check
+        // call) — landing in ordinary kernel `.text`, so calling either
+        // from `.user_text` faults immediately (confirmed via
+        // disassembly: the fault PC was exactly `core::ptr::
+        // read_volatile`'s own compiled body). A raw inline `asm!("",
+        // ...)` block is NEVER a function call — it is always emitted
+        // directly at the call site — so it is the only form of "treat
+        // this value as opaque" that is safe to use here.
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                // SAFETY: a no-op asm block with no real instructions —
+                // its only purpose is the `inout` operand, which forces
+                // the compiler to treat `v` as unknown/possibly-changed
+                // after this point, so it cannot fold or reuse a stale
+                // stack slot for the value used below.
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall(sys::FS_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::FS_OPEN, zero!(), zero!() | 2); // path=0 ("/greeting"), flags=WRITE (real Write demo below needs it)
+        let fs_handle = raw_syscall(sys::FS_OPEN_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_handle, zero!());
+        raw_syscall(sys::FS_STAT, zero!(), zero!()); // path=0
+        let fs_size = raw_syscall(sys::FS_STAT_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_size, zero!());
+        raw_syscall(sys::FS_WRITE, fs_handle, zero!());
+        let fs_written = raw_syscall(sys::FS_WRITE_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_written, zero!());
+        raw_syscall(sys::FS_READ, fs_handle, fs_written);
+        let fs_read = raw_syscall(sys::FS_READ_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_read, zero!());
+        raw_syscall(sys::FS_CLOSE, fs_handle, zero!());
+        let fs_closed = raw_syscall(sys::FS_CLOSE_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_closed, zero!());
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
@@ -774,8 +971,19 @@ extern "C" fn umode_root() -> ! {
 /// register except `rax` (the return value) — this project's own
 /// convention (see `hal_x86_64::cpu::SyscallHandler`'s doc comment):
 /// `rax` = opcode, `rdi` = a0, `rsi` = a1.
+///
+/// `#[inline(never)]` (+ mandatory `#[link_section = ".user_text"]`,
+/// since a non-inlined function must stay in the U=1-mapped range
+/// itself): see riscv64's own `raw_syscall`'s extensive doc comment for
+/// the real, QEMU-found miscompilation this avoids — LLVM under this
+/// project's pinned nightly produced incorrect codegen for multiple
+/// sequential calls to an `#[inline(always)]` function wrapping an asm
+/// block that can switch threads (this specific x86_64 arm was not
+/// independently exercised/observed broken, but gets the identical
+/// preventive fix for consistency).
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[inline(never)]
+#[link_section = ".user_text"]
 unsafe fn raw_syscall_x86(opcode: usize, a0: usize, a1: usize) -> usize {
     let ret: usize;
     // SAFETY: forwarded from this function's own contract.
@@ -800,8 +1008,11 @@ unsafe fn raw_syscall_x86(opcode: usize, a0: usize, a1: usize) -> usize {
 /// # Safety
 /// Same contract as `raw_syscall_x86` — `int 0x80` preserves every
 /// register except `rax`/`rsi` for this opcode specifically.
+///
+/// `#[inline(never)]` — see `raw_syscall_x86`'s own doc comment.
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[inline(never)]
+#[link_section = ".user_text"]
 unsafe fn raw_syscall2_x86(opcode: usize, a0: usize, a1: usize) -> (usize, usize) {
     let (r0, r1): (usize, usize);
     // SAFETY: forwarded from this function's own contract.
@@ -824,6 +1035,12 @@ unsafe fn raw_syscall2_x86(opcode: usize, a0: usize, a1: usize) -> (usize, usize
 /// `G_IPC_EP` exactly.
 #[cfg(target_arch = "x86_64")]
 static mut G_IPC_EP_X86: u32 = 0;
+
+/// fs-native's endpoint capability slot in the caller's (root's) own
+/// capability space — mirrors riscv64's own `G_FS_EP` exactly (see that
+/// static's own doc comment).
+#[cfg(target_arch = "x86_64")]
+static mut G_FS_EP_X86: u32 = 0;
 
 /// The x86_64 Root Task entry. Linked into `.user_text` (its own
 /// `U=1` `R+X` pages at the linked VMA, per hal-x86_64's linker.ld) and
@@ -881,6 +1098,44 @@ extern "C" fn umode_root_x86() -> ! {
         let ipc_ep = raw_syscall_x86(sys::IPC_ENDPOINT_CAP, 0, 0);
         let ipc_reply = raw_syscall_x86(sys::IPC_CALL, ipc_ep, 0xC0FFEE);
         raw_syscall_x86(sys::REPORT, ipc_reply, 0);
+
+        // 7b. fs-native: the REAL FsRequest/FsResponse wire protocol,
+        //     over the SAME real Call/Recv/Reply mechanism, driving a
+        //     REAL isolated process's REAL MemFs (03-Kernel-Subsystems-
+        //     Layer.md §2.2/§5.3) — mirrors riscv64's own `umode_root`
+        //     step 7b exactly (see its own doc comment). `zero!()`:
+        //     same stack-slot-reuse miscompilation riscv64's own comment
+        //     documents in full — not independently observed broken on
+        //     this arch, but applied for the identical preventive
+        //     reason `#[inline(never)]` was applied to `raw_syscall_x86`
+        //     itself (both are defense against the SAME LLVM `-O0`
+        //     behavior, which is a compiler/optimization-level property,
+        //     not an ISA one).
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                // SAFETY: a no-op asm block — see riscv64's own
+                // `umode_root`'s identical macro for the full rationale.
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_x86(sys::FS_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::FS_OPEN, zero!(), zero!() | 2); // path=0 ("/greeting"), flags=WRITE (real Write demo below needs it)
+        let fs_handle = raw_syscall_x86(sys::FS_OPEN_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_handle, zero!());
+        raw_syscall_x86(sys::FS_STAT, zero!(), zero!()); // path=0
+        let fs_size = raw_syscall_x86(sys::FS_STAT_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_size, zero!());
+        raw_syscall_x86(sys::FS_WRITE, fs_handle, zero!());
+        let fs_written = raw_syscall_x86(sys::FS_WRITE_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_written, zero!());
+        raw_syscall_x86(sys::FS_READ, fs_handle, fs_written);
+        let fs_read = raw_syscall_x86(sys::FS_READ_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_read, zero!());
+        raw_syscall_x86(sys::FS_CLOSE, fs_handle, zero!());
+        let fs_closed = raw_syscall_x86(sys::FS_CLOSE_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_closed, zero!());
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the LAPIC timer, then loop forever bumping
@@ -1199,6 +1454,92 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 None => TrapOutcome::Resume(0),
             };
         }
+        // fs-native: the REAL FsRequest/FsResponse wire protocol — see
+        // riscv64's own identical arms (this file's `sys::FS_DEMO_START`
+        // doc comment) for the full rationale. Always called by root in
+        // this demo, so `kstate().root_thread` is correct here, unlike
+        // the generic IPC arms above (which the SERVER thread also
+        // calls).
+        sys::FS_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::fs_demo_start(hal, caller, FS_NATIVE_ELF, elf_loader::machine::EM_X86_64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_FS_EP_X86, before any later FS_OPEN/FS_STAT/
+                    // FS_CLOSE call.
+                    unsafe { core::ptr::addr_of_mut!(G_FS_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::FS_OPEN => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by FS_DEMO_START, before
+            // any FS_OPEN call.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_open_call(hal, caller, ep, a0 as u32, a1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_OPEN_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_open_result());
+        }
+        sys::FS_STAT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_stat_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_STAT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_stat_result());
+        }
+        sys::FS_CLOSE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_close_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_CLOSE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_close_result());
+        }
+        sys::FS_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_write_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_write_result());
+        }
+        sys::FS_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_read_call(hal, caller, ep, a0 as u32, a1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
+        }
         sys::P2_PREEMPT_START => {
             // The cooperative §8.4 round-trip is done; spawn the fault-
             // isolation demo (03-Kernel-Subsystems-Layer.md §5.2) and
@@ -1438,8 +1779,15 @@ fn spawn_faulty_driver_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::T
 /// except `x0` (the return value) — this project's own convention (see
 /// `hal_arm64::cpu::SyscallHandler`'s doc comment): `x8` = opcode,
 /// `x0`/`x1` = a0/a1.
+///
+/// `#[inline(never)]` (+ mandatory `#[link_section = ".user_text"]`):
+/// see riscv64's own `raw_syscall`'s extensive doc comment for the
+/// real, QEMU-found miscompilation this avoids (not independently
+/// exercised/observed broken on aarch64, but gets the identical
+/// preventive fix for consistency).
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
+#[inline(never)]
+#[link_section = ".user_text"]
 unsafe fn raw_syscall_aarch64(opcode: usize, a0: usize, a1: usize) -> usize {
     let ret: usize;
     // SAFETY: forwarded from this function's own contract.
@@ -1464,8 +1812,11 @@ unsafe fn raw_syscall_aarch64(opcode: usize, a0: usize, a1: usize) -> usize {
 /// # Safety
 /// Same contract as `raw_syscall_aarch64` — `svc #0` preserves every
 /// register except `x0`/`x1` for this opcode specifically.
+///
+/// `#[inline(never)]` — see `raw_syscall_aarch64`'s own doc comment.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
+#[inline(never)]
+#[link_section = ".user_text"]
 unsafe fn raw_syscall2_aarch64(opcode: usize, a0: usize, a1: usize) -> (usize, usize) {
     let (r0, r1): (usize, usize);
     // SAFETY: forwarded from this function's own contract.
@@ -1488,6 +1839,12 @@ unsafe fn raw_syscall2_aarch64(opcode: usize, a0: usize, a1: usize) -> (usize, u
 /// exactly.
 #[cfg(target_arch = "aarch64")]
 static mut G_IPC_EP_AARCH64: u32 = 0;
+
+/// fs-native's endpoint capability slot in the caller's (root's) own
+/// capability space — mirrors riscv64's own `G_FS_EP`/x86_64's
+/// `G_FS_EP_X86` exactly (see `G_FS_EP`'s own doc comment).
+#[cfg(target_arch = "aarch64")]
+static mut G_FS_EP_AARCH64: u32 = 0;
 
 /// The aarch64 Root Task entry. Linked into `.user_text` (its own
 /// `AP_USER` `R+X` pages at the linked VMA, per hal-arm64's linker.ld)
@@ -1545,6 +1902,42 @@ extern "C" fn umode_root_aarch64() -> ! {
         let ipc_ep = raw_syscall_aarch64(sys::IPC_ENDPOINT_CAP, 0, 0);
         let ipc_reply = raw_syscall_aarch64(sys::IPC_CALL, ipc_ep, 0xC0FFEE);
         raw_syscall_aarch64(sys::REPORT, ipc_reply, 0);
+
+        // 7b. fs-native: the REAL FsRequest/FsResponse wire protocol,
+        //     over the SAME real Call/Recv/Reply mechanism, driving a
+        //     REAL isolated process's REAL MemFs (03-Kernel-Subsystems-
+        //     Layer.md §2.2/§5.3) — mirrors riscv64's own `umode_root`
+        //     step 7b / x86_64's own step 7b exactly (see their doc
+        //     comments). `zero!()`: same stack-slot-reuse miscompilation
+        //     those doc comments document in full — not independently
+        //     observed broken on this arch, but applied for the
+        //     identical preventive reason `#[inline(never)]` was applied
+        //     to `raw_syscall_aarch64` itself.
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                // SAFETY: a no-op asm block — see riscv64's own
+                // `umode_root`'s identical macro for the full rationale.
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_aarch64(sys::FS_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::FS_OPEN, zero!(), zero!() | 2); // path=0 ("/greeting"), flags=WRITE (real Write demo below needs it)
+        let fs_handle = raw_syscall_aarch64(sys::FS_OPEN_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_handle, zero!());
+        raw_syscall_aarch64(sys::FS_STAT, zero!(), zero!()); // path=0
+        let fs_size = raw_syscall_aarch64(sys::FS_STAT_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_size, zero!());
+        raw_syscall_aarch64(sys::FS_WRITE, fs_handle, zero!());
+        let fs_written = raw_syscall_aarch64(sys::FS_WRITE_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_written, zero!());
+        raw_syscall_aarch64(sys::FS_READ, fs_handle, fs_written);
+        let fs_read = raw_syscall_aarch64(sys::FS_READ_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_read, zero!());
+        raw_syscall_aarch64(sys::FS_CLOSE, fs_handle, zero!());
+        let fs_closed = raw_syscall_aarch64(sys::FS_CLOSE_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_closed, zero!());
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the timer PPI, then loop forever bumping this
@@ -1830,6 +2223,92 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 }
                 None => TrapOutcome::Resume(0),
             };
+        }
+        // fs-native: the REAL FsRequest/FsResponse wire protocol — see
+        // riscv64's own identical arms (this file's `sys::FS_DEMO_START`
+        // doc comment) for the full rationale. Always called by root in
+        // this demo, so `kstate().root_thread` is correct here, unlike
+        // the generic IPC arms above (which the SERVER thread also
+        // calls).
+        sys::FS_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::fs_demo_start(hal, caller, FS_NATIVE_ELF, elf_loader::machine::EM_AARCH64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_FS_EP_AARCH64, before any later FS_OPEN/FS_STAT/
+                    // FS_CLOSE call.
+                    unsafe { core::ptr::addr_of_mut!(G_FS_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::FS_OPEN => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by FS_DEMO_START, before
+            // any FS_OPEN call.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_open_call(hal, caller, ep, x0 as u32, x1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_OPEN_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_open_result());
+        }
+        sys::FS_STAT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_stat_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_STAT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_stat_result());
+        }
+        sys::FS_CLOSE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_close_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_CLOSE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_close_result());
+        }
+        sys::FS_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_write_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_write_result());
+        }
+        sys::FS_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_read_call(hal, caller, ep, x0 as u32, x1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
         }
         sys::P2_PREEMPT_START => {
             // The cooperative §8.4 round-trip is done; spawn the fault-
@@ -2393,6 +2872,90 @@ fn simurgh_syscall(
                 }
                 None => TrapOutcome::Resume(0),
             };
+        }
+        // fs-native: the REAL FsRequest/FsResponse wire protocol (see
+        // `sys::FS_DEMO_START`'s own doc comment) — always called by
+        // root in this demo, so `kstate().root_thread` (not `sched.
+        // running()`) is correct here, unlike the generic IPC arms
+        // above (which the SERVER thread also calls).
+        sys::FS_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::fs_demo_start(hal, caller, FS_NATIVE_ELF, elf_loader::machine::EM_RISCV) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes G_FS_EP,
+                    // before any later FS_OPEN/FS_STAT/FS_CLOSE call.
+                    unsafe { core::ptr::addr_of_mut!(G_FS_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::FS_OPEN => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by FS_DEMO_START, before
+            // any FS_OPEN call.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_open_call(hal, caller, ep, a0 as u32, a1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_OPEN_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_open_result());
+        }
+        sys::FS_STAT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_stat_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_STAT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_stat_result());
+        }
+        sys::FS_CLOSE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_close_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_CLOSE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_close_result());
+        }
+        sys::FS_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_write_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_write_result());
+        }
+        sys::FS_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_read_call(hal, caller, ep, a0 as u32, a1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
         }
         _ => {}
     }

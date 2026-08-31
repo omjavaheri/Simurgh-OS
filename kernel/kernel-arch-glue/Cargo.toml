@@ -32,4 +32,7 @@ hal-core    = { path = "../../hal/hal-core" }
 # `spawn_process_from_elf`'s loader (subsystems-as-processes packaging) —
 # architecture-independent pure logic, no violation of this crate's own
 # "no architecture crate name" rule above.
-elf-loader  = { path = "../../elf-loader" }
+elf-loader   = { path = "../../elf-loader" }
+# The real FsRequest/FsResponse codec (fs-native's own real IPC demo) —
+# `#![no_std]`, no `alloc` (matches this crate's own constraint).
+ipc-protocol = { path = "../../ipc-protocol" }

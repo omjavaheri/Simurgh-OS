@@ -24,13 +24,13 @@
 
 use crate::state::KernelState;
 use crate::tcb::ThreadState;
-use hal_core::{HalInterface, MapPermissions, VirtAddr};
+use hal_core::{HalInterface, MapPermissions, PhysAddr, VirtAddr};
 use kernel_cap::{
     CapId, CapTableError, Capability, CapabilityRights, KernelObjectKind, ObjectId, ObjectRef,
     PageTableId, ThreadId, UntypedId,
 };
 use kernel_ipc::fastpath::{fast_path_eligible, FastPathDecision};
-use kernel_ipc::{EndpointError, IpcError, RecvOutcome, SendOutcome, SmallMessage};
+use kernel_ipc::{EndpointError, IpcError, RecvOutcome, SendOutcome, SharedRegion, SmallMessage};
 use kernel_mm::{KernelObjectType, MmError, PAGE_SIZE};
 use kernel_sched::SchedError;
 
@@ -416,6 +416,19 @@ impl KernelState {
                         .alloc_untyped(obj_phys, per)
                         .ok_or(SyscallError::ObjectTableFull)?;
                     (KernelObjectKind::UntypedMemory, id.as_u32())
+                }
+                KernelObjectType::SharedRegion => {
+                    // MVP: full RW is always the widest a fresh region
+                    // permits — `Retype` carries no rights argument (same
+                    // "no size/rights argument yet" gap `Untyped`'s own
+                    // arm above already notes); a peer can still be
+                    // GRANTed a narrower derived capability later via the
+                    // ordinary `CapGrant` rights-narrowing path.
+                    let region = SharedRegion::new(PhysAddr::new(obj_phys as usize), per as usize, CapabilityRights::RW);
+                    let id = self
+                        .alloc_shared_region(region)
+                        .ok_or(SyscallError::ObjectTableFull)?;
+                    (KernelObjectKind::SharedRegion, id.as_u32())
                 }
             };
 
@@ -868,6 +881,40 @@ mod tests {
                     CapabilityRights::READ,
                 );
                 assert!(c.is_ok());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retype_untyped_into_shared_region_gives_new_cap() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer);
+        let r = k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::SharedRegion,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap();
+        match r {
+            SyscallReturn::NewCaps { cap, count } => {
+                assert_eq!(count, 1);
+                let c = k
+                    .resolve(caller, cap, KernelObjectKind::SharedRegion, CapabilityRights::READ)
+                    .unwrap();
+                let region = k
+                    .shared_region(kernel_cap::SharedRegionId::new(c.object.id.as_u32()))
+                    .unwrap();
+                assert_eq!(region.size, PAGE_SIZE);
+                assert!(region.max_rights.contains(CapabilityRights::RW));
             }
             other => panic!("unexpected {other:?}"),
         }

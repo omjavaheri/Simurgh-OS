@@ -10,14 +10,14 @@
 // `hal-<arch>` crate's own `src/` directory; this script only selects
 // which one to pass, keyed on the target architecture being built.
 //
-// ALSO locates `device-manager-bin`'s separately-built ELF, for all
-// three architectures, and exposes its path via `DEVICE_MANAGER_ELF_PATH`,
-// consumed in `main.rs` through
-// `include_bytes!(env!("DEVICE_MANAGER_ELF_PATH"))` — same pattern as
-// `uefi-bootloader/build.rs`'s `KERNEL_STUB_PATH`. The developer must
-// build it FIRST (`cargo xbuild-subsystem-device-manager-<arch>`); if
-// the expected file is missing, this build script fails with a clear
-// message rather than embedding stale or absent bytes.
+// ALSO locates `device-manager-bin`'s AND `fs-native-bin`'s separately-
+// built ELFs, for all three architectures, and exposes their paths via
+// `DEVICE_MANAGER_ELF_PATH`/`FS_NATIVE_ELF_PATH`, consumed in `main.rs`
+// through `include_bytes!(env!(...))` — same pattern as `uefi-
+// bootloader/build.rs`'s `KERNEL_STUB_PATH`. The developer must build
+// each FIRST (`cargo xbuild-subsystem-<name>-<arch>`); if an expected
+// file is missing, this build script fails with a clear message rather
+// than embedding stale or absent bytes.
 // ============================================================================
 
 fn main() {
@@ -70,5 +70,30 @@ fn main() {
     println!(
         "cargo:rustc-env=DEVICE_MANAGER_ELF_PATH={}",
         dm_path.canonicalize().unwrap().display()
+    );
+
+    // Same as above, for `fs-native-bin` (03-Kernel-Subsystems-Layer.md
+    // §2.2/§5.3) — the second real subsystem process.
+    let fs_build_alias = format!("cargo xbuild-subsystem-fs-native-{target_arch}");
+    let fs_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("fs-native-bin");
+
+    if !fs_path.exists() {
+        panic!(
+            "kernel build.rs: fs-native-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {fs_build_alias}",
+            fs_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", fs_path.display());
+    println!(
+        "cargo:rustc-env=FS_NATIVE_ELF_PATH={}",
+        fs_path.canonicalize().unwrap().display()
     );
 }

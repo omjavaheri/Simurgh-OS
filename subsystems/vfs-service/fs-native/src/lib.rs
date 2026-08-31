@@ -32,6 +32,12 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// fs-native's real process entry point (03-Kernel-Subsystems-Layer.md
+/// §2.2/§5.3) — see that module's own doc comment. Mirrors `device-
+/// manager::subsystem_entry`'s own unconditional module declaration
+/// (per-architecture gating lives inside the file, not at this level).
+pub mod subsystem_entry;
+
 /// Errors from the in-memory store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {

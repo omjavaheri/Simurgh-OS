@@ -394,8 +394,10 @@ pub fn enter(
     // currently-executing image mapped once this table activates —
     // computed generically from `BootInfo` (never a hardcoded per-
     // architecture constant): riscv64's image sits at ~0x8020_0000+
-    // (needs 3 GiB); x86_64's tiny, low (`KERNEL_LMA_BASE = 0x0020_0000`)
-    // image needs only 1. `.user_text`/`.user_stack` then land in the
+    // (needs 3 GiB); x86_64's tiny, low (`KERNEL_LMA_BASE = 0x0180_0000`
+    // — see hal-x86_64/linker.ld's own doc comment for why it moved up
+    // from the original 0x0020_0000) image still needs only 1. `.user_
+    // text`/`.user_stack` then land in the
     // FIRST GiB slot this leaves free (GiB `bytes_gib` itself) — each
     // architecture's own linker.ld picks its `.user_text` VMA to match
     // (0xC000_0000 = GiB 3 for riscv64, 0x4000_0000 = GiB 1 for x86_64;
@@ -886,12 +888,28 @@ pub fn spawn_process_from_elf(
 
     // 3 pages, not 1 — see `enter`'s own `root_pt` carve for why.
     let root_pt = carve(state, 4096 * 3)?;
-    let pool = carve(state, 4096 * 8)?;
+    // 32 page-table-walk scratch pages, not `spawn_process`'s own 8 —
+    // **real bug found via QEMU** (fs-native's own spawn): a bigger ELF
+    // image (fs-native-bin links `alloc`/`BTreeMap`/`ipc_protocol`'s
+    // codec, roughly double device-manager-bin's own size) spans enough
+    // 2 MiB regions across its `.text`/`.rodata`/`.data`/`.bss`
+    // PT_LOAD segments plus the stack that 8 pool pages ran out mid-
+    // walk (`map_range` returned `u32::MAX`, logged "map_range error
+    // (PT_LOAD segment)"), which this function's own `?` then silently
+    // turned into a `None` return — cascading into a FAR worse failure
+    // one level up: `fs_demo_start`'s shared-page setup never ran, so
+    // `G_FS_SHARED_PHYS` stayed at its `usize::MAX` sentinel, and the
+    // very next `write_shared_fs_message` call dereferenced it,
+    // panicking on an unaligned/null pointer. Bumping the pool is pure
+    // headroom — existing, smaller callers (device-manager-bin) simply
+    // use fewer of a bigger pool, unchanged behavior.
+    const POOL_PAGES: usize = 32;
+    let pool = carve(state, 4096 * POOL_PAGES as u64)?;
     let stack_phys = carve(state, round4k(stack_len) as u64)?;
     // SAFETY: fresh untyped RAM, identity-addressable (paging is not yet
     // active on this new space); single-core. `map_range` needs the pool
     // pre-zeroed.
-    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 8) };
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * POOL_PAGES) };
 
     // SAFETY: single-core; only written once, by `enter`, before any
     // process (including this generic-spawn path) can run.
@@ -906,7 +924,7 @@ pub fn spawn_process_from_elf(
             len,
             perm,
             pool + used as usize * 4096,
-            8 - used as usize,
+            POOL_PAGES - used as usize,
         );
         if n == u32::MAX {
             false
@@ -917,7 +935,35 @@ pub fn spawn_process_from_elf(
     };
 
     for seg in segments {
-        let mem_size4k = round4k(seg.mem_size as usize);
+        // **Real bug found via QEMU** (fs-native's own spawn — the
+        // FIRST ELF this loader ever loaded whose linker output didn't
+        // happen to leave every PT_LOAD segment's own `p_vaddr` already
+        // page-aligned): `map_range` requires page-aligned inputs
+        // (`(vaddr | paddr | len) & 0xFFF != 0` is a hard error, per its
+        // own doc comment), but nothing here ever page-ALIGNED
+        // `seg.vaddr` before passing it straight through — this loop
+        // just trusted the ELF's own `p_vaddr` to already be a multiple
+        // of 4 KiB. device-manager-bin's own linker output happened to
+        // satisfy that by luck (every one of its PT_LOAD segments
+        // landed on a page boundary); fs-native-bin's third segment
+        // (`.data`, `vaddr=0xc0022790` — a genuine, ELF-spec-legal
+        // "page-unaligned within an otherwise page-aligned OUTPUT
+        // section" layout, common whenever ld groups multiple smaller
+        // input sections before the segment's declared alignment
+        // point) was the first to violate that unstated assumption,
+        // failing `map_range`'s own precondition check every time
+        // (confirmed via a temporary diagnostic print: `vaddr=
+        // 0xc0022790`, low 12 bits `0x790`, nonzero). Fixed the
+        // standard way any ELF loader handles this (matching what
+        // Linux's own loader does): round `p_vaddr` DOWN to the
+        // containing page, and carry the resulting in-page offset
+        // through the mapped SIZE and the file-data COPY destination,
+        // so the segment's actual bytes still land at the CORRECT
+        // (unaligned) virtual address once mapped, just via a
+        // page-aligned `map_range` call.
+        let page_off = seg.vaddr as usize & 0xFFF;
+        let aligned_vaddr = seg.vaddr as usize - page_off;
+        let mem_size4k = round4k(seg.mem_size as usize + page_off);
         if mem_size4k == 0 {
             continue;
         }
@@ -943,11 +989,16 @@ pub fn spawn_process_from_elf(
         // ".bss inside PT_LOAD" convention (mem_size > file_size is
         // zero-filled) — the same handling `elf-loader`'s own doc
         // comment describes for `uefi-bootloader`'s use of this shape.
+        // The copy destination is offset by `page_off`: `seg_phys` now
+        // names the containing PAGE (per the alignment fix above), not
+        // `seg.vaddr` itself, so the segment's own bytes must start
+        // `page_off` bytes into it to land at the correct address once
+        // `aligned_vaddr + page_off` (== `seg.vaddr`) is mapped.
         unsafe {
             core::ptr::write_bytes(seg_phys as *mut u8, 0, mem_size4k);
             core::ptr::copy_nonoverlapping(
                 elf_bytes.as_ptr().add(file_offset),
-                seg_phys as *mut u8,
+                (seg_phys + page_off) as *mut u8,
                 file_size,
             );
         }
@@ -968,7 +1019,7 @@ pub fn spawn_process_from_elf(
             perm |= 4;
         }
 
-        if !step(seg.vaddr as usize, seg_phys, mem_size4k, perm) {
+        if !step(aligned_vaddr, seg_phys, mem_size4k, perm) {
             klog!("spawn_process_from_elf: map_range error (PT_LOAD segment)\r\n");
             return None;
         }
@@ -1159,6 +1210,57 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
         t.state = ThreadState::Exited;
     }
     state.sched.remove(root);
+    // Retire `p2_ipc_demo_start`'s own one-shot server thread too, for
+    // the identical reason root's own old TCB is retired just above —
+    // see `G_IPC_SERVER_TID`'s own "Real bug found via QEMU" doc comment
+    // for the full story (a `pick_next` tie-break flip, triggered by
+    // fs-native's own extra thread, resumed this long-done thread's
+    // stale saved context instead of the intended A/B/C rotation).
+    // SAFETY: single-core; only read (and cleared) here, written once by
+    // `p2_ipc_demo_start` before this can ever run.
+    if let Some(server_tid) = unsafe { core::ptr::addr_of!(G_IPC_SERVER_TID).read() } {
+        if let Some(t) = state.tcb_mut(server_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(server_tid);
+        unsafe { core::ptr::addr_of_mut!(G_IPC_SERVER_TID).write(None) };
+    }
+    // fs-native's own thread hits the SAME bug class as the demo server
+    // just above, for a DIFFERENT underlying reason: **real bug found
+    // via QEMU** (aarch64 specifically — confirmed via a temporary
+    // `p2_tick` diagnostic showing `incoming=5`, fs-native's own known
+    // tid, immediately followed by a total, silent, rapid-refire hang —
+    // riscv64/x86_64 happened not to hit it, purely by thread-ID tie-
+    // break luck, the same way the demo server's own bug above was
+    // luck-dependent). Unlike the demo server, fs-native is a REAL,
+    // ongoing service — `do_reply` (correctly, generically) marks IT
+    // `Ready` again after each reply, since a real server loops back to
+    // `Recv` for its next request. But after its OWN LAST reply
+    // (`FS_CLOSE`'s, in this MVP demo), fs-native never actually gets
+    // CPU time again to reach that next `Recv` and block on it PROPERLY
+    // — `do_reply`'s own switch hands control back to the CALLER (root),
+    // not to the replying thread itself, by design (see `SyscallOp::
+    // Reply`'s own doc comment) — so fs-native is left `Ready`-but-
+    // never-resumed, exactly like the demo server, and can be picked by
+    // this SAME ordinary `pick_next` round-robin it was never meant to
+    // join. Unlike the demo server, fs-native must NOT be `sched.
+    // remove()`d — its own TCB slot has to stay valid forever, since
+    // `fs_ipc_call`'s own direct `dispatch(fs_tid, ...)` (bypassing
+    // `pick_next` entirely, on every architecture) is how it is
+    // ACTUALLY meant to run for any future request. `note_blocked`
+    // (not `remove`) is exactly the right tool: it removes fs-native
+    // from `pick_next`'s own candidate pool (its own `RunState` is no
+    // longer `Ready`) while leaving the TCB slot itself fully intact —
+    // a later `dispatch()` call unconditionally commits a thread as
+    // running regardless of its current `RunState`, so this in no way
+    // blocks a genuine future `fs_ipc_call`. Harmless no-op if
+    // fs-native happened to already be properly `BlockedOnRecv` (e.g.
+    // riscv64/x86_64, where this was never actually observed broken).
+    // SAFETY: single-core; `G_FS_TID` written once by `fs_demo_start`,
+    // read-only here.
+    if let Some(fs_tid) = unsafe { core::ptr::addr_of!(G_FS_TID).read() } {
+        let _ = state.sched.note_blocked(fs_tid);
+    }
     // `state.sched.remove(root)` clears `running` (root was it), and this
     // switch to `fresh_tid` happens directly via `user_ctx_switch_ptrs`,
     // bypassing `preempt_tick`/`cooperative_yield` (whose own `Switch`
@@ -1595,6 +1697,46 @@ pub fn p2_ipc_reply(hal: &HalInterface, caller: ThreadId, to_raw: u32, label: u6
     }
 }
 
+/// `p2_ipc_demo_start`'s own one-shot server thread, so `p2_preempt_start`
+/// can explicitly retire it once the demo's role is done.
+///
+/// **Real bug found via QEMU** (this session's x86_64 preemption crash,
+/// exposed only once fs-native's own extra spawned thread shifted later
+/// `ThreadId` numbering): `do_reply` (`kernel_core::syscall`) correctly,
+/// generically marks a REPLYING thread `Ready` again afterward — right
+/// behavior for a REAL, ongoing server that loops back to `Recv` for the
+/// next request (fs-native's own thread relies on exactly this). This
+/// demo's OWN server (`umode_ipc_server*`) does NOT loop back — per its
+/// own doc comment, `IPC_REPLY` "always switches away on success", so the
+/// `jmp 2b` after it is genuinely unreachable, and the thread is DONE
+/// forever the moment it replies. But nothing ever told the SCHEDULER
+/// that: `do_reply`'s own `note_ready(replier, ...)` leaves it `Ready`
+/// permanently. Confirmed via QEMU's own `-d int` exception trace: the
+/// crash's own register dump (RAX=0x2c=`IPC_REPLY`'s opcode, RSI=
+/// 0xc0ffef, the demo's own reply sentinel) is UNMISTAKABLY this
+/// server's own long-stale saved context, resumed by `p2_tick`'s
+/// ordinary round-robin `pick_next` — its own vruntime=0 (never
+/// meaningfully ran) usually LOSES `pick_next`'s "lowest wins" tie-break
+/// against process C/the fresh loop thread (also vruntime=0, but a
+/// HIGHER `ThreadId`, per `pick_next`'s own "`ThreadId` as a stable tie-
+/// break" rule) — UNTIL fs-native's own extra spawned thread shifts
+/// every LATER `ThreadId` up by one, at which point THIS demo server's
+/// own (unchanged, lower) `ThreadId` starts winning instead. Resuming it
+/// crashes (not merely spins harmlessly in its own `jmp 2b`) because its
+/// OWN saved `rip` is unrelated to that loop in the first place — it is
+/// whatever `f.rip` the CPU had captured at the ORIGINAL `int 0x80`/
+/// `ecall`/`svc` trap boundary for its OWN `IPC_REPLY` call, which this
+/// MVP demo's fast-path save never had a reason to make land on a safe,
+/// re-enterable instruction (it was never meant to be re-entered at
+/// all). The real fix is retiring this thread once its one-shot role
+/// ends — see `p2_preempt_start`'s own use of this static — not treating
+/// its `rip` as if resuming it were ever a supported outcome.
+///
+/// # Safety
+/// Single-core; written once by `p2_ipc_demo_start`, read (and cleared)
+/// once by `p2_preempt_start`.
+static mut G_IPC_SERVER_TID: Option<ThreadId> = None;
+
 /// `IPC_DEMO_START` demo opcode: creates the endpoint this whole demo
 /// runs on and spawns the SERVER thread (`server_entry_vma`, sharing the
 /// caller's OWN address + capability space — like `p2_preempt_start`'s
@@ -1625,6 +1767,10 @@ pub fn p2_ipc_demo_start(
         _ => return None,
     };
     let server = k.alloc_tcb(k.root_cap_space, k.root_addr_space)?;
+    // SAFETY: single-core; written once here, read only by
+    // `p2_preempt_start` (which retires this thread once the demo's own
+    // one-shot role is done — see `G_IPC_SERVER_TID`'s own doc comment).
+    unsafe { core::ptr::addr_of_mut!(G_IPC_SERVER_TID).write(Some(server)) };
     // `root_frame = 0`: share the caller's OWN (already-active) address
     // space — same convention `p2_preempt_start`'s own fresh thread uses.
     // Stack: reuse `G_A_STACK_TOP` (root's own U-mode stack top, already
@@ -1665,6 +1811,598 @@ pub fn p2_ipc_demo_start(
     let _ = k.sched.dispatch(server, hal.now_ns());
     let (save, into) = k.user_ctx_switch_ptrs(caller, server)?;
     Some((ep_cap.as_u32(), save, into))
+}
+
+// ============================================================================
+// fs-native as a REAL, isolated process, driven by the REAL FsRequest/
+// FsResponse wire protocol over the REAL Call/Recv/Reply mechanism above
+// (03-Kernel-Subsystems-Layer.md §2.2/§5.3) — the first time this
+// project's IPC fast path drives a genuine subsystem's own logic
+// end-to-end, not just a demo payload. Unlike `p2_ipc_demo_start`'s
+// server (which shares the caller's own address AND capability space —
+// `.user_text`, embedded in the kernel image), fs-native is spawned via
+// `spawn_process_from_elf` exactly like device-manager: its own address
+// space, its own capability space, its own separately-built ELF.
+//
+// Two problems that mechanism doesn't solve on its own, both handled
+// here: (1) the Endpoint capability the caller Retypes lives in the
+// CALLER's cap space only — `grant_cap_into` copies it into fs-native's
+// own fresh cap space (predictably landing at slot 0, since a brand-new
+// `CapTable` always allocates its first slot from 0 — see `CapTable::
+// new`'s own free-list construction); (2) `SmallMessage` carries up to 6
+// data words, but every architecture's own raw syscall convention this
+// project defined only threads 2 payload registers (`a0`/`a1`,
+// `rdi`/`rsi`, `x0`/`x1`) through `int 0x80`/`svc`/`ecall` — nowhere
+// near enough for a real `FsRequest`/`FsResponse`. Rather than widening
+// every `hal-<arch>::cpu::SyscallHandler` signature (a much bigger,
+// unrelated change), the full `SmallMessage` (label + all 6 words,
+// zero-padded) is marshalled through ONE shared physical frame instead —
+// the same "share a frame, not the message registers" principle
+// `ipc-protocol::fs`'s own `shared_cap` field already uses for bulk
+// Read/Write data, just applied to the whole small message here.
+//
+// A `.user_text` function (this project's OWN in-kernel demo code, NOT
+// fs-native's own separate ELF image) must never call a regular,
+// non-inlined function living in the surrounding kernel binary's `.text`
+// — the risk that already bit this project once (see hal-x86_64's own
+// `#[inline(always)]`/`opt-level` fix for device-manager's very first
+// in-kernel process). `ipc_protocol::codec::{encode,decode}_fs_*` are
+// ordinary functions, so `kernel/src/main.rs`'s `umode_root*` never
+// calls them directly: those functions live EITHER here (this crate is
+// a normal `rlib`, not `.user_text`) or inside `fs-native-bin` itself
+// (a fully separate, self-contained ELF — every byte of it is U=1, so
+// there is no "calling into kernel .text" risk there at all). `umode_
+// root*` only ever passes plain integers to the wrapper opcodes below.
+// ============================================================================
+
+/// Physical address of the one page shared between the caller (accessed
+/// via the kernel's own always-present identity map — see `p2_report_a`'s
+/// own cross-checks for the same pattern) and fs-native's own process
+/// (mapped into ITS address space at a fixed VA by `fs_demo_start`).
+/// `usize::MAX` = not yet set up (`fs_demo_start` has not run).
+///
+/// # Safety
+/// Single-core; written once by `fs_demo_start`, read only afterward.
+static mut G_FS_SHARED_PHYS: usize = usize::MAX;
+
+/// Physical address of the one page shared for BULK Read/Write data —
+/// same contract as `G_FS_SHARED_PHYS`, just the SECOND shared page
+/// (`FS_DATA_VA`, not `FS_SHARED_VA`).
+///
+/// # Safety
+/// Single-core; written once by `fs_demo_start`, read only afterward.
+static mut G_FS_DATA_PHYS: usize = usize::MAX;
+
+/// fs-native's own `ThreadId`, written once by `fs_demo_start` and read
+/// by `fs_ipc_call` — see that function's own doc comment for why every
+/// FS call after the first needs to know this directly rather than
+/// trusting `do_send`'s general fallback. Same `Option<ThreadId>`
+/// convention `DM_TID` already uses for the identical "permanent,
+/// spawned-once target thread" shape.
+///
+/// # Safety
+/// Single-core; written once by `fs_demo_start`, read only afterward.
+static mut G_FS_TID: Option<ThreadId> = None;
+
+/// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
+/// shared fs page. Always writes all 6 word slots (unused ones as 0)
+/// rather than tracking a separate length — `decode_fs_request`/
+/// `decode_fs_response`'s own `need(n)` checks only require AT LEAST
+/// `n` words to be present, so extra trailing zeros are harmless, and
+/// this keeps the wire layout fixed-size (56 bytes) with no separate
+/// length field to keep in sync.
+///
+/// # Safety
+/// `G_FS_SHARED_PHYS` must already be a valid, exclusively-owned,
+/// mapped physical frame (`fs_demo_start` has run).
+unsafe fn write_shared_fs_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_FS_SHARED_PHYS` only written once by
+    // `fs_demo_start`, before this can ever be called.
+    let base = unsafe { core::ptr::addr_of!(G_FS_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: forwarded from this function's own contract — `base`
+    // names a valid, mapped, 4 KiB physical frame, and low RAM is
+    // always identity-mapped for kernel-mode access regardless of
+    // which process's page table is currently active (the same
+    // assumption every other `p2_*` physical-address cross-check in
+    // this file already relies on).
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back a `SmallMessage` written by `write_shared_fs_message` (by
+/// either side — this is a plain, symmetric shared-memory read).
+///
+/// # Safety
+/// Same contract as `write_shared_fs_message`.
+unsafe fn read_shared_fs_message() -> SmallMessage {
+    // SAFETY: single-core; same contract as `write_shared_fs_message`.
+    let base = unsafe { core::ptr::addr_of!(G_FS_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        // `from_words` cannot fail here: `words.len() == MSG_MAX_WORDS`.
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// Copies `cap` (from `src_cs`) into `dst_cs`, narrowed to `rights` —
+/// the SAME derive-then-move sequence `kernel_core::syscall::do_cap_grant`
+/// uses for the real, capability-gated `SyscallOp::CapGrant`, just
+/// called directly on `CapSpaceId`s this trusted glue code already
+/// holds rather than through a `target_thread: CapId` lookup (which
+/// would require the caller to ALREADY hold a `ThreadControlBlock`
+/// capability for the destination — something `spawn_process`/
+/// `spawn_process_from_elf` deliberately do not hand out, matching
+/// every other kernel-arch-glue bootstrap helper's own "trusted glue,
+/// not a real syscall" precedent). `cap` itself is left untouched in
+/// `src_cs` — only the freshly `derive_child`'d COPY is moved out, so
+/// the caller keeps its own capability to the same underlying object.
+fn grant_cap_into(
+    state: &mut KernelState,
+    src_cs: kernel_cap::CapSpaceId,
+    cap: CapId,
+    dst_cs: kernel_cap::CapSpaceId,
+    rights: CapabilityRights,
+) -> Option<CapId> {
+    let child = state.cap_space_mut(src_cs)?.derive_child(cap, rights, 0).ok()?;
+    let moved = state.cap_space_mut(src_cs)?.take(child).ok()?;
+    state.cap_space_mut(dst_cs)?.insert_root(moved).ok()
+}
+
+/// VA fs-native's own process maps the shared fs page at — an address no
+/// other mapping in ITS OWN (freshly carved, otherwise-empty) address
+/// space uses; safe to reuse across every architecture's own isolated
+/// spawn, unlike `.user_text`'s own per-architecture base VMA
+/// constraints (this is a plain data page, not an ELF image base).
+const FS_SHARED_VA: usize = 0xD800_0000;
+
+/// VA fs-native's own process maps the shared BULK DATA region at — a
+/// second, separate page from `FS_SHARED_VA` (which only ever carries
+/// the small, fixed-size `SmallMessage` header). Real `Read`/`Write`
+/// bytes travel here instead, per `ipc_protocol::fs`'s own "bulk data
+/// travels through a SharedRegion, not the message" design.
+const FS_DATA_VA: usize = 0xD810_0000;
+
+/// fs-native's own deterministic capability slot for its one shared data
+/// region, in ITS OWN capability space — same reasoning `FS_ENDPOINT_CAP`
+/// (fs-native's own `subsystem_entry.rs` constant) already documents for
+/// slot 0: `fs_demo_start` grants fs-native's fresh, otherwise-empty cap
+/// space exactly two capabilities, in a fixed order (the endpoint, then
+/// this region), and a `CapTable`'s free list always allocates
+/// sequentially from an empty table, so the SECOND grant is guaranteed
+/// to land at slot 1.
+const FS_DATA_SHARED_CAP_SLOT: u32 = 1;
+
+/// Fixed MVP test payload for the `FS_WRITE`/`FS_READ` demo opcodes —
+/// same "one demo, one hardcoded scenario" convention `resolve_path`'s
+/// own `PathId(0)`-only precedent (fs-native's `subsystem_entry.rs`)
+/// already establishes; a real VFS Router would carry caller-supplied
+/// bytes, not a kernel-glue constant.
+const FS_DEMO_WRITE_DATA: &[u8] = b"hello from root, write demo!";
+
+/// One-time setup: creates the endpoint fs-native and its client
+/// (`caller`, always the Root Task in this MVP) rendezvous on, spawns
+/// fs-native as a genuinely isolated process from its own separately-
+/// built ELF image (`fs_elf`), grants it a capability to the SAME
+/// endpoint object, gives it a page of memory shared with the kernel's
+/// own identity map for the real `SmallMessage` payload, and switches
+/// straight to it (see this function's own tail comment for why that
+/// switch is mandatory, not optional, unlike a bare spawn). Returns the
+/// endpoint's capability slot in the CALLER's own cap space (fs-native's
+/// own copy always lands at slot 0 — see `grant_cap_into`'s own doc
+/// comment on why that is deterministic for a freshly spawned,
+/// otherwise-empty process) plus the `(save, into)` switch pointers the
+/// caller wraps in a `TrapOutcome::SwitchTo`.
+pub fn fs_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    fs_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+
+    const FS_STACK_VMA: usize = 0xC040_0000;
+    const FS_STACK_LEN: usize = 4096 * 16;
+    let (fs_tid, fs_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, fs_elf, expected_machine, FS_STACK_VMA, FS_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any `fs_ipc_call`
+    // (reached only via FS_OPEN/FS_STAT/FS_CLOSE, all issued after this
+    // opcode returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_FS_TID).write(Some(fs_tid)) };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, fs_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Carve and map the shared fs page into fs-native's OWN fresh
+    // address space — mirrors `spawn_process`/`spawn_process_from_elf`'s
+    // own "carve untyped, map_range directly, no SyscallOp ceremony"
+    // pattern (this is trusted bootstrap glue, not a real user syscall).
+    let fs_addr_space = k.tcb(fs_tid)?.addr_space;
+    let fs_root_pt = k.addr_space_mut(fs_addr_space)?.root_phys().as_usize();
+    let shared_phys = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: `shared_phys` is fresh untyped RAM, identity-addressable
+    // (paging is not active on the CURRENT core for this address —
+    // it is only ever touched through the kernel's own identity map or
+    // fs-native's own U=1 mapping below), single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+    // `map_range`'s own pool MUST be real, 4 KiB-ALIGNED physical
+    // memory — it stamps page-table-walk PTEs directly at `pool_base +
+    // N*4096`, computing each frame number via `>> 12` (`map_range`'s
+    // own doc comment: "pool frames are zeroed"). **Real bug found via
+    // QEMU**: an earlier draft used a plain local `[u8; 4096*2]` array
+    // here instead — a stack address has NO 4 KiB alignment guarantee
+    // (Rust gives arrays only their element's own alignment, 1 byte for
+    // `u8`), so the resulting PTEs silently truncated to the wrong
+    // frame, corrupting fs-native's own page table without any error
+    // return at all — a SILENT hang once fs-native's process actually
+    // ran into the corrupted mapping, with no diagnostic. Every OTHER
+    // caller in this file already gets this right via `carve()` (real,
+    // explicitly 4 KiB-aligned untyped memory); this one-off inline
+    // call is fixed the same way.
+    let pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed (same contract every other
+    // pool carve in this file already documents).
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(
+        fs_root_pt,
+        FS_SHARED_VA,
+        shared_phys,
+        4096,
+        1 | 2 | 8, // R+W+U
+        pool,
+        2,
+    );
+    if n == u32::MAX {
+        klog!("fs_demo_start: map_range error (shared page)\r\n");
+        return None;
+    }
+
+    // SAFETY: single-core; written exactly once here, before any of the
+    // `fs_*_call`/`fs_*_result` functions below can be reached (they are
+    // only ever wired to opcodes issued after this one).
+    unsafe { core::ptr::addr_of_mut!(G_FS_SHARED_PHYS).write(shared_phys) };
+
+    // Second shared page, for BULK Read/Write data (03-Kernel-Subsystems-
+    // Layer.md §5.2's own "zero-copy, not the message" rule) — this time
+    // via a REAL `SyscallOp::Retype` into `KernelObjectType::SharedRegion`
+    // (the genuine capability object, not a bare untyped carve like the
+    // SmallMessage page just above), proving the capability actually
+    // works end to end, not just compiling.
+    let region_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::SharedRegion,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    // Resolve the freshly retyped capability back to its own
+    // `SharedRegion` description to learn the physical base `map_range`
+    // below needs — `Retype`'s own `NewCaps` return only carries the
+    // CALLER's new `CapId`, not the object itself.
+    let region_id = k.cap_space(src_cs)?.lookup(region_cap)?.object.id;
+    let region_phys = k
+        .shared_region(kernel_cap::SharedRegionId::new(region_id.as_u32()))?
+        .phys_base
+        .as_usize();
+    grant_cap_into(k, src_cs, region_cap, fs_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // Fresh, dedicated pool for this SECOND `map_range` call — reusing
+    // the message page's own (already-consumed) `pool` variable here
+    // would violate `map_range`'s own "pool frames are zeroed and
+    // untouched" precondition for a fresh walk; every other multi-map
+    // caller in this file (e.g. `spawn_process_from_elf`'s own per-
+    // segment walks share ONE pool because they're carved together up
+    // front — this one is a separate, later carve, so it gets its own).
+    let data_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed (same contract every other
+    // pool carve in this file already documents).
+    unsafe { core::ptr::write_bytes(data_pool as *mut u8, 0, 4096 * 2) };
+    let n2 = hal.map_range(
+        fs_root_pt,
+        FS_DATA_VA,
+        region_phys,
+        4096,
+        1 | 2 | 8, // R+W+U
+        data_pool,
+        2,
+    );
+    if n2 == u32::MAX {
+        klog!("fs_demo_start: map_range error (data page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // FS_WRITE/FS_READ call can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_FS_DATA_PHYS).write(region_phys) };
+
+    // Switch straight to fs-native, exactly like `p2_ipc_demo_start`
+    // does for its own in-kernel server — **real bug found via QEMU**:
+    // without this, `caller`'s FIRST `FS_OPEN` (issued immediately
+    // after this opcode returns) is a `Call` racing a receiver that has
+    // NEVER YET RUN AT ALL, so `do_send`'s fast path (which requires
+    // the receiver already blocked in `Recv`) cannot trigger — it falls
+    // back to `pick_next`'s general fairness, which can and did pick a
+    // completely unrelated already-`Ready` thread instead of fs-native,
+    // silently stranding BOTH `caller` (still `BlockedOnReply`, nothing
+    // will ever `Reply` to it) and fs-native (spawned but never
+    // scheduled) forever — the exact same bug class `p2_ipc_demo_start`
+    // itself was already fixed for, and `p2_ipc_recv`'s own hardcoded
+    // "switch to root" doc comment already explains from the other
+    // side. Fixed by switching to fs-native HERE, unconditionally: it
+    // runs its own boot sequence (seed `/greeting`) and reaches its own
+    // first `IPC_RECV`, which (per `p2_ipc_recv`'s own existing,
+    // unmodified logic) finds nothing queued yet and switches straight
+    // back to `k.root_thread` — by the time `caller` resumes from THIS
+    // switch and issues `FS_OPEN`, fs-native is genuinely blocked in
+    // `Recv`, so the real fast path (already proven across all three
+    // architectures) takes over correctly from there on.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(fs_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, fs_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// `Call`, specialized for the fs-native demo's known, fixed 2-party
+/// (root <-> fs-native) shape — unlike `p2_ipc_call` (generic, trusts
+/// whichever thread `do_send`'s fast path or `pick_next`'s general
+/// fallback hands back).
+///
+/// **Real bug found via QEMU**: `FS_OPEN` (the very first FS call) works
+/// via `p2_ipc_call`'s plain fast path ONLY because `fs_demo_start`
+/// explicitly switches to fs-native first, so it is already blocked in
+/// `Recv` by the time `FS_OPEN` runs. Every call AFTER that point (e.g.
+/// `FS_STAT`, right after `FS_OPEN`'s own `Reply`) is NOT covered by
+/// that guarantee: `do_reply` (correctly) leaves the replier merely
+/// `Ready` (see its own doc comment), not resumed — fs-native has not
+/// actually run again to reach its OWN next `IPC_RECV` by the time
+/// `caller` issues the next FS opcode. So `do_send`'s fast path cannot
+/// trigger, and falls back to `SendOutcome::SenderQueued` + `pick_next`
+/// — general fairness, which silently picked some OTHER unrelated
+/// `Ready` thread (left over from an earlier demo phase) instead of
+/// fs-native, stranding `caller` in `BlockedOnReply` forever (fs-native,
+/// never scheduled, never reaches `Recv` to see the queued message) — a
+/// totally silent hang, confirmed via QEMU (output stops dead right
+/// after `FS_OPEN`'s own report, every run). Exactly the same bug class
+/// `p2_ipc_recv`'s and `p2_ipc_demo_start`'s own "Real bug found via
+/// QEMU" comments already describe for the sibling cases; the identical
+/// fix applies: since this demo is a deterministic 2-party RPC, bypass
+/// `pick_next`'s answer and switch straight to the known fs-native
+/// `ThreadId` instead. Safe to discard whatever `pick_next` chose:
+/// `pick_next` is read-only ("without committing to it" — see its own
+/// doc comment), so overriding its answer here never corrupts scheduler
+/// bookkeeping — the thread it would have picked simply stays `Ready`,
+/// untouched, for a later call to actually choose.
+fn fs_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_FS_TID` is written once by `fs_demo_start`,
+    // before any FS_OPEN/FS_STAT/FS_CLOSE call (this function) can run.
+    let fs_tid = unsafe { core::ptr::addr_of!(G_FS_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(fs_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, fs_tid)?;
+            // `pending_from`/`pending_msg` are only ever set on the
+            // thread `do_send`'s OWN fast path actually delivered to
+            // directly (see `p2_ipc_call`'s own comment) — that is
+            // fs-native exactly when `n == fs_tid` (the fast path DID
+            // trigger); when it did not (the general-fallback case this
+            // function exists to correct), the message is merely queued
+            // in the endpoint, for fs-native's own next `IPC_RECV` to
+            // pick up the ordinary way, so there is nothing to poke.
+            let poke = if n == fs_tid {
+                k.tcb_mut(fs_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `FS_OPEN` demo opcode: builds a REAL `FsRequest::Open` (per-arch
+/// `.user_text` code passes only `path_id`/`flags_bits` as plain
+/// integers — see this section's own doc comment on why), marshals it
+/// through the shared fs page, and issues a REAL `SyscallOp::Call`.
+pub fn fs_open_call(
+    hal: &HalInterface,
+    caller: ThreadId,
+    ep_cap: u32,
+    path_id: u32,
+    flags_bits: u32,
+) -> Option<IpcSwitch> {
+    let flags = ipc_protocol::OpenFlags::from_bits(flags_bits).unwrap_or(ipc_protocol::OpenFlags::empty());
+    let req = ipc_protocol::FsRequest::Open {
+        path: ipc_protocol::PathId(path_id),
+        flags,
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: `fs_demo_start` has already run by the time any `.user_
+    // text` code can reach this opcode (it needs `ep_cap`, which only
+    // `fs_demo_start`'s own return value provides).
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` fs-native's `IPC_REPLY` just wrote into
+/// the shared fs page, once the caller resumes from `fs_open_call`'s own
+/// switch. Returns the new handle, or `usize::MAX` on any error/decode
+/// failure — `.user_text` code reports this raw via `sys::REPORT`.
+pub fn fs_open_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Opened { handle }) => handle.0 as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `FS_STAT` demo opcode: builds a REAL `FsRequest::Stat`.
+pub fn fs_stat_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, path_id: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::FsRequest::Stat {
+        path: ipc_protocol::PathId(path_id),
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: see `fs_open_call`'s own contract.
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` for `fs_stat_call`. Returns the file's
+/// real size, or `usize::MAX` on any error/decode failure.
+pub fn fs_stat_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Stat { size, .. }) => size as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `FS_CLOSE` demo opcode: builds a REAL `FsRequest::Close`.
+pub fn fs_close_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, handle: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::FsRequest::Close {
+        handle: ipc_protocol::FileHandle(handle),
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: see `fs_open_call`'s own contract.
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` for `fs_close_call`. Returns `1` for a
+/// real `Closed`, `0` for anything else (error/decode failure).
+pub fn fs_close_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Closed) => 1,
+        _ => 0,
+    }
+}
+
+/// `FS_WRITE` demo opcode: writes `FS_DEMO_WRITE_DATA` (fixed MVP test
+/// payload — see that constant's own doc comment) into the shared DATA
+/// region's own physical memory, then builds a REAL `FsRequest::Write`
+/// naming it via `shared_cap` (fs-native's own deterministic slot for
+/// its one shared data region — `FS_DATA_SHARED_CAP_SLOT`). `offset` is
+/// always 0 for this MVP demo — no partial-write exercise yet.
+pub fn fs_write_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, handle: u32) -> Option<IpcSwitch> {
+    // SAFETY: `G_FS_DATA_PHYS` was set once by `fs_demo_start`, before
+    // any FS_WRITE call can be reached; identity-mapped for kernel-mode
+    // access like every other physical cross-check in this file.
+    unsafe {
+        let base = core::ptr::addr_of!(G_FS_DATA_PHYS).read() as *mut u8;
+        core::ptr::copy_nonoverlapping(FS_DEMO_WRITE_DATA.as_ptr(), base, FS_DEMO_WRITE_DATA.len());
+    }
+    let req = ipc_protocol::FsRequest::Write {
+        handle: ipc_protocol::FileHandle(handle),
+        offset: 0,
+        len: FS_DEMO_WRITE_DATA.len() as u32,
+        shared_cap: FS_DATA_SHARED_CAP_SLOT,
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: see `fs_open_call`'s own contract.
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` for `fs_write_call`. Returns the byte
+/// count, or `usize::MAX` on any error/decode failure.
+pub fn fs_write_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Written { bytes }) => bytes as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `FS_READ` demo opcode: builds a REAL `FsRequest::Read` for `len`
+/// bytes at offset 0 (always following an `FS_WRITE`, in this demo's
+/// own fixed sequence — never past EOF).
+pub fn fs_read_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, handle: u32, len: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::FsRequest::Read {
+        handle: ipc_protocol::FileHandle(handle),
+        offset: 0,
+        len,
+        shared_cap: FS_DATA_SHARED_CAP_SLOT,
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: see `fs_open_call`'s own contract.
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` for `fs_read_call`, AND cross-checks the
+/// shared data region's own physical bytes against `FS_DEMO_WRITE_DATA`
+/// — proving the REAL Write→Read round-trip actually moved real bytes
+/// through fs-native's own `MemFs`, zero-copy (same "read back via the
+/// kernel's own identity map and compare" verification style every
+/// other real demo in this file already uses — e.g. the two-Sv39-spaces
+/// zero-copy proof). Returns the byte count, or `usize::MAX` on any
+/// error/decode failure (the match/mismatch verdict is logged, not
+/// folded into the return value, so `.user_text`'s own `REPORT` still
+/// reports the plain byte count like every other FS opcode).
+pub fn fs_read_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    let bytes = match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Read { bytes }) => bytes as usize,
+        _ => return usize::MAX,
+    };
+    // SAFETY: same contract as `fs_write_call`'s own read of
+    // `G_FS_DATA_PHYS`.
+    let matches = unsafe {
+        let base = core::ptr::addr_of!(G_FS_DATA_PHYS).read() as *const u8;
+        bytes == FS_DEMO_WRITE_DATA.len() && core::slice::from_raw_parts(base, bytes) == FS_DEMO_WRITE_DATA
+    };
+    klog!(
+        "fs_read_result: real Write->Read round-trip through fs-native's own MemFs (03 5.3) -> {}\r\n",
+        if matches { "MATCH, zero-copy through the SharedRegion capability" } else { "MISMATCH" }
+    );
+    bytes
 }
 
 /// Busy-park forever. The in-kernel demo threads have nothing to return

@@ -102,6 +102,12 @@ kernel_id! {
 }
 
 kernel_id! {
+    /// Id of a `SharedRegion` object — a zero-copy bulk-transfer memory
+    /// range (02-Microkernel-Layer.md §5.2).
+    SharedRegionId
+}
+
+kernel_id! {
     /// Id of a scheduler `ChainGroup` — the set of threads participating in
     /// one synchronous IPC chain, charged a shared `vruntime`
     /// (02-Microkernel-Layer.md §4.3).

@@ -79,13 +79,24 @@ const DM_RESPAWN_DRIVER: usize = 33;
 /// # Safety
 /// `ecall` from U-mode traps to the kernel's S-mode handler, which
 /// preserves every register except `a0`. No memory access happens here —
-/// only register-in/register-out, so there is no mapped-page precondition
-/// beyond `.user_text` itself already being executable.
+/// only register-in/register-out; this crate's own `[[bin]]` (`device-
+/// manager-bin`) is a fully separate, self-contained ELF image (every
+/// byte of it U=1 — see that crate's own doc comment), so there is no
+/// "calling into non-executable kernel .text" precondition here the way
+/// `kernel/src/main.rs`'s own `.user_text` demo code has to worry about.
 ///
 /// Returns whatever the kernel wrote back into `a0` (`0` for opcodes that
 /// carry no return value, e.g. `DM_REPORT`).
+///
+/// `#[inline(never)]`: a real, QEMU-found bug — see `kernel/src/
+/// main.rs`'s riscv64 `raw_syscall`'s own extensive doc comment. Under
+/// this project's pinned nightly, LLVM produced incorrect codegen for
+/// multiple sequential calls to an `#[inline(always)]` function
+/// wrapping an asm block that can switch threads; a real (non-inlined)
+/// function call sidesteps it by using the standard calling convention,
+/// which already treats `a0`-`a7` as fully clobbered.
 #[cfg(target_arch = "riscv64")]
-#[inline(always)]
+#[inline(never)]
 unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     let ret;
     // SAFETY: forwarded from this function's own contract.
@@ -107,8 +118,10 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
 /// own convention (see `hal_x86_64::cpu::SyscallHandler`'s doc comment):
 /// `rax` = opcode (`a7`), `rdi` = `a0`, `rsi` = `a1`. Same register-only
 /// contract as the riscv64 variant above.
+///
+/// `#[inline(never)]` — see the riscv64 variant's own doc comment.
 #[cfg(target_arch = "x86_64")]
-#[inline(always)]
+#[inline(never)]
 unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     let ret: usize;
     // SAFETY: forwarded from this function's own contract.
@@ -130,8 +143,10 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
 /// own convention (see `hal_arm64::cpu::SyscallHandler`'s doc comment):
 /// `x8` = opcode (`a7`), `x0` = `a0`, `x1` = `a1`. Same register-only
 /// contract as the riscv64/x86_64 variants above.
+///
+/// `#[inline(never)]` — see the riscv64 variant's own doc comment.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
+#[inline(never)]
 unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     let ret: usize;
     // SAFETY: forwarded from this function's own contract.

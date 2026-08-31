@@ -69,6 +69,9 @@ pub const MAX_ENDPOINTS: usize = 48;
 /// Maximum `Notification` objects.
 pub const MAX_NOTIFICATIONS: usize = 48;
 
+/// Maximum `SharedRegion` objects (§5.2).
+pub const MAX_SHARED_REGIONS: usize = 32;
+
 /// Blocked-thread queue depth on each endpoint (the `Q` of `Endpoint`).
 pub const ENDPOINT_QUEUE: usize = 8;
 

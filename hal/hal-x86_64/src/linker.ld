@@ -35,12 +35,35 @@ ENTRY(_start)
 KERNEL_VMA_BASE = 0xffffffff80000000;
 
 /* Physical load address: where the UEFI bootloader stub actually places
- * this image in RAM before jumping to _start. Kept at a conventional
- * low, 2MB-aligned address that avoids the first megabyte (historically
- * reserved / used by firmware structures) and aligns to a 2MB huge-page
- * boundary, which hal-core's setup_identity_mapping (memory.rs) can use
- * directly for its minimal kernel mapping. */
-KERNEL_LMA_BASE = 0x00200000;
+ * this image in RAM before jumping to _start. 2MB-aligned, which
+ * hal-core's setup_identity_mapping (memory.rs) can use directly for its
+ * minimal kernel mapping.
+ *
+ * **Real bug found via QEMU** (this session's fs-native work, which
+ * embeds a second subsystem ELF into the kernel image, growing it past
+ * ~6MB): the ORIGINAL value here, 0x0020_0000 (2MB — "avoids the first
+ * megabyte, historically reserved for firmware structures"), was too
+ * close to the front of RAM. `uefi-bootloader`'s own ELF loader must
+ * `AllocatePages(AllocateType::Address(segment.paddr), ...)` each
+ * PT_LOAD segment at ITS OWN exact physical address (this kernel is not
+ * position-independent — VMA and LMA are related by a fixed offset, see
+ * this file's own header comment), which requires the ENTIRE segment's
+ * range to already be free. OVMF/QEMU's own memory map (confirmed via a
+ * temporary diagnostic dump in `uefi-bootloader::load_kernel_segments`)
+ * reserves several small `ACPI_NON_VOLATILE` regions scattered through
+ * 0x0080_0000-0x0090_0000, followed by a `BOOT_SERVICES_DATA` block
+ * through 0x0178_0000 (very likely OVMF's own bookkeeping for the
+ * ~11MB bootloader.efi image, which embeds this same kernel ELF as
+ * `.rodata`, growing in lockstep with it) — a kernel image over ~6MB
+ * now spans directly across those holes, and `AllocatePages` cannot
+ * skip over them. The first LARGE contiguous free (`CONVENTIONAL`)
+ * region in that same dump starts at 0x0178_0000 and runs for 163MB
+ * (to 0x0BB6_C000) — comfortably past every firmware-reserved block
+ * with room for this project's kernel to keep growing. `0x0180_0000`
+ * (24MB, still 2MB-aligned) is chosen from inside it, not right at its
+ * start, for a small margin against the exact boundary shifting by a
+ * page or two on a different OVMF build. */
+KERNEL_LMA_BASE = 0x01800000;
 
 SECTIONS
 {

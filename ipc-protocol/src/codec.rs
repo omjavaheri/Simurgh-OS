@@ -11,12 +11,13 @@
 //! low-overhead, versioned).
 //!
 //! Position in the system: called on both ends of every layer-3 IPC. This
-//! module implements the `FsRequest` codec in full as the reference, and
-//! the `DriverRequest`/`DriverResponse` codec (used by the real Device
-//! Manager ↔ driver process IPC — 03-Kernel-Subsystems-Layer.md §2.1,
-//! §5.2) the identical way; the remaining namespaces follow the same
-//! pattern and are a mechanical follow-up (their opcodes/labels are
-//! already defined).
+//! module implements the `FsRequest`/`FsResponse` codec in full as the
+//! reference (`FsResponse` used for real by the fs-native process —
+//! 03-Kernel-Subsystems-Layer.md §2.2, §5.3), and the `DriverRequest`/
+//! `DriverResponse` codec (used by the real Device Manager ↔ driver
+//! process IPC — §2.1, §5.2) the identical way; the remaining namespaces
+//! follow the same pattern and are a mechanical follow-up (their
+//! opcodes/labels are already defined).
 //!
 //! Safety/invariants: `decode_*` is total — it returns `DecodeError` for a
 //! bad version, an unknown opcode, or a truncated payload, and never
@@ -24,7 +25,7 @@
 //! ============================================================================
 
 use crate::driver::{DriverErrorCode, DriverRequest, DriverResponse};
-use crate::fs::{FileHandle, FsRequest, OpenFlags, PathId};
+use crate::fs::{FileHandle, FsErrorCode, FsRequest, FsResponse, OpenFlags, PathId};
 use crate::{label_parts, Namespace, PROTOCOL_VERSION};
 use kernel_ipc::SmallMessage;
 
@@ -151,6 +152,108 @@ pub fn decode_fs_request(msg: &SmallMessage) -> Result<FsRequest, DecodeError> {
             Ok(FsRequest::Close {
                 handle: FileHandle(w[0] as u32),
             })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// FsResponse opcodes — a separate small sequence from the FsRequest
+// opcodes above; the two are never decoded by the same function (each
+// side of the IPC knows which direction a given message is), so the
+// numbers may overlap in principle, but are kept sequential-and-distinct
+// here for readability when reading a raw trace — same convention
+// `OP_DRR_*` below uses relative to `OP_DR_*`.
+const OP_FR_OPENED: u8 = 1;
+const OP_FR_READ: u8 = 2;
+const OP_FR_WRITTEN: u8 = 3;
+const OP_FR_STAT: u8 = 4;
+const OP_FR_CLOSED: u8 = 5;
+const OP_FR_ERROR: u8 = 6;
+
+/// Encodes a `FsResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Opened`: `[handle]`
+/// - `Read`: `[bytes]`
+/// - `Written`: `[bytes]`
+/// - `Stat`: `[size, is_dir]`
+/// - `Closed`: `[]`
+/// - `Error`: `[code]`
+pub fn encode_fs_response(resp: &FsResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 2]) = match *resp {
+        FsResponse::Opened { handle } => (OP_FR_OPENED, [handle.0 as u64, 0]),
+        FsResponse::Read { bytes } => (OP_FR_READ, [bytes as u64, 0]),
+        FsResponse::Written { bytes } => (OP_FR_WRITTEN, [bytes as u64, 0]),
+        FsResponse::Stat { size, is_dir } => (OP_FR_STAT, [size, is_dir as u64]),
+        FsResponse::Closed => (OP_FR_CLOSED, [0, 0]),
+        FsResponse::Error { code } => (OP_FR_ERROR, [code as u64, 0]),
+    };
+    let n = if op == OP_FR_STAT {
+        2
+    } else if op == OP_FR_CLOSED {
+        0
+    } else {
+        1
+    };
+    // `from_words` cannot fail here: n <= 2 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Fs.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Fs.label(op)))
+}
+
+/// Decodes a `FsResponse` from a `SmallMessage`.
+pub fn decode_fs_response(msg: &SmallMessage) -> Result<FsResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Fs) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_FR_OPENED => {
+            need(1)?;
+            Ok(FsResponse::Opened {
+                handle: FileHandle(w[0] as u32),
+            })
+        }
+        OP_FR_READ => {
+            need(1)?;
+            Ok(FsResponse::Read { bytes: w[0] as u32 })
+        }
+        OP_FR_WRITTEN => {
+            need(1)?;
+            Ok(FsResponse::Written { bytes: w[0] as u32 })
+        }
+        OP_FR_STAT => {
+            need(2)?;
+            Ok(FsResponse::Stat {
+                size: w[0],
+                is_dir: w[1] != 0,
+            })
+        }
+        OP_FR_CLOSED => Ok(FsResponse::Closed),
+        OP_FR_ERROR => {
+            need(1)?;
+            let code = match w[0] {
+                1 => FsErrorCode::NotFound,
+                2 => FsErrorCode::Denied,
+                3 => FsErrorCode::BadHandle,
+                4 => FsErrorCode::BadPath,
+                5 => FsErrorCode::Unsupported,
+                6 => FsErrorCode::BadSharedRegion,
+                7 => FsErrorCode::Io,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(FsResponse::Error { code })
         }
         _ => Err(DecodeError::UnknownOpcode),
     }
@@ -382,6 +485,47 @@ mod tests {
         let mut msg = SmallMessage::new(Namespace::Fs.label(OP_READ));
         msg.push(1).unwrap(); // only 1 word, Read needs 4
         assert_eq!(decode_fs_request(&msg), Err(DecodeError::Truncated));
+    }
+
+    fn fs_response_roundtrip(resp: FsResponse) {
+        let msg = encode_fs_response(&resp);
+        assert_eq!(decode_fs_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_fs_response_variants_roundtrip() {
+        fs_response_roundtrip(FsResponse::Opened {
+            handle: FileHandle(3),
+        });
+        fs_response_roundtrip(FsResponse::Read { bytes: 512 });
+        fs_response_roundtrip(FsResponse::Written { bytes: 128 });
+        fs_response_roundtrip(FsResponse::Stat {
+            size: 4096,
+            is_dir: false,
+        });
+        fs_response_roundtrip(FsResponse::Stat {
+            size: 0,
+            is_dir: true,
+        });
+        fs_response_roundtrip(FsResponse::Closed);
+        fs_response_roundtrip(FsResponse::Error {
+            code: FsErrorCode::NotFound,
+        });
+    }
+
+    #[test]
+    fn fs_response_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Driver.label(OP_FR_OPENED));
+        assert_eq!(
+            decode_fs_response(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn fs_response_bad_field_is_rejected() {
+        let msg = SmallMessage::from_words(Namespace::Fs.label(OP_FR_ERROR), &[99]).unwrap();
+        assert_eq!(decode_fs_response(&msg), Err(DecodeError::BadField));
     }
 
     fn driver_request_roundtrip(req: DriverRequest) {

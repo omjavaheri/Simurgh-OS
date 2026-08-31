@@ -40,8 +40,8 @@ pub mod cdt;
 
 pub use cdt::{CapSlot, CapTable, CapTableError};
 pub use ids::{
-    CapId, CapSpaceId, ChainGroupId, EndpointId, NotificationId, ObjectId, PageTableId, ThreadId,
-    UntypedId,
+    CapId, CapSpaceId, ChainGroupId, EndpointId, NotificationId, ObjectId, PageTableId,
+    SharedRegionId, ThreadId, UntypedId,
 };
 pub use rights::CapabilityRights;
 
@@ -73,6 +73,10 @@ pub use rights::CapabilityRights;
 /// - `CapabilitySpace`: the per-process table of capabilities itself (§3).
 ///   A thread's `CapSpaceId` selects which `CapabilitySpace` its `CapId`
 ///   arguments are resolved against.
+/// - `SharedRegion`: a physical memory range mapped into more than one
+///   process's address space for zero-copy bulk transfer (§5.2). A
+///   capability to a shared region, with `READ`/`WRITE`, bounds the widest
+///   mapping a peer holding it may be granted (`SharedRegion::max_rights`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelObjectKind {
     /// Untyped physical memory awaiting `retype` (02-Microkernel-Layer.md §3).
@@ -87,6 +91,8 @@ pub enum KernelObjectKind {
     Notification,
     /// A process's capability table (§3).
     CapabilitySpace,
+    /// A zero-copy shared memory region (§5.2).
+    SharedRegion,
 }
 
 /// An unforgeable reference to one kernel object: its kind plus its
