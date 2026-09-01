@@ -1,18 +1,17 @@
 //! ============================================================================
-//! subsystem_entry.rs — riscv64
+//! subsystem_entry.rs — riscv64 / aarch64 / x86_64
 //!
 //! Note on this file's ONE architecture-conditional piece: same narrow,
 //! documented exception `driver-virtio-blk::subsystem_entry`'s own file
 //! header explains — `raw_syscall`/`raw_syscall2`'s job is issuing the raw
-//! syscall INSTRUCTION itself (`ecall`), an unavoidable ISA detail. Every
-//! other line in this file is architecture-generic (riscv64-only for now
-//! only because `driver_virtio_net` itself is — this crate's own module
-//! doc comment).
+//! syscall INSTRUCTION itself (`ecall`/`svc #0`/`int 0x80`), an unavoidable
+//! ISA detail. Every other line in this file is architecture-generic.
 //!
 //! Purpose: the virtio-net driver's real process entry point. Serves
 //! `ipc_protocol::{DriverRequest,DriverResponse}` over the real
 //! `SyscallOp::Call/Recv/Reply` mechanism, driving a genuine `driver_
-//! virtio_net::VirtioNet` against real, mapped virtio-mmio hardware —
+//! virtio_net::VirtioNet` against real, mapped virtio hardware (either
+//! transport — `new_driver_for_this_transport`'s own doc comment) —
 //! mirroring `driver-virtio-blk::subsystem_entry`'s own IPC-serving shape,
 //! but `SendFrame`/`PollFrame` in place of `ReadBlocks`/`WriteBlocks`
 //! (both driven directly here rather than through `VirtioNet::handle_
@@ -26,12 +25,16 @@
 //! Position in the system: `kernel_arch_glue::spawn_virtio_net_driver`
 //! spawns this process via `spawn_process_from_elf` — its own isolated
 //! address space and capability space. It is granted exactly one
-//! capability (an `Endpoint`, landing at slot 0) and has three regions
-//! pre-mapped directly into its address space before its first
-//! instruction ever runs: the virtio-mmio transport window (`DRV_MMIO_
-//! VA`), the RX queue's own `SharedRegion` (`DRV_RX_VA` — ALSO carries the
+//! capability (an `Endpoint`, landing at slot 0) and has regions pre-
+//! mapped directly into its address space before its first instruction
+//! ever runs: for `Transport::Mmio` (riscv64), the virtio-mmio transport
+//! window (`DRV_MMIO_VA`); for `Transport::Pci` (aarch64/x86_64), nothing
+//! at that VA at all — the PCI capability windows are resolved instead
+//! into the RX region's own `layout::PCI_INFO_OFFSET` header block. Both
+//! transports ALSO get the RX queue's own `SharedRegion` (`DRV_RX_VA` —
+//! ALSO carries the negotiated MAC, the PCI info block, and the
 //! `DriverRequest`/`DriverResponse` marshaling area, see `driver_virtio_
-//! net::layout`'s own doc comment), and the TX queue's own `SharedRegion`
+//! net::layout`'s own doc comment) and the TX queue's own `SharedRegion`
 //! (`DRV_TX_VA`).
 //!
 //! Safety/invariants: unlike `device-manager::subsystem_entry`, this file
@@ -111,22 +114,95 @@ unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
     (r0, r1)
 }
 
-/// Host-build stand-in (this crate is riscv64-only for now, per its own
-/// module doc comment — unlike `driver-virtio-blk`/`fs-native`'s own
-/// `subsystem_entry.rs`, which each define all three architectures'
-/// `raw_syscall`s so ONE of them always matches a host `cargo test`
-/// target). `subsystem_main` is never called from a host test (there is
-/// no live kernel to `ecall` into), so this body is unreachable in
-/// practice — it exists only so the crate compiles on a non-riscv64 host
-/// for `cargo test`'s own pure-logic coverage of the rest of this crate.
-#[cfg(not(target_arch = "riscv64"))]
+/// # Safety
+/// `int 0x80` from Ring 3 traps to `hal_x86_64::cpu`'s dedicated DPL-3
+/// gate, which preserves every register except `rax`/`rsi`.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") a7 => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// See `fs-native::subsystem_entry::raw_syscall2`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1): (usize, usize);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") a7 => r0,
+            in("rdi") a0,
+            inlateout("rsi") a1 => r1,
+            options(nostack),
+        );
+    }
+    (r0, r1)
+}
+
+/// # Safety
+/// `svc #0` from EL0 traps to `hal_arm64::cpu`'s shared EL0-synchronous
+/// vector, which preserves every register except `x0`/`x1`.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") a7,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+        );
+    }
+    ret
+}
+
+/// See `fs-native::subsystem_entry::raw_syscall2`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1): (usize, usize);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") a7,
+            inlateout("x0") a0 => r0,
+            inlateout("x1") a1 => r1,
+        );
+    }
+    (r0, r1)
+}
+
+/// Host-build stand-in (none of the three `#[cfg(target_arch = ...)]`
+/// blocks above match a non-`{riscv64,x86_64,aarch64}` host, which is
+/// never the case for this project's own CI/dev hosts today, but kept for
+/// forward-compatibility, matching `driver-virtio-blk::subsystem_entry`'s
+/// own identical stand-in). `subsystem_main` is never called from a host
+/// test (there is no live kernel to `ecall` into), so this body is
+/// unreachable in practice.
+#[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(never)]
 unsafe fn raw_syscall(_a7: usize, _a0: usize, _a1: usize) -> usize {
     unreachable!("driver-virtio-net's subsystem_main never runs on a host build")
 }
 
 /// See `raw_syscall`'s own doc comment (host-build stand-in).
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(never)]
 unsafe fn raw_syscall2(_a7: usize, _a0: usize, _a1: usize) -> (usize, usize) {
     unreachable!("driver-virtio-net's subsystem_main never runs on a host build")
@@ -220,10 +296,42 @@ fn handle_poll_frame(drv: &mut crate::VirtioNet) -> DriverResponse {
     }
 }
 
-/// Constructs the `VirtioNet` driver against this process's own three
-/// pre-mapped regions.
-fn new_driver() -> crate::VirtioNet {
-    crate::VirtioNet::new(DRV_MMIO_VA, DRV_RX_VA, DRV_TX_VA)
+/// Constructs the right `VirtioNet` for whichever transport this process
+/// was actually granted — read from the RX region's own `transport_kind`
+/// header word (`driver_virtio_net::layout::PCI_INFO_OFFSET`'s own doc
+/// comment for the full field layout; `kernel_arch_glue`'s own spawn-time
+/// PCI capability-list walk populates it for `Transport::Pci`, or leaves
+/// it `0` for `Transport::Mmio`, in which case `DRV_MMIO_VA` — pre-mapped
+/// the same trusted way regardless — is used directly). Mirrors `driver_
+/// virtio_blk::subsystem_entry::new_driver_for_this_transport` exactly.
+fn new_driver_for_this_transport() -> crate::VirtioNet {
+    // SAFETY: `DRV_RX_VA` is mapped `U=1 R+W` in this process's own
+    // address space by `kernel_arch_glue::spawn_virtio_net_driver`,
+    // before this process is ever scheduled.
+    let transport_kind =
+        unsafe { ((DRV_RX_VA + crate::layout::PCI_INFO_OFFSET) as *const u64).read_volatile() };
+    if transport_kind == 0 {
+        return crate::VirtioNet::new(DRV_MMIO_VA, DRV_RX_VA, DRV_TX_VA);
+    }
+    // SAFETY: same contract as the `transport_kind` read above; each
+    // field is a `u64` at a fixed offset within the same info block.
+    let read_u64_at = |field_offset: usize| unsafe {
+        ((DRV_RX_VA + crate::layout::PCI_INFO_OFFSET + field_offset) as *const u64).read_volatile()
+    };
+    let common_cfg_va = read_u64_at(8) as usize;
+    let notify_cfg_va = read_u64_at(16) as usize;
+    let notify_off_multiplier = read_u64_at(24) as u32;
+    let isr_cfg_va = read_u64_at(32) as usize;
+    let device_cfg_va = read_u64_at(40) as usize;
+    crate::VirtioNet::new_pci(
+        common_cfg_va,
+        notify_cfg_va,
+        notify_off_multiplier,
+        isr_cfg_va,
+        device_cfg_va,
+        DRV_RX_VA,
+        DRV_TX_VA,
+    )
 }
 
 /// The virtio-net driver's process entry point. Runs `probe()` exactly
@@ -240,7 +348,7 @@ fn new_driver() -> crate::VirtioNet {
 /// behavior exactly.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
-    let mut drv = new_driver();
+    let mut drv = new_driver_for_this_transport();
     let _ = drv.probe();
 
     loop {

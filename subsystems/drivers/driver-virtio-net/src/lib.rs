@@ -2,13 +2,16 @@
 //! driver-virtio-net
 //!
 //! Purpose: the MVP network driver — virtio-net (03-Kernel-Subsystems-
-//! Layer.md §2.3/§5.4) over virtio-mmio, riscv64 ONLY for now (Device Tree
-//! discovery via `hal_riscv64::peripheral`, which already classifies a
-//! `DEVICE_ID == 1` virtio-mmio slot as `PeripheralKind::Network` — no HAL
-//! change was needed to unblock this crate). aarch64 (virtio-pci) and
-//! x86_64 (virtio-pci + MSI-X) fan-out is a follow-up, mirroring
-//! `driver-virtio-blk`'s own multi-session history (that driver, too,
-//! started MMIO/riscv64-only before later sessions added PCI transports).
+//! Layer.md §2.3/§5.4) over EITHER of two transports (`Transport`'s own
+//! doc comment): virtio-mmio (riscv64, Device Tree discovery) or
+//! virtio-pci "modern" (aarch64/x86_64, PCI/ECAM discovery) — mirrors
+//! `driver_virtio_blk::Transport`'s own shape exactly, one session later.
+//! No MSI-X/INTx interrupt wiring on either PCI architecture: unlike
+//! `driver_virtio_blk`, this driver is polling-only on EVERY architecture
+//! (this module's own doc comment on why), so there is nothing for either
+//! PCI platform's own interrupt-controller path to plug into — the
+//! device's own capability list may still advertise MSI-X, but this
+//! driver never enables it and never needs to.
 //! Runs as its own isolated process, implements `driver_framework::
 //! DeviceDriver`, and serves `DriverRequest::{SendFrame,PollFrame}` by
 //! driving TWO virtio virtqueues (receiveq1/transmitq1, spec §5.1.2).
@@ -20,31 +23,31 @@
 //! acceptance demo).
 //!
 //! Position in the system: layer-3 process, spawned by `kernel_arch_glue::
-//! spawn_virtio_net_driver`. Its virtio-mmio register window (discovered
-//! by the HAL peripheral scan, `hal_core::peripheral`) and TWO virtqueue/
-//! buffer `SharedRegion`s (one per queue — see `layout`'s own doc comment
-//! for why this driver needs two separate regions where `driver_virtio_
-//! blk` gets by with one) are pre-mapped directly into its address space
-//! at spawn time, exactly like `driver-virtio-blk`'s own trusted-bootstrap
-//! pattern.
+//! spawn_virtio_net_driver`. Its virtio register window(s) (discovered by
+//! the HAL peripheral scan, `hal_core::peripheral`, and — for `Transport::
+//! Pci` only — resolved from a real PCI capability-list walk `kernel_
+//! arch_glue` performs at spawn time, never this crate) are pre-mapped
+//! directly into its address space at spawn time, exactly like `driver_
+//! virtio_blk`'s own trusted-bootstrap pattern. TWO virtqueue/buffer
+//! `SharedRegion`s (one per queue — see `layout`'s own doc comment for
+//! why this driver needs two separate regions where `driver_virtio_blk`
+//! gets by with one) are pre-mapped the same way.
 //!
 //! MVP scope: `do_probe` runs the virtio 1.x device-init handshake for
 //! BOTH queues and negotiates ONLY `VIRTIO_F_VERSION_1` (mandatory) plus
 //! `VIRTIO_NET_F_MAC` (if the device offers it, to read a real MAC from
 //! config space rather than a hardcoded fallback — QEMU's own virtio-net
 //! backend always offers it). No offload features (checksum/TSO/GSO/
-//! MRG_RXBUF) are negotiated, matching the fixed 10-byte `virtio_net_hdr`
-//! this driver always writes/expects. Completion is a bounded busy-poll on
-//! each queue's own used ring (no interrupt-driven path yet — a
-//! deliberately smaller first step than `driver-virtio-blk`'s own history,
-//! which added interrupts in a LATER session too) — `submit_tx` blocks
-//! (bounded) for its own completion; `poll_rx` is explicitly non-blocking
-//! (a single check), because unlike a block read a network reply may
-//! never arrive at all, so the caller (this driver's own `subsystem_
-//! entry.rs`, driven in turn by `kernel_arch_glue`'s own demo sequencing)
-//! is the one that retries across separate `Call`s.
+//! MRG_RXBUF) are negotiated, matching the fixed 12-byte `virtio_net_hdr_
+//! v1` this driver always writes/expects. Completion is a bounded busy-
+//! poll on each queue's own used ring — `submit_tx` blocks (bounded) for
+//! its own completion; `poll_rx` is explicitly non-blocking (a single
+//! check), because unlike a block read a network reply may never arrive
+//! at all, so the caller (this driver's own `subsystem_entry.rs`, driven
+//! in turn by `kernel_arch_glue`'s own demo sequencing) is the one that
+//! retries across separate `Call`s.
 //!
-//! Safety/invariants: every MMIO/virtqueue-memory access goes through
+//! Safety/invariants: every MMIO/PCI/virtqueue-memory access goes through
 //! `read_volatile`/`write_volatile` with a `// SAFETY:` note tying it to
 //! the caller's "already mapped" contract (`self.ready`), mirroring
 //! `driver_virtio_blk` exactly.
@@ -132,6 +135,48 @@ pub mod status {
     pub const DRIVER_OK: u32 = 4;
 }
 
+/// virtio-pci "modern" transport (spec §4.1.4) register layouts — offsets
+/// WITHIN whichever BAR+offset window the device's own PCI capability
+/// list (spec §4.1.4, cap_id 0x09) resolved for each `cfg_type`.
+/// Numerically identical to `driver_virtio_blk::pci_common`'s own module
+/// (the virtio-pci register FILE is the same regardless of device type —
+/// only `DEVICE_CFG`'s own contents differ) — redefined here rather than
+/// shared, matching this project's established one-crate-owns-its-own-
+/// register-map layout. No `QUEUE_MSIX_VECTOR` field: unlike `driver_
+/// virtio_blk`, this driver never negotiates MSI-X on any architecture
+/// (this crate's own module doc comment on why).
+pub mod pci_common {
+    /// le32 — selects which 32-bit word `DEVICE_FEATURE` reads.
+    pub const DEVICE_FEATURE_SELECT: usize = 0x00;
+    /// le32.
+    pub const DEVICE_FEATURE: usize = 0x04;
+    /// le32 — selects which 32-bit word `DRIVER_FEATURE` writes.
+    pub const DRIVER_FEATURE_SELECT: usize = 0x08;
+    /// le32.
+    pub const DRIVER_FEATURE: usize = 0x0c;
+    /// u8 — same semantics as virtio-mmio's `STATUS`, different width.
+    pub const DEVICE_STATUS: usize = 0x14;
+    /// le16 — selects which queue the fields below name.
+    pub const QUEUE_SELECT: usize = 0x16;
+    /// le16, read-write: read for `QUEUE_NUM_MAX`, written for
+    /// `QUEUE_NUM` — the same register serves both roles in the PCI
+    /// layout (unlike MMIO's two separate registers).
+    pub const QUEUE_SIZE: usize = 0x18;
+    /// le16 — write 1 once this queue's addresses below are set, the
+    /// PCI equivalent of MMIO's `QUEUE_READY`.
+    pub const QUEUE_ENABLE: usize = 0x1c;
+    /// le16 — this queue's own offset (in `notify_off_multiplier`
+    /// units) into the NOTIFY_CFG BAR window; read once per queue during
+    /// `probe` and cached (`rx_notify_off`/`tx_notify_off`).
+    pub const QUEUE_NOTIFY_OFF: usize = 0x1e;
+    /// le64.
+    pub const QUEUE_DESC: usize = 0x20;
+    /// le64.
+    pub const QUEUE_DRIVER: usize = 0x28;
+    /// le64.
+    pub const QUEUE_DEVICE: usize = 0x30;
+}
+
 /// `VIRTIO_F_VERSION_1` (feature bit 32, word index 1) — mandatory for the
 /// modern transport this driver speaks, same as `driver_virtio_blk`'s own.
 pub const VIRTIO_F_VERSION_1: u32 = 1 << (32 - 32);
@@ -181,12 +226,7 @@ pub const TX_QUEUE: u32 = 1;
 /// the ONE captured outbound frame was missing its first 2 bytes (a
 /// broadcast destination MAC that should read `ff ff ff ff ff ff` instead
 /// began right at its 5th byte) — proof the device was consuming 2 MORE
-/// header bytes than this driver intended, silently eating the front of
-/// every real Ethernet frame this driver ever sent (and, symmetrically,
-/// misreading the true length of anything it ever received) — not a
-/// virtqueue/completion bug at all, despite `poll_rx`'s own inverted-
-/// comparison bug (fixed separately, see that function's own doc
-/// comment) looking like the obvious suspect at first.
+/// header bytes than this driver intended.
 ///
 /// Always zero-filled on TX (no GSO/checksum offload requested —
 /// `gso_type = VIRTIO_NET_HDR_GSO_NONE = 0` is the all-zero value; the
@@ -230,7 +270,10 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 ///   `16..48`  descriptor table (`QUEUE_SIZE` * 16 bytes = 32 bytes).
 ///   `48..56`  avail (driver) ring (`4 + QUEUE_SIZE * 2` = 8 bytes).
 ///   `64..84`  used (device) ring (`4 + QUEUE_SIZE * 8` = 20 bytes).
-///   `256..256+710` the `virtio_net_hdr` (10 bytes) + frame buffer
+///   `96..96+48` `PCI_INFO_OFFSET`: RX region only, `Transport::Pci`'s own
+///             resolved register-window VAs — see that constant's own
+///             doc comment.
+///   `256..256+712` the `virtio_net_hdr` (12 bytes) + frame buffer
 ///             (`FRAME_MAX` = 700 bytes) — descriptor slot 0 always
 ///             points here (single buffer in flight per queue, MVP
 ///             scope).
@@ -258,6 +301,26 @@ pub mod layout {
     pub const AVAIL_OFFSET: usize = 48;
     /// The used (device) ring.
     pub const USED_OFFSET: usize = 64;
+    /// RX region only: the register-window info block `kernel_arch_glue`'s
+    /// own PCI capability-list walk resolves at spawn time and writes here
+    /// for `Transport::Pci` — this driver process has no other way to
+    /// learn it (no PCI-config-space access of its own, and no VA->PA-or-
+    /// back translation syscall exists for a non-root thread; same
+    /// reasoning as `driver_virtio_blk::layout::PCI_INFO_OFFSET`'s own doc
+    /// comment). Comfortably clear of the used ring above (`64..84`) and
+    /// the MAC/message regions. Five `u64`s (no `msix_vector` field —
+    /// this driver never negotiates MSI-X, this crate's own module doc
+    /// comment):
+    ///   `+0`  `transport_kind` (`0` = `Transport::Mmio`, meaningless —
+    ///         the driver uses `DRV_NET_MMIO_VA` directly in that case;
+    ///         `1` = `Transport::Pci`, the four fields below are real).
+    ///   `+8`  `common_cfg_va`
+    ///   `+16` `notify_cfg_va`
+    ///   `+24` `notify_off_multiplier` (widened to `u64` for uniform
+    ///         field width; the real value always fits `u32`)
+    ///   `+32` `isr_cfg_va`
+    ///   `+40` `device_cfg_va`
+    pub const PCI_INFO_OFFSET: usize = 96;
     /// The `virtio_net_hdr` + frame buffer (descriptor slot 0, both
     /// queues).
     pub const BUFFER_OFFSET: usize = 256;
@@ -298,18 +361,51 @@ struct VirtqDescRaw {
 /// — mirrors `driver_virtio_blk::STATUS_TIMEOUT`'s own role.
 const MAX_SPINS: u32 = 20_000_000;
 
-/// The virtio-net driver state. MMIO transport only for now (see this
-/// crate's own module doc comment) — no `Transport` enum yet, unlike
-/// `driver_virtio_blk` (which grew one only once a second, PCI-based
-/// architecture actually needed it; this crate will grow the same shape
-/// when its own PCI fan-out session arrives).
+/// The transport this driver instance speaks — see each variant's own
+/// doc comment. `VirtioNet`'s own probe/submit/poll logic is transport-
+/// generic; only the low-level register accessors below branch on this.
+/// Mirrors `driver_virtio_blk::Transport` exactly, one session later.
+pub enum Transport {
+    /// virtio-mmio (riscv64, discovered via Device Tree) — one flat,
+    /// always-32-bit register window at `base`.
+    Mmio {
+        /// Mapped virtual base of the virtio-mmio transport window.
+        base: usize,
+    },
+    /// virtio-pci "modern" (aarch64/x86_64, discovered via PCI/ECAM) —
+    /// FOUR independently-located sub-regions, resolved once by `kernel_
+    /// arch_glue`'s own PCI capability-list walk at spawn time and pre-
+    /// mapped the same trusted way the MMIO window is (this driver
+    /// process never parses PCI capabilities itself).
+    Pci {
+        /// Mapped virtual base of the COMMON_CFG sub-region
+        /// (`pci_common`'s own offsets, cfg_type 1).
+        common: usize,
+        /// Mapped virtual base of the NOTIFY_CFG sub-region (cfg_type
+        /// 2) — a specific queue's own doorbell lives at `notify +
+        /// queue_notify_off * notify_off_multiplier`, a le16 write.
+        notify: usize,
+        /// `notify_off_multiplier` from the device's own `virtio_pci_
+        /// notify_cap` (the NOTIFY_CFG capability's own trailing field
+        /// beyond the base `virtio_pci_cap` struct).
+        notify_off_multiplier: u32,
+        /// Mapped virtual base of the ISR_CFG sub-region (cfg_type 3) —
+        /// a single u8, read-to-clear (spec §4.1.4.5).
+        isr: usize,
+        /// Mapped virtual base of the DEVICE_CFG sub-region (cfg_type
+        /// 4) — device-specific config space (the MAC), the PCI
+        /// equivalent of MMIO's `CONFIG` region.
+        device_cfg: usize,
+    },
+}
+
+/// The virtio-net driver state.
 pub struct VirtioNet {
-    /// Mapped virtual base of the virtio-mmio transport window (0 = not
-    /// granted yet).
-    mmio_base: usize,
+    /// The transport this instance speaks.
+    transport: Transport,
     /// Mapped virtual base of the RX queue's own `SharedRegion` (also
-    /// carries the negotiated MAC and the message-marshaling area — see
-    /// `layout`'s own doc comment).
+    /// carries the negotiated MAC, the `Transport::Pci` info block, and
+    /// the message-marshaling area — see `layout`'s own doc comment).
     rx_base: usize,
     /// Mapped virtual base of the TX queue's own `SharedRegion`.
     tx_base: usize,
@@ -324,6 +420,15 @@ pub struct VirtioNet {
     tx_next_idx: u16,
     /// The negotiated device MAC (all-zero until `do_probe` runs).
     mac: [u8; 6],
+    /// `Transport::Pci` only: the RX queue's own `queue_notify_off`
+    /// (`pci_common::QUEUE_NOTIFY_OFF`'s own doc comment), read once
+    /// during `probe` and cached. Always `0` (harmless — never read) for
+    /// `Transport::Mmio`.
+    rx_notify_off: u16,
+    /// Same role as `rx_notify_off`, for the TX queue — a SEPARATE field
+    /// because, unlike `driver_virtio_blk` (one queue only), this driver
+    /// has two queues, each with its own independent notify offset.
+    tx_notify_off: u16,
 }
 
 impl VirtioNet {
@@ -333,13 +438,41 @@ impl VirtioNet {
     /// exists).
     pub const fn new(mmio_base: usize, rx_base: usize, tx_base: usize) -> Self {
         Self {
-            mmio_base,
+            transport: Transport::Mmio { base: mmio_base },
             rx_base,
             tx_base,
             ready: false,
             rx_next_idx: 0,
             tx_next_idx: 0,
             mac: [0; 6],
+            rx_notify_off: 0,
+            tx_notify_off: 0,
+        }
+    }
+
+    /// Creates the driver bound to a virtio-pci "modern" transport
+    /// (`Transport::Pci`'s own doc comment covers each sub-region's role)
+    /// and RX/TX queue regions.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new_pci(
+        common: usize,
+        notify: usize,
+        notify_off_multiplier: u32,
+        isr: usize,
+        device_cfg: usize,
+        rx_base: usize,
+        tx_base: usize,
+    ) -> Self {
+        Self {
+            transport: Transport::Pci { common, notify, notify_off_multiplier, isr, device_cfg },
+            rx_base,
+            tx_base,
+            ready: false,
+            rx_next_idx: 0,
+            tx_next_idx: 0,
+            mac: [0; 6],
+            rx_notify_off: 0,
+            tx_notify_off: 0,
         }
     }
 
@@ -347,12 +480,213 @@ impl VirtioNet {
     /// base — `probe`'s own "nothing granted yet" early-return check,
     /// mirroring `driver_virtio_blk::VirtioBlk::transport_is_bound`.
     fn regions_bound(&self) -> bool {
-        self.mmio_base != 0 && self.rx_base != 0 && self.tx_base != 0
+        let transport_bound = match self.transport {
+            Transport::Mmio { base } => base != 0,
+            Transport::Pci { common, .. } => common != 0,
+        };
+        transport_bound && self.rx_base != 0 && self.tx_base != 0
     }
 
     /// The negotiated device MAC (all-zero before `probe` succeeds).
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    // ---- transport-generic register accessors ---------------------
+    //
+    // Each one branches on `self.transport` and uses whichever width
+    // (`u32` for MMIO's uniformly-32-bit registers; the PCI spec's own
+    // mixed u8/u16/u32/u64 widths for `Transport::Pci`) that transport's
+    // own register actually is — mirrors `driver_virtio_blk`'s own
+    // accessor set exactly.
+
+    /// # Safety
+    /// The transport's own base(s) must be real, mapped windows.
+    unsafe fn read_device_feature(&self, word: u32) -> u32 {
+        match self.transport {
+            Transport::Mmio { base } => unsafe {
+                ((base + mmio::DEVICE_FEATURES_SEL) as *mut u32).write_volatile(word);
+                ((base + mmio::DEVICE_FEATURES) as *const u32).read_volatile()
+            },
+            Transport::Pci { common, .. } => unsafe {
+                ((common + pci_common::DEVICE_FEATURE_SELECT) as *mut u32).write_volatile(word);
+                ((common + pci_common::DEVICE_FEATURE) as *const u32).read_volatile()
+            },
+        }
+    }
+
+    /// # Safety
+    /// Same contract as `read_device_feature`.
+    unsafe fn write_driver_feature(&self, word: u32, value: u32) {
+        match self.transport {
+            Transport::Mmio { base } => unsafe {
+                ((base + mmio::DRIVER_FEATURES_SEL) as *mut u32).write_volatile(word);
+                ((base + mmio::DRIVER_FEATURES) as *mut u32).write_volatile(value);
+            },
+            Transport::Pci { common, .. } => unsafe {
+                ((common + pci_common::DRIVER_FEATURE_SELECT) as *mut u32).write_volatile(word);
+                ((common + pci_common::DRIVER_FEATURE) as *mut u32).write_volatile(value);
+            },
+        }
+    }
+
+    /// # Safety
+    /// Same contract as `read_device_feature`.
+    unsafe fn read_status(&self) -> u32 {
+        match self.transport {
+            Transport::Mmio { base } => unsafe { ((base + mmio::STATUS) as *const u32).read_volatile() },
+            Transport::Pci { common, .. } => unsafe {
+                ((common + pci_common::DEVICE_STATUS) as *const u8).read_volatile() as u32
+            },
+        }
+    }
+
+    /// # Safety
+    /// Same contract as `read_device_feature`.
+    unsafe fn write_status(&self, value: u32) {
+        match self.transport {
+            Transport::Mmio { base } => unsafe { ((base + mmio::STATUS) as *mut u32).write_volatile(value) },
+            Transport::Pci { common, .. } => unsafe {
+                ((common + pci_common::DEVICE_STATUS) as *mut u8).write_volatile(value as u8)
+            },
+        }
+    }
+
+    /// # Safety
+    /// Same contract as `read_device_feature`.
+    unsafe fn select_queue(&self, idx: u32) {
+        match self.transport {
+            Transport::Mmio { base } => unsafe { ((base + mmio::QUEUE_SEL) as *mut u32).write_volatile(idx) },
+            Transport::Pci { common, .. } => unsafe {
+                ((common + pci_common::QUEUE_SELECT) as *mut u16).write_volatile(idx as u16)
+            },
+        }
+    }
+
+    /// # Safety
+    /// Same contract as `read_device_feature`; a queue must already be
+    /// selected via `select_queue`.
+    unsafe fn read_queue_size_max(&self) -> u32 {
+        match self.transport {
+            Transport::Mmio { base } => unsafe { ((base + mmio::QUEUE_NUM_MAX) as *const u32).read_volatile() },
+            Transport::Pci { common, .. } => unsafe {
+                ((common + pci_common::QUEUE_SIZE) as *const u16).read_volatile() as u32
+            },
+        }
+    }
+
+    /// # Safety
+    /// Same contract as `read_queue_size_max`.
+    unsafe fn write_queue_size(&self, size: u32) {
+        match self.transport {
+            Transport::Mmio { base } => unsafe { ((base + mmio::QUEUE_NUM) as *mut u32).write_volatile(size) },
+            Transport::Pci { common, .. } => unsafe {
+                ((common + pci_common::QUEUE_SIZE) as *mut u16).write_volatile(size as u16)
+            },
+        }
+    }
+
+    /// # Safety
+    /// Same contract as `read_queue_size_max`.
+    unsafe fn write_queue_addrs(&self, desc: u64, avail: u64, used: u64) {
+        match self.transport {
+            Transport::Mmio { base } => unsafe {
+                ((base + mmio::QUEUE_DESC_LOW) as *mut u32).write_volatile(desc as u32);
+                ((base + mmio::QUEUE_DESC_HIGH) as *mut u32).write_volatile((desc >> 32) as u32);
+                ((base + mmio::QUEUE_DRIVER_LOW) as *mut u32).write_volatile(avail as u32);
+                ((base + mmio::QUEUE_DRIVER_HIGH) as *mut u32).write_volatile((avail >> 32) as u32);
+                ((base + mmio::QUEUE_DEVICE_LOW) as *mut u32).write_volatile(used as u32);
+                ((base + mmio::QUEUE_DEVICE_HIGH) as *mut u32).write_volatile((used >> 32) as u32);
+            },
+            Transport::Pci { common, .. } => unsafe {
+                ((common + pci_common::QUEUE_DESC) as *mut u64).write_volatile(desc);
+                ((common + pci_common::QUEUE_DRIVER) as *mut u64).write_volatile(avail);
+                ((common + pci_common::QUEUE_DEVICE) as *mut u64).write_volatile(used);
+            },
+        }
+    }
+
+    /// Marks the currently-selected queue live — MMIO's `QUEUE_READY` /
+    /// PCI's `QUEUE_ENABLE`, the same semantic bit. For `Transport::Pci`
+    /// ALSO reads `queue_notify_off` and returns it (the caller stores it
+    /// into whichever of `rx_notify_off`/`tx_notify_off` matches the
+    /// queue just enabled — this driver has TWO independently-selected
+    /// queues, unlike `driver_virtio_blk`'s single one, so the caller
+    /// must route the returned value itself). `0` (harmless) for
+    /// `Transport::Mmio`.
+    ///
+    /// # Safety
+    /// Same contract as `read_queue_size_max`.
+    unsafe fn enable_queue(&self) -> u16 {
+        match self.transport {
+            Transport::Mmio { base } => unsafe {
+                ((base + mmio::QUEUE_READY) as *mut u32).write_volatile(1);
+                0
+            },
+            Transport::Pci { common, .. } => unsafe {
+                let notify_off = ((common + pci_common::QUEUE_NOTIFY_OFF) as *const u16).read_volatile();
+                ((common + pci_common::QUEUE_ENABLE) as *mut u16).write_volatile(1);
+                notify_off
+            },
+        }
+    }
+
+    /// Rings the doorbell for `queue_idx`, whose own `notify_off` the
+    /// caller passes (from `rx_notify_off`/`tx_notify_off` — see
+    /// `enable_queue`'s own doc comment for why this driver, unlike
+    /// `driver_virtio_blk`, cannot cache a single notify offset).
+    ///
+    /// # Safety
+    /// Same contract as `read_device_feature`; `enable_queue` must
+    /// already have run for this queue.
+    unsafe fn notify_queue(&self, queue_idx: u32, notify_off: u16) {
+        match self.transport {
+            Transport::Mmio { base } => unsafe {
+                ((base + mmio::QUEUE_NOTIFY) as *mut u32).write_volatile(queue_idx)
+            },
+            Transport::Pci { notify, notify_off_multiplier, .. } => unsafe {
+                let addr = notify + (notify_off as usize) * (notify_off_multiplier as usize);
+                (addr as *mut u16).write_volatile(queue_idx as u16);
+            },
+        }
+    }
+
+    /// Reads and acknowledges the device's own pending interrupt cause —
+    /// MMIO's own explicit read-`INTERRUPT_STATUS`-then-write-
+    /// `INTERRUPT_ACK`-the-same-value pair, or PCI's single read-to-clear
+    /// `ISR_CFG` byte (spec §4.1.4.5) — both fully consumed here, so the
+    /// caller never needs to know which. Called unconditionally after
+    /// every completion (this driver never actually WAITS on the
+    /// resulting interrupt line — it always polls the used ring directly,
+    /// this crate's own module doc comment — but draining whatever cause
+    /// is pending still avoids a later poll observing a stale one).
+    ///
+    /// # Safety
+    /// Same contract as `read_device_feature`.
+    unsafe fn ack_interrupt(&self) {
+        match self.transport {
+            Transport::Mmio { base } => unsafe {
+                let cause = ((base + mmio::INTERRUPT_STATUS) as *const u32).read_volatile();
+                ((base + mmio::INTERRUPT_ACK) as *mut u32).write_volatile(cause);
+            },
+            Transport::Pci { isr, .. } => unsafe {
+                let _ = (isr as *const u8).read_volatile();
+            },
+        }
+    }
+
+    /// Reads one byte of the device-specific config space (the MAC,
+    /// spec §5.1.4) at `offset`.
+    ///
+    /// # Safety
+    /// Same contract as `read_device_feature`.
+    unsafe fn read_config_byte(&self, offset: usize) -> u8 {
+        match self.transport {
+            Transport::Mmio { base } => unsafe { ((base + mmio::CONFIG + offset) as *const u8).read_volatile() },
+            Transport::Pci { device_cfg, .. } => unsafe {
+                ((device_cfg + offset) as *const u8).read_volatile()
+            },
+        }
     }
 
     /// The physical address of `region_base + offset`, derived from the
@@ -369,7 +703,9 @@ impl VirtioNet {
     }
 
     /// Publishes descriptor slot 0 of `region_base`'s own queue into the
-    /// avail ring and rings the doorbell for `queue_idx`. `desc` is the
+    /// avail ring and rings the doorbell for `queue_idx` (using
+    /// `notify_off` — `enable_queue`'s own doc comment on why this is a
+    /// per-call parameter, not a single cached field). `desc` is the
     /// caller-built descriptor (already pointing at `BUFFER_OFFSET`, with
     /// the right `len`/`flags` for the direction — device-writable for
     /// RX, device-readable for TX). `next_idx` is threaded through
@@ -380,7 +716,15 @@ impl VirtioNet {
     /// # Safety
     /// `region_base` must be mapped; `queue_idx` must already be
     /// `select_queue`d and set up (`do_probe`'s own contract).
-    unsafe fn publish_and_notify(&self, region_base: usize, queue_idx: u32, next_idx: &mut u16, desc: VirtqDescRaw) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn publish_and_notify(
+        &self,
+        region_base: usize,
+        queue_idx: u32,
+        notify_off: u16,
+        next_idx: &mut u16,
+        desc: VirtqDescRaw,
+    ) {
         // SAFETY: `DESC_OFFSET` (32 bytes, slot 0 only ever used) is
         // within the mapped region — forwarded from this method's own
         // contract.
@@ -393,10 +737,8 @@ impl VirtioNet {
             *next_idx = next_idx.wrapping_add(1);
             q_write_u16(region_base, layout::AVAIL_OFFSET + 2, *next_idx); // avail.idx
         }
-        // SAFETY: same contract as this method's own.
-        unsafe {
-            ((self.mmio_base + mmio::QUEUE_NOTIFY) as *mut u32).write_volatile(queue_idx);
-        }
+        // SAFETY: `notify_queue`'s own contract (forwarded).
+        unsafe { self.notify_queue(queue_idx, notify_off) };
     }
 
     /// Posts (or re-posts) the ONE RX buffer this driver keeps in flight
@@ -418,94 +760,86 @@ impl VirtioNet {
         // already selected/enabled by `do_probe`.
         let rx_base = self.rx_base;
         let mut next_idx = self.rx_next_idx;
-        unsafe { self.publish_and_notify(rx_base, RX_QUEUE, &mut next_idx, desc) };
+        unsafe { self.publish_and_notify(rx_base, RX_QUEUE, self.rx_notify_off, &mut next_idx, desc) };
         self.rx_next_idx = next_idx;
     }
 
     /// Runs the virtio 1.x device-init handshake (spec §3.1) for BOTH
-    /// queues. Real MMIO/virtqueue reads/writes throughout — see each
-    /// helper's own `# Safety`.
+    /// queues. Real MMIO/PCI/virtqueue reads/writes throughout, via the
+    /// transport-generic accessors above. For `Transport::Mmio` only,
+    /// ALSO verifies `MAGIC_VALUE`/`DEVICE_ID`/`VERSION` first — a PCI
+    /// device has no equivalent registers at all (PCI discovery already
+    /// confirmed vendor/class during the bus scan).
     fn do_probe(&mut self) -> Result<(), DriverError> {
-        let base = self.mmio_base;
-        // SAFETY: `base` is trusted per this method's own contract
-        // (verified non-zero by the caller, `probe`).
-        let magic = unsafe { ((base + mmio::MAGIC_VALUE) as *const u32).read_volatile() };
-        // SAFETY: same contract.
-        let device_id = unsafe { ((base + mmio::DEVICE_ID) as *const u32).read_volatile() };
-        // SAFETY: same contract.
-        let version = unsafe { ((base + mmio::VERSION) as *const u32).read_volatile() };
-        const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
-        const VIRTIO_NETWORK_DEVICE: u32 = 1;
-        const VIRTIO_MMIO_VERSION_MODERN: u32 = 2;
-        if magic != VIRTIO_MMIO_MAGIC || device_id != VIRTIO_NETWORK_DEVICE {
-            return Err(DriverError::ProbeFailed);
-        }
-        // Same "modern-only, reject anything else" reasoning as
-        // `driver_virtio_blk::VirtioBlk::do_probe`'s own check — this
-        // driver's whole register map is the version-2 transport's own
-        // layout.
-        if version != VIRTIO_MMIO_VERSION_MODERN {
-            return Err(DriverError::ProbeFailed);
+        if let Transport::Mmio { base } = self.transport {
+            // SAFETY: `base` is trusted per this method's own contract
+            // (verified non-zero by the caller, `probe`).
+            let magic = unsafe { ((base + mmio::MAGIC_VALUE) as *const u32).read_volatile() };
+            // SAFETY: same contract.
+            let device_id = unsafe { ((base + mmio::DEVICE_ID) as *const u32).read_volatile() };
+            // SAFETY: same contract.
+            let version = unsafe { ((base + mmio::VERSION) as *const u32).read_volatile() };
+            const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+            const VIRTIO_NETWORK_DEVICE: u32 = 1;
+            const VIRTIO_MMIO_VERSION_MODERN: u32 = 2;
+            if magic != VIRTIO_MMIO_MAGIC || device_id != VIRTIO_NETWORK_DEVICE {
+                return Err(DriverError::ProbeFailed);
+            }
+            // Same "modern-only, reject anything else" reasoning as
+            // `driver_virtio_blk::VirtioBlk::do_probe`'s own check.
+            if version != VIRTIO_MMIO_VERSION_MODERN {
+                return Err(DriverError::ProbeFailed);
+            }
         }
 
-        // SAFETY: every accessor call below is a plain volatile MMIO
-        // access to `base` (trusted per this method's own contract,
-        // verified by the caller `probe`) or to `self.rx_base`/`self.
-        // tx_base` (same contract).
+        // SAFETY: every accessor call below shares its own contract —
+        // the transport's own base(s) are trusted per this method's own
+        // contract (verified by the caller, `probe`).
         unsafe {
-            ((base + mmio::STATUS) as *mut u32).write_volatile(0);
-            ((base + mmio::STATUS) as *mut u32).write_volatile(status::ACKNOWLEDGE);
-            ((base + mmio::STATUS) as *mut u32).write_volatile(status::ACKNOWLEDGE | status::DRIVER);
+            self.write_status(0);
+            self.write_status(status::ACKNOWLEDGE);
+            self.write_status(status::ACKNOWLEDGE | status::DRIVER);
 
             // Feature negotiation (spec §3.1 steps 3-6): VIRTIO_F_VERSION_1
             // is mandatory; VIRTIO_NET_F_MAC is accepted IF offered (see
             // this constant's own doc comment) so a real MAC can be read
             // from config space below.
-            ((base + mmio::DEVICE_FEATURES_SEL) as *mut u32).write_volatile(0);
-            let dev_features_lo = ((base + mmio::DEVICE_FEATURES) as *const u32).read_volatile();
-            ((base + mmio::DEVICE_FEATURES_SEL) as *mut u32).write_volatile(1);
-            let dev_features_hi = ((base + mmio::DEVICE_FEATURES) as *const u32).read_volatile();
+            let dev_features_lo = self.read_device_feature(0);
+            let dev_features_hi = self.read_device_feature(1);
             let mac_offered = dev_features_lo & VIRTIO_NET_F_MAC != 0;
 
-            ((base + mmio::DRIVER_FEATURES_SEL) as *mut u32).write_volatile(0);
-            ((base + mmio::DRIVER_FEATURES) as *mut u32)
-                .write_volatile(if mac_offered { VIRTIO_NET_F_MAC } else { 0 });
-            ((base + mmio::DRIVER_FEATURES_SEL) as *mut u32).write_volatile(1);
-            ((base + mmio::DRIVER_FEATURES) as *mut u32)
-                .write_volatile(dev_features_hi & VIRTIO_F_VERSION_1);
+            self.write_driver_feature(0, if mac_offered { VIRTIO_NET_F_MAC } else { 0 });
+            self.write_driver_feature(1, dev_features_hi & VIRTIO_F_VERSION_1);
 
-            ((base + mmio::STATUS) as *mut u32)
-                .write_volatile(status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK);
-            let after_features = ((base + mmio::STATUS) as *const u32).read_volatile();
+            self.write_status(status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK);
+            let after_features = self.read_status();
             if after_features & status::FEATURES_OK == 0 {
-                ((base + mmio::STATUS) as *mut u32).write_volatile(status::FAILED);
+                self.write_status(status::FAILED);
                 return Err(DriverError::ProbeFailed);
             }
 
             // Queue setup (spec §3.1 step 7, §4.2.3.2) — RX then TX.
             for (queue_idx, region_base) in [(RX_QUEUE, self.rx_base), (TX_QUEUE, self.tx_base)] {
-                ((base + mmio::QUEUE_SEL) as *mut u32).write_volatile(queue_idx);
-                let max = ((base + mmio::QUEUE_NUM_MAX) as *const u32).read_volatile();
+                self.select_queue(queue_idx);
+                let max = self.read_queue_size_max();
                 if max == 0 || (max as u16) < QUEUE_SIZE {
-                    ((base + mmio::STATUS) as *mut u32).write_volatile(status::FAILED);
+                    self.write_status(status::FAILED);
                     return Err(DriverError::ProbeFailed);
                 }
-                ((base + mmio::QUEUE_NUM) as *mut u32).write_volatile(QUEUE_SIZE as u32);
+                self.write_queue_size(QUEUE_SIZE as u32);
                 let desc_phys = Self::region_phys(region_base, layout::DESC_OFFSET);
                 let avail_phys = Self::region_phys(region_base, layout::AVAIL_OFFSET);
                 let used_phys = Self::region_phys(region_base, layout::USED_OFFSET);
-                ((base + mmio::QUEUE_DESC_LOW) as *mut u32).write_volatile(desc_phys as u32);
-                ((base + mmio::QUEUE_DESC_HIGH) as *mut u32).write_volatile((desc_phys >> 32) as u32);
-                ((base + mmio::QUEUE_DRIVER_LOW) as *mut u32).write_volatile(avail_phys as u32);
-                ((base + mmio::QUEUE_DRIVER_HIGH) as *mut u32).write_volatile((avail_phys >> 32) as u32);
-                ((base + mmio::QUEUE_DEVICE_LOW) as *mut u32).write_volatile(used_phys as u32);
-                ((base + mmio::QUEUE_DEVICE_HIGH) as *mut u32).write_volatile((used_phys >> 32) as u32);
-                ((base + mmio::QUEUE_READY) as *mut u32).write_volatile(1);
+                self.write_queue_addrs(desc_phys, avail_phys, used_phys);
+                let notify_off = self.enable_queue();
+                if queue_idx == RX_QUEUE {
+                    self.rx_notify_off = notify_off;
+                } else {
+                    self.tx_notify_off = notify_off;
+                }
             }
 
-            ((base + mmio::STATUS) as *mut u32).write_volatile(
-                status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
-            );
+            self.write_status(status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK);
 
             // Device-specific config space: `mac` is the struct's first
             // field (spec §5.1.4) — only meaningful if `mac_offered`;
@@ -514,7 +848,7 @@ impl VirtioNet {
             self.mac = if mac_offered {
                 let mut m = [0u8; 6];
                 for (i, byte) in m.iter_mut().enumerate() {
-                    *byte = ((base + mmio::CONFIG + i) as *const u8).read_volatile();
+                    *byte = self.read_config_byte(i);
                 }
                 m
             } else {
@@ -577,7 +911,7 @@ impl VirtioNet {
         let mut next_idx = self.tx_next_idx;
         // SAFETY: `publish_and_notify`'s own contract — `tx_base` is
         // mapped, TX_QUEUE was set up by `do_probe`.
-        unsafe { self.publish_and_notify(tx_base, TX_QUEUE, &mut next_idx, desc) };
+        unsafe { self.publish_and_notify(tx_base, TX_QUEUE, self.tx_notify_off, &mut next_idx, desc) };
         self.tx_next_idx = next_idx;
 
         let mut completed = false;
@@ -590,15 +924,11 @@ impl VirtioNet {
             }
             core::hint::spin_loop();
         }
-        // SAFETY: `self.mmio_base` is mapped (forwarded from this
-        // method's own contract) — drain whatever interrupt cause is
-        // pending so a later `submit_tx`/`poll_rx` is not stuck behind a
-        // stale one, mirroring `driver_virtio_blk::VirtioBlk::ack_
-        // interrupt`'s own role.
-        unsafe {
-            let cause = ((self.mmio_base + mmio::INTERRUPT_STATUS) as *const u32).read_volatile();
-            ((self.mmio_base + mmio::INTERRUPT_ACK) as *mut u32).write_volatile(cause);
-        }
+        // SAFETY: `ack_interrupt`'s own contract (forwarded) — drain
+        // whatever interrupt cause is pending so a later `submit_tx`/
+        // `poll_rx` is not stuck behind a stale one, mirroring `driver_
+        // virtio_blk::VirtioBlk::ack_interrupt`'s own role.
+        unsafe { self.ack_interrupt() };
         completed
     }
 
@@ -621,19 +951,7 @@ impl VirtioNet {
         // idx` (the avail.idx value `post_rx_buffer` last published) —
         // same "used_idx == next_idx means done" direction `driver_
         // virtio_blk::VirtioBlk::completion_pending`/`wait_for_
-        // completion` both use; this function's own FIRST version had it
-        // backwards (`== ` guarded the EARLY RETURN instead of the
-        // proceed-to-read path) — **real bug found via QEMU**: with the
-        // comparison inverted, `used_idx (0, genuinely nothing completed
-        // yet) != rx_next_idx (1, just published)` was already true on
-        // the very FIRST poll, so the "nothing new" branch never
-        // triggered and every single call fell through to read a used-
-        // ring slot the device had never actually written, reporting a
-        // phantom `FrameReceived { len: 0 }` forever regardless of real
-        // device state (confirmed via a temporary diagnostic log: every
-        // one of 5000+ poll attempts logged `len=0` starting immediately
-        // after the ARP request was sent, far too fast for even a
-        // genuine SLIRP reply, and never varying).
+        // completion` both use.
         if used_idx != self.rx_next_idx {
             return None;
         }
@@ -645,11 +963,8 @@ impl VirtioNet {
         let slot = ((self.rx_next_idx.wrapping_sub(1)) as usize % QUEUE_SIZE as usize) as usize;
         let entry_off = layout::USED_OFFSET + 4 + slot * 8 + 4;
         let total_len = unsafe { ((self.rx_base + entry_off) as *const u32).read_volatile() };
-        // SAFETY: `self.rx_base` is mapped (this method's own contract).
-        unsafe {
-            let cause = ((self.mmio_base + mmio::INTERRUPT_STATUS) as *const u32).read_volatile();
-            ((self.mmio_base + mmio::INTERRUPT_ACK) as *mut u32).write_volatile(cause);
-        }
+        // SAFETY: `ack_interrupt`'s own contract (forwarded).
+        unsafe { self.ack_interrupt() };
         // SAFETY: `post_rx_buffer`'s own contract (`self.rx_base` mapped).
         unsafe { self.post_rx_buffer() };
         Some(total_len.saturating_sub(VIRTIO_NET_HDR_LEN as u32))
@@ -742,6 +1057,25 @@ mod tests {
         assert!(!VirtioNet::new(0x1000, 0, 0x2000).regions_bound());
         assert!(!VirtioNet::new(0x1000, 0x2000, 0).regions_bound());
         assert!(VirtioNet::new(0x1000, 0x2000, 0x3000).regions_bound());
+    }
+
+    #[test]
+    fn probe_without_pci_common_cfg_fails() {
+        // Same reasoning as `probe_without_regions_fails`, `Transport::
+        // Pci` side: `common == 0` is `transport_bound`'s own "not
+        // granted yet" sentinel for this transport too.
+        let mut d = VirtioNet::new_pci(0, 0, 0, 0, 0, 0, 0);
+        assert_eq!(d.probe(), Err(DriverError::ProbeFailed));
+    }
+
+    #[test]
+    fn pci_transport_is_bound_once_common_cfg_is_real() {
+        // Constructing with a non-zero `common` base alone (no real
+        // hardware touched) is enough for `probe`'s own early-return
+        // check to pass through to the real-hardware path, mirroring
+        // `driver_virtio_blk`'s own identical test.
+        let d = VirtioNet::new_pci(0x4000_0000, 0x4000_1000, 4, 0x4000_2000, 0x4000_3000, 0x5000_0000, 0x6000_0000);
+        assert!(d.regions_bound());
     }
 
     #[test]
