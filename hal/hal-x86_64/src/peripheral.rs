@@ -72,6 +72,42 @@ const PCI_CLASS_DISPLAY: u8 = 0x03;
 /// works; 44 is arbitrary, chosen simply to stay clear of the LAPIC
 /// timer (32) and leave low headroom free for any future device.
 const X86_64_VIRTIO_BLK_MSI_VECTOR: u32 = 44;
+/// Same role as `X86_64_VIRTIO_BLK_MSI_VECTOR`, for the virtio-net
+/// device — a SEPARATE vector, not the same one. **Real bug found via
+/// QEMU** (driver-virtio-net's own multi-arch interrupt-driven-TX
+/// session): every PCI device this scan discovered was originally
+/// assigned `X86_64_VIRTIO_BLK_MSI_VECTOR` unconditionally, regardless
+/// of `kind` — harmless while virtio-blk was the only PCI device this
+/// project ever bound a REAL IRQ to (virtio-net stayed polling-only, so
+/// its own `IrqBind` was never even attempted), but the instant BOTH a
+/// virtio-blk AND a virtio-net device are present in the same boot
+/// (QEMU's own default `-netdev`+`-device virtio-net-pci` alongside
+/// `-device virtio-blk-pci`, or even aarch64's/x86_64's own board
+/// defaults), `kernel_arch_glue::spawn_virtio_net_driver`'s own
+/// `IrqBind` call failed outright — `hal_x86_64::interrupt::InterruptCtrl
+/// ::register_irq`'s own `HalError::IrqAlreadyRegistered` check
+/// (correctly) rejected registering the SAME vector blk's own `IrqBind`
+/// had already claimed moments earlier. Fixed by giving each `Peripheral
+/// Kind` its own reserved vector (`msi_vector_for_kind` below) — the
+/// same "HAL discovers a real IRQ id, kernel-arch-glue just uses it"
+/// shape either way, just no longer collapsing every device onto one.
+const X86_64_VIRTIO_NET_MSI_VECTOR: u32 = 45;
+
+/// Picks the reserved MSI-X vector for a just-classified PCI device —
+/// see `X86_64_VIRTIO_NET_MSI_VECTOR`'s own doc comment for why this
+/// must NOT collapse onto a single shared constant. `PeripheralKind::
+/// Unknown`/`Gpu`/anything else this project does not yet bind a real
+/// IRQ to still gets a distinct-from-blk/net vector (harmless — nothing
+/// calls `IrqBind` for those kinds today, so no collision is possible
+/// either way; kept distinct anyway so this function never needs a
+/// TODO the day one of them does).
+fn msi_vector_for_kind(kind: PeripheralKind) -> u32 {
+    match kind {
+        PeripheralKind::Block => X86_64_VIRTIO_BLK_MSI_VECTOR,
+        PeripheralKind::Network => X86_64_VIRTIO_NET_MSI_VECTOR,
+        _ => X86_64_VIRTIO_NET_MSI_VECTOR + 1,
+    }
+}
 
 fn ecam_offset(bus: u8, device: u8, function: u8) -> u64 {
     ((bus as u64) << 20) | ((device as u64) << 15) | ((function as u64) << 12)
@@ -233,7 +269,7 @@ impl PeripheralDiscovery {
                         kind,
                         mmio_base,
                         mmio_size,
-                        X86_64_VIRTIO_BLK_MSI_VECTOR,
+                        msi_vector_for_kind(kind),
                         config_space_base,
                     );
                     device_count += 1;
@@ -287,6 +323,17 @@ mod tests {
     fn ecam_offset_computes_correct_layout() {
         let offset = ecam_offset(1, 2, 3);
         assert_eq!(offset, 0x100000 | 0x10000 | 0x3000);
+    }
+
+    #[test]
+    fn msi_vector_for_kind_never_collapses_blk_and_net_onto_the_same_vector() {
+        // Real bug this test guards against — `X86_64_VIRTIO_NET_MSI_
+        // VECTOR`'s own doc comment: `IrqBind` for a SECOND real PCI
+        // device fails outright if it gets assigned the SAME vector an
+        // earlier `IrqBind` already claimed.
+        assert_ne!(msi_vector_for_kind(PeripheralKind::Block), msi_vector_for_kind(PeripheralKind::Network));
+        assert!(msi_vector_for_kind(PeripheralKind::Block) >= crate::interrupt::FIRST_USABLE_IRQ_VECTOR as u32);
+        assert!(msi_vector_for_kind(PeripheralKind::Network) >= crate::interrupt::FIRST_USABLE_IRQ_VECTOR as u32);
     }
 
     #[test]

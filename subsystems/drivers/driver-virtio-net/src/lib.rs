@@ -6,12 +6,33 @@
 //! doc comment): virtio-mmio (riscv64, Device Tree discovery) or
 //! virtio-pci "modern" (aarch64/x86_64, PCI/ECAM discovery) — mirrors
 //! `driver_virtio_blk::Transport`'s own shape exactly, one session later.
-//! No MSI-X/INTx interrupt wiring on either PCI architecture: unlike
-//! `driver_virtio_blk`, this driver is polling-only on EVERY architecture
-//! (this module's own doc comment on why), so there is nothing for either
-//! PCI platform's own interrupt-controller path to plug into — the
-//! device's own capability list may still advertise MSI-X, but this
-//! driver never enables it and never needs to.
+//!
+//! TX completion is now genuinely interrupt-driven (PLIC/MSI-X/legacy
+//! INTx, matching `driver_virtio_blk`'s own IRQ-line wiring exactly —
+//! `kernel_arch_glue::wire_virtio_pci_transport_net` programs MSI-X on
+//! x86_64 the same way `wire_virtio_pci_transport` does for blk): a
+//! transmit queue completion is a LOCAL virtqueue event the device
+//! always eventually produces on its own, regardless of network
+//! conditions, so a bounded real `Wait` (this crate's own module doc
+//! comment continues below) is exactly as safe as `driver_virtio_blk`'s
+//! own interrupt-driven I/O.
+//!
+//! RX (`PollFrame`) DELIBERATELY stays a single non-blocking used-ring
+//! check, NOT converted to a blocking `Wait` — this is a considered
+//! choice, not unfinished work: a network reply may never arrive at all
+//! (unlike a local block read/write or a local TX completion, both of
+//! which the device always eventually produces on its own), and this
+//! kernel has no `Wait`-with-timeout primitive — a `SyscallOp::Wait` on
+//! a `Notification` that never gets signalled again blocks the calling
+//! thread PERMANENTLY, with no way to un-block it. Making `PollFrame`
+//! itself block on the IRQ notification would trade the current design's
+//! bounded-by-retry-COUNT worst case (the outer caller's own finite
+//! `Call` retry loop, `kernel_arch_glue`'s own net demo) for a genuinely
+//! unbounded one (a single lost reply wedges this driver process
+//! forever, unrecoverable). The caller retrying non-blocking `PollFrame`
+//! `Call`s is therefore the correct design for "might never arrive"
+//! traffic, not a limitation — see `poll_rx`'s own doc comment.
+//!
 //! Runs as its own isolated process, implements `driver_framework::
 //! DeviceDriver`, and serves `DriverRequest::{SendFrame,PollFrame}` by
 //! driving TWO virtio virtqueues (receiveq1/transmitq1, spec §5.1.2).
@@ -142,9 +163,7 @@ pub mod status {
 /// (the virtio-pci register FILE is the same regardless of device type —
 /// only `DEVICE_CFG`'s own contents differ) — redefined here rather than
 /// shared, matching this project's established one-crate-owns-its-own-
-/// register-map layout. No `QUEUE_MSIX_VECTOR` field: unlike `driver_
-/// virtio_blk`, this driver never negotiates MSI-X on any architecture
-/// (this crate's own module doc comment on why).
+/// register-map layout.
 pub mod pci_common {
     /// le32 — selects which 32-bit word `DEVICE_FEATURE` reads.
     pub const DEVICE_FEATURE_SELECT: usize = 0x00;
@@ -175,7 +194,25 @@ pub mod pci_common {
     pub const QUEUE_DRIVER: usize = 0x28;
     /// le64.
     pub const QUEUE_DEVICE: usize = 0x30;
+    /// le16, PER-QUEUE (governed by whatever `QUEUE_SELECT` currently
+    /// names) — assigns the currently-selected queue's own completions
+    /// to an MSI-X table entry. Numerically identical to `driver_virtio_
+    /// blk::pci_common::QUEUE_MSIX_VECTOR` — see that constant's own doc
+    /// comment for the real bug (device RESET during `do_probe` clears
+    /// any earlier assignment) this driver's own `write_queue_msix_
+    /// vector` call, from inside `do_probe`'s per-queue setup loop,
+    /// exists to avoid.
+    pub const QUEUE_MSIX_VECTOR: usize = 0x1a;
 }
+
+/// `VIRTIO_MSI_NO_VECTOR` (virtio 1.x spec §4.1.4.3) — the reset default
+/// / "no vector assigned" sentinel `write_queue_msix_vector` writes for
+/// `Transport::Mmio` (harmless there — see that method's own doc
+/// comment) and whatever `new`'s own default leaves `msix_vector` at
+/// before `kernel_arch_glue`'s own PCI wiring ever overwrites it via
+/// `new_pci`. Numerically identical to `driver_virtio_blk::
+/// VIRTIO_MSI_NO_VECTOR`.
+pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;
 
 /// `VIRTIO_F_VERSION_1` (feature bit 32, word index 1) — mandatory for the
 /// modern transport this driver speaks, same as `driver_virtio_blk`'s own.
@@ -308,18 +345,21 @@ pub mod layout {
     /// back translation syscall exists for a non-root thread; same
     /// reasoning as `driver_virtio_blk::layout::PCI_INFO_OFFSET`'s own doc
     /// comment). Comfortably clear of the used ring above (`64..84`) and
-    /// the MAC/message regions. Five `u64`s (no `msix_vector` field —
-    /// this driver never negotiates MSI-X, this crate's own module doc
-    /// comment):
+    /// the MAC/message regions. Same seven `u64`s as `driver_virtio_blk::
+    /// layout::PCI_INFO_OFFSET`, now that TX completion is real
+    /// interrupt-driven (this crate's own module doc comment):
     ///   `+0`  `transport_kind` (`0` = `Transport::Mmio`, meaningless —
     ///         the driver uses `DRV_NET_MMIO_VA` directly in that case;
-    ///         `1` = `Transport::Pci`, the four fields below are real).
+    ///         `1` = `Transport::Pci`, the fields below are real).
     ///   `+8`  `common_cfg_va`
     ///   `+16` `notify_cfg_va`
     ///   `+24` `notify_off_multiplier` (widened to `u64` for uniform
     ///         field width; the real value always fits `u32`)
     ///   `+32` `isr_cfg_va`
     ///   `+40` `device_cfg_va`
+    ///   `+48` `msix_vector` (widened to `u64`; the real value always
+    ///         fits `u16` — `VIRTIO_MSI_NO_VECTOR` if MSI-X was not
+    ///         enabled, e.g. aarch64's own legacy-INTx choice)
     pub const PCI_INFO_OFFSET: usize = 96;
     /// The `virtio_net_hdr` + frame buffer (descriptor slot 0, both
     /// queues).
@@ -429,6 +469,13 @@ pub struct VirtioNet {
     /// because, unlike `driver_virtio_blk` (one queue only), this driver
     /// has two queues, each with its own independent notify offset.
     tx_notify_off: u16,
+    /// `Transport::Pci` only: the MSI-X table entry BOTH queues' own
+    /// completions are assigned to (`write_queue_msix_vector`'s own doc
+    /// comment) — `VIRTIO_MSI_NO_VECTOR` for `Transport::Mmio` or
+    /// whenever `kernel_arch_glue`'s own PCI wiring did not enable MSI-X
+    /// (aarch64's own legacy-INTx choice; `wire_virtio_pci_transport_
+    /// net`'s own doc comment).
+    msix_vector: u16,
 }
 
 impl VirtioNet {
@@ -447,12 +494,16 @@ impl VirtioNet {
             mac: [0; 6],
             rx_notify_off: 0,
             tx_notify_off: 0,
+            msix_vector: VIRTIO_MSI_NO_VECTOR,
         }
     }
 
     /// Creates the driver bound to a virtio-pci "modern" transport
     /// (`Transport::Pci`'s own doc comment covers each sub-region's role)
-    /// and RX/TX queue regions.
+    /// and RX/TX queue regions. `msix_vector`: the MSI-X table entry
+    /// `kernel_arch_glue`'s own PCI wiring already programmed for BOTH
+    /// queues (`VIRTIO_MSI_NO_VECTOR` if MSI-X was not enabled for this
+    /// device, e.g. aarch64's own legacy-INTx choice).
     #[allow(clippy::too_many_arguments)]
     pub const fn new_pci(
         common: usize,
@@ -462,6 +513,7 @@ impl VirtioNet {
         device_cfg: usize,
         rx_base: usize,
         tx_base: usize,
+        msix_vector: u16,
     ) -> Self {
         Self {
             transport: Transport::Pci { common, notify, notify_off_multiplier, isr, device_cfg },
@@ -473,6 +525,7 @@ impl VirtioNet {
             mac: [0; 6],
             rx_notify_off: 0,
             tx_notify_off: 0,
+            msix_vector,
         }
     }
 
@@ -628,6 +681,27 @@ impl VirtioNet {
                 ((common + pci_common::QUEUE_ENABLE) as *mut u16).write_volatile(1);
                 notify_off
             },
+        }
+    }
+
+    /// Assigns the CURRENTLY selected queue's own completions to
+    /// `self.msix_vector`. Called unconditionally from `do_probe`, for
+    /// BOTH queues and regardless of whether a real vector is in use —
+    /// same real-bug rationale as `driver_virtio_blk::VirtioBlk::write_
+    /// queue_msix_vector`'s own doc comment (`do_probe`'s own `write_
+    /// status(0)` device RESET clears any earlier per-queue assignment
+    /// `kernel_arch_glue`'s own PCI wiring made before this process's
+    /// first instruction ever ran). `Transport::Mmio` has no such
+    /// register, so this is a harmless no-op there.
+    ///
+    /// # Safety
+    /// Same contract as `read_device_feature`.
+    unsafe fn write_queue_msix_vector(&self) {
+        if let Transport::Pci { common, .. } = self.transport {
+            // SAFETY: forwarded from this method's own contract.
+            unsafe {
+                ((common + pci_common::QUEUE_MSIX_VECTOR) as *mut u16).write_volatile(self.msix_vector)
+            };
         }
     }
 
@@ -821,6 +895,7 @@ impl VirtioNet {
             // Queue setup (spec §3.1 step 7, §4.2.3.2) — RX then TX.
             for (queue_idx, region_base) in [(RX_QUEUE, self.rx_base), (TX_QUEUE, self.tx_base)] {
                 self.select_queue(queue_idx);
+                self.write_queue_msix_vector();
                 let max = self.read_queue_size_max();
                 if max == 0 || (max as u16) < QUEUE_SIZE {
                     self.write_status(status::FAILED);
@@ -871,9 +946,8 @@ impl VirtioNet {
         Ok(())
     }
 
-    /// Submits ONE frame on the TX queue and busy-polls (bounded) for its
-    /// own completion — mirrors `driver_virtio_blk::VirtioBlk::wait_for_
-    /// completion`'s own bounded-spin shape exactly. `len` is the frame's
+    /// Publishes ONE frame's descriptor chain on the TX queue and rings
+    /// the doorbell — does NOT wait for completion. `len` is the frame's
     /// own byte length; the frame's bytes themselves must ALREADY be
     /// written at `tx_base + layout::BUFFER_OFFSET + VIRTIO_NET_HDR_LEN`
     /// by the caller BEFORE this call — this method only zero-fills the
@@ -882,16 +956,19 @@ impl VirtioNet {
     /// "caller already placed the data, this method only writes the
     /// header" convention (avoids a same-address `copy_nonoverlapping`,
     /// which `subsystem_entry.rs`'s own zero-copy staging would otherwise
-    /// trigger). Returns `true` once the device's used ring shows this
-    /// chain consumed, `false` on timeout (the caller should treat this
-    /// as `DriverErrorCode::DeviceIo`, same as `driver_virtio_blk`'s own
-    /// `STATUS_TIMEOUT` handling).
+    /// trigger).
+    ///
+    /// `pub`: `subsystem_entry.rs` calls this directly for the real
+    /// interrupt-driven TX path — only it can issue the actual `Wait`
+    /// ecall in between submission and completion (this crate's own
+    /// module doc comment on why TX, unlike RX, is safe to make
+    /// interrupt-driven).
     ///
     /// # Safety
     /// `self.ready` must be true (`probe` already mapped every region and
     /// set up both queues), and the frame bytes must already be staged as
     /// described above.
-    pub unsafe fn submit_tx(&mut self, len: usize) -> bool {
+    pub unsafe fn submit_tx_request(&mut self, len: usize) {
         // SAFETY: `layout::BUFFER_OFFSET..+VIRTIO_NET_HDR_LEN` is within
         // the mapped TX region (forwarded from this method's own
         // contract) — the header is always all-zero (no GSO/checksum
@@ -913,22 +990,69 @@ impl VirtioNet {
         // mapped, TX_QUEUE was set up by `do_probe`.
         unsafe { self.publish_and_notify(tx_base, TX_QUEUE, self.tx_notify_off, &mut next_idx, desc) };
         self.tx_next_idx = next_idx;
+    }
+
+    /// Whether the LAST `submit_tx_request`'s own chain has landed in the
+    /// TX used ring yet — same "`used.idx == next_idx` means done"
+    /// direction as `driver_virtio_blk::VirtioBlk::completion_pending`.
+    ///
+    /// `pub`: `subsystem_entry.rs`'s own real interrupt-driven TX path
+    /// checks this itself after each `Wait`, rather than trusting a
+    /// single `Wait` return as proof of completion — same "the shared
+    /// vector can carry other event sources too" rationale as `driver_
+    /// virtio_blk::VirtioBlk::completion_pending`'s own doc comment.
+    ///
+    /// # Safety
+    /// Same contract as `submit_tx_request`.
+    pub unsafe fn tx_completion_pending(&self) -> bool {
+        // SAFETY: `q_read_u16`'s own contract.
+        let used_idx = unsafe { q_read_u16(self.tx_base, layout::USED_OFFSET + 2) };
+        used_idx == self.tx_next_idx
+    }
+
+    /// Acknowledges the interrupt at the device — the tail end of TX
+    /// completion handling, called once `tx_completion_pending` is true.
+    ///
+    /// `pub`: same reasoning as `submit_tx_request`'s own doc comment.
+    ///
+    /// # Safety
+    /// Same contract as `submit_tx_request`.
+    pub unsafe fn ack_tx_completion(&mut self) {
+        // SAFETY: `ack_interrupt`'s own contract (forwarded).
+        unsafe { self.ack_interrupt() };
+    }
+
+    /// Submits ONE frame on the TX queue and busy-polls (bounded) for its
+    /// own completion via `submit_tx_request`/`tx_completion_pending`/
+    /// `ack_tx_completion` above — mirrors `driver_virtio_blk::VirtioBlk::
+    /// wait_for_completion`'s own bounded-spin shape exactly, and kept
+    /// for the same reason that method is kept: a documented, still-
+    /// correct, host-testable alternative to the real interrupt-driven
+    /// path `subsystem_entry.rs` now uses in production. Returns `true`
+    /// once the device's used ring shows this chain consumed, `false` on
+    /// timeout (the caller should treat this as `DriverErrorCode::
+    /// DeviceIo`, same as `driver_virtio_blk`'s own `STATUS_TIMEOUT`
+    /// handling).
+    ///
+    /// # Safety
+    /// Same contract as `submit_tx_request`.
+    pub unsafe fn submit_tx(&mut self, len: usize) -> bool {
+        // SAFETY: forwarded from this method's own contract.
+        unsafe { self.submit_tx_request(len) };
 
         let mut completed = false;
         for _ in 0..MAX_SPINS {
-            // SAFETY: `q_read_u16`'s own contract.
-            let used_idx = unsafe { q_read_u16(self.tx_base, layout::USED_OFFSET + 2) };
-            if used_idx == self.tx_next_idx {
+            // SAFETY: forwarded from this method's own contract.
+            if unsafe { self.tx_completion_pending() } {
                 completed = true;
                 break;
             }
             core::hint::spin_loop();
         }
-        // SAFETY: `ack_interrupt`'s own contract (forwarded) — drain
+        // SAFETY: forwarded from this method's own contract — drain
         // whatever interrupt cause is pending so a later `submit_tx`/
-        // `poll_rx` is not stuck behind a stale one, mirroring `driver_
-        // virtio_blk::VirtioBlk::ack_interrupt`'s own role.
-        unsafe { self.ack_interrupt() };
+        // `poll_rx` is not stuck behind a stale one.
+        unsafe { self.ack_tx_completion() };
         completed
     }
 
@@ -1064,7 +1188,7 @@ mod tests {
         // Same reasoning as `probe_without_regions_fails`, `Transport::
         // Pci` side: `common == 0` is `transport_bound`'s own "not
         // granted yet" sentinel for this transport too.
-        let mut d = VirtioNet::new_pci(0, 0, 0, 0, 0, 0, 0);
+        let mut d = VirtioNet::new_pci(0, 0, 0, 0, 0, 0, 0, VIRTIO_MSI_NO_VECTOR);
         assert_eq!(d.probe(), Err(DriverError::ProbeFailed));
     }
 
@@ -1074,7 +1198,16 @@ mod tests {
         // hardware touched) is enough for `probe`'s own early-return
         // check to pass through to the real-hardware path, mirroring
         // `driver_virtio_blk`'s own identical test.
-        let d = VirtioNet::new_pci(0x4000_0000, 0x4000_1000, 4, 0x4000_2000, 0x4000_3000, 0x5000_0000, 0x6000_0000);
+        let d = VirtioNet::new_pci(
+            0x4000_0000,
+            0x4000_1000,
+            4,
+            0x4000_2000,
+            0x4000_3000,
+            0x5000_0000,
+            0x6000_0000,
+            0,
+        );
         assert!(d.regions_bound());
     }
 

@@ -3254,27 +3254,19 @@ unsafe fn wire_virtio_pci_transport(
 }
 
 /// `driver-virtio-net`'s own counterpart to `wire_virtio_pci_transport`
-/// above — same COMMON_CFG/NOTIFY_CFG/ISR_CFG/DEVICE_CFG capability walk
-/// and BAR-mapping machinery (reused directly: `walk_virtio_pci_
-/// capabilities`, `map_pci_bar`, `pci_cfg_read32`/`write32`, the same
-/// Memory-Space+Bus-Master enable dance and its own real-bug rationale —
-/// see that function's own doc comment for all of it), but deliberately
-/// SIMPLER in two ways that both trace back to the same fact: this driver
-/// never negotiates MSI-X on any architecture (`driver_virtio_net`'s own
-/// crate-level doc comment — it is polling-only everywhere, unlike blk
-/// which genuinely needs interrupts on riscv64/aarch64/x86_64 alike).
-/// 1. No `irq`/`msi_message` handling at all — no `enable_and_program_
-///    msix` call, no `msix_vector` field written.
-/// 2. No `G_DRV_ISR_CFG_VA` write — that global exists only to feed
-///    `virtio_blk_irq_trampoline`, an interrupt-context handler this
-///    driver has no counterpart of (`subsystem_entry.rs`'s own transport
-///    construction reads `isr_cfg_va` straight out of the header block
-///    written below, no kernel-side global needed).
-///
-/// Writes `driver_virtio_net::layout::PCI_INFO_OFFSET`'s own six-`u64`
-/// header (one fewer field than blk's own seven — no `msix_vector`) into
-/// `region_phys` (always the RX region — `layout::PCI_INFO_OFFSET`'s own
-/// doc comment: "RX region only").
+/// above — same COMMON_CFG/NOTIFY_CFG/ISR_CFG/DEVICE_CFG capability walk,
+/// BAR-mapping machinery, and MSI-X programming (reused directly: `walk_
+/// virtio_pci_capabilities`, `map_pci_bar`, `pci_cfg_read32`/`write32`,
+/// `enable_and_program_msix`, the same Memory-Space+Bus-Master enable
+/// dance and its own real-bug rationale — see that function's own doc
+/// comment for all of it). TX completion is now real interrupt-driven on
+/// every architecture (`driver_virtio_net`'s own crate-level doc comment
+/// on why RX deliberately stays non-blocking-poll-only instead), so this
+/// function needs exactly the same MSI-X wiring `wire_virtio_pci_
+/// transport` already does for blk — the only remaining difference is
+/// the header block this writes (`driver_virtio_net::layout::PCI_INFO_
+/// OFFSET`, a DIFFERENT crate's own offsets, even though the byte shape
+/// happens to match blk's own seven `u64`s exactly).
 ///
 /// # Safety
 /// Same contract as `wire_virtio_pci_transport`.
@@ -3285,6 +3277,7 @@ unsafe fn wire_virtio_pci_transport_net(
     caller_root_pt: usize,
     config_phys: u64,
     region_phys: usize,
+    irq: u32,
 ) -> Option<()> {
     let cfg_pool = k
         .untyped_mut(kernel_cap::UntypedId::new(0))
@@ -3361,6 +3354,33 @@ unsafe fn wire_virtio_pci_transport_net(
     let isr_cfg_va = resolve(caps.isr, "ISR_CFG");
     let device_cfg_va = resolve(caps.device, "DEVICE_CFG");
 
+    // MSI-X (x86_64 only — see `wire_virtio_pci_transport`'s own doc
+    // comment on `msi_message`'s data-driven, never-`target_arch`
+    // rationale; identical here). `msix_vector` defaults to `driver_
+    // virtio_net::VIRTIO_MSI_NO_VECTOR`, overwritten below only on
+    // success — aarch64's own virtio-pci device has no MSI-X capability
+    // at all (`caps.msix` is `None`), so this block is simply never
+    // reached there, exactly like blk's own identical branch.
+    let mut msix_vector = driver_virtio_net::VIRTIO_MSI_NO_VECTOR;
+    if let Some(msix) = caps.msix {
+        if let Some(msi_message) = hal.msi_message(irq) {
+            // SAFETY: forwarded from this function's own contract.
+            let enabled = unsafe {
+                enable_and_program_msix(k, hal, caller_root_pt, config_va, msix, common, msi_message)
+            };
+            if enabled.is_none() {
+                klog!("wire_virtio_pci_transport_net: failed to enable MSI-X\r\n");
+                return None;
+            }
+            msix_vector = 0; // table entry 0 — this MVP's only vector, matching enable_and_program_msix's own table write.
+        }
+    }
+
+    // SAFETY: single-core; written once here, before `IrqBind`
+    // (`spawn_virtio_net_driver`'s own caller) installs the trampoline
+    // that reads it — see `G_DRV_NET_ISR_CFG_VA`'s own doc comment.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_ISR_CFG_VA).write(isr_cfg_va) };
+
     let header = region_phys + driver_virtio_net::layout::PCI_INFO_OFFSET;
     // SAFETY: `region_phys` is the driver's own fresh, zeroed RX
     // `SharedRegion`, identity-addressable, single-core — same contract
@@ -3372,6 +3392,7 @@ unsafe fn wire_virtio_pci_transport_net(
         ((header + 24) as *mut u64).write_volatile(caps.notify_off_multiplier as u64);
         ((header + 32) as *mut u64).write_volatile(isr_cfg_va as u64);
         ((header + 40) as *mut u64).write_volatile(device_cfg_va as u64);
+        ((header + 48) as *mut u64).write_volatile(msix_vector as u64);
     }
 
     Some(())
@@ -3958,6 +3979,20 @@ static mut G_DRV_NET_MAC: [u8; 6] = [0; 6];
 /// destination MAC for the ICMP echo request.
 static mut G_DRV_NET_GW_MAC: Option<[u8; 6]> = None;
 
+/// `Transport::Mmio`'s own counterpart to `G_DRV_MMIO_PHYS`, for the net
+/// device — same "ack the DEVICE's own registers directly from interrupt
+/// context, a different process's own private `VirtioNet` state is
+/// unreachable from here" rationale as that static's own doc comment.
+/// `usize::MAX` (never written) for `Transport::Pci`, exactly like
+/// `G_DRV_MMIO_PHYS`'s own convention.
+static mut G_DRV_NET_MMIO_PHYS: usize = usize::MAX;
+
+/// `Transport::Pci`'s own counterpart to `G_DRV_NET_MMIO_PHYS` — same
+/// role and same "reuse the driver's own already-mapped BAR VA, no new
+/// kernel-side mapping needed" reasoning as `G_DRV_ISR_CFG_VA`'s own doc
+/// comment.
+static mut G_DRV_NET_ISR_CFG_VA: usize = usize::MAX;
+
 /// VA the virtio-mmio transport window is pre-mapped at in the driver's
 /// own address space — must stay numerically equal to `driver_virtio_
 /// net::subsystem_entry::DRV_MMIO_VA`.
@@ -4011,14 +4046,67 @@ fn net_checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// The trampoline `SyscallOp::IrqBind` installs with the platform's
+/// `InterruptController` for the virtio-net device's own IRQ line —
+/// mirrors `virtio_blk_irq_trampoline` exactly, substituting `driver_
+/// virtio_net`'s own `mmio`/`G_DRV_NET_*` names for `driver_virtio_
+/// blk`'s (see that function's own doc comment for the full "why ack
+/// HERE, not later in the driver process's own time" rationale — it
+/// applies identically to this device).
+pub fn virtio_net_irq_trampoline(irq: hal_core::interrupt::IrqId) {
+    // SAFETY: single-core; `G_DRV_NET_MMIO_PHYS` was written once by
+    // `spawn_virtio_net_driver` (only for `Transport::Mmio`), before
+    // `IrqBind` installed this trampoline; the virtio-mmio window is
+    // identity-mapped in the kernel's own address space, same as
+    // `virtio_blk_irq_trampoline`'s own identical read.
+    unsafe {
+        let mmio_phys = core::ptr::addr_of!(G_DRV_NET_MMIO_PHYS).read();
+        if mmio_phys != usize::MAX {
+            let status = ((mmio_phys + driver_virtio_net::mmio::INTERRUPT_STATUS) as *const u32)
+                .read_volatile();
+            ((mmio_phys + driver_virtio_net::mmio::INTERRUPT_ACK) as *mut u32)
+                .write_volatile(status);
+        }
+    }
+
+    // SAFETY: single-core; `G_DRV_NET_ISR_CFG_VA` was written once by
+    // `wire_virtio_pci_transport_net`, before `IrqBind` installed this
+    // trampoline; see `G_DRV_NET_ISR_CFG_VA`'s own doc comment for why
+    // this VA is safely dereferenceable exactly when this trampoline
+    // runs.
+    unsafe {
+        let isr_va = core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read();
+        if isr_va != usize::MAX {
+            let _isr_reason = (isr_va as *const u8).read_volatile();
+        }
+    }
+
+    let k = kstate();
+    let hal = khal();
+    let Some(nid) = k.notification_for_irq(irq.as_u32()) else {
+        return;
+    };
+    let Some(notif) = k.notification_mut(nid) else {
+        return;
+    };
+    let woken = notif.signal(1);
+    let now = hal.now_ns();
+    for &tid in woken.as_slice() {
+        k.wake_blocked(tid, now);
+    }
+}
+
 /// Spawns the virtio-net driver process from its own separately-built ELF
-/// (`drv_elf`), grants it an `Endpoint` (slot 0), and pre-maps its virtio
-/// register window(s) plus TWO freshly retyped `SharedRegion`s (RX at
-/// `DRV_NET_RX_VA`, TX at `DRV_NET_TX_VA`) directly into its address
+/// (`drv_elf`), grants it an `Endpoint` (slot 0) and a `Notification`
+/// already bound to the device's own IRQ line (slot 1), and pre-maps its
+/// virtio register window(s) plus TWO freshly retyped `SharedRegion`s (RX
+/// at `DRV_NET_RX_VA`, TX at `DRV_NET_TX_VA`) directly into its address
 /// space — same trusted-bootstrap pattern as `spawn_virtio_blk_driver`,
-/// with an `is_pci` branch (aarch64/x86_64) mirroring that function's own,
-/// and no `IrqBind` on EITHER transport (polling-only on every
-/// architecture — `driver_virtio_net`'s own module doc comment).
+/// with an `is_pci` branch (aarch64/x86_64) mirroring that function's own.
+/// TX completion is now real interrupt-driven on every architecture (RX
+/// deliberately stays non-blocking-poll-only — `driver_virtio_net`'s own
+/// module doc comment on why); the `Notification` grant and `IrqBind`
+/// below exist for that TX path.
 ///
 /// Returns `None` (and logs) if no `Network`-kind peripheral was
 /// discovered at boot (`KernelState::root_mmio_net_cap` still the
@@ -4092,6 +4180,10 @@ pub fn spawn_virtio_net_driver(
             klog!("spawn_virtio_net_driver: map_range error (mmio window)\r\n");
             return None;
         }
+        // SAFETY: single-core; written once here, before `IrqBind`
+        // installs `virtio_net_irq_trampoline` — see `G_DRV_NET_MMIO_
+        // PHYS`'s own doc comment.
+        unsafe { core::ptr::addr_of_mut!(G_DRV_NET_MMIO_PHYS).write(mmio.phys_base as usize) };
     }
 
     // Retype and pre-map the RX queue's own `SharedRegion`.
@@ -4162,14 +4254,12 @@ pub fn spawn_virtio_net_driver(
     unsafe { core::ptr::addr_of_mut!(G_DRV_NET_TX_PHYS).write(tx_phys) };
 
     // For PCI transport, resolve+map the device's own virtio-pci "modern"
-    // register windows and write the `PCI_INFO_OFFSET` header block into
-    // the RX region (`driver_virtio_net::layout::PCI_INFO_OFFSET`'s own
-    // doc comment) — `new_driver_for_this_transport` reads this block to
-    // pick `Transport::Pci` over the `transport_kind == 0` default the
-    // freshly-zeroed RX region already carries for MMIO transport. No
-    // MSI-X (unlike `spawn_virtio_blk_driver`'s own PCI branch): this
-    // driver is polling-only on every architecture, so there is no
-    // interrupt vector to program at all.
+    // register windows (including MSI-X, on x86_64) and write the
+    // `PCI_INFO_OFFSET` header block into the RX region (`driver_virtio_
+    // net::layout::PCI_INFO_OFFSET`'s own doc comment) —
+    // `new_driver_for_this_transport` reads this block to pick
+    // `Transport::Pci` over the `transport_kind == 0` default the
+    // freshly-zeroed RX region already carries for MMIO transport.
     if is_pci {
         let caller_addr_space = k.tcb(caller)?.addr_space;
         let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
@@ -4182,13 +4272,60 @@ pub fn spawn_virtio_net_driver(
         // (the switch to the driver process happens only at this
         // function's own tail).
         let wired = unsafe {
-            wire_virtio_pci_transport_net(k, hal, drv_root_pt, caller_root_pt, mmio.config_space_base, rx_phys)
+            wire_virtio_pci_transport_net(
+                k,
+                hal,
+                drv_root_pt,
+                caller_root_pt,
+                mmio.config_space_base,
+                rx_phys,
+                mmio.irq,
+            )
         };
         if wired.is_none() {
             klog!("spawn_virtio_net_driver: wire_virtio_pci_transport_net failed\r\n");
             return None;
         }
     }
+
+    // Retype a `Notification` and bind the virtio-net device's own IRQ
+    // line to it — same "root does the `IrqBind` itself, then grants the
+    // ALREADY-BOUND notification into the driver's cap space" pattern as
+    // `spawn_virtio_blk_driver`'s own identical block (see its own doc
+    // comment for the full rationale); lands at slot 1 (the endpoint
+    // above was the first grant, at slot 0). Used only by the TX
+    // completion path — RX deliberately stays non-blocking-poll-only
+    // (this crate's own `driver_virtio_net` module doc comment).
+    let notif_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Notification,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::IrqBind {
+            mmio: mmio_cap,
+            notification: notif_cap,
+            handler: virtio_net_irq_trampoline,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::Done) => {}
+        _ => {
+            klog!("spawn_virtio_net_driver: IrqBind failed\r\n");
+            return None;
+        }
+    }
+    grant_cap_into(k, src_cs, notif_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
 
     // Switch straight to the driver — same race-avoidance rationale as
     // `spawn_virtio_blk_driver`'s own doc comment on why.

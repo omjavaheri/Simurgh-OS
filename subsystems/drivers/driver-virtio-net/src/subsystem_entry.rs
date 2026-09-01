@@ -54,11 +54,31 @@ use kernel_ipc::SmallMessage;
 const IPC_RECV: usize = 43;
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_REPLY`.
 const IPC_REPLY: usize = 44;
+/// Must stay numerically equal to `kernel/src/main.rs`'s
+/// `sys::DRV_IRQ_WAIT` — the real interrupt-driven wait for a
+/// just-submitted TX request to complete (see this file's own
+/// `handle_send_frame`). Numerically identical to, and REUSED as-is
+/// from, `driver_virtio_blk::subsystem_entry`'s own constant of the same
+/// name/value — `sys::DRV_IRQ_WAIT`'s own kernel-side dispatch arm is
+/// already fully generic (it operates on "whichever process issued this
+/// ecall" + "whichever cap slot `a0` names" — see `kernel_arch_glue::
+/// drv_irq_wait_step`'s own doc comment), so this driver needs no
+/// opcode of its own.
+const DRV_IRQ_WAIT: usize = 63;
 
 /// The endpoint capability's slot in THIS process's own capability
 /// space — see `fs-native::subsystem_entry::FS_ENDPOINT_CAP`'s own doc
 /// comment on why this is a compile-time constant, not a runtime lookup.
 const DRV_ENDPOINT_CAP: usize = 0;
+
+/// The `Notification` capability's slot in THIS process's own
+/// capability space — the SECOND grant `kernel_arch_glue::spawn_
+/// virtio_net_driver` makes into this process's fresh cap space (the
+/// endpoint above is the first, at slot 0), already bound to the
+/// device's own IRQ line via `IrqBind` before this process's first
+/// instruction ever runs. Mirrors `driver_virtio_blk::subsystem_entry::
+/// DRV_NOTIF_CAP` exactly.
+const DRV_NOTIF_CAP: usize = 1;
 
 /// VA the virtio-mmio transport window is mapped at in THIS process's own
 /// address space — must stay numerically equal to `kernel_arch_glue::
@@ -258,11 +278,33 @@ macro_rules! zero {
     }};
 }
 
+/// Real interrupt-driven wait for a just-submitted TX request to
+/// complete — issues `DRV_IRQ_WAIT` (`SyscallOp::Wait` on the
+/// `Notification` this process's own `IrqBind` capability grant already
+/// bound to the device's IRQ line). The kernel side genuinely idles the
+/// core (`wfi`/`hlt`, architecture-dependent) until the interrupt fires
+/// — mirrors `driver_virtio_blk::subsystem_entry::wait_for_irq` exactly.
+///
+/// `#[inline(never)]` — same rationale as `raw_syscall`'s own doc
+/// comment.
+#[inline(never)]
+unsafe fn wait_for_irq() -> u64 {
+    // SAFETY: `raw_syscall`'s own contract; the return value here is a
+    // plain `usize` (the notification's signal bits).
+    unsafe { raw_syscall(DRV_IRQ_WAIT, DRV_NOTIF_CAP, zero!()) as u64 }
+}
+
 /// Handles a `SendFrame { len }` request: the frame bytes are ALREADY
 /// staged (by `kernel_arch_glue`'s own demo, before issuing the `Call`)
 /// at `DRV_TX_VA + driver_virtio_net::layout::BUFFER_OFFSET + VIRTIO_NET_
-/// HDR_LEN` — see `VirtioNet::submit_tx`'s own doc comment for why this
-/// avoids a same-address copy.
+/// HDR_LEN` — see `VirtioNet::submit_tx_request`'s own doc comment for
+/// why this avoids a same-address copy. Drives the REAL interrupt-driven
+/// completion path (`VirtioNet::submit_tx_request`/`tx_completion_
+/// pending`/`ack_tx_completion`) — `drv.submit_tx` (the busy-poll
+/// alternative) is deliberately NOT called here, mirroring `driver_
+/// virtio_blk::subsystem_entry::handle_io`'s own split for the identical
+/// reason: only THIS file can issue the actual `Wait` ecall in between
+/// submission and completion.
 fn handle_send_frame(drv: &mut crate::VirtioNet, len: u32) -> DriverResponse {
     if !drv.is_ready() {
         return DriverResponse::Failed { code: DriverErrorCode::ProbeFailed };
@@ -275,11 +317,36 @@ fn handle_send_frame(drv: &mut crate::VirtioNet, len: u32) -> DriverResponse {
     // staged per this function's own doc comment (the caller's
     // responsibility, matching `driver_virtio_blk::subsystem_entry`'s own
     // `handle_io` trust boundary for `WriteBlocks`' pre-staged data).
-    if unsafe { drv.submit_tx(len as usize) } {
-        DriverResponse::FrameSent
-    } else {
-        DriverResponse::Failed { code: DriverErrorCode::DeviceIo }
+    unsafe { drv.submit_tx_request(len as usize) };
+    // Loop `Wait`, not a single call — see `VirtioBlk::completion_
+    // pending`'s own doc comment (referenced from `VirtioNet::tx_
+    // completion_pending`'s own) for why one interrupt fire is not proof
+    // THIS request completed. Bounded (not infinite): a TX completion is
+    // a LOCAL virtqueue event the device always eventually produces on
+    // its own (unlike an RX reply, which may never arrive at all — this
+    // crate's own module doc comment on why ONLY TX is safe to make
+    // interrupt-driven at all), so a bounded retry here is exactly as
+    // safe as `driver_virtio_blk::subsystem_entry::handle_io`'s own
+    // identical bound.
+    const MAX_WAIT_RETRIES: u32 = 8;
+    let mut retries = 0u32;
+    loop {
+        // SAFETY: `raw_syscall`'s own contract (forwarded via `wait_for_irq`).
+        unsafe { wait_for_irq() };
+        // SAFETY: `submit_tx_request`'s own contract.
+        if unsafe { drv.tx_completion_pending() } {
+            break;
+        }
+        retries += 1;
+        if retries >= MAX_WAIT_RETRIES {
+            return DriverResponse::Failed { code: DriverErrorCode::DeviceIo };
+        }
     }
+    // SAFETY: same contract as `submit_tx_request` — the loop above only
+    // exits once the used ring genuinely shows this request's own
+    // completion.
+    unsafe { drv.ack_tx_completion() };
+    DriverResponse::FrameSent
 }
 
 /// Handles a `PollFrame` request: one non-blocking check of the RX queue
@@ -323,6 +390,7 @@ fn new_driver_for_this_transport() -> crate::VirtioNet {
     let notify_off_multiplier = read_u64_at(24) as u32;
     let isr_cfg_va = read_u64_at(32) as usize;
     let device_cfg_va = read_u64_at(40) as usize;
+    let msix_vector = read_u64_at(48) as u16;
     crate::VirtioNet::new_pci(
         common_cfg_va,
         notify_cfg_va,
@@ -331,6 +399,7 @@ fn new_driver_for_this_transport() -> crate::VirtioNet {
         device_cfg_va,
         DRV_RX_VA,
         DRV_TX_VA,
+        msix_vector,
     )
 }
 
