@@ -135,13 +135,9 @@ static DRIVER_VIRTIO_BLK_ELF: &[u8] = include_bytes!(env!("DRIVER_VIRTIO_BLK_ELF
 /// `driver-virtio-net-bin`'s own separately-built ELF image — same
 /// packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), the
 /// fourth real subsystem process (03-Kernel-Subsystems-Layer.md
-/// §2.3/§5.4). riscv64 ONLY for now (`driver-virtio-net`'s own module
-/// doc comment on why) — `build.rs` only emits `DRIVER_VIRTIO_NET_ELF_
-/// PATH` for that one target_arch, so unlike `DEVICE_MANAGER_ELF` above
-/// this one IS `cfg`-gated (an unconditional `include_bytes!(env!(...))`
-/// would fail to compile for aarch64/x86_64, where that env var is never
-/// set).
-#[cfg(target_arch = "riscv64")]
+/// §2.3/§5.4), now fanned out to all three architectures — `build.rs`
+/// emits `DRIVER_VIRTIO_NET_ELF_PATH` unconditionally for every
+/// `target_arch`, same as `DRIVER_VIRTIO_BLK_ELF` above.
 static DRIVER_VIRTIO_NET_ELF: &[u8] = include_bytes!(env!("DRIVER_VIRTIO_NET_ELF_PATH"));
 
 // ----------------------------------------------------------------------------
@@ -1372,6 +1368,114 @@ static mut G_FS_EP_X86: u32 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut G_DRV_EP_X86: u32 = 0;
 
+/// The virtio-net driver's endpoint capability slot in the caller's
+/// (root's) own capability space — mirrors riscv64's own `G_DRV_NET_EP`
+/// exactly (see that static's own doc comment).
+#[cfg(target_arch = "x86_64")]
+static mut G_DRV_NET_EP_X86: u32 = 0;
+
+/// x86_64 counterpart of `net_demo_riscv64` — same sequence, same
+/// `usize::MAX`-means-"no Network-kind peripheral" convention, just
+/// `raw_syscall_x86` instead of `raw_syscall`. See `net_demo_riscv64`'s
+/// own doc comment for the full rationale (including why the retry loop
+/// lives in a separate straight-line function below, and the honest,
+/// still-open account of the intermittent preemption hang that
+/// investigation was chasing — riscv64-specific findings, not
+/// necessarily applicable here, but the SAME 40-tick preemption demo
+/// shape this architecture's own `umode_root_x86` tail also runs).
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_demo_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let net_ep = raw_syscall_x86(sys::DRV_NET_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, net_ep, zero!());
+        if net_ep != usize::MAX {
+            raw_syscall_x86(sys::DRV_NET_PROBE, zero!(), zero!());
+            let net_probed = raw_syscall_x86(sys::DRV_NET_PROBE_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, net_probed, zero!());
+            if net_probed == 0 {
+                raw_syscall_x86(sys::DRV_NET_ARP_SEND, zero!(), zero!());
+                let arp_sent = raw_syscall_x86(sys::DRV_NET_ARP_SEND_RESULT, zero!(), zero!());
+                raw_syscall_x86(sys::REPORT, arp_sent, zero!());
+                if arp_sent == 0 {
+                    const MAX_NET_POLL_ATTEMPTS: usize = 5_000;
+                    let mut arp_verdict = 0usize;
+                    for _ in 0..MAX_NET_POLL_ATTEMPTS {
+                        arp_verdict = net_arp_poll_once_x86();
+                        if arp_verdict == 2 {
+                            break;
+                        }
+                    }
+                    raw_syscall_x86(sys::REPORT, arp_verdict, zero!());
+                    if arp_verdict == 2 {
+                        raw_syscall_x86(sys::DRV_NET_PING_SEND, zero!(), zero!());
+                        let ping_sent = raw_syscall_x86(sys::DRV_NET_PING_SEND_RESULT, zero!(), zero!());
+                        raw_syscall_x86(sys::REPORT, ping_sent, zero!());
+                        if ping_sent == 0 {
+                            let mut ping_verdict = 0usize;
+                            for _ in 0..MAX_NET_POLL_ATTEMPTS {
+                                ping_verdict = net_ping_poll_once_x86();
+                                if ping_verdict == 2 {
+                                    break;
+                                }
+                            }
+                            raw_syscall_x86(sys::REPORT, ping_verdict, zero!());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// x86_64 counterpart of `net_arp_poll_once` — see its own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_arp_poll_once_x86() -> usize {
+    // SAFETY: same contract as `net_demo_x86`'s own.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_x86(sys::DRV_NET_ARP_POLL, zero!(), zero!());
+        raw_syscall_x86(sys::DRV_NET_ARP_POLL_RESULT, zero!(), zero!())
+    }
+}
+
+/// x86_64 counterpart of `net_ping_poll_once` — see its own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_ping_poll_once_x86() -> usize {
+    // SAFETY: same contract as `net_demo_x86`'s own.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_x86(sys::DRV_NET_PING_POLL, zero!(), zero!());
+        raw_syscall_x86(sys::DRV_NET_PING_POLL_RESULT, zero!(), zero!())
+    }
+}
+
 /// The x86_64 Root Task entry. Linked into `.user_text` (its own
 /// `U=1` `R+X` pages at the linked VMA, per hal-x86_64's linker.ld) and
 /// run in Ring 3 by `kernel-arch-glue::enter`. Extends the original
@@ -1493,6 +1597,12 @@ extern "C" fn umode_root_x86() -> ! {
             let drv_read = raw_syscall_x86(sys::DRV_BLK_READ_RESULT, zero!(), zero!());
             raw_syscall_x86(sys::REPORT, drv_read, zero!());
         }
+
+        // 7d. virtio-net demo (03-Kernel-Subsystems-Layer.md §2.3/§5.4) —
+        // see `net_demo_x86`'s own doc comment for what it does and why
+        // it is a SEPARATE `.user_text` function rather than inlined
+        // here (mirrors riscv64's own `net_demo_riscv64` call site).
+        net_demo_x86();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the LAPIC timer, then loop forever bumping
@@ -1965,6 +2075,97 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::DRV_BLK_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
         }
+        // virtio-net driver: mirrors riscv64's own identical arms (this
+        // file's `sys::DRV_NET_DEMO_START` doc comment) — same
+        // `Transport`-erased `kernel_arch_glue::spawn_virtio_net_driver`
+        // entry point, just `EM_X86_64` and this architecture's own
+        // `G_DRV_NET_EP_X86` slot. Polling-only on every architecture
+        // (no MSI-X, unlike the virtio-blk arms above) — `driver_virtio_
+        // net`'s own crate-level doc comment on why.
+        sys::DRV_NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_net_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_NET_ELF,
+                elf_loader::machine::EM_X86_64,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_NET_EP_X86, before any later DRV_NET_* call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::DRV_NET_PROBE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_NET_DEMO_START,
+            // before any DRV_NET_PROBE call.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_X86).read() };
+            return match kernel_arch_glue::drv_net_probe_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PROBE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_probe_result());
+        }
+        sys::DRV_NET_ARP_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_X86).read() };
+            return match kernel_arch_glue::drv_net_arp_send_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_ARP_SEND_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_arp_send_result());
+        }
+        sys::DRV_NET_ARP_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_X86).read() };
+            return match kernel_arch_glue::drv_net_arp_poll_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_ARP_POLL_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_arp_poll_result());
+        }
+        sys::DRV_NET_PING_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_X86).read() };
+            return match kernel_arch_glue::drv_net_ping_send_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PING_SEND_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_ping_send_result());
+        }
+        sys::DRV_NET_PING_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_X86).read() };
+            return match kernel_arch_glue::drv_net_ping_poll_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PING_POLL_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_ping_poll_result());
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -2314,6 +2515,110 @@ static mut G_FS_EP_AARCH64: u32 = 0;
 #[cfg(target_arch = "aarch64")]
 static mut G_DRV_EP_AARCH64: u32 = 0;
 
+/// The virtio-net driver's endpoint capability slot in the caller's
+/// (root's) own capability space — mirrors riscv64's own `G_DRV_NET_EP`
+/// exactly (see that static's own doc comment).
+#[cfg(target_arch = "aarch64")]
+static mut G_DRV_NET_EP_AARCH64: u32 = 0;
+
+/// aarch64 counterpart of `net_demo_riscv64` — same sequence, same
+/// `usize::MAX`-means-"no Network-kind peripheral" convention, just
+/// `raw_syscall_aarch64` instead of `raw_syscall`. See `net_demo_
+/// riscv64`'s own doc comment for the full rationale.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_demo_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let net_ep = raw_syscall_aarch64(sys::DRV_NET_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, net_ep, zero!());
+        if net_ep != usize::MAX {
+            raw_syscall_aarch64(sys::DRV_NET_PROBE, zero!(), zero!());
+            let net_probed = raw_syscall_aarch64(sys::DRV_NET_PROBE_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, net_probed, zero!());
+            if net_probed == 0 {
+                raw_syscall_aarch64(sys::DRV_NET_ARP_SEND, zero!(), zero!());
+                let arp_sent = raw_syscall_aarch64(sys::DRV_NET_ARP_SEND_RESULT, zero!(), zero!());
+                raw_syscall_aarch64(sys::REPORT, arp_sent, zero!());
+                if arp_sent == 0 {
+                    const MAX_NET_POLL_ATTEMPTS: usize = 5_000;
+                    let mut arp_verdict = 0usize;
+                    for _ in 0..MAX_NET_POLL_ATTEMPTS {
+                        arp_verdict = net_arp_poll_once_aarch64();
+                        if arp_verdict == 2 {
+                            break;
+                        }
+                    }
+                    raw_syscall_aarch64(sys::REPORT, arp_verdict, zero!());
+                    if arp_verdict == 2 {
+                        raw_syscall_aarch64(sys::DRV_NET_PING_SEND, zero!(), zero!());
+                        let ping_sent =
+                            raw_syscall_aarch64(sys::DRV_NET_PING_SEND_RESULT, zero!(), zero!());
+                        raw_syscall_aarch64(sys::REPORT, ping_sent, zero!());
+                        if ping_sent == 0 {
+                            let mut ping_verdict = 0usize;
+                            for _ in 0..MAX_NET_POLL_ATTEMPTS {
+                                ping_verdict = net_ping_poll_once_aarch64();
+                                if ping_verdict == 2 {
+                                    break;
+                                }
+                            }
+                            raw_syscall_aarch64(sys::REPORT, ping_verdict, zero!());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// aarch64 counterpart of `net_arp_poll_once` — see its own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_arp_poll_once_aarch64() -> usize {
+    // SAFETY: same contract as `net_demo_aarch64`'s own.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_aarch64(sys::DRV_NET_ARP_POLL, zero!(), zero!());
+        raw_syscall_aarch64(sys::DRV_NET_ARP_POLL_RESULT, zero!(), zero!())
+    }
+}
+
+/// aarch64 counterpart of `net_ping_poll_once` — see its own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_ping_poll_once_aarch64() -> usize {
+    // SAFETY: same contract as `net_demo_aarch64`'s own.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_aarch64(sys::DRV_NET_PING_POLL, zero!(), zero!());
+        raw_syscall_aarch64(sys::DRV_NET_PING_POLL_RESULT, zero!(), zero!())
+    }
+}
+
 /// The aarch64 Root Task entry. Linked into `.user_text` (its own
 /// `AP_USER` `R+X` pages at the linked VMA, per hal-arm64's linker.ld)
 /// and run at EL0 by `kernel-arch-glue::enter`. Extends the original
@@ -2432,6 +2737,12 @@ extern "C" fn umode_root_aarch64() -> ! {
             let drv_read = raw_syscall_aarch64(sys::DRV_BLK_READ_RESULT, zero!(), zero!());
             raw_syscall_aarch64(sys::REPORT, drv_read, zero!());
         }
+
+        // 7d. virtio-net demo (03-Kernel-Subsystems-Layer.md §2.3/§5.4) —
+        // see `net_demo_aarch64`'s own doc comment for what it does and
+        // why it is a SEPARATE `.user_text` function rather than inlined
+        // here (mirrors riscv64's own `net_demo_riscv64` call site).
+        net_demo_aarch64();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the timer PPI, then loop forever bumping this
@@ -2872,6 +3183,98 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::DRV_BLK_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
+        }
+        // virtio-net driver: mirrors riscv64's own identical arms (this
+        // file's `sys::DRV_NET_DEMO_START` doc comment) — same
+        // `Transport`-erased `kernel_arch_glue::spawn_virtio_net_driver`
+        // entry point, just `EM_AARCH64` and this architecture's own
+        // `G_DRV_NET_EP_AARCH64` slot. Polling-only on every architecture
+        // (no MSI-X, unlike the virtio-blk arms above) — `driver_virtio_
+        // net`'s own crate-level doc comment on why.
+        sys::DRV_NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_net_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_NET_ELF,
+                elf_loader::machine::EM_AARCH64,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_NET_EP_AARCH64, before any later DRV_NET_*
+                    // call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::DRV_NET_PROBE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_NET_DEMO_START,
+            // before any DRV_NET_PROBE call.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_AARCH64).read() };
+            return match kernel_arch_glue::drv_net_probe_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PROBE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_probe_result());
+        }
+        sys::DRV_NET_ARP_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_AARCH64).read() };
+            return match kernel_arch_glue::drv_net_arp_send_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_ARP_SEND_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_arp_send_result());
+        }
+        sys::DRV_NET_ARP_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_AARCH64).read() };
+            return match kernel_arch_glue::drv_net_arp_poll_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_ARP_POLL_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_arp_poll_result());
+        }
+        sys::DRV_NET_PING_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_AARCH64).read() };
+            return match kernel_arch_glue::drv_net_ping_send_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PING_SEND_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_ping_send_result());
+        }
+        sys::DRV_NET_PING_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_AARCH64).read() };
+            return match kernel_arch_glue::drv_net_ping_poll_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PING_POLL_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_ping_poll_result());
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();

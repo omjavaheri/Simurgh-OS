@@ -3253,6 +3253,130 @@ unsafe fn wire_virtio_pci_transport(
     Some(())
 }
 
+/// `driver-virtio-net`'s own counterpart to `wire_virtio_pci_transport`
+/// above — same COMMON_CFG/NOTIFY_CFG/ISR_CFG/DEVICE_CFG capability walk
+/// and BAR-mapping machinery (reused directly: `walk_virtio_pci_
+/// capabilities`, `map_pci_bar`, `pci_cfg_read32`/`write32`, the same
+/// Memory-Space+Bus-Master enable dance and its own real-bug rationale —
+/// see that function's own doc comment for all of it), but deliberately
+/// SIMPLER in two ways that both trace back to the same fact: this driver
+/// never negotiates MSI-X on any architecture (`driver_virtio_net`'s own
+/// crate-level doc comment — it is polling-only everywhere, unlike blk
+/// which genuinely needs interrupts on riscv64/aarch64/x86_64 alike).
+/// 1. No `irq`/`msi_message` handling at all — no `enable_and_program_
+///    msix` call, no `msix_vector` field written.
+/// 2. No `G_DRV_ISR_CFG_VA` write — that global exists only to feed
+///    `virtio_blk_irq_trampoline`, an interrupt-context handler this
+///    driver has no counterpart of (`subsystem_entry.rs`'s own transport
+///    construction reads `isr_cfg_va` straight out of the header block
+///    written below, no kernel-side global needed).
+///
+/// Writes `driver_virtio_net::layout::PCI_INFO_OFFSET`'s own six-`u64`
+/// header (one fewer field than blk's own seven — no `msix_vector`) into
+/// `region_phys` (always the RX region — `layout::PCI_INFO_OFFSET`'s own
+/// doc comment: "RX region only").
+///
+/// # Safety
+/// Same contract as `wire_virtio_pci_transport`.
+unsafe fn wire_virtio_pci_transport_net(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    drv_root_pt: usize,
+    caller_root_pt: usize,
+    config_phys: u64,
+    region_phys: usize,
+) -> Option<()> {
+    let cfg_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(cfg_pool as *mut u8, 0, 4096 * 2) };
+    let cfg_n = hal.map_range(
+        caller_root_pt,
+        KERNEL_PCI_CFG_VA,
+        config_phys as usize,
+        4096,
+        1 | 2, // R+W, kernel-only (no U bit) — EL1/S-mode code only.
+        cfg_pool,
+        2,
+    );
+    if cfg_n == u32::MAX {
+        klog!("wire_virtio_pci_transport_net: map_range error (ECAM config-space page)\r\n");
+        return None;
+    }
+    // Modifying a LIVE, currently-active page table — same reasoning as
+    // `wire_virtio_pci_transport`'s own identical flush.
+    hal.flush_tlb();
+    let config_va = KERNEL_PCI_CFG_VA as u64;
+
+    // Enable Memory Space + Bus Master — same real-bug rationale as
+    // `wire_virtio_pci_transport`'s own doc comment.
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let cmd_status = pci_cfg_read32(config_va, PCI_COMMAND_OFFSET);
+        pci_cfg_write32(
+            config_va,
+            PCI_COMMAND_OFFSET,
+            cmd_status | PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER,
+        );
+    }
+
+    // SAFETY: forwarded from this function's own contract; `config_va`
+    // is the mapping just installed above.
+    let caps = unsafe { walk_virtio_pci_capabilities(config_va) };
+    let Some(common) = caps.common else {
+        klog!("wire_virtio_pci_transport_net: no COMMON_CFG capability found\r\n");
+        return None;
+    };
+
+    let mut mapped: [(u8, usize); DRV_PCI_MAX_BARS] = [(0, 0); DRV_PCI_MAX_BARS];
+    let mut mapped_count = 0usize;
+
+    // SAFETY: forwarded.
+    let common_va = unsafe {
+        map_pci_bar(k, hal, drv_root_pt, config_va, common.bar, &mut mapped, &mut mapped_count)
+    }?;
+    let common_cfg_va = common_va + common.offset as usize;
+
+    let mut resolve = |window: Option<VirtioPciCapWindow>, name: &str| -> usize {
+        let Some(w) = window else {
+            klog!("wire_virtio_pci_transport_net: no {} capability found\r\n", name);
+            return 0;
+        };
+        // SAFETY: forwarded from this function's own contract.
+        let base = unsafe {
+            map_pci_bar(k, hal, drv_root_pt, config_va, w.bar, &mut mapped, &mut mapped_count)
+        };
+        match base {
+            Some(va) => va + w.offset as usize,
+            None => {
+                klog!("wire_virtio_pci_transport_net: failed to map {} BAR\r\n", name);
+                0
+            }
+        }
+    };
+    let notify_cfg_va = resolve(caps.notify, "NOTIFY_CFG");
+    let isr_cfg_va = resolve(caps.isr, "ISR_CFG");
+    let device_cfg_va = resolve(caps.device, "DEVICE_CFG");
+
+    let header = region_phys + driver_virtio_net::layout::PCI_INFO_OFFSET;
+    // SAFETY: `region_phys` is the driver's own fresh, zeroed RX
+    // `SharedRegion`, identity-addressable, single-core — same contract
+    // `wire_virtio_pci_transport`'s own identical write relies on.
+    unsafe {
+        (header as *mut u64).write_volatile(1); // transport_kind = Pci
+        ((header + 8) as *mut u64).write_volatile(common_cfg_va as u64);
+        ((header + 16) as *mut u64).write_volatile(notify_cfg_va as u64);
+        ((header + 24) as *mut u64).write_volatile(caps.notify_off_multiplier as u64);
+        ((header + 32) as *mut u64).write_volatile(isr_cfg_va as u64);
+        ((header + 40) as *mut u64).write_volatile(device_cfg_va as u64);
+    }
+
+    Some(())
+}
+
 /// # Safety
 /// `G_DRV_QUEUE_PHYS` must already be a valid, exclusively-owned,
 /// identity-addressable physical page (true from `spawn_virtio_blk_
@@ -3888,12 +4012,13 @@ fn net_checksum(data: &[u8]) -> u16 {
 }
 
 /// Spawns the virtio-net driver process from its own separately-built ELF
-/// (`drv_elf`), grants it an `Endpoint` (slot 0), and pre-maps its
-/// virtio-mmio window plus TWO freshly retyped `SharedRegion`s (RX at
+/// (`drv_elf`), grants it an `Endpoint` (slot 0), and pre-maps its virtio
+/// register window(s) plus TWO freshly retyped `SharedRegion`s (RX at
 /// `DRV_NET_RX_VA`, TX at `DRV_NET_TX_VA`) directly into its address
 /// space — same trusted-bootstrap pattern as `spawn_virtio_blk_driver`,
-/// MMIO-only (no `Transport::Pci` branch — this driver's own module doc
-/// comment on why) and no `IrqBind` (polling-only, same doc comment).
+/// with an `is_pci` branch (aarch64/x86_64) mirroring that function's own,
+/// and no `IrqBind` on EITHER transport (polling-only on every
+/// architecture — `driver_virtio_net`'s own module doc comment).
 ///
 /// Returns `None` (and logs) if no `Network`-kind peripheral was
 /// discovered at boot (`KernelState::root_mmio_net_cap` still the
@@ -3915,6 +4040,10 @@ pub fn spawn_virtio_net_driver(
         k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32(),
     );
     let mmio = *k.mmio_region(mmio_id)?;
+    // A nonzero `config_space_base` means this device was discovered over
+    // PCI — same convention `spawn_virtio_blk_driver`'s own `is_pci`
+    // check already established.
+    let is_pci = mmio.config_space_base != 0;
 
     let ep_cap = match k.dispatch(
         caller,
@@ -3943,19 +4072,26 @@ pub fn spawn_virtio_net_driver(
     let drv_addr_space = k.tcb(drv_tid)?.addr_space;
     let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
 
-    // Pre-map the virtio-mmio transport window (real device MMIO, MMIO-
-    // only transport — this driver's own module doc comment).
-    let mmio_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
-    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
-    // `map_range` needs the pool pre-zeroed.
-    unsafe { core::ptr::write_bytes(mmio_pool as *mut u8, 0, 4096 * 2) };
-    let n = hal.map_range(drv_root_pt, DRV_NET_MMIO_VA, mmio.phys_base as usize, 4096, 1 | 2 | 8, mmio_pool, 2);
-    if n == u32::MAX {
-        klog!("spawn_virtio_net_driver: map_range error (mmio window)\r\n");
-        return None;
+    // Pre-map the virtio-mmio transport window — skipped entirely for PCI
+    // transport (`is_pci`): virtio-pci's own register windows are
+    // resolved and mapped individually below, by `wire_virtio_pci_
+    // transport_net`, from whichever BAR(s) its capability list actually
+    // names — same "MMIO map only when NOT PCI" branch `spawn_virtio_blk_
+    // driver`'s own doc comment covers.
+    if !is_pci {
+        let mmio_pool = k
+            .untyped_mut(kernel_cap::UntypedId::new(0))
+            .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+            .map(|p| p.as_usize())?;
+        // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+        // `map_range` needs the pool pre-zeroed.
+        unsafe { core::ptr::write_bytes(mmio_pool as *mut u8, 0, 4096 * 2) };
+        let n =
+            hal.map_range(drv_root_pt, DRV_NET_MMIO_VA, mmio.phys_base as usize, 4096, 1 | 2 | 8, mmio_pool, 2);
+        if n == u32::MAX {
+            klog!("spawn_virtio_net_driver: map_range error (mmio window)\r\n");
+            return None;
+        }
     }
 
     // Retype and pre-map the RX queue's own `SharedRegion`.
@@ -4024,6 +4160,35 @@ pub fn spawn_virtio_net_driver(
         return None;
     }
     unsafe { core::ptr::addr_of_mut!(G_DRV_NET_TX_PHYS).write(tx_phys) };
+
+    // For PCI transport, resolve+map the device's own virtio-pci "modern"
+    // register windows and write the `PCI_INFO_OFFSET` header block into
+    // the RX region (`driver_virtio_net::layout::PCI_INFO_OFFSET`'s own
+    // doc comment) — `new_driver_for_this_transport` reads this block to
+    // pick `Transport::Pci` over the `transport_kind == 0` default the
+    // freshly-zeroed RX region already carries for MMIO transport. No
+    // MSI-X (unlike `spawn_virtio_blk_driver`'s own PCI branch): this
+    // driver is polling-only on every architecture, so there is no
+    // interrupt vector to program at all.
+    if is_pci {
+        let caller_addr_space = k.tcb(caller)?.addr_space;
+        let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+        // SAFETY: `mmio.config_space_base` is a live ECAM address (this
+        // kernel boot-seeded it from `hal_arm64`/`hal_x86_64::peripheral`'s
+        // own PCI scan, the same trust boundary `mmio.phys_base` already
+        // relies on); `rx_phys` is this function's own fresh, zeroed
+        // `SharedRegion`, forwarded from that write above. `caller_root_
+        // pt`: `caller`'s own page table, still the ACTIVE one right now
+        // (the switch to the driver process happens only at this
+        // function's own tail).
+        let wired = unsafe {
+            wire_virtio_pci_transport_net(k, hal, drv_root_pt, caller_root_pt, mmio.config_space_base, rx_phys)
+        };
+        if wired.is_none() {
+            klog!("spawn_virtio_net_driver: wire_virtio_pci_transport_net failed\r\n");
+            return None;
+        }
+    }
 
     // Switch straight to the driver — same race-avoidance rationale as
     // `spawn_virtio_blk_driver`'s own doc comment on why.

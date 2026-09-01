@@ -7,11 +7,9 @@
 // rationale — Cargo only honors `cargo:rustc-link-arg*` from the crate
 // that actually produces the `[[bin]]`).
 //
-// riscv64 ONLY for now (this crate's own `lib.rs` module doc comment on
-// why the MVP demo starts on one architecture, matching driver-virtio-
-// blk's own history). For any other `target_arch` — including a plain
-// host build of this crate's library, which is also a normal `rlib` with
-// its own host-testable unit tests — this build script does nothing.
+// For any `target_arch` outside the three below (including a plain host
+// build of this crate's library, which is also a normal `rlib` with its
+// own host-testable unit tests), this build script does nothing.
 // ============================================================================
 
 fn main() {
@@ -21,6 +19,8 @@ fn main() {
 
     let linker_script_name = match target_arch.as_str() {
         "riscv64" => "subsystem-bin-riscv64.ld",
+        "x86_64" => "subsystem-bin-x86_64.ld",
+        "aarch64" => "subsystem-bin-aarch64.ld",
         _ => return,
     };
 
