@@ -1146,6 +1146,11 @@ impl DeviceDriver for VirtioBlk {
                 sector_size: Self::SECTOR_SIZE,
                 sector_count: self.capacity_sectors,
             },
+            // Network-only opcodes (03-Kernel-Subsystems-Layer.md §2.3) —
+            // meaningless for a block device.
+            DriverRequest::SendFrame { .. } | DriverRequest::PollFrame => DriverResponse::Failed {
+                code: DriverErrorCode::Unsupported,
+            },
         }
     }
 }

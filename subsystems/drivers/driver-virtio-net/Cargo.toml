@@ -1,0 +1,37 @@
+# ============================================================================
+# driver-virtio-net  (03-Kernel-Subsystems-Layer.md §2.3/§5.4)
+#
+# The MVP network driver: virtio-net over MMIO on QEMU (riscv64 only for
+# now — mirrors driver-virtio-blk's own one-architecture-first pace, see
+# this crate's own `lib.rs` module doc comment). A separate process that
+# implements `driver_framework::DeviceDriver`.
+#
+# `#![no_std]`. `rlib` for now (the process entry shim lands with the
+# layer-2 TCB-load path).
+# ============================================================================
+[package]
+name        = "driver-virtio-net"
+description = "virtio-net MMIO network driver for Simurgh (03-Kernel-Subsystems-Layer.md §2.3/§5.4)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "driver-virtio-net-bin"
+path = "src/bin/driver-virtio-net-bin.rs"
+# Same reasoning as driver-virtio-blk-bin's own `[[bin]]`: a host `cargo
+# test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
+[dependencies]
+driver-framework = { path = "../driver-framework" }
+ipc-protocol     = { path = "../../../ipc-protocol" }
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly, same reasoning as driver-virtio-blk's own dependency on it.
+kernel-ipc       = { path = "../../../kernel/kernel-ipc" }

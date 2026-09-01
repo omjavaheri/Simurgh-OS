@@ -58,6 +58,26 @@ pub enum DriverRequest {
     /// Ask the driver to quiesce (flush, mask its IRQ) ahead of a planned
     /// restart or shutdown. Reply: `Ready`.
     Quiesce,
+    /// A network-device send: transmit `len` bytes already written by the
+    /// caller into the driver's own frame buffer (network drivers have no
+    /// `shared_cap`-addressed bulk region the way block drivers do — the
+    /// frame rides the SAME pre-mapped `SharedRegion` the driver's
+    /// transport registers live in, matching `driver_virtio_net::layout`'s
+    /// own single-region-carries-everything convention). Reply:
+    /// `FrameSent` or `Failed`.
+    SendFrame {
+        /// Frame length in bytes (Ethernet header included).
+        len: u32,
+    },
+    /// A network-device poll: check the RX queue ONCE for a received
+    /// frame — bounded, never blocks (§2.3's own kernel-bypass note aside,
+    /// the standard path has no interrupt-driven RX yet; a caller wanting
+    /// to wait for a reply re-issues this across multiple `Call`s, the
+    /// same "driver does one primitive step, the caller sequences" split
+    /// `ReadBlocks`/`WriteBlocks` already follow). Reply: `FrameReceived`
+    /// (frame bytes already written into the driver's own frame buffer)
+    /// or `Failed { code: NoData }` if nothing had arrived.
+    PollFrame,
 }
 
 /// A reply from a driver process.
@@ -80,6 +100,14 @@ pub enum DriverResponse {
         /// Machine-readable error code.
         code: DriverErrorCode,
     },
+    /// A `SendFrame` was submitted to the device.
+    FrameSent,
+    /// A `PollFrame` found a received frame; `len` bytes are already in
+    /// the driver's own frame buffer.
+    FrameReceived {
+        /// Frame length in bytes.
+        len: u32,
+    },
 }
 
 /// Driver error codes.
@@ -96,4 +124,6 @@ pub enum DriverErrorCode {
     DeviceIo = 4,
     /// The request kind is not supported by this driver.
     Unsupported = 5,
+    /// `PollFrame` found nothing within its bounded, non-blocking check.
+    NoData = 6,
 }

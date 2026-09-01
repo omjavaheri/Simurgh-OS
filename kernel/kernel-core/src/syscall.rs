@@ -1203,6 +1203,56 @@ mod tests {
         assert_eq!(region.irq, 7);
     }
 
+    /// Same shape as `kernel_with_mmio_blk`, `Network`-kind instead —
+    /// `populate_from_boot_info`'s Step 3d.
+    fn kernel_with_mmio_net() -> KernelState {
+        let mut m = HardwareManifestRaw::zeroed();
+        m.cpu_core_count = 1;
+        m.push_memory_region(MemoryRegionRaw::new(
+            0x100_0000,
+            32 * 1024 * 1024,
+            MemoryRegionKindRaw::Usable,
+            false,
+        ))
+        .unwrap();
+        m.timer = TimerInfoRaw::new(TimerKindRaw::Tsc, 1_000_000_000, false);
+        let _ = m.push_peripheral_device(hal_manifest::raw::PeripheralDeviceRaw::new(
+            hal_manifest::raw::PeripheralKindRaw::Network,
+            0x1000_2000,
+            0x1000,
+            8,
+        ));
+        let boot = BootInfo::new(
+            BootProtocol::Uefi,
+            m,
+            0x1000,
+            (0x10_0000, 0x20_0000),
+            (0x20_0000, 0x21_0000),
+            0,
+        );
+        KernelState::from_boot_info(&boot).unwrap()
+    }
+
+    #[test]
+    fn boot_seeds_mmio_region_cap_for_the_discovered_network_device() {
+        let k = kernel_with_mmio_net();
+        assert_ne!(k.root_mmio_net_cap, CapId::new(u32::MAX));
+        let c = k
+            .resolve(
+                k.root_thread,
+                k.root_mmio_net_cap,
+                KernelObjectKind::MmioRegion,
+                CapabilityRights::READ,
+            )
+            .unwrap();
+        let region = k
+            .mmio_region(kernel_cap::MmioRegionId::new(c.object.id.as_u32()))
+            .unwrap();
+        assert_eq!(region.phys_base, 0x1000_2000);
+        assert_eq!(region.size, 0x1000);
+        assert_eq!(region.irq, 8);
+    }
+
     #[test]
     fn map_accepts_an_mmio_region_frame() {
         let mut k = kernel_with_mmio_blk();

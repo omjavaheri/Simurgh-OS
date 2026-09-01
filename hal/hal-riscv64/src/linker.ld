@@ -87,13 +87,69 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
 
-        /* Boot-time stack, same 64 KiB sizing rationale as the other
-         * two architectures. RISC-V's calling convention (per the
-         * RISC-V ELF psABI) requires 16-byte stack alignment at a
-         * function call boundary, same as x86_64/ARM64. */
+        /* Boot-time stack. RISC-V's calling convention (per the RISC-V
+         * ELF psABI) requires 16-byte stack alignment at a function
+         * call boundary, same as x86_64/ARM64.
+         *
+         * 256 KiB, not the original 64 KiB — bumped defensively while
+         * investigating an intermittent hang (below), and kept: this is
+         * the KERNEL's own S-mode stack, with no guard page (it sits
+         * directly inside `.bss`, immediately adjacent to ordinary
+         * kernel statics — a RISC-V stack grows DOWN, so overflowing it
+         * would silently overwrite whatever `.bss` data the linker
+         * placed at lower addresses, no fault, no symptom until a
+         * corrupted static is read later). EVERY trap/syscall dispatch
+         * runs on it, including the virtio-net driver's own spawn/demo
+         * code (`kernel_arch_glue::spawn_virtio_net_driver` and the
+         * `drv_net_*` functions, 03-Kernel-Subsystems-Layer.md §2.3/
+         * §5.4) — among the largest additions to that crate to date,
+         * at `[profile.dev]`'s default `opt-level = 0` unless overridden
+         * (see `kernel`/`driver-virtio-blk`'s own Cargo.toml comments for
+         * this project's established precedent of exactly this class of
+         * bug: `kernel/kernel/src/main.rs`'s `DM_STACK_LEN` doc comment
+         * documents an earlier, CONFIRMED instance of this identical
+         * 64 KiB -> larger stack fix, for device-manager's own stack).
+         *
+         * **Honest record, not a confirmed fix**: while adding the
+         * virtio-net driver, a real, intermittent hang appeared —
+         * arming the preemptive timer (02-Microkernel-Layer.md §4) then
+         * never reaching device-manager's first scheduled turn, only
+         * on boots where the new ARP-resolve + ICMP-echo round trip
+         * actually succeeded end to end. `-d int` tracing showed an
+         * otherwise perfectly ordinary-looking, endless `s_timer` +
+         * `sbi_set_timer` cycle that never reached `kernel_arch_glue::
+         * P2_TICK_BUDGET` — consistent with (though never conclusively
+         * proven to BE) exactly this "no guard page, silent .bss
+         * corruption" symptom. This stack bump, together with `[profile.
+         * dev.package.kernel-arch-glue] opt-level = 2` (workspace
+         * `Cargo.toml`), made the hang disappear on the FIRST retest —
+         * but neither change, alone or together, reproduced that fix
+         * reliably across the several repeated clean rebuild+boot
+         * trials that followed (some passed, most did not, with no
+         * single code change correlating consistently with the
+         * outcome). The leading theory by the end of that investigation
+         * shifted: `kernel_arch_glue::preempt`'s own doc comments
+         * already flag the 40-tick preemption demo's vruntime fairness
+         * as "too QEMU-timing-dependent" even without any networking
+         * involved (see that module's own history, including a prior
+         * aarch64 session where an atypical QEMU CPU config alone
+         * flipped this SAME demo's verdict to MISMATCH) — attaching a
+         * `-netdev user` (SLIRP) backend plausibly adds real host-side
+         * jitter to the SAME single QEMU thread that also delivers the
+         * guest's timer interrupts, on top of an already timing-fragile
+         * demo, independent of any code in this repository. Kept at
+         * 256 KiB anyway: real, harmless hardening against the ORIGINAL
+         * 64 KiB genuinely being tight for this crate's now-larger call
+         * graph, whether or not it was the deciding factor in any one
+         * boot. TODO(omid): if this hang recurs and blocks real work,
+         * treat it as a QEMU/host timing investigation (a dedicated
+         * `-icount`/deterministic-timing QEMU run, or profiling the
+         * host's own SLIRP thread), not a kernel-code one — this
+         * comment's own investigation already covers the code-level
+         * avenues that did NOT reliably fix it. */
         . = ALIGN(16);
         __boot_stack_bottom = .;
-        . += 64K;
+        . += 256K;
         __boot_stack_top = .;
 
         __bss_end = .;

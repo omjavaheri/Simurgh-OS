@@ -265,13 +265,16 @@ const OP_DR_IRQ: u8 = 2;
 const OP_DR_READ_BLOCKS: u8 = 3;
 const OP_DR_WRITE_BLOCKS: u8 = 4;
 const OP_DR_QUIESCE: u8 = 5;
+const OP_DR_SEND_FRAME: u8 = 6;
+const OP_DR_POLL_FRAME: u8 = 7;
 
 /// Encodes a `DriverRequest` into a `SmallMessage`.
 ///
 /// Word layout by variant:
-/// - `Probe`, `Quiesce`: `[]`
+/// - `Probe`, `Quiesce`, `PollFrame`: `[]`
 /// - `Irq`: `[line]`
 /// - `ReadBlocks` / `WriteBlocks`: `[lba, sector_count, shared_cap]`
+/// - `SendFrame`: `[len]`
 pub fn encode_driver_request(req: &DriverRequest) -> SmallMessage {
     let (op, words): (u8, [u64; 3]) = match *req {
         DriverRequest::Probe => (OP_DR_PROBE, [0, 0, 0]),
@@ -293,9 +296,11 @@ pub fn encode_driver_request(req: &DriverRequest) -> SmallMessage {
             [lba, sector_count as u64, shared_cap as u64],
         ),
         DriverRequest::Quiesce => (OP_DR_QUIESCE, [0, 0, 0]),
+        DriverRequest::SendFrame { len } => (OP_DR_SEND_FRAME, [len as u64, 0, 0]),
+        DriverRequest::PollFrame => (OP_DR_POLL_FRAME, [0, 0, 0]),
     };
     let n = match op {
-        OP_DR_IRQ => 1,
+        OP_DR_IRQ | OP_DR_SEND_FRAME => 1,
         OP_DR_READ_BLOCKS | OP_DR_WRITE_BLOCKS => 3,
         _ => 0,
     };
@@ -345,6 +350,11 @@ pub fn decode_driver_request(msg: &SmallMessage) -> Result<DriverRequest, Decode
             })
         }
         OP_DR_QUIESCE => Ok(DriverRequest::Quiesce),
+        OP_DR_SEND_FRAME => {
+            need(1)?;
+            Ok(DriverRequest::SendFrame { len: w[0] as u32 })
+        }
+        OP_DR_POLL_FRAME => Ok(DriverRequest::PollFrame),
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -357,6 +367,8 @@ pub fn decode_driver_request(msg: &SmallMessage) -> Result<DriverRequest, Decode
 const OP_DRR_READY: u8 = 1;
 const OP_DRR_COMPLETED: u8 = 2;
 const OP_DRR_FAILED: u8 = 3;
+const OP_DRR_FRAME_SENT: u8 = 4;
+const OP_DRR_FRAME_RECEIVED: u8 = 5;
 
 /// Encodes a `DriverResponse` into a `SmallMessage`.
 ///
@@ -364,6 +376,8 @@ const OP_DRR_FAILED: u8 = 3;
 /// - `Ready`: `[sector_size, sector_count]`
 /// - `Completed`: `[sectors]`
 /// - `Failed`: `[code]`
+/// - `FrameSent`: `[]`
+/// - `FrameReceived`: `[len]`
 pub fn encode_driver_response(resp: &DriverResponse) -> SmallMessage {
     let (op, words): (u8, [u64; 2]) = match *resp {
         DriverResponse::Ready {
@@ -372,8 +386,10 @@ pub fn encode_driver_response(resp: &DriverResponse) -> SmallMessage {
         } => (OP_DRR_READY, [sector_size as u64, sector_count]),
         DriverResponse::Completed { sectors } => (OP_DRR_COMPLETED, [sectors as u64, 0]),
         DriverResponse::Failed { code } => (OP_DRR_FAILED, [code as u64, 0]),
+        DriverResponse::FrameSent => (OP_DRR_FRAME_SENT, [0, 0]),
+        DriverResponse::FrameReceived { len } => (OP_DRR_FRAME_RECEIVED, [len as u64, 0]),
     };
-    let n = if op == OP_DRR_READY { 2 } else { 1 };
+    let n = if op == OP_DRR_READY { 2 } else if op == OP_DRR_FRAME_SENT { 0 } else { 1 };
     // `from_words` cannot fail here: n <= 2 <= MSG_MAX_WORDS.
     SmallMessage::from_words(Namespace::Driver.label(op), &words[..n])
         .unwrap_or_else(|_| SmallMessage::new(Namespace::Driver.label(op)))
@@ -419,9 +435,15 @@ pub fn decode_driver_response(msg: &SmallMessage) -> Result<DriverResponse, Deco
                 3 => DriverErrorCode::BadSharedRegion,
                 4 => DriverErrorCode::DeviceIo,
                 5 => DriverErrorCode::Unsupported,
+                6 => DriverErrorCode::NoData,
                 _ => return Err(DecodeError::BadField),
             };
             Ok(DriverResponse::Failed { code })
+        }
+        OP_DRR_FRAME_SENT => Ok(DriverResponse::FrameSent),
+        OP_DRR_FRAME_RECEIVED => {
+            need(1)?;
+            Ok(DriverResponse::FrameReceived { len: w[0] as u32 })
         }
         _ => Err(DecodeError::UnknownOpcode),
     }
@@ -548,6 +570,8 @@ mod tests {
             shared_cap: 9,
         });
         driver_request_roundtrip(DriverRequest::Quiesce);
+        driver_request_roundtrip(DriverRequest::SendFrame { len: 60 });
+        driver_request_roundtrip(DriverRequest::PollFrame);
     }
 
     fn driver_response_roundtrip(resp: DriverResponse) {
@@ -565,6 +589,11 @@ mod tests {
         driver_response_roundtrip(DriverResponse::Failed {
             code: DriverErrorCode::DeviceIo,
         });
+        driver_response_roundtrip(DriverResponse::Failed {
+            code: DriverErrorCode::NoData,
+        });
+        driver_response_roundtrip(DriverResponse::FrameSent);
+        driver_response_roundtrip(DriverResponse::FrameReceived { len: 60 });
     }
 
     #[test]

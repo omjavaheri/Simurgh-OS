@@ -152,6 +152,12 @@ xbuild-subsystem-fs-native-riscv64 = "build -p fs-native --bin fs-native-bin --t
 xbuild-subsystem-driver-virtio-blk-x86_64  = "build -p driver-virtio-blk --bin driver-virtio-blk-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-driver-virtio-blk-aarch64 = "build -p driver-virtio-blk --bin driver-virtio-blk-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-driver-virtio-blk-riscv64 = "build -p driver-virtio-blk --bin driver-virtio-blk-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for driver-virtio-net's own separately-built ELF (03-
+# Kernel-Subsystems-Layer.md §2.3/§5.4) — riscv64 ONLY for now (`driver-
+# virtio-net`'s own module doc comment on why; its own `build.rs` has no
+# linker script for the other two architectures yet, so those aliases
+# are not defined until that fan-out session).
+xbuild-subsystem-driver-virtio-net-riscv64 = "build -p driver-virtio-net --bin driver-virtio-net-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)

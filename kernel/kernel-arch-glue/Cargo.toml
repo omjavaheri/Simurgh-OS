@@ -41,3 +41,12 @@ ipc-protocol = { path = "../../ipc-protocol" }
 # `driver_virtio_blk::subsystem_entry`, the one `#[cfg(target_arch)]`-
 # gated module in that crate).
 driver-virtio-blk = { path = "../../subsystems/drivers/driver-virtio-blk" }
+# Same reasoning as `driver-virtio-blk` above, for `driver_virtio_net::
+# layout`'s own offset constants (03-Kernel-Subsystems-Layer.md §2.3/§5.4).
+# NOTE: deliberately NOT a dependency on the `netstack` crate itself —
+# `netstack`'s own frame builders/parsers return `alloc::vec::Vec`, and
+# this crate (like the rest of `kernel/*`, design decision D1) stays
+# alloc-free; `net_ping_demo` below re-implements the same ARP/ICMP wire
+# shapes as fixed-size, no-alloc byte writes directly into the TX
+# `SharedRegion`'s own physical memory instead.
+driver-virtio-net = { path = "../../subsystems/drivers/driver-virtio-net" }

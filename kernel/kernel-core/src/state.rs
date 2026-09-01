@@ -123,6 +123,14 @@ pub struct KernelState {
     /// `CapId::new(u32::MAX)` if none was found or the cap space was
     /// full, exactly mirroring `root_page_table_cap`'s own sentinel.
     pub root_mmio_blk_cap: CapId,
+    /// The capability, in the Root Task's own cap space, naming the FIRST
+    /// `Network`-kind `MmioRegion` the boot-time HAL peripheral scan
+    /// discovered (`populate_from_boot_info`'s Step 3d) — same rationale
+    /// as `root_mmio_blk_cap`'s own doc comment, one driver kind later
+    /// (`driver-virtio-net`, 03-Kernel-Subsystems-Layer.md §2.3/§5.4).
+    /// `CapId::new(u32::MAX)` if none was found or the cap space was
+    /// full.
+    pub root_mmio_net_cap: CapId,
     /// How many `UntypedMemory` objects the boot path created.
     pub untyped_count: u32,
 
@@ -368,6 +376,7 @@ impl KernelState {
         root_addr_space: PageTableId::new(0),
         root_page_table_cap: CapId::new(u32::MAX),
         root_mmio_blk_cap: CapId::new(u32::MAX),
+        root_mmio_net_cap: CapId::new(u32::MAX),
         untyped_count: 0,
         map_pool_base: 0,
         map_pool_len: 0,
@@ -546,6 +555,35 @@ impl KernelState {
             })
             .unwrap_or(CapId::new(u32::MAX));
 
+        // Step 3d: same as Step 3c, for the first `Network`-kind device
+        // — `root_mmio_net_cap`'s own doc comment covers the rationale
+        // (unblocks `driver-virtio-net`, 03-Kernel-Subsystems-Layer.md
+        // §2.3/§5.4).
+        let root_mmio_net_cap = boot
+            .hardware_manifest
+            .peripheral_devices()
+            .iter()
+            .find(|d| d.kind == PeripheralKindRaw::Network)
+            .and_then(|d| {
+                self.alloc_mmio_region_direct(MmioRegionDescriptor {
+                    phys_base: d.mmio_base,
+                    size: d.mmio_size,
+                    irq: d.irq,
+                    config_space_base: d.config_space_base,
+                })
+            })
+            .and_then(|mmio_id| {
+                let cap = Capability::full(ObjectRef::new(
+                    KernelObjectKind::MmioRegion,
+                    ObjectId::new(mmio_id.as_u32()),
+                ));
+                self.cap_space_mut(root_cs)
+                    .expect("root cap space exists")
+                    .insert_root(cap)
+                    .ok()
+            })
+            .unwrap_or(CapId::new(u32::MAX));
+
         // Step 4: schedule the Root Task.
         self.sched
             .admit(root_tid, SchedulerMode::Interactive, kernel_sched::MAX_PRIORITY, None)
@@ -563,6 +601,7 @@ impl KernelState {
         self.root_addr_space = root_as;
         self.root_page_table_cap = root_page_table_cap;
         self.root_mmio_blk_cap = root_mmio_blk_cap;
+        self.root_mmio_net_cap = root_mmio_net_cap;
         self.untyped_count = untyped_made;
         Ok(())
     }
