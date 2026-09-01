@@ -296,17 +296,79 @@ fn handle_io(drv: &mut crate::VirtioBlk, kind: crate::BlkReqType, lba: u64, sect
     // SAFETY: `drv.is_ready()` (checked above) means `probe` already
     // mapped both regions — `submit_request`'s own contract.
     unsafe { drv.submit_request(kind, lba, crate::VirtioBlk::SECTOR_SIZE as usize) };
-    // SAFETY: `raw_syscall`'s own contract (forwarded via `wait_for_irq`).
-    unsafe { wait_for_irq() };
-    // SAFETY: same contract as `submit_request` — the real interrupt
-    // already fired (`wait_for_irq` only returns once it has), so a
-    // completion is genuinely ready to read.
+    // Loop `Wait`, not a single call — see `VirtioBlk::completion_
+    // pending`'s own doc comment for why one interrupt fire is not
+    // proof THIS request completed (a stale/spurious one, e.g. from
+    // device setup, can already be latched pending at the GIC). Each
+    // iteration's own `wait_for_irq` still genuinely idles the core
+    // (`hal_arm64::cpu::wfi`/`hal_riscv64::cpu::wfi`) rather than
+    // busy-polling — only the OUTER retry is new here. Bounded (not an
+    // infinite loop) for the same reason `VirtioBlk::wait_for_
+    // completion`'s own `MAX_SPINS` is bounded: a device that never
+    // completes this request must not wedge the driver process forever.
+    const MAX_WAIT_RETRIES: u32 = 8;
+    let mut retries = 0u32;
+    loop {
+        // SAFETY: `raw_syscall`'s own contract (forwarded via `wait_for_irq`).
+        unsafe { wait_for_irq() };
+        // SAFETY: `submit_request`'s own contract.
+        if unsafe { drv.completion_pending() } {
+            break;
+        }
+        retries += 1;
+        if retries >= MAX_WAIT_RETRIES {
+            return DriverResponse::Failed { code: DriverErrorCode::DeviceIo };
+        }
+    }
+    // SAFETY: same contract as `submit_request` — the loop above only
+    // exits once the used ring genuinely shows this request's own
+    // completion, so a real status byte is ready to read.
     let status = unsafe { drv.ack_completion() };
     if status == 0 {
         DriverResponse::Completed { sectors: 1 }
     } else {
         DriverResponse::Failed { code: DriverErrorCode::DeviceIo }
     }
+}
+
+/// Constructs the right `VirtioBlk` for whichever transport this
+/// process was actually granted — read from the queue region's own
+/// `transport_kind` header word (`driver_virtio_blk::layout::
+/// PCI_INFO_OFFSET`'s own doc comment for the full field layout;
+/// `kernel_arch_glue`'s own spawn-time PCI capability-list walk
+/// populates it for `Transport::Pci`, or leaves it `0` for `Transport::
+/// Mmio`, in which case `DRV_MMIO_VA` — pre-mapped the same trusted way
+/// regardless — is used directly).
+fn new_driver_for_this_transport() -> crate::VirtioBlk {
+    // SAFETY: `DRV_QUEUE_VA` is mapped `U=1 R+W` in this process's own
+    // address space by `kernel_arch_glue::spawn_virtio_blk_driver`,
+    // before this process is ever scheduled — same contract as
+    // `read_shared_message`'s own `DRV_QUEUE_VA` access.
+    let transport_kind = unsafe {
+        ((DRV_QUEUE_VA + crate::layout::PCI_INFO_OFFSET) as *const u64).read_volatile()
+    };
+    if transport_kind == 0 {
+        return crate::VirtioBlk::new(DRV_MMIO_VA, DRV_QUEUE_VA);
+    }
+    // SAFETY: same contract as the `transport_kind` read above; each
+    // field is a `u64` at a fixed offset within the same info block.
+    let read_u64_at = |field_offset: usize| unsafe {
+        ((DRV_QUEUE_VA + crate::layout::PCI_INFO_OFFSET + field_offset) as *const u64)
+            .read_volatile()
+    };
+    let common_cfg_va = read_u64_at(8) as usize;
+    let notify_cfg_va = read_u64_at(16) as usize;
+    let notify_off_multiplier = read_u64_at(24) as u32;
+    let isr_cfg_va = read_u64_at(32) as usize;
+    let device_cfg_va = read_u64_at(40) as usize;
+    crate::VirtioBlk::new_pci(
+        common_cfg_va,
+        notify_cfg_va,
+        notify_off_multiplier,
+        isr_cfg_va,
+        device_cfg_va,
+        DRV_QUEUE_VA,
+    )
 }
 
 /// The virtio-blk driver's process entry point. Runs `probe()` exactly
@@ -327,7 +389,7 @@ fn handle_io(drv: &mut crate::VirtioBlk, kind: crate::BlkReqType, lba: u64, sect
 /// never hangs), it simply never becomes ready.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
-    let mut drv = crate::VirtioBlk::new(DRV_MMIO_VA, DRV_QUEUE_VA);
+    let mut drv = new_driver_for_this_transport();
     let _ = drv.probe();
 
     loop {

@@ -294,6 +294,19 @@ pub struct PeripheralDeviceRaw {
     /// Opaque device index — same contract as `ComputeDeviceRaw::
     /// device_index`.
     pub device_index: u32,
+
+    /// PCI Configuration Space physical address (ECAM: `ecam_base +
+    /// ecam_offset(bus, device, function)` — see `hal_arm64::compute::
+    /// ecam_offset`'s own doc comment for the formula), `0` for devices
+    /// with no PCI config space at all (e.g. riscv64's virtio-mmio
+    /// transport, discovered via Device Tree, not PCI). A modern
+    /// virtio-pci device's driver walks this device's OWN capability
+    /// list starting here (spec §4.1.4) to locate its COMMON_CFG/
+    /// NOTIFY_CFG/ISR_CFG/DEVICE_CFG sub-regions — `mmio_base`/
+    /// `mmio_size` above name the BAR those sub-regions live within
+    /// (QEMU's own `virtio-pci-modern` convention: BAR4, all four
+    /// regions in one window), not the config space itself.
+    pub config_space_base: u64,
 }
 
 impl PeripheralDeviceRaw {
@@ -304,6 +317,7 @@ impl PeripheralDeviceRaw {
         mmio_size: 0,
         irq: 0,
         device_index: 0,
+        config_space_base: 0,
     };
     pub fn new(kind: PeripheralKindRaw, mmio_base: u64, mmio_size: u64, irq: u32) -> Self {
         Self {
@@ -313,6 +327,24 @@ impl PeripheralDeviceRaw {
             mmio_size,
             irq,
             device_index: 0,
+            config_space_base: 0,
+        }
+    }
+
+    /// Like `new`, but also names the PCI Configuration Space physical
+    /// address — for a virtio-pci device, where `mmio_base` alone
+    /// (a BAR) is not enough for the driver to even START capability-
+    /// list negotiation (see `config_space_base`'s own doc comment).
+    pub fn new_pci(
+        kind: PeripheralKindRaw,
+        mmio_base: u64,
+        mmio_size: u64,
+        irq: u32,
+        config_space_base: u64,
+    ) -> Self {
+        Self {
+            config_space_base,
+            ..Self::new(kind, mmio_base, mmio_size, irq)
         }
     }
 }

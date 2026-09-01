@@ -51,6 +51,50 @@ const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
 const PCI_CLASS_NETWORK: u8 = 0x02;
 const PCI_CLASS_DISPLAY: u8 = 0x03;
 
+/// PCI config-space byte offset of the Interrupt Pin register (the
+/// upper byte of the dword at 0x3C — PCI Local Bus Spec §6.2.4): which
+/// of the 4 legacy INTx lines (1=INTA..4=INTD, 0=none) this function
+/// uses.
+const PCI_INTERRUPT_PIN_OFFSET: u8 = 0x3C;
+
+/// QEMU `virt` machine's own GIC SPI base for its PCIe host bridge's 4
+/// legacy INTx lines (`hw/arm/virt.c`'s own `VIRT_PCIE` `irqmap` entry
+/// — a fixed, long-stable constant for this board across QEMU
+/// versions), matching this crate's own established pattern of
+/// hardcoding QEMU virt's known-fixed values elsewhere (see
+/// `compute::QEMU_VIRT_DEFAULT_ECAM_BASE` / `interrupt`'s own GICD/GICR
+/// base defaults).
+const QEMU_VIRT_PCIE_IRQ_SPI_BASE: u32 = 3;
+
+/// Resolves a virtio-pci device's own legacy INTx line to a GIC INTID,
+/// replicating QEMU's own `pci_swizzle_map_irq_fn` — the standard PCI
+/// slot-based INTx swizzle (PCI-to-PCI Bridge Architecture Spec §9.1)
+/// its generic PCIe host bridge (gpex) applies before wiring each of
+/// the 4 already-swizzled lines to a FIXED GIC SPI starting at
+/// `QEMU_VIRT_PCIE_IRQ_SPI_BASE`. Returns `0` (this project's own
+/// "no IRQ" sentinel — `kernel_core::state::MmioRegionDescriptor::irq`'s
+/// own doc comment) if the device's own Interrupt Pin register reads 0
+/// (uses no legacy interrupt at all — an MSI-only device, out of scope
+/// for this MVP, same "not resolved here" stance this file's own
+/// module doc comment already takes toward non-BAR0 capability
+/// windows).
+///
+/// # Safety
+/// Same contract as `ecam_read_u32`.
+unsafe fn resolve_pci_intx_irq(ecam_base: u64, bus: u8, device: u8, function: u8) -> u32 {
+    // SAFETY: forwarded from this function's own contract.
+    let dword =
+        unsafe { ecam_read_u32(ecam_base, bus, device, function, PCI_INTERRUPT_PIN_OFFSET) };
+    let interrupt_pin = (dword >> 8) & 0xFF;
+    if interrupt_pin == 0 {
+        return 0;
+    }
+    let pin0 = interrupt_pin - 1; // INTA=1..INTD=4 -> 0-based.
+    let swizzled = (device as u32 + pin0) % 4;
+    let spi = QEMU_VIRT_PCIE_IRQ_SPI_BASE + swizzled;
+    32 + spi // GIC INTID: SGIs 0-15, PPIs 16-31, SPIs start at 32.
+}
+
 /// Maps a PCI class code (for a device already confirmed to carry
 /// virtio's own vendor id) to this project's own `PeripheralKind`.
 fn classify_virtio_pci_device(header: &PciDeviceHeader) -> PeripheralKind {
@@ -147,9 +191,18 @@ impl PeripheralDiscovery {
                     // SAFETY: same ordering contract as above.
                     let bar0 = unsafe { probe_bar0(ecam_base, bus, device, function) };
                     let (mmio_base, mmio_size) = bar0.unwrap_or((0, 0));
+                    let config_space_base = ecam_base + ecam_offset(bus, device, function);
+                    // SAFETY: same ordering contract as above.
+                    let irq = unsafe { resolve_pci_intx_irq(ecam_base, bus, device, function) };
 
                     let kind = classify_virtio_pci_device(&header);
-                    devices[device_count] = PeripheralDevice::new(kind, mmio_base, mmio_size, 0);
+                    devices[device_count] = PeripheralDevice::new_pci(
+                        kind,
+                        mmio_base,
+                        mmio_size,
+                        irq,
+                        config_space_base,
+                    );
                     device_count += 1;
                 }
             }

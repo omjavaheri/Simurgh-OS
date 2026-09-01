@@ -36,6 +36,23 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 LOG="$WORK/serial.log"
 
+# Translates a POSIX path to native form for a QEMU argument — needed on
+# Windows/Git-Bash (MSYS), where the *_bin_ qemu-system-*.exe is a real
+# Windows binary that cannot resolve `/tmp/...`-style paths on its own.
+# MSYS itself auto-translates an argument that STARTS with `/`, but that
+# heuristic misses a path embedded after a driver prefix (`fat:rw:$ESP`
+# below) — the whole argument does not start with `/`, so it reaches
+# QEMU untranslated and QEMU reports "Could not read directory". A no-op
+# everywhere `cygpath` doesn't exist (Linux/WSL/CI), so this stays
+# harmless on every platform this script already supported.
+native_path() {
+	if command -v cygpath >/dev/null 2>&1; then
+		cygpath -w "$1"
+	else
+		printf '%s\n' "$1"
+	fi
+}
+
 PASS_MARKER_1="BootInfo validation: OK"
 PASS_MARKER_2="Phase 1 complete"
 
@@ -111,9 +128,9 @@ x86_64 | aarch64)
 	fi
 
 	run_qemu "${QEMU[@]}" \
-		-drive "if=pflash,format=raw,readonly=on,file=$CODE" \
-		-drive "if=pflash,format=raw,file=$VARS_RW" \
-		-drive "format=raw,file=fat:rw:$ESP" \
+		-drive "if=pflash,format=raw,readonly=on,file=$(native_path "$CODE")" \
+		-drive "if=pflash,format=raw,file=$(native_path "$VARS_RW")" \
+		-drive "format=raw,file=fat:rw:$(native_path "$ESP")" \
 		-nographic -no-reboot -net none
 	;;
 

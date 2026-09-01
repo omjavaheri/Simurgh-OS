@@ -241,6 +241,9 @@ mod dynamic {
         pub mmio_size: u64,
         pub irq: u32,
         pub device_index: u32,
+        /// See `PeripheralDeviceRaw::config_space_base`'s own doc
+        /// comment — `0` for a device with no PCI config space.
+        pub config_space_base: u64,
         pub capability_token: Option<Cap>,
     }
 
@@ -252,6 +255,7 @@ mod dynamic {
                 mmio_size: raw.mmio_size,
                 irq: raw.irq,
                 device_index: raw.device_index,
+                config_space_base: raw.config_space_base,
                 capability_token: None,
             }
         }

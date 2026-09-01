@@ -75,6 +75,10 @@ pub struct MmioRegionDescriptor {
     /// the HAL discovery code, not this crate, is responsible for that
     /// translation).
     pub irq: u32,
+    /// See `hal_manifest::raw::PeripheralDeviceRaw::config_space_base`'s
+    /// own doc comment — `0` for a device with no PCI config space
+    /// (e.g. riscv64's virtio-mmio transport).
+    pub config_space_base: u64,
 }
 
 /// The entire mutable kernel state. One instance for the life of the
@@ -527,6 +531,7 @@ impl KernelState {
                     phys_base: d.mmio_base,
                     size: d.mmio_size,
                     irq: d.irq,
+                    config_space_base: d.config_space_base,
                 })
             })
             .and_then(|mmio_id| {

@@ -2451,6 +2451,24 @@ static mut G_DRV_QUEUE_PHYS: usize = usize::MAX;
 /// run later in the driver process's own time.
 static mut G_DRV_MMIO_PHYS: usize = usize::MAX;
 
+/// `Transport::Pci`'s own counterpart to `G_DRV_MMIO_PHYS`: the ISR_CFG
+/// register's own VA — a VA, not a physical address, because unlike
+/// virtio-mmio's window (identity-mapped, dereferenceable from ANY
+/// active page table) virtio-pci's BAR only exists at a HIGH physical
+/// address (QEMU virt's own highmem PCI aperture, e.g. `0x80_0000_0000`
+/// — see `KERNEL_PCI_CFG_VA`'s own doc comment for the identical class
+/// of problem this solves for ECAM config space). Deliberately reuses
+/// `wire_virtio_pci_transport`'s own `isr_cfg_va` (a VA in `drv_root_
+/// pt`, NOT `caller_root_pt`) rather than building a SEPARATE kernel-
+/// side mapping: `virtio_blk_irq_trampoline` only ever fires while
+/// `drv_irq_wait_step`'s own `wfi()` retry loop is spinning INSIDE the
+/// driver process's own `DRV_IRQ_WAIT` syscall — i.e., while `drv_
+/// root_pt` (not `caller_root_pt`) is the ACTIVE TTBR0_EL1, since a
+/// `Wait`-blocked thread's own trap context is never unwound back to
+/// its caller — so the driver's OWN existing BAR mapping is already
+/// exactly what this needs, with no new mapping required.
+static mut G_DRV_ISR_CFG_VA: usize = usize::MAX;
+
 /// VA the virtio-mmio transport window is pre-mapped at in the driver's
 /// own address space — must stay numerically equal to
 /// `driver_virtio_blk::subsystem_entry::DRV_MMIO_VA`.
@@ -2460,6 +2478,484 @@ const DRV_MMIO_VA: usize = 0xD820_0000;
 /// own address space — must stay numerically equal to
 /// `driver_virtio_blk::subsystem_entry::DRV_QUEUE_VA`.
 const DRV_QUEUE_VA: usize = 0xD830_0000;
+
+// ============================================================================
+// virtio-pci "modern" transport support (aarch64) — PCI capability-list
+// walking + BAR mapping. Unlike `DRV_MMIO_VA`/`DRV_QUEUE_VA` above, the
+// driver process never hardcodes the VA(s) this section maps its
+// register windows at: it learns them entirely from the `PCI_INFO_
+// OFFSET` header block this section writes into the SAME `SharedRegion`
+// `DRV_QUEUE_VA` already covers (see `driver_virtio_blk::layout::
+// PCI_INFO_OFFSET`'s own doc comment for the field layout, and
+// `driver_virtio_blk::subsystem_entry::new_driver_for_this_transport`
+// for the reader). This split exists because — unlike virtio-mmio's
+// single fixed register block at a HAL-discovered base — virtio-pci
+// "modern" scatters its 4 register windows (COMMON/NOTIFY/ISR/
+// DEVICE_CFG) across a PCI capability list (virtio 1.x spec §4.1.4)
+// that only THIS trusted glue code (not the HAL, which only reports
+// BAR0 — see `hal_arm64::peripheral`'s own module doc comment) is
+// positioned to resolve, since resolving it requires live PCI config-
+// space + BAR reads no HAL discovery pass performs.
+// ============================================================================
+
+/// PCI config-space byte offset of the Capabilities Pointer register
+/// (Type 0x00 header, PCI Local Bus Spec §6.7) — valid whenever the
+/// Status register's own Capabilities List bit (offset 0x06, bit 4) is
+/// set, which every virtio-pci "modern" device sets by construction
+/// (the only kind `hal_arm64::peripheral::PeripheralDiscovery` reports
+/// a nonzero `config_space_base` for in the first place).
+const PCI_CAP_POINTER_OFFSET: u32 = 0x34;
+
+/// PCI config-space byte offset of the Command register (Type 0x00
+/// header, PCI Local Bus Spec §6.2.2) — a u16 register, but written
+/// here as the low half of the u32 word it shares with Status (0x06),
+/// via a read-modify-write so Status's own write-1-to-clear error bits
+/// are never touched.
+const PCI_COMMAND_OFFSET: u32 = 0x04;
+/// Command register bit 1: Memory Space Enable — decode of this
+/// function's own memory BARs stays OFF until this is set (PCI Local
+/// Bus Spec §6.2.2), independent of whether those BARs are otherwise
+/// correctly sized/assigned.
+const PCI_COMMAND_MEMORY_SPACE: u32 = 1 << 1;
+/// Command register bit 2: Bus Master Enable — required before this
+/// function may itself initiate a memory transaction (irrelevant to
+/// the driver's own MMIO register reads/writes, which are CPU-
+/// initiated, but required regardless for virtqueue DMA once the
+/// device is driving completions).
+const PCI_COMMAND_BUS_MASTER: u32 = 1 << 2;
+
+/// Vendor-specific capability id (PCI Local Bus Spec §6.7's own
+/// Capability ID assignments) — the only capability id virtio-pci
+/// devices attach to the standard PCI capability list (virtio 1.x spec
+/// §4.1.4, `struct virtio_pci_cap`'s own `cap_vndr` field).
+const PCI_CAP_ID_VENDOR_SPECIFIC: u8 = 0x09;
+
+/// `cfg_type` byte values from `struct virtio_pci_cap` (virtio 1.x spec
+/// §4.1.4.3).
+const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
+const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+
+/// Base VA for virtio-pci BAR window(s) — one `DRV_PCI_BAR_VA_STRIDE`
+/// slot per DISTINCT BAR index the capability list below references,
+/// starting well clear of `DRV_QUEUE_VA`'s own single page. QEMU's own
+/// virtio-pci-modern devices bundle all 4 capability windows into ONE
+/// BAR (so in practice exactly one slot is ever used), but the virtio
+/// spec does not require that, so this supports up to `DRV_PCI_MAX_
+/// BARS` distinct ones.
+const DRV_PCI_BAR_VA_BASE: usize = 0xD840_0000;
+/// Headroom reserved per distinct BAR — generously above the low-KiB
+/// window sizes QEMU's own virtio-pci-modern BARs actually use.
+const DRV_PCI_BAR_VA_STRIDE: usize = 0x10_0000;
+const DRV_PCI_MAX_BARS: usize = 4;
+
+/// VA `wire_virtio_pci_transport` maps a PCI function's own ECAM
+/// config-space page at, in the CALLER's (root's) own address space —
+/// see that function's own doc comment for why this mapping (not a
+/// raw physical dereference) is required at all: unlike `mmio.phys_
+/// base` (a BAR base, always within the low few GiB `map_ram_identity`
+/// already covers for every process), ECAM config space sits at
+/// `hal_arm64::compute`'s own `QEMU_VIRT_DEFAULT_ECAM_BASE` (0x40_1000_
+/// 0000, ~256 GiB) — far outside ANY process's own identity-mapped
+/// range, so a raw pointer dereference against it faults under
+/// whichever page table happens to be active (a REAL bug found via
+/// QEMU: without this mapping, `spawn_virtio_blk_driver`'s PCI branch
+/// hangs the very first time `walk_virtio_pci_capabilities` reads
+/// config space, root's own EL1 code faulting under its own `root_pt`).
+const KERNEL_PCI_CFG_VA: usize = 0xD800_0000;
+
+/// Raw PCI/PCIe config-space reads, `config_phys` already folding in
+/// bus/device/function (exactly the value `hal_arm64::peripheral::
+/// PeripheralDiscovery::new` assembled into `MmioRegionDescriptor::
+/// config_space_base` at boot) — callers here only ever add a register
+/// offset on top.
+///
+/// # Safety
+/// `config_phys` must be a live, mapped ECAM config-space address for
+/// the life of the call — true for every `MmioRegionDescriptor` this
+/// kernel boot-seeds, the same trust boundary `mmio.phys_base` reads
+/// elsewhere in this file already rely on.
+unsafe fn pci_cfg_read8(config_phys: u64, offset: u32) -> u8 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { ((config_phys + offset as u64) as *const u8).read_volatile() }
+}
+
+/// # Safety
+/// Same contract as `pci_cfg_read8`.
+unsafe fn pci_cfg_read32(config_phys: u64, offset: u32) -> u32 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { ((config_phys + offset as u64) as *const u32).read_volatile() }
+}
+
+/// # Safety
+/// Same contract as `pci_cfg_read8`.
+unsafe fn pci_cfg_write32(config_phys: u64, offset: u32, val: u32) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { ((config_phys + offset as u64) as *mut u32).write_volatile(val) };
+}
+
+/// Resolves BAR `bar_index`'s own physical base + size on the PCI
+/// function at `config_phys` — the general, arbitrary-index counterpart
+/// to `hal_arm64::peripheral`'s own discovery-time BAR0-only probe
+/// (that one lives in the HAL and only ever reports BAR0; this one
+/// lives here, resolved lazily only for whichever BAR(s) `walk_virtio_
+/// pci_capabilities` below actually references). Correctly follows a
+/// 64-bit memory BAR (bits[2:1] == 0b10 of the BAR register) onto its
+/// own upper dword at `bar_index + 1` (PCI Local Bus Spec §6.2.5.1) —
+/// QEMU's own virtio-pci-modern devices route COMMON/NOTIFY/ISR/
+/// DEVICE_CFG through exactly such a BAR (typically BAR4).
+///
+/// # Safety
+/// Same contract as `pci_cfg_read8`; additionally performs the standard
+/// write-all-ones/read-back/restore sizing dance on the live BAR
+/// register(s) — not safe against a concurrent access to the SAME
+/// function's config space, which this single-core, root-only
+/// bootstrap path (called only from `spawn_virtio_blk_driver`, before
+/// the driver process it is resolving registers FOR has even started
+/// running) never has.
+unsafe fn pci_bar_phys(config_phys: u64, bar_index: u8) -> Option<(u64, u64)> {
+    let bar_off = 0x10 + (bar_index as u32) * 4;
+    // SAFETY: forwarded from this function's own contract.
+    let bar_lo = unsafe { pci_cfg_read32(config_phys, bar_off) };
+    if bar_lo & 0x1 != 0 {
+        return None; // I/O-space BAR — out of scope, same as hal-arm64's own probe_bar0.
+    }
+    let is_64bit = (bar_lo >> 1) & 0x3 == 0b10;
+
+    // SAFETY: forwarded; original value restored immediately below —
+    // standard PCI BAR-sizing procedure (spec §6.2.5.1).
+    unsafe { pci_cfg_write32(config_phys, bar_off, 0xFFFF_FFFF) };
+    // SAFETY: forwarded.
+    let size_lo = unsafe { pci_cfg_read32(config_phys, bar_off) };
+    // SAFETY: forwarded; restoring.
+    unsafe { pci_cfg_write32(config_phys, bar_off, bar_lo) };
+
+    let base_lo = (bar_lo & 0xFFFF_FFF0) as u64;
+
+    if !is_64bit {
+        if size_lo == 0 {
+            return None;
+        }
+        let size = (!(size_lo & 0xFFFF_FFF0) as u64) + 1;
+        return Some((base_lo, size));
+    }
+
+    let bar_hi_off = bar_off + 4;
+    // SAFETY: forwarded.
+    let bar_hi = unsafe { pci_cfg_read32(config_phys, bar_hi_off) };
+    // SAFETY: forwarded; restored below.
+    unsafe { pci_cfg_write32(config_phys, bar_hi_off, 0xFFFF_FFFF) };
+    // SAFETY: forwarded.
+    let size_hi = unsafe { pci_cfg_read32(config_phys, bar_hi_off) };
+    // SAFETY: forwarded; restoring.
+    unsafe { pci_cfg_write32(config_phys, bar_hi_off, bar_hi) };
+
+    let base = base_lo | ((bar_hi as u64) << 32);
+    let size_mask = ((size_hi as u64) << 32) | (size_lo & 0xFFFF_FFF0) as u64;
+    if size_mask == 0 {
+        return None;
+    }
+    let size = (!size_mask) + 1;
+    Some((base, size))
+}
+
+/// One resolved virtio-pci capability window: which BAR it lives in,
+/// plus its own byte offset/length within that BAR (`struct
+/// virtio_pci_cap`, virtio 1.x spec §4.1.4.3).
+#[derive(Clone, Copy, Default)]
+struct VirtioPciCapWindow {
+    bar: u8,
+    offset: u32,
+}
+
+/// The capability windows a virtio-pci "modern" device's own capability
+/// list carries (virtio 1.x spec §4.1.4) — `notify` additionally needs
+/// `notify_off_multiplier` (`struct virtio_pci_notify_cap`'s own
+/// extension field, spec §4.1.4.4) to locate a specific queue's own
+/// doorbell within the NOTIFY_CFG window.
+#[derive(Default)]
+struct VirtioPciCapLayout {
+    common: Option<VirtioPciCapWindow>,
+    notify: Option<VirtioPciCapWindow>,
+    notify_off_multiplier: u32,
+    isr: Option<VirtioPciCapWindow>,
+    device: Option<VirtioPciCapWindow>,
+}
+
+/// Walks the standard PCI capability list (starting at the
+/// Capabilities Pointer register, offset 0x34) looking for vendor-
+/// specific (id 0x09) capabilities, classifying each by its own
+/// `cfg_type` byte (virtio 1.x spec §4.1.4.3) — the real counterpart to
+/// `hal_arm64::peripheral`'s own discovery-time BAR0-only read (see
+/// that module's own doc comment on why the full walk is deliberately
+/// deferred to here, the driver-spawning trusted glue, rather than done
+/// at HAL discovery time).
+///
+/// # Safety
+/// Same contract as `pci_cfg_read8`.
+unsafe fn walk_virtio_pci_capabilities(config_phys: u64) -> VirtioPciCapLayout {
+    let mut layout = VirtioPciCapLayout::default();
+
+    // SAFETY: forwarded from this function's own contract.
+    let mut ptr = unsafe { pci_cfg_read8(config_phys, PCI_CAP_POINTER_OFFSET) };
+    // Bounded walk — a real capability list is a finite linked list
+    // within a 256-byte config space; this guards against a malformed
+    // device looping the list forever (defensive even though this only
+    // ever walks an emulated/passthrough device's own config space).
+    for _ in 0..48 {
+        if ptr == 0 {
+            break;
+        }
+        // SAFETY: forwarded.
+        let cap_id = unsafe { pci_cfg_read8(config_phys, ptr as u32) };
+        // SAFETY: forwarded.
+        let cap_next = unsafe { pci_cfg_read8(config_phys, ptr as u32 + 1) };
+
+        if cap_id == PCI_CAP_ID_VENDOR_SPECIFIC {
+            // SAFETY: forwarded.
+            let cfg_type = unsafe { pci_cfg_read8(config_phys, ptr as u32 + 3) };
+            // SAFETY: forwarded.
+            let bar = unsafe { pci_cfg_read8(config_phys, ptr as u32 + 4) };
+            // SAFETY: forwarded.
+            let offset = unsafe { pci_cfg_read32(config_phys, ptr as u32 + 8) };
+            let window = VirtioPciCapWindow { bar, offset };
+
+            match cfg_type {
+                VIRTIO_PCI_CAP_COMMON_CFG => layout.common = Some(window),
+                VIRTIO_PCI_CAP_NOTIFY_CFG => {
+                    layout.notify = Some(window);
+                    // SAFETY: forwarded — `struct virtio_pci_notify_cap`'s
+                    // own extension field, spec §4.1.4.4.
+                    layout.notify_off_multiplier =
+                        unsafe { pci_cfg_read32(config_phys, ptr as u32 + 16) };
+                }
+                VIRTIO_PCI_CAP_ISR_CFG => layout.isr = Some(window),
+                VIRTIO_PCI_CAP_DEVICE_CFG => layout.device = Some(window),
+                _ => {}
+            }
+        }
+
+        ptr = cap_next;
+    }
+
+    layout
+}
+
+/// Maps virtio-pci BAR `bar_index`'s own physical window into the
+/// driver process's address space, returning its virtual base —
+/// memoized against `mapped`/`mapped_count` so the SAME BAR referenced
+/// by more than one capability window (COMMON/NOTIFY/ISR/DEVICE_CFG
+/// commonly all share one BAR — see this section's own module doc
+/// comment) is mapped exactly once. Mirrors the untyped-carve + `map_
+/// range` pattern `spawn_virtio_blk_driver`'s own virtio-mmio window
+/// pre-map already uses, generalized to an arbitrary size (a BAR can be
+/// larger than one page, unlike the fixed single-page virtio-mmio
+/// window).
+///
+/// # Safety
+/// Same contract as `pci_bar_phys`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn map_pci_bar(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    drv_root_pt: usize,
+    config_phys: u64,
+    bar_index: u8,
+    mapped: &mut [(u8, usize); DRV_PCI_MAX_BARS],
+    mapped_count: &mut usize,
+) -> Option<usize> {
+    if let Some((_, va)) = mapped[..*mapped_count].iter().find(|(b, _)| *b == bar_index) {
+        return Some(*va);
+    }
+    if *mapped_count >= DRV_PCI_MAX_BARS {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own contract.
+    let (bar_phys, bar_size) = unsafe { pci_bar_phys(config_phys, bar_index) }?;
+    let map_len = (bar_size as usize).div_ceil(4096) * 4096;
+    if map_len == 0 || map_len > DRV_PCI_BAR_VA_STRIDE {
+        return None; // would collide with the next BAR slot's own VA range.
+    }
+    let va = DRV_PCI_BAR_VA_BASE + *mapped_count * DRV_PCI_BAR_VA_STRIDE;
+
+    // Pool sizing: one new L2 table plus up to one new L3 table per
+    // 2 MiB (512 pages) of mapped range, +1 page of slack — the same
+    // "pool is page-table scratch, not target-region-sized" contract
+    // `map_range`'s own doc comment establishes, just scaled up from
+    // the fixed single-page virtio-mmio pre-map's `pool_len = 2`.
+    let pages_needed = map_len / 4096;
+    let pool_pages = 2 + pages_needed.div_ceil(512);
+    let pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, (4096 * pool_pages) as u64).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed (same contract every other
+    // pool carve in this file already documents).
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * pool_pages) };
+    let n = hal.map_range(
+        drv_root_pt,
+        va,
+        bar_phys as usize,
+        map_len,
+        1 | 2 | 8, // R+W+U — the driver's own user-mode register window.
+        pool,
+        pool_pages,
+    );
+    if n == u32::MAX {
+        return None;
+    }
+
+    mapped[*mapped_count] = (bar_index, va);
+    *mapped_count += 1;
+    Some(va)
+}
+
+/// Resolves and maps a virtio-pci "modern" device's own 4 capability
+/// windows (COMMON/NOTIFY/ISR/DEVICE_CFG) into the driver process, then
+/// writes the `PCI_INFO_OFFSET` header block (`driver_virtio_blk::
+/// layout::PCI_INFO_OFFSET`'s own doc comment) into `region_phys` so
+/// `driver_virtio_blk::subsystem_entry::new_driver_for_this_transport`
+/// can construct a `Transport::Pci`-backed `VirtioBlk` without ever
+/// needing its own copy of these addresses. Returns `None` (and logs)
+/// if COMMON_CFG — the one capability window virtio-pci-modern cannot
+/// function without — was not found, or if mapping its own BAR failed;
+/// NOTIFY/ISR/DEVICE_CFG are logged-and-skipped individually since a
+/// missing one still leaves `VirtioBlk::probe` able to fail cleanly
+/// rather than dereference a null VA (mirrors `spawn_virtio_blk_driver`'s
+/// own "no allocation, no process" failure philosophy applied at
+/// finer, per-window grain here).
+///
+/// First maps `config_phys`'s own ECAM page (already page-aligned —
+/// `ecam_offset`'s own construction) into `caller_root_pt` at `KERNEL_
+/// PCI_CFG_VA` — see that const's own doc comment for why this kernel-
+/// side mapping is required before ANY read/write against config space,
+/// unlike a BAR's own target window (`mmio.phys_base`, always within
+/// the identity-mapped low GiB range every process already carries).
+/// Every capability-list walk and BAR-sizing probe below reads through
+/// `KERNEL_PCI_CFG_VA`, never the raw `config_phys`, for exactly this
+/// reason (`pci_bar_phys`'s own BAR-register reads/writes live WITHIN
+/// this same config-space page, not the BAR's own target memory).
+///
+/// # Safety
+/// Same contract as `pci_bar_phys` / `map_pci_bar`.
+unsafe fn wire_virtio_pci_transport(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    drv_root_pt: usize,
+    caller_root_pt: usize,
+    config_phys: u64,
+    region_phys: usize,
+) -> Option<()> {
+    let cfg_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(cfg_pool as *mut u8, 0, 4096 * 2) };
+    let cfg_n = hal.map_range(
+        caller_root_pt,
+        KERNEL_PCI_CFG_VA,
+        config_phys as usize,
+        4096,
+        1 | 2, // R+W, kernel-only (no U bit) — EL1/S-mode code only.
+        cfg_pool,
+        2,
+    );
+    if cfg_n == u32::MAX {
+        klog!("wire_virtio_pci_transport: map_range error (ECAM config-space page)\r\n");
+        return None;
+    }
+    // Modifying a LIVE, currently-active page table (unlike every other
+    // `map_range` call in this file, which always targets a not-yet-
+    // activated process) — flush before relying on the fresh mapping,
+    // cheap insurance against any stale walk-cache state.
+    hal.flush_tlb();
+    let config_va = KERNEL_PCI_CFG_VA as u64;
+
+    // Enable Memory Space + Bus Master (PCI Local Bus Spec §6.2.2) —
+    // **real bug found via QEMU**: without this, EVERY register in
+    // BAR4's own MMIO window reads back 0xFFFFFFFF, regardless of page
+    // tables or exception level (confirmed by reading the SAME
+    // physical window directly from EL1 with its own fresh mapping —
+    // still 0xFFFFFFFF), because the device's memory decode is simply
+    // OFF until a driver explicitly turns it on. Every peripheral this
+    // project touched before virtio-pci was virtio-mmio, which has no
+    // such gate at all, so this step never had a reason to exist here
+    // until now. Read-modify-write (not a raw overwrite) so Status's
+    // own write-1-to-clear bits, sharing this same u32 word, are never
+    // touched.
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let cmd_status = pci_cfg_read32(config_va, PCI_COMMAND_OFFSET);
+        pci_cfg_write32(
+            config_va,
+            PCI_COMMAND_OFFSET,
+            cmd_status | PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER,
+        );
+    }
+
+    // SAFETY: forwarded from this function's own contract; `config_va`
+    // is the mapping just installed above.
+    let caps = unsafe { walk_virtio_pci_capabilities(config_va) };
+    let Some(common) = caps.common else {
+        klog!("wire_virtio_pci_transport: no COMMON_CFG capability found\r\n");
+        return None;
+    };
+
+    let mut mapped: [(u8, usize); DRV_PCI_MAX_BARS] = [(0, 0); DRV_PCI_MAX_BARS];
+    let mut mapped_count = 0usize;
+
+    // SAFETY: forwarded.
+    let common_va = unsafe {
+        map_pci_bar(k, hal, drv_root_pt, config_va, common.bar, &mut mapped, &mut mapped_count)
+    }?;
+    let common_cfg_va = common_va + common.offset as usize;
+
+    let mut resolve = |window: Option<VirtioPciCapWindow>, name: &str| -> usize {
+        let Some(w) = window else {
+            klog!("wire_virtio_pci_transport: no {} capability found\r\n", name);
+            return 0;
+        };
+        // SAFETY: forwarded from this function's own contract.
+        let base = unsafe {
+            map_pci_bar(k, hal, drv_root_pt, config_va, w.bar, &mut mapped, &mut mapped_count)
+        };
+        match base {
+            Some(va) => va + w.offset as usize,
+            None => {
+                klog!("wire_virtio_pci_transport: failed to map {} BAR\r\n", name);
+                0
+            }
+        }
+    };
+    let notify_cfg_va = resolve(caps.notify, "NOTIFY_CFG");
+    let isr_cfg_va = resolve(caps.isr, "ISR_CFG");
+    let device_cfg_va = resolve(caps.device, "DEVICE_CFG");
+    // SAFETY: single-core; written once here, before `IrqBind`
+    // (`spawn_virtio_blk_driver`'s own caller) installs the trampoline
+    // that reads it — see `G_DRV_ISR_CFG_VA`'s own doc comment for why
+    // this VA (not a physical address) is what the trampoline needs.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_ISR_CFG_VA).write(isr_cfg_va) };
+
+    let header = region_phys + driver_virtio_blk::layout::PCI_INFO_OFFSET;
+    // SAFETY: `region_phys` is the driver's own fresh, zeroed
+    // `SharedRegion`, identity-addressable, single-core — same
+    // contract every other direct physical write in this file relies
+    // on for that region.
+    unsafe {
+        (header as *mut u64).write_volatile(1); // transport_kind = Pci
+        ((header + 8) as *mut u64).write_volatile(common_cfg_va as u64);
+        ((header + 16) as *mut u64).write_volatile(notify_cfg_va as u64);
+        ((header + 24) as *mut u64).write_volatile(caps.notify_off_multiplier as u64);
+        ((header + 32) as *mut u64).write_volatile(isr_cfg_va as u64);
+        ((header + 40) as *mut u64).write_volatile(device_cfg_va as u64);
+    }
+
+    Some(())
+}
 
 /// # Safety
 /// `G_DRV_QUEUE_PHYS` must already be a valid, exclusively-owned,
@@ -2578,6 +3074,27 @@ pub fn virtio_blk_irq_trampoline(irq: hal_core::interrupt::IrqId) {
         }
     }
 
+    // `Transport::Pci`'s own counterpart to the MMIO ack above — same
+    // "must happen HERE, not later in the driver process's own time"
+    // rationale (`G_DRV_MMIO_PHYS`'s own doc comment), same real-bug
+    // consequence if skipped (a level-sensitive INTx line the GIC keeps
+    // re-delivering the instant this trap returns — the exact PCI
+    // counterpart of the MMIO PLIC storm already documented above).
+    // Unlike MMIO's separate STATUS-read/ACK-write pair, virtio-pci's
+    // ISR_CFG (virtio 1.x spec §4.1.4.5) is a SINGLE byte that clears
+    // (deasserting INTx) on the read itself — no separate ack write.
+    // SAFETY: single-core; `G_DRV_ISR_CFG_VA` was written once by
+    // `wire_virtio_pci_transport`, before `IrqBind` installed this
+    // trampoline; see that static's own doc comment for why this VA
+    // (in `drv_root_pt`, not a physical address) is safely
+    // dereferenceable exactly when this trampoline runs.
+    unsafe {
+        let isr_va = core::ptr::addr_of!(G_DRV_ISR_CFG_VA).read();
+        if isr_va != usize::MAX {
+            let _isr_reason = (isr_va as *const u8).read_volatile();
+        }
+    }
+
     let k = kstate();
     let hal = khal();
     let Some(nid) = k.notification_for_irq(irq.as_u32()) else {
@@ -2633,9 +3150,24 @@ pub fn spawn_virtio_blk_driver(
         k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32(),
     );
     let mmio = *k.mmio_region(mmio_id)?;
-    // SAFETY: single-core; written once here, before `IrqBind` below
-    // installs the trampoline that reads it.
-    unsafe { core::ptr::addr_of_mut!(G_DRV_MMIO_PHYS).write(mmio.phys_base as usize) };
+    // A nonzero `config_space_base` means this device was discovered
+    // over PCI (`hal_arm64::peripheral`'s own `PeripheralDevice::
+    // new_pci` — riscv64's virtio-mmio discovery never sets it, see
+    // `MmioRegionDescriptor::config_space_base`'s own doc comment), so
+    // the driver needs virtio-pci "modern" register windows resolved
+    // via `wire_virtio_pci_transport` below rather than the single
+    // fixed virtio-mmio block this function pre-maps at `DRV_MMIO_VA`.
+    let is_pci = mmio.config_space_base != 0;
+    if !is_pci {
+        // SAFETY: single-core; written once here, before `IrqBind`
+        // below installs the trampoline that reads it. Left at its
+        // `usize::MAX` sentinel for PCI transport — that trampoline's
+        // own virtio-mmio-specific INTERRUPT_STATUS/ACK read does not
+        // apply to virtio-pci's own ISR_CFG ack mechanism (a single
+        // read-to-clear byte at a DIFFERENT, capability-resolved
+        // address) — PCI interrupt-context ack is not yet wired here.
+        unsafe { core::ptr::addr_of_mut!(G_DRV_MMIO_PHYS).write(mmio.phys_base as usize) };
+    }
 
     let ep_cap = match k.dispatch(
         caller,
@@ -2666,27 +3198,35 @@ pub fn spawn_virtio_blk_driver(
 
     // Pre-map the virtio-mmio transport window — real device MMIO, not
     // RAM, so (unlike every other `map_range` call in this file) there
-    // is nothing to zero or copy into it first.
-    let mmio_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
-    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
-    // `map_range` needs the pool pre-zeroed (same contract every other
-    // pool carve in this file already documents).
-    unsafe { core::ptr::write_bytes(mmio_pool as *mut u8, 0, 4096 * 2) };
-    let n = hal.map_range(
-        drv_root_pt,
-        DRV_MMIO_VA,
-        mmio.phys_base as usize,
-        4096,
-        1 | 2 | 8, // R+W+U
-        mmio_pool,
-        2,
-    );
-    if n == u32::MAX {
-        klog!("spawn_virtio_blk_driver: map_range error (mmio window)\r\n");
-        return None;
+    // is nothing to zero or copy into it first. Skipped entirely for
+    // PCI transport (`is_pci`): virtio-pci's own register windows are
+    // resolved and mapped individually below, by `wire_virtio_pci_
+    // transport`, from whichever BAR(s) its capability list actually
+    // names — `mmio.phys_base`/`mmio.size` here are only ever BAR0's
+    // own base/size (`hal_arm64::peripheral`'s own module doc comment),
+    // which need not even be one of the BARs virtio-pci-modern uses.
+    if !is_pci {
+        let mmio_pool = k
+            .untyped_mut(kernel_cap::UntypedId::new(0))
+            .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+            .map(|p| p.as_usize())?;
+        // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+        // `map_range` needs the pool pre-zeroed (same contract every
+        // other pool carve in this file already documents).
+        unsafe { core::ptr::write_bytes(mmio_pool as *mut u8, 0, 4096 * 2) };
+        let n = hal.map_range(
+            drv_root_pt,
+            DRV_MMIO_VA,
+            mmio.phys_base as usize,
+            4096,
+            1 | 2 | 8, // R+W+U
+            mmio_pool,
+            2,
+        );
+        if n == u32::MAX {
+            klog!("spawn_virtio_blk_driver: map_range error (mmio window)\r\n");
+            return None;
+        }
     }
 
     // Retype and pre-map the virtqueue/data `SharedRegion` — a REAL
@@ -2724,6 +3264,40 @@ pub fn spawn_virtio_blk_driver(
     // SAFETY: `region_phys` is identity-addressable, freshly zeroed
     // above.
     unsafe { (region_phys as *mut u64).write_volatile(region_phys as u64) };
+
+    // For PCI transport, resolve+map the device's own virtio-pci
+    // "modern" register windows and write the `PCI_INFO_OFFSET` header
+    // block right after `PHYS_BASE_OFFSET` above — both live in the
+    // SAME region, and `new_driver_for_this_transport` reads this block
+    // to pick `Transport::Pci` over the `transport_kind == 0` default
+    // this freshly-zeroed region already carries for MMIO transport.
+    if is_pci {
+        // SAFETY: `mmio.config_space_base` is a live ECAM address (this
+        // kernel boot-seeded it from `hal_arm64::peripheral`'s own PCI
+        // scan, the same trust boundary `mmio.phys_base` already
+        // relies on); `region_phys` is this function's own fresh,
+        // zeroed `SharedRegion`, forwarded from that write above.
+        // `caller_root_pt`: `caller`'s own page table, still the ACTIVE
+        // one right now (the switch to the driver process happens only
+        // at this function's own tail) — see `KERNEL_PCI_CFG_VA`'s own
+        // doc comment for why `wire_virtio_pci_transport` needs it.
+        let caller_addr_space = k.tcb(caller)?.addr_space;
+        let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+        let wired = unsafe {
+            wire_virtio_pci_transport(
+                k,
+                hal,
+                drv_root_pt,
+                caller_root_pt,
+                mmio.config_space_base,
+                region_phys,
+            )
+        };
+        if wired.is_none() {
+            klog!("spawn_virtio_blk_driver: wire_virtio_pci_transport failed\r\n");
+            return None;
+        }
+    }
 
     let queue_pool = k
         .untyped_mut(kernel_cap::UntypedId::new(0))

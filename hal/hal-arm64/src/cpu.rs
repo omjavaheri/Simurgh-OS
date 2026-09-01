@@ -224,14 +224,25 @@ core::arch::global_asm!(
         b generic_trap_halt
 
     sync_exception_entry:
-        // Synchronous exceptions (data/instruction aborts, SVC, etc.)
-        // are not yet dispatched to a registered handler in this MVP
-        // phase (no code in this crate currently issues SVC, and page
-        // faults are not expected given the identity/kernel-only
-        // mapping memory.rs establishes) — halted defensively rather
-        // than silently ignored.
-        wfi
-        b sync_exception_entry
+        // Synchronous exceptions taken while ALREADY executing at EL1
+        // (data/instruction aborts, alignment faults, etc. — NOT SVC,
+        // which only ever arrives from EL0 via the Lower-EL group
+        // below). **Real bug found via QEMU**: this used to be a bare
+        // `wfi; b sync_exception_entry` spin with zero diagnostics —
+        // when `kernel_arch_glue::wire_virtio_pci_transport`'s own
+        // fresh ECAM mapping first triggered a genuine EL1 data abort
+        // (03-Kernel-Subsystems-Layer.md's virtio-pci transport work),
+        // this silently swallowed EVERY diagnostic signal (no ESR/ELR/
+        // FAR ever reached serial), making a real, root-causeable fault
+        // indistinguishable from an actual infinite loop elsewhere in
+        // the kernel — cost real debugging time working blind. `bl`
+        // into `common_sync_el1_entry` instead: no register save is
+        // needed (this path never resumes — see that function's own
+        // doc comment), just reads ESR_EL1/ELR_EL1/FAR_EL1 and dumps
+        // them over the PL011 (`trap_diag`, already proven safe from
+        // trap context by the EL0 sync path below) before halting.
+        bl common_sync_el1_entry
+        b sync_exception_entry // unreachable: common_sync_el1_entry never returns.
 
     irq_exception_entry:
         // Mirrors hal-x86_64's isr_common_trampoline: save the
@@ -407,6 +418,31 @@ core::arch::global_asm!(
 /// covering every line, disambiguated only after entry).
 #[no_mangle]
 extern "C" fn common_interrupt_entry() {
+    // See `hal_arm64_wfi`'s own doc comment: if this nested IRQ's own
+    // preferred return address falls anywhere from `hal_arm64_wfi_retry`
+    // through `hal_arm64_wfi_at` inclusive (QEMU/TCG's own return-
+    // address choice — observed to vary — when `wfi` is a NOP because
+    // the interrupt was ALREADY pending the instant it would execute),
+    // redirect straight to `hal_arm64_wfi_done` — otherwise the eventual
+    // `eret` re-attempts (some or all of) `wfi()`'s own body instead of
+    // returning to its caller, hanging forever once the ALREADY-serviced
+    // interrupt genuinely stops recurring.
+    #[cfg(target_os = "none")]
+    {
+        let elr: u64;
+        // SAFETY: reading/writing ELR_EL1 has no preconditions inside an
+        // exception handler, which `irq_exception_entry` guarantees this
+        // runs inside of.
+        unsafe {
+            core::arch::asm!("mrs {0}, elr_el1", out(reg) elr);
+            let retry = core::ptr::addr_of!(hal_arm64_wfi_retry) as u64;
+            let at = core::ptr::addr_of!(hal_arm64_wfi_at) as u64;
+            let done = core::ptr::addr_of!(hal_arm64_wfi_done) as u64;
+            if elr >= retry && elr <= at {
+                core::arch::asm!("msr elr_el1, {0}", in(reg) done);
+            }
+        }
+    }
     crate::interrupt::dispatch_current_irq();
 }
 
@@ -673,17 +709,49 @@ impl CpuAbstraction<{ crate::ARM64_CONTEXT_BYTES }> for Cpu {
             // names a PML4 and therefore needs a 2-page root (see
             // `hal_x86_64::cpu`'s `x86_64_paging` module doc comment).
             // EPD1 = 1 disables any TTBR1_EL1 walk (this project only
-            // ever uses TTBR0/the lower half); IPS = 0b001 (36-bit,
-            // 64 GiB) comfortably covers QEMU virt's RAM range for this
-            // MVP phase and avoids relying on TCR_EL1.IPS's otherwise
-            // architecturally UNSPECIFIED reset value.
+            // ever uses TTBR0/the lower half); IPS (bits [34:32]) =
+            // 0b010 (40-bit, 1 TiB) — **REAL bug found via QEMU, TWO
+            // layers deep**: this field was NEVER actually being
+            // programmed. The original `(0b001 << 16)` (and this
+            // session's own first, WRONG fix attempt, `(0b010 << 16)`)
+            // both land on bits [21:16], which is `T1SZ` — an unrelated
+            // TTBR1 field that `EPD1 = 1` makes irrelevant either way —
+            // NOT `TCR_EL1.IPS` (bits [34:32]). Since IPS was therefore
+            // NEVER explicitly set by this function, it kept whatever
+            // architecturally-unspecified reset value QEMU's cortex-a72
+            // model happens to power on with (empirically 0 here — 32-
+            // bit/4 GiB) — invisible for every physical address this
+            // project ever touched before now (QEMU virt's RAM, PL011,
+            // GICD/GICR, and every BAR-target window all sit under
+            // 4 GiB), until `kernel_arch_glue::wire_virtio_pci_
+            // transport`'s own `map_range` of QEMU virt's PCIe ECAM
+            // window (`hal_arm64::compute::QEMU_VIRT_DEFAULT_ECAM_BASE`,
+            // 0x40_1000_0000, ~256 GiB) became the FIRST output address
+            // in this project's history to exceed it — a syntactically
+            // valid PTE, architecturally unreachable under a 4 GiB IPS
+            // (ARM ARM: any output-address bit above the configured IPS
+            // set in a leaf/table descriptor is an Address Size Fault
+            // regardless of the rest of the descriptor's content).
+            // Manifested as a totally silent hang, not a visible fault —
+            // `sync_exception_entry`'s own doc comment covers the
+            // SEPARATE, compounding bug that made this so hard to
+            // isolate (an EL1-taken exception had no diagnostic path at
+            // all until this same investigation added one). Confirmed
+            // by direct register dump: before this fix, a triggering
+            // access read back `tcr_el1=0x823519` — bits [34:32] all
+            // zero — alongside `id_aa64mmfr0_el1=0x1124`
+            // (`ID_AA64MMFR0_EL1.PARange` = 0b0100 = 44-bit), proving
+            // the CPU itself supports far more than what was actually
+            // configured. 40-bit (1 TiB) comfortably covers ECAM with
+            // plenty of headroom while staying well within that 44-bit
+            // hardware ceiling.
             let tcr: u64 = 25          // T0SZ
                 | (0b01 << 8)          // IRGN0 = write-back
                 | (0b01 << 10)         // ORGN0 = write-back
                 | (0b11 << 12)         // SH0 = inner shareable
                 | (0b00 << 14)         // TG0 = 4 KiB granule
-                | (0b001 << 16)        // IPS = 36-bit
-                | (1u64 << 23);        // EPD1 = 1
+                | (1u64 << 23)         // EPD1 = 1
+                | (0b010u64 << 32);    // IPS = 40-bit (bits [34:32])
             core::arch::asm!("msr tcr_el1, {0}", in(reg) tcr);
             core::arch::asm!("isb");
 
@@ -1099,14 +1167,40 @@ extern "C" fn common_sync_entry(_frame: *mut SyncFrame) {}
 #[cfg(target_os = "none")]
 #[no_mangle]
 extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
-    let (esr, elr, far): (u64, u64, u64);
-    // SAFETY: reading ESR_EL1/ELR_EL1/FAR_EL1 has no preconditions
-    // inside an exception handler, which `sync_el0_entry` guarantees
-    // this runs inside of.
+    let (esr, elr, far, spsr): (u64, u64, u64, u64);
+    // SAFETY: reading ESR_EL1/ELR_EL1/FAR_EL1/SPSR_EL1 has no
+    // preconditions inside an exception handler, which `sync_el0_entry`
+    // guarantees this runs inside of. `spsr` is captured here, this
+    // early, for the SAME reason `elr` already was (see the `Resume`
+    // arm's own doc comment below) — **real bug found via QEMU**: the
+    // virtio-blk driver's own `DRV_IRQ_WAIT` handling (03-Kernel-
+    // Subsystems-Layer.md §5.1) is the FIRST syscall handler in this
+    // project's aarch64 port that can genuinely take a NESTED interrupt
+    // (the hardware completion IRQ, via `hal_arm64::cpu::wfi`'s own
+    // temporary `DAIF.I` clear) WHILE STILL EXECUTING the outer `svc`
+    // handler, before this function ever returns to `sync_el0_entry`'s
+    // own final `eret`. That nested IRQ lands on the "Current EL, SPx"
+    // vector (`irq_exception_entry`), which hardware enters by
+    // OVERWRITING `ELR_EL1`/`SPSR_EL1` with the interrupted-`wfi`
+    // address/state — there is only ONE such register pair, not a
+    // stack, so this clobbers whatever the ORIGINAL `svc` exception had
+    // there. The `elr` fix already existed (the explicit `msr elr_el1`
+    // in `Resume`/`Resume2` below, from an earlier "double-advance"
+    // bugfix) and happened to ALSO restore `elr` correctly here, but
+    // NOTHING restored `spsr_el1` — the final `eret` therefore ran with
+    // whatever `SPSR_EL1` the nested IRQ's OWN entry had left behind
+    // (`EL1h`, not this thread's real `EL0t`), so the CPU did not drop
+    // privilege at all and kept fetching at the (EL0-only, `PXN`-marked)
+    // resume address — an EL1 instruction-fetch permission fault at
+    // that exact address, confirmed via `common_sync_el1_entry`'s own
+    // diagnostic dump. Fixed by capturing `spsr` here (before the
+    // handler can possibly call `wfi`) and writing it back explicitly,
+    // mirroring `elr`'s own restore exactly.
     unsafe {
         core::arch::asm!("mrs {0}, esr_el1", out(reg) esr);
         core::arch::asm!("mrs {0}, elr_el1", out(reg) elr);
         core::arch::asm!("mrs {0}, far_el1", out(reg) far);
+        core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr);
     }
     let ec = (esr >> 26) & 0x3F;
 
@@ -1158,16 +1252,25 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
                 // on entry). Fixed: `elr` used AS-IS in both this arm and
                 // `SwitchTo` below.
                 //
-                // SAFETY: writing ELR_EL1 is valid within an exception
-                // handler.
-                unsafe { core::arch::asm!("msr elr_el1, {0}", in(reg) elr) };
+                // SAFETY: writing ELR_EL1/SPSR_EL1 is valid within an
+                // exception handler. `spsr` restored alongside `elr` —
+                // see this function's own top-of-body doc comment for
+                // why a nested IRQ (taken inside the handler call just
+                // above, via `wfi`) can otherwise have clobbered it.
+                unsafe {
+                    core::arch::asm!("msr elr_el1, {0}", in(reg) elr);
+                    core::arch::asm!("msr spsr_el1, {0}", in(reg) spsr);
+                }
             }
             TrapOutcome::Resume2(a0, a1) => {
                 f.regs[SyncFrame::X0] = a0 as u64;
                 f.regs[SyncFrame::X0 + 1] = a1 as u64;
-                // SAFETY: writing ELR_EL1 is valid within an exception
-                // handler. `elr` unchanged — same reasoning as `Resume`.
-                unsafe { core::arch::asm!("msr elr_el1, {0}", in(reg) elr) };
+                // SAFETY: same as the `Resume` arm just above. `elr`/
+                // `spsr` unchanged — same reasoning as `Resume`.
+                unsafe {
+                    core::arch::asm!("msr elr_el1, {0}", in(reg) elr);
+                    core::arch::asm!("msr spsr_el1, {0}", in(reg) spsr);
+                }
             }
             TrapOutcome::SwitchTo { save, into } => {
                 // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
@@ -1276,6 +1379,7 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
     }
 
     trap_diag(ec, elr, far);
+    trap_diag_full_esr(esr);
     halt_on_unexpected_exception();
 }
 
@@ -1418,7 +1522,151 @@ fn trap_diag(ec: u64, elr: u64, far: u64) {
     puts("\r\n");
 }
 
+/// Dumps the FULL `ESR_EL1` value (not just `trap_diag`'s `ec` field) —
+/// see `common_sync_el1_entry`'s own doc comment for why the ISS bits
+/// this carries (e.g. a Data Abort's DFSC, bits [5:0]) matter here.
+/// Same PL011-direct-write mechanism as `trap_diag`, deliberately
+/// self-contained rather than sharing its `putb`/`puts`/`puthex` (all
+/// `fn` items local to that function's own body, not reusable here).
 #[cfg(target_os = "none")]
+fn trap_diag_full_esr(esr: u64) {
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_DR: u64 = 0x000;
+    const PL011_FR: u64 = 0x018;
+    const PL011_FR_TXFF: u32 = 1 << 5;
+    fn putb(b: u8) {
+        // SAFETY: same fixed, documented QEMU-virt PL011 MMIO base and
+        // polled-transmit sequence as `trap_diag`'s own `putb`.
+        unsafe {
+            while (core::ptr::read_volatile((PL011_BASE + PL011_FR) as *const u32)
+                & PL011_FR_TXFF)
+                != 0
+            {}
+            core::ptr::write_volatile((PL011_BASE + PL011_DR) as *mut u32, b as u32);
+        }
+    }
+    fn puts(s: &str) {
+        for b in s.bytes() {
+            putb(b);
+        }
+    }
+    fn puthex(v: u64) {
+        puts("0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                putb(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+            }
+        }
+    }
+    puts("full esr_el1=");
+    puthex(esr);
+    puts("\r\n");
+}
+
+/// Dumps `TCR_EL1` and `ID_AA64MMFR0_EL1` — for diagnosing an "Address
+/// size fault" (`trap_diag_full_esr`'s DFSC bits [5:0] == 0b0000LL):
+/// confirms whether `TCR_EL1.IPS` (bits [18:16]) actually carries
+/// `activate_address_space`'s intended value, and whether `ID_
+/// AA64MMFR0_EL1.PARange` (bits [3:0]) — the CPU's own max supported
+/// physical address size — is smaller than that, in which case the
+/// IPS write was "constrained unpredictable" per the ARM ARM. Same
+/// self-contained PL011-direct-write mechanism as `trap_diag`/`trap_
+/// diag_full_esr`.
+#[cfg(target_os = "none")]
+fn trap_diag_tcr_mmfr0(tcr: u64, mmfr0: u64) {
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_DR: u64 = 0x000;
+    const PL011_FR: u64 = 0x018;
+    const PL011_FR_TXFF: u32 = 1 << 5;
+    fn putb(b: u8) {
+        // SAFETY: same fixed, documented QEMU-virt PL011 MMIO base and
+        // polled-transmit sequence as `trap_diag`'s own `putb`.
+        unsafe {
+            while (core::ptr::read_volatile((PL011_BASE + PL011_FR) as *const u32)
+                & PL011_FR_TXFF)
+                != 0
+            {}
+            core::ptr::write_volatile((PL011_BASE + PL011_DR) as *mut u32, b as u32);
+        }
+    }
+    fn puts(s: &str) {
+        for b in s.bytes() {
+            putb(b);
+        }
+    }
+    fn puthex(v: u64) {
+        puts("0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                putb(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+            }
+        }
+    }
+    puts("tcr_el1=");
+    puthex(tcr);
+    puts(" tcr.ips=");
+    puthex((tcr >> 32) & 0x7);
+    puts(" id_aa64mmfr0_el1=");
+    puthex(mmfr0);
+    puts(" mmfr0.parange=");
+    puthex(mmfr0 & 0xF);
+    puts("\r\n");
+}
+
+/// Called (via `bl`, no register save) from `sync_exception_entry` —
+/// a synchronous exception taken while ALREADY executing at EL1. Never
+/// returns: reads ESR_EL1/ELR_EL1/FAR_EL1, dumps them via `trap_diag`
+/// (safe here for the same reason it is safe from `common_sync_entry`'s
+/// EL0 path — a fixed physical PL011 write, no dependency on whatever
+/// translation state provoked this exception), then halts. No register
+/// save is needed: unlike `common_sync_entry`'s EL0 path (which can
+/// legitimately resume or switch to a different thread), an EL1-taken
+/// exception in this MVP phase has no defined recovery — the aborting
+/// EL1 code's own register state is simply abandoned, exactly like
+/// `generic_trap_halt`'s existing stance for every other unexpected
+/// vector in this table.
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_sync_el1_entry() -> ! {
+    let (esr, elr, far, tcr, mmfr0): (u64, u64, u64, u64, u64);
+    // SAFETY: reading ESR_EL1/ELR_EL1/FAR_EL1/TCR_EL1/ID_AA64MMFR0_EL1
+    // has no preconditions inside an exception handler.
+    unsafe {
+        core::arch::asm!("mrs {0}, esr_el1", out(reg) esr);
+        core::arch::asm!("mrs {0}, elr_el1", out(reg) elr);
+        core::arch::asm!("mrs {0}, far_el1", out(reg) far);
+        core::arch::asm!("mrs {0}, tcr_el1", out(reg) tcr);
+        core::arch::asm!("mrs {0}, id_aa64mmfr0_el1", out(reg) mmfr0);
+    }
+    let ec = (esr >> 26) & 0x3F;
+    trap_diag(ec, elr, far);
+    // Also surface the FULL ESR (not just its EC field, which
+    // `trap_diag` already printed) — the ISS bits (DFSC for a Data
+    // Abort, e.g.) are what actually pin down WHY the translation
+    // failed, which `trap_diag`'s existing line alone does not carry.
+    trap_diag_full_esr(esr);
+    trap_diag_tcr_mmfr0(tcr, mmfr0);
+    halt_on_unexpected_exception();
+}
+
+/// Host (`cargo test`) stub — reached only from the bare-metal
+/// `sync_exception_entry`'s `bl common_sync_el1_entry`, which (being
+/// part of a `global_asm!` block) is not itself `#[cfg(target_os =
+/// "none")]`-gated and so is present in every build; same "unresolved
+/// symbol at link time otherwise" reasoning as `common_sync_entry`'s
+/// own host stub above.
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_sync_el1_entry() -> ! {
+    loop {}
+}
+
 fn halt_on_unexpected_exception() -> ! {
     loop {
         // SAFETY: `wfi` is the standard, side-effect-free halt.
@@ -1786,6 +2034,135 @@ pub unsafe fn poke_saved_a0_a1(ctx: *mut u8, a0: usize, a1: usize) {
     }
 }
 
+/// `DAIF` bit 1 (IRQ mask) — the GLOBAL gate on whether a pending,
+/// GICv3-enabled interrupt is actually TAKEN while already executing in
+/// EL1, exactly `wfi`'s own situation here (a trap taken from a LOWER
+/// exception level, e.g. EL0, is unaffected by this bit). `boot.S`
+/// never unmasks `DAIF` before `kernel_main` returns (see `hal_arm64_
+/// rust_entry`'s own comment beside its `bootstrap_current_core` call),
+/// so this bit stays set (IRQs masked) for the entire EL1 lifetime —
+/// mirrors hal-riscv64's own `SSTATUS_SIE_BIT` exactly, same root cause.
+const DAIF_IRQ_MASK_BIT: u64 = 1 << 7; // DAIF[7] = I (IRQ mask), per AArch64 DAIF layout.
+
+// The `wfi` instruction and its immediate neighbors, individually
+// labelled so `common_interrupt_entry` (cpu.rs) can compare a nested
+// interrupt's own `ELR_EL1` against them. **Real bug found via QEMU**
+// (the virtio-blk driver's own `DRV_IRQ_WAIT` retry loop,
+// 03-Kernel-Subsystems-Layer.md §5.1 — the SECOND Wait+wfi+IRQ cycle in
+// a row, never the first): per the ARMv8-A Architecture Reference
+// Manual, `wfi` behaves as a NOP if a pending, unmasked interrupt
+// already exists the instant it would execute — QEMU/TCG implements
+// this NOP case by routing straight to the interrupt exception instead
+// of ever retiring `wfi`, but (confirmed via a temporary diagnostic
+// dumping `ELR_EL1` on every nested-IRQ entry, across several runs) the
+// exception's own preferred return address in that case is NOT
+// consistently "the `wfi` instruction's own PC" — it can ALSO land on
+// the address of whatever `bl` most recently transferred control toward
+// `wfi` (observed once each way, same binary, two back-to-back Wait
+// cycles), an artifact of QEMU/TCG's own translation-block granularity
+// for this specific "interrupt already pending, skip an entire no-op'd
+// instruction" case, not anything documented as part of the AArch64
+// exception model itself. A fix that only special-cased the `wfi`
+// opcode's own address (an earlier attempt) therefore still hung on the
+// OTHER shape of the exact same race. Since `wfi()`'s device-completion
+// notify can race ahead of the retry loop reaching `wfi()` at all (the
+// interrupt becomes pending, but stays masked, in the gap between `drv_
+// irq_wait_step`'s own "still Blocked" check and this call), this race
+// is entirely real, not a theoretical corner case — it reproduced on
+// the SECOND driver I/O request in this codebase's very first
+// two-request virtio-pci sequence, and only once the incidental extra
+// serial-I/O latency of an unrelated one-time debug print (removed
+// earlier) stopped widening the "still Blocked" -> `wfi()` gap enough
+// to avoid it. Without a fix, `eret` lands back somewhere that
+// re-attempts (some or all of) `wfi()`'s own body instead of returning
+// to its Rust caller — and since the interrupt that raced ahead is
+// ALREADY fully acknowledged/EOI'd by the time this happens, a genuine
+// SECOND `wfi` blocks forever waiting for an event that will never come
+// again: a silent, total hang with zero further diagnostic output.
+//
+// Fixed by making the ENTIRE function — prologue, `wfi`, epilogue —
+// one single, uninterrupted, label-marked block of `global_asm!` (no
+// nested `bl` anywhere near the `wfi` instruction, unlike an earlier
+// attempt that isolated `wfi` in its own tiny callee specifically to
+// make its address comparable — that extra call boundary is exactly
+// what let QEMU/TCG attribute the race to the CALL SITE instead of the
+// `wfi` instruction in the first place) plus a WIDE recognized range in
+// `common_interrupt_entry`: any `ELR_EL1` from `hal_arm64_wfi_retry`
+// (right before `daifclr`) through `hal_arm64_wfi_at` (the `wfi`
+// mnemonic itself) inclusive is treated as "this `wfi()` call never
+// meaningfully progressed" and redirected straight to `hal_arm64_wfi_
+// done` (`daifset` + restore + `ret`) — `daifclr` and `wfi` are both
+// idempotent/side-effect-free to skip in this exact circumstance, so
+// jumping past either (or both) is always safe, and `wfi()` is
+// guaranteed to return to its OWN caller exactly once per call
+// regardless of which sub-address this race lands on.
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .global hal_arm64_wfi
+    .global hal_arm64_wfi_retry
+    .global hal_arm64_wfi_at
+    .global hal_arm64_wfi_done
+    hal_arm64_wfi:
+        str x30, [sp, #-16]!
+    hal_arm64_wfi_retry:
+        msr daifclr, #2
+    hal_arm64_wfi_at:
+        wfi
+    hal_arm64_wfi_done:
+        msr daifset, #2
+        ldr x30, [sp], #16
+        ret
+    "#
+);
+
+#[cfg(target_os = "none")]
+extern "C" {
+    fn hal_arm64_wfi();
+    /// See `hal_arm64_wfi`'s own doc comment. Address-only markers (never
+    /// called) — `common_interrupt_entry` compares `ELR_EL1` against
+    /// them via `&hal_arm64_wfi_retry as *const _ as u64`, etc.
+    static hal_arm64_wfi_retry: core::ffi::c_void;
+    static hal_arm64_wfi_at: core::ffi::c_void;
+    static hal_arm64_wfi_done: core::ffi::c_void;
+}
+
+/// Halts the core in EL1 until any interrupt fires — `wfi`, ARMv8-A
+/// Architecture Reference Manual §D1.9. Temporarily clears `DAIF.I`
+/// around the instruction itself (see `DAIF_IRQ_MASK_BIT`'s own doc
+/// comment for why this is required here specifically) and restores it
+/// to masked afterward — ordinary EL1 kernel code between exception
+/// entry and `eret` otherwise always runs with IRQs deferred to
+/// well-known points (this call being the first, deliberate exception),
+/// so leaving `DAIF.I` clear past this one instruction would be a real
+/// change to that invariant, not a harmless cleanup left undone.
+/// Mirrors hal-riscv64's own `wfi()` exactly, same rationale. The real
+/// body lives in the labelled `hal_arm64_wfi` `global_asm!` block above
+/// — see ITS doc comment for why (a QEMU/TCG-specific return-address
+/// quirk `common_interrupt_entry` must correct for).
+#[cfg(target_os = "none")]
+pub fn wfi() {
+    // SAFETY: `hal_arm64_wfi` sets/clears exactly the IRQ mask bit of
+    // `DAIF` around `wfi` and otherwise has no preconditions beyond
+    // "valid to execute at the current exception level" (true at EL1);
+    // it always eventually returns to this call site (immediately if an
+    // interrupt is already pending — see its own doc comment for the
+    // return-address subtlety `common_interrupt_entry` handles — or
+    // after a genuine hardware wait) rather than ever deadlocking.
+    unsafe { hal_arm64_wfi() };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn wfi() {
+    // Host test build: no real EL1/DAIF state exists — a no-op, same
+    // stance hal-riscv64's own non-bare-metal build takes implicitly
+    // (its `wfi` is entirely `#[cfg(target_os = "none")]`-gated with no
+    // host fallback; this crate adds one instead so `hal_arm64::cpu::
+    // wfi` remains callable, unconditionally, by architecture-erased
+    // callers built for the host test target).
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1907,7 +2284,7 @@ pub(crate) mod aarch64_paging {
     /// User (EL0) execute-never (bit 54) — see `PXN`'s doc comment.
     pub const UXN: u64 = 1 << 54;
     /// Output/next-level-table address mask, bits 47:12 (this project's
-    /// IPS = 36-bit choice — see `activate_address_space` — comfortably
+    /// IPS = 40-bit choice — see `activate_address_space` — comfortably
     /// fits within this 48-bit-capable field).
     const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
