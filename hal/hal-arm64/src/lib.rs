@@ -69,12 +69,26 @@ _start:
     msr     sctlr_el1, x1
     isb
     // Step 1: establish a known-good stack.
-    adr     x1, __boot_stack_top
+    //
+    // `adrp`+`add :lo12:`, NOT the single-instruction `adr` this used
+    // to be: `adr`'s encoding only reaches ±1 MiB from its OWN address,
+    // and `_start` sits near the very START of the image while
+    // `__boot_stack_top`/`__bss_end` sit AFTER the entire `.bss`
+    // section — a real link error (`relocation ... out of range`) hit
+    // once the boot stack was enlarged past a small size (see
+    // `.bss`'s own doc comment on `__boot_stack_bottom`/`_top` for
+    // why). `adrp`+`add` has no such range limit (reaches anywhere in
+    // a 4 GiB window), matching the idiom this project's own compiled
+    // Rust code already uses for far-symbol addressing.
+    adrp    x1, __boot_stack_top
+    add     x1, x1, :lo12:__boot_stack_top
     mov     sp, x1
 
     // Step 2: zero .bss.
-    adr     x1, __bss_start
-    adr     x2, __bss_end
+    adrp    x1, __bss_start
+    add     x1, x1, :lo12:__bss_start
+    adrp    x2, __bss_end
+    add     x2, x2, :lo12:__bss_end
 2:  cmp     x1, x2
     b.ge    3f
     str     xzr, [x1], #8
@@ -99,6 +113,7 @@ pub mod compute;
 pub mod cpu;
 pub mod interrupt;
 pub mod memory;
+pub mod peripheral;
 pub mod power;
 pub mod timer;
 
@@ -154,6 +169,26 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // ------------------------------------------------------------------
     let cpu = cpu::Cpu::new();
 
+    // PRE-EXISTING GAP found while bringing up this session's U-mode/
+    // syscall work (mirrors the identical gap found and fixed in
+    // hal-x86_64's own entry point in the prior session): this call was
+    // simply never here at all — confirmed via `grep -rn
+    // "bootstrap_current_core"` across this crate turning up only the
+    // method's own definition, never a call site. VBAR_EL1 was therefore
+    // never installed, so any exception taken on this core (synchronous
+    // or IRQ) would vector through whatever VBAR_EL1 value firmware left
+    // active rather than this crate's own `arm64_vector_table`. Fixed by
+    // calling it here, mirroring hal-riscv64's own entry point exactly.
+    //
+    // SAFETY: called exactly once, here, before anything on this core
+    // can fault or take an interrupt (boot.S never unmasks DAIF between
+    // `_start` and this point).
+    if hal_core::cpu::CpuAbstraction::bootstrap_current_core(&cpu).is_err() {
+        // Nothing sensible to do this early; fall through and let the
+        // later BootInfo path surface the failure (same fallback
+        // hal-riscv64's own entry point uses).
+    }
+
     // ------------------------------------------------------------------
     // Step 2: parse the firmware memory map into
     // hal_manifest::raw::MemoryRegionRaw entries (section 3.2) and
@@ -186,15 +221,72 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // ------------------------------------------------------------------
     let compute = compute::ComputeDiscovery::new(QEMU_VIRT_DEFAULT_ECAM_BASE);
     let power = power::PowerThermalImpl::new(&compute);
+    // Same `ecam_base`, same "MMU still off, dereferences as a physical
+    // address" contract as `ComputeDiscovery::new` just above — see
+    // this file's own comment on that call.
+    let peripheral = peripheral::PeripheralDiscovery::new(QEMU_VIRT_DEFAULT_ECAM_BASE);
 
-    let hal = Arm64Hal {
-        cpu,
-        memory,
-        timer,
-        interrupt,
-        compute,
-        power,
+    // Built into `.bss` static storage, NOT a plain local: `build_interface`
+    // below bakes raw pointers into `hal.cpu`/`hal.timer` (via `HalInterface`'s
+    // opaque `*const ()` state fields) that must stay valid for the life of
+    // the system — `kernel_main` never returns, and per-process `SwitchTo`/
+    // `Terminate` handling in `cpu::restore_user_and_eret` resets SP_EL1 to a
+    // fixed boot-stack baseline on every process switch (see that function's
+    // own doc comment), reusing and overwriting stack memory above the
+    // current frame. A genuinely-stack-resident `Arm64Hal` here was a REAL,
+    // exposed bug this session: `hal.timer`'s bytes got corrupted the moment
+    // enough post-switch stack depth was used, surfacing as a "divide by
+    // zero" panic in `Timer::now_ns` reading a clobbered `frequency_hz`
+    // through `HalInterface`'s `timer_state` pointer. Mirrors `kernel_main`'s
+    // own identical fix for `HalInterface` itself (`kernel/kernel/src/
+    // main.rs`) and `KernelState::init_global`'s "no stack temporary"
+    // rationale.
+    static mut HAL_STORAGE: core::mem::MaybeUninit<Arm64Hal> = core::mem::MaybeUninit::uninit();
+    // SAFETY: single-core boot, this function runs exactly once, before
+    // this static is read anywhere else. `addr_of_mut!`/`addr_of!` avoid
+    // forming an intermediate `&mut`/`&` to the `static mut` itself.
+    let hal: &'static Arm64Hal = unsafe {
+        core::ptr::addr_of_mut!(HAL_STORAGE).cast::<Arm64Hal>().write(Arm64Hal {
+            cpu,
+            memory,
+            timer,
+            interrupt,
+            compute,
+            power,
+        });
+        &*core::ptr::addr_of!(HAL_STORAGE).cast::<Arm64Hal>()
     };
+
+    // PRE-EXISTING GAP found while bringing up this session's preemptive-
+    // scheduler work (same class of gap as `Cpu::bootstrap_current_core`'s
+    // own, found+fixed in a prior session): `InterruptCtrl::
+    // bootstrap_current_core` (interrupt.rs) — which enables the GICv3 CPU
+    // interface and the timer PPI at the distributor — and `interrupt::
+    // set_global_controller`/`set_global_timer` (which `dispatch_current_
+    // irq` needs to have any effect at all — it no-ops while its stored
+    // pointer is still null) were never called anywhere in this crate.
+    // Without them, the timer PPI this session's `cpu::irq_el0_entry`
+    // exists to handle would never even reach the core in the first
+    // place. `hal.interrupt.gicd_base()` is accessed here via a plain
+    // physical write (see `bootstrap_current_core`'s own SAFETY
+    // contract) — sound at this point in boot exactly like every other
+    // fixed-physical-address MMIO poke this crate already makes before
+    // paging activates (e.g. `trap_diag`'s PL011 writes), since the MMU
+    // is off and QEMU's `virt` machine places the GICD at a fixed
+    // physical address requiring no translation.
+    //
+    // SAFETY: called exactly once, after `Cpu::bootstrap_current_core`
+    // (VBAR_EL1 already loaded above) and before any interrupt can
+    // legitimately be taken (boot.S never unmasks DAIF before this
+    // function returns via `kernel_main`, which does so only once
+    // dropping to EL0).
+    if unsafe { hal.interrupt.bootstrap_current_core() }.is_err() {
+        // Nothing sensible to do this early; same fallback as the CPU
+        // bootstrap call above.
+    }
+    interrupt::set_global_controller(&hal.interrupt);
+    interrupt::set_global_timer(&hal.timer);
+
     // ------------------------------------------------------------------
     // Step 5: assemble BootInfo (hal-core/src/boot.rs) from everything
     // discovered above, using the linker-provided image/stack bounds
@@ -218,6 +310,7 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
         memory::built_hardware_manifest(
             &hal.memory,
             &hal.compute,
+            &peripheral,
             &hal.power,
             &hal.cpu,
             &hal.interrupt,
@@ -234,7 +327,7 @@ pub extern "C" fn hal_arm64_rust_entry(uefi_memory_map: *const u8) -> ! {
         "hal-arm64 constructed an internally inconsistent BootInfo"
     );
 
-    let hal_interface = hal_core::build_interface(&hal.cpu, &hal.timer);
+    let hal_interface = hal_core::build_interface(&hal.cpu, &hal.timer, &hal.interrupt);
 
     extern "Rust" {
         fn kernel_main(hal: hal_core::HalInterface, boot_info: hal_core::BootInfo) -> !;

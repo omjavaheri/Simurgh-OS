@@ -37,6 +37,10 @@ path = "src/main.rs"
 # table lookup for ACPI RSDP) — see the handoff document's rationale
 # for choosing this over hand-rolling the UEFI spec's raw structures.
 uefi = { version = "0.31", default-features = false }
+# Shared ELF64 (ET_EXEC, static) parser — this crate's own former
+# src/elf.rs, promoted to a workspace crate once kernel-arch-glue
+# needed the identical logic to load subsystem process images.
+elf-loader = { path = "../elf-loader" }
 
 [profile.dev]
 panic = "abort"

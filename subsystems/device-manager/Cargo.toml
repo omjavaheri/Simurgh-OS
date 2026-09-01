@@ -17,9 +17,21 @@ version.workspace    = true
 authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
+build = "build.rs"
 
 [lib]
 crate-type = ["rlib"]
+
+# The REAL, separately-built process image (see src/bin/device-manager-bin.rs's
+# own doc comment) — "subsystems as processes" packaging,
+# IMPLEMENTATION-PLAN.md follow-up. riscv64-only for now (this session's
+# scope; x86_64/aarch64 need their own subsystem-bin-<arch>.ld first).
+[[bin]]
+name = "device-manager-bin"
+path = "src/bin/device-manager-bin.rs"
+# Same reasoning as kernel/kernel's own `[[bin]]`: a host `cargo test`
+# harness would pull in `std` and collide on `panic_impl`.
+test = false
 
 [dependencies]
 hal-manifest = { path = "../../hal/hal-manifest", default-features = false }

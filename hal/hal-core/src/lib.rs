@@ -107,6 +107,13 @@ pub mod interrupt;
 /// first-class entities.
 pub mod compute;
 
+/// Peripheral (MMIO transport) Device Discovery — not a numbered
+/// HAL-Layer.md section (see this module's own doc comment): ordinary
+/// peripherals (block/network/GPU/console devices, discovered via
+/// virtio-mmio today), distinct from `compute`'s GPU/NPU/TPU/FPGA-only
+/// scope.
+pub mod peripheral;
+
 /// Power & Thermal Query Interface (section 3.7): per-domain DVFS and
 /// temperature.
 pub mod power;
@@ -140,6 +147,8 @@ pub use timer::{TimerAbstraction, TimerCallback, TimerMode};
 pub use interrupt::{InterruptController, IrqHandler, IrqId};
 
 pub use compute::{ComputeDevice, ComputeDeviceDiscovery, ComputeKind, VendorId};
+
+pub use peripheral::{PeripheralDevice, PeripheralDeviceDiscovery, PeripheralKind};
 
 pub use power::{DomainsAboveThresholdIter, DvfsRequest, DvfsState, MilliCelsius, PowerDomain, PowerThermal};
 

@@ -39,6 +39,11 @@ use kernel_cap::KernelObjectKind;
 ///   `kernel-core` static storage — IMPLEMENTATION-PLAN.md D2 — so the
 ///   frame here is the resource-accounting charge, not the literal
 ///   backing store yet).
+/// - `SharedRegion`: a zero-copy bulk-transfer memory range (§5.2). One
+///   page in this MVP model — enough for the fs-native Read/Write demo's
+///   own bulk payload; a `size_bits`-style variable-size extension is a
+///   later `feat:` follow-up, matching `Untyped`'s own "no size argument
+///   yet" note below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelObjectType {
     /// Sub-divide into smaller `UntypedMemory` regions.
@@ -53,6 +58,8 @@ pub enum KernelObjectType {
     Notification,
     /// A process capability table.
     CapabilitySpace,
+    /// A zero-copy shared memory region.
+    SharedRegion,
 }
 
 impl KernelObjectType {
@@ -67,6 +74,7 @@ impl KernelObjectType {
             Self::Endpoint => KernelObjectKind::Endpoint,
             Self::Notification => KernelObjectKind::Notification,
             Self::CapabilitySpace => KernelObjectKind::CapabilitySpace,
+            Self::SharedRegion => KernelObjectKind::SharedRegion,
         }
     }
 }
@@ -100,5 +108,7 @@ pub const fn object_size_bytes(kind: KernelObjectType) -> usize {
         KernelObjectType::Notification => PAGE_SIZE,
         // One frame charge per cap space (see enum doc).
         KernelObjectType::CapabilitySpace => PAGE_SIZE,
+        // One page of zero-copy bulk-transfer space (see enum doc).
+        KernelObjectType::SharedRegion => PAGE_SIZE,
     }
 }

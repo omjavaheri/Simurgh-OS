@@ -184,12 +184,22 @@ core::arch::global_asm!(
     .align 7
     b generic_trap_halt         // SError
 
-    // --- Lower EL, AArch64 (offsets 0x400-0x5FF): reserved for future
-    // EL0 user-space support (layer 3+, not yet implemented).
+    // --- Lower EL, AArch64 (offsets 0x400-0x5FF): EL0 (U-mode) Root Task
+    // support — the ACTIVE group once `enter_user`/`resume_user` below
+    // drop this core to EL0. Synchronous is where `svc` (this project's
+    // syscall boundary, analogous to x86_64's `int 0x80` / riscv64's
+    // `ecall`) and per-process fault isolation both land (03-Kernel-
+    // Subsystems-Layer.md §2.1/§5.2); IRQ is where the timer PPI lands
+    // for preemptive scheduling (02-Microkernel-Layer.md §4) once a
+    // running U-mode thread is interrupted — `irq_el0_entry` mirrors
+    // `sync_el0_entry`'s own save/dispatch/restore shape exactly, just
+    // keyed off a registered `TickHandler` instead of `SyscallHandler`/
+    // `FaultHandler`. FIQ/SError from EL0 stay minimal trap-halts — this
+    // project never legitimately takes either.
     .align 7
-    b generic_trap_halt
+    b sync_el0_entry
     .align 7
-    b generic_trap_halt
+    b irq_el0_entry
     .align 7
     b generic_trap_halt
     .align 7
@@ -214,14 +224,25 @@ core::arch::global_asm!(
         b generic_trap_halt
 
     sync_exception_entry:
-        // Synchronous exceptions (data/instruction aborts, SVC, etc.)
-        // are not yet dispatched to a registered handler in this MVP
-        // phase (no code in this crate currently issues SVC, and page
-        // faults are not expected given the identity/kernel-only
-        // mapping memory.rs establishes) — halted defensively rather
-        // than silently ignored.
-        wfi
-        b sync_exception_entry
+        // Synchronous exceptions taken while ALREADY executing at EL1
+        // (data/instruction aborts, alignment faults, etc. — NOT SVC,
+        // which only ever arrives from EL0 via the Lower-EL group
+        // below). **Real bug found via QEMU**: this used to be a bare
+        // `wfi; b sync_exception_entry` spin with zero diagnostics —
+        // when `kernel_arch_glue::wire_virtio_pci_transport`'s own
+        // fresh ECAM mapping first triggered a genuine EL1 data abort
+        // (03-Kernel-Subsystems-Layer.md's virtio-pci transport work),
+        // this silently swallowed EVERY diagnostic signal (no ESR/ELR/
+        // FAR ever reached serial), making a real, root-causeable fault
+        // indistinguishable from an actual infinite loop elsewhere in
+        // the kernel — cost real debugging time working blind. `bl`
+        // into `common_sync_el1_entry` instead: no register save is
+        // needed (this path never resumes — see that function's own
+        // doc comment), just reads ESR_EL1/ELR_EL1/FAR_EL1 and dumps
+        // them over the PL011 (`trap_diag`, already proven safe from
+        // trap context by the EL0 sync path below) before halting.
+        bl common_sync_el1_entry
+        b sync_exception_entry // unreachable: common_sync_el1_entry never returns.
 
     irq_exception_entry:
         // Mirrors hal-x86_64's isr_common_trampoline: save the
@@ -264,6 +285,126 @@ core::arch::global_asm!(
         ldp x27, x28, [sp], #16
         ldp x29, x30, [sp], #16
         eret
+
+    sync_el0_entry:
+        // The EL0 (U-mode) synchronous-exception trampoline — where a
+        // `svc` (this project's syscall boundary, mirroring hal-x86_64's
+        // dedicated `int 0x80` gate / hal-riscv64's `ecall` handling)
+        // from the Root Task lands. Saves ALL 31 GPRs (x0-x30) so
+        // `common_sync_entry` gets a full syscall-argument view (x8 =
+        // opcode, x0/x1 = a0/a1, per this project's own convention —
+        // see `SyscallHandler`'s doc comment) AND so the frame is
+        // sufficient, on its own, to seed a resumable `Aarch64UserContext`
+        // for the `SwitchTo`/`Terminate` outcomes below — unlike
+        // hal-riscv64's trap_entry, no sp-offset correction is needed
+        // here: AArch64 banks SP_EL0/SP_EL1 separately, so the EL0
+        // thread's stack pointer is never one of x0-x30 in the first
+        // place (captured instead via `mrs sp_el0` in
+        // `save_frame_as_user_context`).
+        //
+        // A `SwitchTo`/`Terminate` outcome diverges straight into
+        // `restore_user_and_eret` and NEVER returns here to run this
+        // trampoline's own `add sp, sp, #256` epilogue below — see that
+        // function's own doc comment for the real stack-leak bug this
+        // caused (across many repeated process switches) and how it is
+        // fixed THERE instead of here (an earlier attempt at fixing it
+        // in THIS prologue broke the cooperative two-process `SwitchTo`
+        // round-trip and was reverted).
+        sub sp, sp, #256
+        stp x0, x1,   [sp, #0]
+        stp x2, x3,   [sp, #16]
+        stp x4, x5,   [sp, #32]
+        stp x6, x7,   [sp, #48]
+        stp x8, x9,   [sp, #64]
+        stp x10, x11, [sp, #80]
+        stp x12, x13, [sp, #96]
+        stp x14, x15, [sp, #112]
+        stp x16, x17, [sp, #128]
+        stp x18, x19, [sp, #144]
+        stp x20, x21, [sp, #160]
+        stp x22, x23, [sp, #176]
+        stp x24, x25, [sp, #192]
+        stp x26, x27, [sp, #208]
+        stp x28, x29, [sp, #224]
+        str x30,      [sp, #240]
+
+        mov x0, sp
+        bl common_sync_entry
+
+        ldp x0, x1,   [sp, #0]
+        ldp x2, x3,   [sp, #16]
+        ldp x4, x5,   [sp, #32]
+        ldp x6, x7,   [sp, #48]
+        ldp x8, x9,   [sp, #64]
+        ldp x10, x11, [sp, #80]
+        ldp x12, x13, [sp, #96]
+        ldp x14, x15, [sp, #112]
+        ldp x16, x17, [sp, #128]
+        ldp x18, x19, [sp, #144]
+        ldp x20, x21, [sp, #160]
+        ldp x22, x23, [sp, #176]
+        ldp x24, x25, [sp, #192]
+        ldp x26, x27, [sp, #208]
+        ldp x28, x29, [sp, #224]
+        ldr x30,      [sp, #240]
+        add sp, sp, #256
+        eret
+
+    irq_el0_entry:
+        // The EL0 (U-mode) IRQ trampoline — where the timer PPI lands
+        // once `enter_user`/`resume_user` has dropped this core to EL0
+        // and `HalInterface::arm_timer` has armed a deadline
+        // (02-Microkernel-Layer.md §4's preemptive scheduler). Saves ALL
+        // 31 GPRs, identically to `sync_el0_entry` above (same reasoning:
+        // `common_irq_el0_entry` needs the full frame to seed a resumable
+        // `Aarch64UserContext` for the `SwitchTo`/`Terminate` outcomes —
+        // no sp-offset correction needed here either, for the same
+        // "SP_EL0/SP_EL1 banked separately" reason `sync_el0_entry`'s own
+        // doc comment gives).
+        //
+        // A `SwitchTo`/`Terminate` outcome diverges the SAME way
+        // `sync_el0_entry`'s own does — see `restore_user_and_eret`'s
+        // doc comment for the stack-reset mechanism that makes this
+        // safe regardless of which trampoline reaches it.
+        sub sp, sp, #256
+        stp x0, x1,   [sp, #0]
+        stp x2, x3,   [sp, #16]
+        stp x4, x5,   [sp, #32]
+        stp x6, x7,   [sp, #48]
+        stp x8, x9,   [sp, #64]
+        stp x10, x11, [sp, #80]
+        stp x12, x13, [sp, #96]
+        stp x14, x15, [sp, #112]
+        stp x16, x17, [sp, #128]
+        stp x18, x19, [sp, #144]
+        stp x20, x21, [sp, #160]
+        stp x22, x23, [sp, #176]
+        stp x24, x25, [sp, #192]
+        stp x26, x27, [sp, #208]
+        stp x28, x29, [sp, #224]
+        str x30,      [sp, #240]
+
+        mov x0, sp
+        bl common_irq_el0_entry
+
+        ldp x0, x1,   [sp, #0]
+        ldp x2, x3,   [sp, #16]
+        ldp x4, x5,   [sp, #32]
+        ldp x6, x7,   [sp, #48]
+        ldp x8, x9,   [sp, #64]
+        ldp x10, x11, [sp, #80]
+        ldp x12, x13, [sp, #96]
+        ldp x14, x15, [sp, #112]
+        ldp x16, x17, [sp, #128]
+        ldp x18, x19, [sp, #144]
+        ldp x20, x21, [sp, #160]
+        ldp x22, x23, [sp, #176]
+        ldp x24, x25, [sp, #192]
+        ldp x26, x27, [sp, #208]
+        ldp x28, x29, [sp, #224]
+        ldr x30,      [sp, #240]
+        add sp, sp, #256
+        eret
     "#
 );
 
@@ -277,6 +418,31 @@ core::arch::global_asm!(
 /// covering every line, disambiguated only after entry).
 #[no_mangle]
 extern "C" fn common_interrupt_entry() {
+    // See `hal_arm64_wfi`'s own doc comment: if this nested IRQ's own
+    // preferred return address falls anywhere from `hal_arm64_wfi_retry`
+    // through `hal_arm64_wfi_at` inclusive (QEMU/TCG's own return-
+    // address choice — observed to vary — when `wfi` is a NOP because
+    // the interrupt was ALREADY pending the instant it would execute),
+    // redirect straight to `hal_arm64_wfi_done` — otherwise the eventual
+    // `eret` re-attempts (some or all of) `wfi()`'s own body instead of
+    // returning to its caller, hanging forever once the ALREADY-serviced
+    // interrupt genuinely stops recurring.
+    #[cfg(target_os = "none")]
+    {
+        let elr: u64;
+        // SAFETY: reading/writing ELR_EL1 has no preconditions inside an
+        // exception handler, which `irq_exception_entry` guarantees this
+        // runs inside of.
+        unsafe {
+            core::arch::asm!("mrs {0}, elr_el1", out(reg) elr);
+            let retry = core::ptr::addr_of!(hal_arm64_wfi_retry) as u64;
+            let at = core::ptr::addr_of!(hal_arm64_wfi_at) as u64;
+            let done = core::ptr::addr_of!(hal_arm64_wfi_done) as u64;
+            if elr >= retry && elr <= at {
+                core::arch::asm!("msr elr_el1, {0}", in(reg) done);
+            }
+        }
+    }
     crate::interrupt::dispatch_current_irq();
 }
 
@@ -485,6 +651,231 @@ impl CpuAbstraction<{ crate::ARM64_CONTEXT_BYTES }> for Cpu {
         }
     }
 
+    #[cfg(target_os = "none")]
+    fn map_ram_identity(&self, root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        aarch64_paging::map_ram_identity(root_frame, bytes_gib, user_accessible)
+    }
+
+    #[cfg(target_os = "none")]
+    fn activate_address_space(&self, root_frame: usize) {
+        if root_frame == 0 {
+            // Disable the MMU, returning to boot.S's initial physical-
+            // addressing state — mirrors hal-riscv64's `satp == 0` Bare-
+            // mode sentinel. Unlike hal-x86_64 (where long mode REQUIRES
+            // `CR0.PG = 1`, so there is no "disable" state to return
+            // to), AArch64 can turn `SCTLR_EL1.M` back off just as
+            // freely as it turned it on.
+            // SAFETY: caller guarantees no code/data this core still
+            // needs depends on the translation being torn down (same
+            // precondition hal-riscv64's `activate_address_space(0)`
+            // documents).
+            unsafe {
+                let mut sctlr: u64;
+                core::arch::asm!("mrs {0}, sctlr_el1", out(reg) sctlr);
+                sctlr &= !1u64; // clear M
+                core::arch::asm!("msr sctlr_el1, {0}", in(reg) sctlr);
+                core::arch::asm!("isb");
+            }
+            return;
+        }
+        // SAFETY: the caller guarantees `root_frame` is a valid, fully
+        // built L1 table (via `map_ram_identity` / `map_range`) that
+        // maps at least all memory this core is currently executing
+        // from and about to touch. MAIR_EL1/TCR_EL1 are configured here
+        // (not in `map_ram_identity`) because they are per-core control
+        // state, not part of the table itself — reconfiguring them on
+        // every activation is cheap and keeps this method self-
+        // contained, mirroring how `memory.rs`'s OWN (separate, dormant
+        // — see this module's doc comment) `activate_page_tables`
+        // bundles the same two registers with its own TTBR0 write.
+        unsafe {
+            // MAIR_EL1: index 0 = Normal, Write-Back (0xFF); index 1 =
+            // Device-nGnRnE (0x00) — unused by this mechanism today (no
+            // MMIO is `map_range`d through it yet) but kept at the same
+            // index convention `memory.rs`'s own mechanism uses, in case
+            // a future caller needs it.
+            let mair: u64 = 0x00FF;
+            core::arch::asm!("msr mair_el1, {0}", in(reg) mair);
+
+            core::arch::asm!("msr ttbr0_el1, {0}", in(reg) root_frame as u64);
+
+            // TCR_EL1: T0SZ = 25 -> 39-bit input address space (2^39 =
+            // 512 GiB), matching this module's 3-level (L1/L2/L3),
+            // 4 KiB-granule table shape — deliberately the SAME VA bit
+            // positions as hal-riscv64's Sv39 (both split a 39-bit VA
+            // into three 9-bit indices + a 12-bit page offset), so a
+            // single 4 KiB page can serve as the L1 ROOT exactly like
+            // Sv39's root does — unlike hal-x86_64, whose CR3 always
+            // names a PML4 and therefore needs a 2-page root (see
+            // `hal_x86_64::cpu`'s `x86_64_paging` module doc comment).
+            // EPD1 = 1 disables any TTBR1_EL1 walk (this project only
+            // ever uses TTBR0/the lower half); IPS (bits [34:32]) =
+            // 0b010 (40-bit, 1 TiB) — **REAL bug found via QEMU, TWO
+            // layers deep**: this field was NEVER actually being
+            // programmed. The original `(0b001 << 16)` (and this
+            // session's own first, WRONG fix attempt, `(0b010 << 16)`)
+            // both land on bits [21:16], which is `T1SZ` — an unrelated
+            // TTBR1 field that `EPD1 = 1` makes irrelevant either way —
+            // NOT `TCR_EL1.IPS` (bits [34:32]). Since IPS was therefore
+            // NEVER explicitly set by this function, it kept whatever
+            // architecturally-unspecified reset value QEMU's cortex-a72
+            // model happens to power on with (empirically 0 here — 32-
+            // bit/4 GiB) — invisible for every physical address this
+            // project ever touched before now (QEMU virt's RAM, PL011,
+            // GICD/GICR, and every BAR-target window all sit under
+            // 4 GiB), until `kernel_arch_glue::wire_virtio_pci_
+            // transport`'s own `map_range` of QEMU virt's PCIe ECAM
+            // window (`hal_arm64::compute::QEMU_VIRT_DEFAULT_ECAM_BASE`,
+            // 0x40_1000_0000, ~256 GiB) became the FIRST output address
+            // in this project's history to exceed it — a syntactically
+            // valid PTE, architecturally unreachable under a 4 GiB IPS
+            // (ARM ARM: any output-address bit above the configured IPS
+            // set in a leaf/table descriptor is an Address Size Fault
+            // regardless of the rest of the descriptor's content).
+            // Manifested as a totally silent hang, not a visible fault —
+            // `sync_exception_entry`'s own doc comment covers the
+            // SEPARATE, compounding bug that made this so hard to
+            // isolate (an EL1-taken exception had no diagnostic path at
+            // all until this same investigation added one). Confirmed
+            // by direct register dump: before this fix, a triggering
+            // access read back `tcr_el1=0x823519` — bits [34:32] all
+            // zero — alongside `id_aa64mmfr0_el1=0x1124`
+            // (`ID_AA64MMFR0_EL1.PARange` = 0b0100 = 44-bit), proving
+            // the CPU itself supports far more than what was actually
+            // configured. 40-bit (1 TiB) comfortably covers ECAM with
+            // plenty of headroom while staying well within that 44-bit
+            // hardware ceiling.
+            let tcr: u64 = 25          // T0SZ
+                | (0b01 << 8)          // IRGN0 = write-back
+                | (0b01 << 10)         // ORGN0 = write-back
+                | (0b11 << 12)         // SH0 = inner shareable
+                | (0b00 << 14)         // TG0 = 4 KiB granule
+                | (1u64 << 23)         // EPD1 = 1
+                | (0b010u64 << 32);    // IPS = 40-bit (bits [34:32])
+            core::arch::asm!("msr tcr_el1, {0}", in(reg) tcr);
+            core::arch::asm!("isb");
+
+            // Enable the MMU (+ D/I caches) — a no-op if already on
+            // (idempotent OR of the same three bits).
+            let mut sctlr: u64;
+            core::arch::asm!("mrs {0}, sctlr_el1", out(reg) sctlr);
+            sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+            core::arch::asm!("msr sctlr_el1, {0}", in(reg) sctlr);
+            core::arch::asm!("isb");
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn flush_tlb(&self) {
+        // SAFETY: `tlbi vmalle1` (all stage-1 EL1&0 entries, every ASID)
+        // with the standard DSB/ISB bracketing has no preconditions in
+        // EL1 and no effect beyond the flush — same whole-TLB-shootdown
+        // scope as hal-riscv64's bare `sfence.vma` / hal-x86_64's CR3
+        // reload.
+        unsafe {
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    fn map_range(
+        &self,
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        aarch64_paging::map_range(root_frame, vaddr, paddr, len, perm_bits, pool_base, pool_len)
+    }
+
+    #[cfg(target_os = "none")]
+    fn enter_user(&self, entry: usize, stack_top: usize) -> ! {
+        // SPSR_EL1 target state for a fresh EL0 (U-mode) entry: M[3:0] =
+        // 0b0000 (EL0t — EL0 always uses SP_EL0, there is no "EL0h"),
+        // every other field (including the DAIF interrupt masks) clear
+        // so the dropped thread runs with interrupts unmasked — mirrors
+        // hal-riscv64's SPIE=1 / hal-x86_64's RFLAGS.IF=1 choice.
+        //
+        // SAFETY: a one-way `eret` into EL0: sets SP_EL0 (banked, so
+        // EL1's own SP_EL1 is untouched), ELR_EL1 (resume PC), SPSR_EL1
+        // (target state), then `eret` loads PSTATE from SPSR_EL1 and
+        // branches to ELR_EL1, dropping privilege. Never returns.
+        unsafe {
+            core::arch::asm!(
+                "msr sp_el0, {sp}",
+                "msr elr_el1, {entry}",
+                "msr spsr_el1, {spsr}",
+                "eret",
+                sp = in(reg) stack_top as u64,
+                entry = in(reg) entry as u64,
+                spsr = in(reg) 0u64,
+                options(noreturn),
+            );
+        }
+    }
+
+    fn init_user_context(
+        &self,
+        context: &mut hal_core::UserContext,
+        entry: usize,
+        stack_top: usize,
+        root_frame: usize,
+    ) {
+        // SAFETY: `hal_core::UserContext` is `#[repr(C, align(8))]` over
+        // exactly `[u8; HAL_USER_CONTEXT_BYTES]`, and `Aarch64UserContext`
+        // is `#[repr(C)]` of a size asserted `<=` that (the `const _`
+        // beside its definition) — so the buffer's leading bytes ARE a
+        // valid `Aarch64UserContext`.
+        let ctx = unsafe {
+            &mut *(context.as_bytes_mut().as_mut_ptr() as *mut Aarch64UserContext)
+        };
+        *ctx = Aarch64UserContext::default();
+        ctx.sp_el0 = stack_top as u64;
+        ctx.elr_el1 = entry as u64;
+        ctx.spsr_el1 = 0; // EL0t, DAIF unmasked — same choice as enter_user.
+
+        // `root_frame == 0` means "keep whatever is active" — read
+        // TTBR0_EL1 back so the first `resume_user` does not clobber
+        // the live translation (mirrors hal-riscv64's `satp` / hal-
+        // x86_64's `cr3` handling here exactly).
+        #[cfg(target_os = "none")]
+        {
+            let ttbr0: u64;
+            // SAFETY: reading TTBR0_EL1 has no preconditions in EL1.
+            unsafe { core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags)) };
+            ctx.ttbr0_el1 = if root_frame != 0 { root_frame as u64 } else { ttbr0 };
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            ctx.ttbr0_el1 = root_frame as u64;
+        }
+    }
+
+    #[cfg(target_os = "none")]
+    unsafe fn resume_user(&self, context: &hal_core::UserContext) -> ! {
+        // SAFETY: the buffer is a valid `Aarch64UserContext` (see
+        // `init_user_context`); the resumable-context + interrupts-
+        // masked obligations are this method's documented caller
+        // contract.
+        let blob = context.as_bytes().as_ptr() as *const Aarch64UserContext;
+        unsafe { restore_user_and_eret(blob) }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    unsafe fn resume_user(&self, context: &hal_core::UserContext) -> ! {
+        let _ = context;
+        unreachable!("resume_user is bare-metal only (host test build)");
+    }
+
     fn set_privilege_level(&self, level: PrivilegeLevel) -> Result<(), HalError> {
         match level {
             // Unlike x86_64 (where Monitor is unsupported), ARM64
@@ -520,6 +911,1256 @@ impl CpuAbstraction<{ crate::ARM64_CONTEXT_BYTES }> for Cpu {
         }
         Ok(())
     }
+}
+
+// ============================================================================
+// U-mode syscall boundary (`svc #0`, EL0 -> EL1) — analogous to
+// hal-riscv64's `ecall`/`SyscallHandler`/`TrapOutcome`/`common_trap_entry`
+// and hal-x86_64's `int 0x80` mechanism, routed through this crate's own
+// `sync_el0_entry` trampoline (the "Lower EL, AArch64, Synchronous" slot
+// of `arm64_vector_table` above) rather than a dedicated separate gate —
+// AArch64 has no per-vector gate table the way x86_64's IDT does; every
+// synchronous exception from EL0 shares ONE entry point, and Rust code
+// (`common_sync_entry`) disambiguates via ESR_EL1.EC, mirroring exactly
+// how hal-riscv64's single `stvec` target disambiguates via `scause`.
+// ============================================================================
+
+/// This project's own syscall convention on AArch64: `svc #0`, with
+/// `x8` = opcode and `x0`/`x1` = the first two arguments — deliberately
+/// the same register convention the real Linux AArch64 syscall ABI uses
+/// (`x8` = syscall number, `x0`-`x5` = arguments, `x0` = return value),
+/// for a convention any ARM developer recognizes, matching hal-x86_64's
+/// own choice to reuse Linux's classic `int 0x80` vector for the same
+/// reason.
+const ESR_EC_SVC_AARCH64: u64 = 0x15;
+
+/// The on-stack layout `sync_el0_entry` pushes/pops: all 31 general-
+/// purpose registers, `regs[i]` holding `x{i}` directly (unlike
+/// hal-riscv64's `TrapFrame`, which is 1-indexed because RISC-V's `x0`
+/// is hardwired zero and never saved — AArch64 has no such register
+/// among x0-x30, so no reindexing is needed here). Notably does NOT
+/// include the stack pointer: AArch64 banks `SP_EL0`/`SP_EL1`
+/// separately, so — unlike hal-riscv64's `trap_entry` (where `x2`/`sp`
+/// is a normal GPR needing a post-hoc offset correction, see
+/// `save_trap_frame_as_user_context`'s doc comment there) — the EL0
+/// thread's stack pointer is never part of this frame at all; it is
+/// read directly via `mrs sp_el0` in `save_frame_as_user_context` below.
+#[repr(C)]
+pub struct SyncFrame {
+    /// x0..x30, in order.
+    pub regs: [u64; 31],
+}
+
+#[cfg(target_os = "none")]
+impl SyncFrame {
+    const X0: usize = 0;
+    const X8: usize = 8;
+}
+
+/// A suspended EL0 thread's full context: `SyncFrame`'s exact same 31
+/// GPRs plus the banked/system state `eret` needs that never lives in a
+/// GPR — `SP_EL0` (the thread's own stack pointer), `ELR_EL1` (resume
+/// PC), `SPSR_EL1` (privilege/interrupt-enable state to restore), and
+/// `TTBR0_EL1` (which address space the thread runs in) — the AArch64
+/// analogue of hal-riscv64's `RiscvUserContext` (`sepc`/`sstatus`/
+/// `satp`) and hal-x86_64's `X8664UserContext` (`rip`/`rflags`/`cr3`,
+/// plus its own banked `ss`/`cs`/`rsp`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Aarch64UserContext {
+    /// x0..x30, in order — same layout as `SyncFrame::regs`.
+    regs: [u64; 31],
+    /// The thread's own (banked) stack pointer.
+    sp_el0: u64,
+    /// Resume program counter in EL0.
+    elr_el1: u64,
+    /// Privilege / interrupt-enable snapshot `eret` restores PSTATE from.
+    spsr_el1: u64,
+    /// Address-space root (`TTBR0_EL1`) the thread executes under.
+    ttbr0_el1: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<Aarch64UserContext>() <= hal_core::HAL_USER_CONTEXT_BYTES);
+};
+
+/// What the syscall handler decided should happen next — identical
+/// shape to hal-riscv64's / hal-x86_64's own `TrapOutcome` (see either
+/// type's doc comment for the rationale behind each variant); duplicated
+/// here rather than shared for the same reason those two duplicate it
+/// from each other: every other piece of the trap-handling surface
+/// (frame layout, restore mechanism) is architecture-local too, and
+/// hal_core defines no such type.
+pub enum TrapOutcome {
+    /// Return to the trapping thread with `.0` in `x0`, `ELR_EL1`
+    /// advanced past the 4-byte `svc` (every AArch64 instruction is
+    /// 4 bytes — unlike x86_64's 2-byte `int 0x80` or riscv64's 4-byte
+    /// `ecall`, which happens to match here). The ordinary syscall
+    /// return.
+    Resume(usize),
+    /// Same as `Resume`, but also places `.1` in `x1` — for a syscall
+    /// whose result genuinely does not fit in one register (e.g. `Recv`
+    /// returning both the sender's `ThreadId` and the message label —
+    /// see `kernel/src/main.rs`'s `IPC_RECV` demo opcode, and hal-
+    /// riscv64's/hal-x86_64's own identical `Resume2`). Unlike
+    /// hal-x86_64 (whose `int 0x80` convention splits the message-input
+    /// register from the return-value one), AAPCS64's `x0` is ALREADY
+    /// both at once — the same "one register, both directions" shape
+    /// riscv64's `a0`/`x10` has — so `x1` (this project's own `a1`
+    /// register) is simply reused for the second value, no register-
+    /// remapping needed the way hal-x86_64's port required. A separate
+    /// variant rather than widening `Resume` itself: every OTHER
+    /// existing caller only ever has one value to return, and this
+    /// keeps them untouched.
+    Resume2(usize, usize),
+    /// Serialise the trapping thread's full context into the
+    /// `HAL_USER_CONTEXT_BYTES` blob at `save`, then restore `into` and
+    /// `eret` into it. Both pointers are kernel-owned, 8-byte-aligned
+    /// `hal_core::UserContext` storage.
+    SwitchTo {
+        /// Where to write the outgoing thread's snapshot.
+        save: *mut u8,
+        /// The incoming thread's context to resume.
+        into: *const u8,
+    },
+    /// Like `SwitchTo`, but only the L4-style IPC fast path's minimal
+    /// register set is saved/restored (AAPCS64's own callee-saved set —
+    /// `x19`-`x28`, `x29`/FP, `x30`/LR — plus this project's own message
+    /// registers `x0`=a0, `x1`=a1, plus the always-mandatory `elr_el1`/
+    /// `spsr_el1`/`sp_el0`/`ttbr0_el1` — see `save_ipc_fast_context`'s
+    /// own doc comment for exactly which and why), not every GPR. Used
+    /// ONLY by `kernel/src/main.rs`'s real `IPC_CALL`/`IPC_RECV`/
+    /// `IPC_REPLY` opcodes — every OTHER switch in this codebase keeps
+    /// using plain `SwitchTo`'s full, unconditional guarantee. Mirrors
+    /// hal-riscv64's/hal-x86_64's identical `SwitchToFast`.
+    SwitchToFast {
+        /// Where to write the outgoing thread's fast-path snapshot.
+        save: *mut u8,
+        /// The incoming thread's fast-path context to resume.
+        into: *const u8,
+    },
+    /// The trapping thread has been TERMINATED — no save (a terminated
+    /// thread never resumes); just restores `into` and `eret`s into it.
+    Terminate {
+        /// The next thread's context to resume.
+        into: *const u8,
+    },
+}
+
+/// Signature of the handler the microkernel registers for a `svc` from
+/// EL0: raw `(x8, x0, x1)` — this project's own convention (see
+/// `ESR_EC_SVC_AARCH64`'s doc comment) — returning a `TrapOutcome`
+/// telling the trampoline how to resume.
+pub type SyscallHandler = fn(usize, usize, usize) -> TrapOutcome;
+
+#[cfg(target_os = "none")]
+static mut SYSCALL_HANDLER: Option<SyscallHandler> = None;
+
+/// Registers the handler `common_sync_entry` calls for a `svc` from
+/// EL0. The microkernel calls this once during boot, before it drops
+/// any process to user mode — same "no handler, no behavior change"
+/// contract as hal-riscv64's `set_syscall_handler` / hal-x86_64's own,
+/// so a binary that links `hal-arm64` but never runs user code (e.g.
+/// `kernel-stub`) simply never registers one.
+#[cfg(target_os = "none")]
+pub fn set_syscall_handler(handler: SyscallHandler) {
+    // SAFETY: single-core boot; set exactly once before any EL0 `svc`
+    // can be taken.
+    unsafe {
+        core::ptr::addr_of_mut!(SYSCALL_HANDLER).write(Some(handler));
+    }
+}
+
+/// Signature of the handler the microkernel registers for a supervisor
+/// timer interrupt (the timer PPI) taken **while a U-mode thread was
+/// running** — the preemptive scheduler's entry point
+/// (02-Microkernel-Layer.md §4). Takes no arguments (`irq_el0_entry`
+/// owns the interrupted frame) and returns a `TrapOutcome`: `Resume` to
+/// let the current thread keep its quantum, or `SwitchTo` to preempt
+/// it. The handler is responsible for re-arming (or cancelling) the
+/// timer via `HalInterface`. Mirrors hal-riscv64's `TickHandler`
+/// exactly.
+pub type TickHandler = fn() -> TrapOutcome;
+
+#[cfg(target_os = "none")]
+static mut TICK_HANDLER: Option<TickHandler> = None;
+
+/// Registers the preemptive-scheduler tick handler `common_irq_el0_
+/// entry` calls when the timer PPI lands on a running U-mode thread.
+/// Set once during boot. Until it is set (and the kernel arms a
+/// deadline via `HalInterface::arm_timer`), the timer PPI still fires
+/// and gets acknowledged/EOI'd by `interrupt::dispatch_current_irq`
+/// (matching `on_timer_interrupt`'s existing callback mechanism) but
+/// triggers no thread switch — so `kernel-stub`, which registers no
+/// handler and never enters U-mode, is unaffected.
+#[cfg(target_os = "none")]
+pub fn set_tick_handler(handler: TickHandler) {
+    // SAFETY: single-core boot; set exactly once before the timer is
+    // armed and before any drop to EL0.
+    unsafe {
+        core::ptr::addr_of_mut!(TICK_HANDLER).write(Some(handler));
+    }
+}
+
+/// `ESR_EL1.EC` = 0x00, "Unknown reason" per the ARM Architecture
+/// Reference Manual — the class every genuinely undefined A64 encoding
+/// traps as, including `udf #0` (Permanently Undefined): this project's
+/// aarch64 fault-injection demo choice (03-Kernel-Subsystems-Layer.md
+/// §5.2), analogous to hal-riscv64's `.word 0` / hal-x86_64's `ud2`.
+/// The ONLY exception class this mechanism currently handles — a real
+/// kernel would extend this to every EC that can legitimately occur
+/// from EL0 (e.g. Data/Instruction Abort, EC 0x24/0x20), a tracked
+/// follow-up once a concrete need arises (same scope decision
+/// hal-x86_64's own `FAULT_VECTOR_UD` doc comment makes).
+const ESR_EC_UNKNOWN_AARCH64: u64 = 0x00;
+
+/// Signature of the handler the microkernel registers for a fatal EL0
+/// exception that is not a `svc`: raw `(ec, elr, far)` — the exception
+/// class, the resume PC, and the fault address (0 for `ESR_EC_UNKNOWN_
+/// AARCH64`, which carries no fault-address ISS field) — mirrors
+/// hal-riscv64's `FaultHandler`'s `(cause_code, sepc, stval)` shape and
+/// hal-x86_64's `FaultHandler`'s `(vector, rip, _reserved)` shape.
+/// Always expected to return `TrapOutcome::Terminate` in practice (the
+/// faulting thread cannot safely resume), though `Resume`/`SwitchTo`
+/// remain valid if a future policy wants to retry or reschedule
+/// instead — same contract as the other two architectures' own
+/// `FaultHandler` types.
+pub type FaultHandler = fn(usize, usize, usize) -> TrapOutcome;
+
+#[cfg(target_os = "none")]
+static mut FAULT_HANDLER: Option<FaultHandler> = None;
+
+/// Registers the handler `common_sync_entry` calls for a fatal EL0
+/// exception that is not a `svc` (03-Kernel-Subsystems-Layer.md §2.1/
+/// §5.2 per-process fault isolation). Same "no handler, no behavior
+/// change" contract as `set_syscall_handler` — a binary that never
+/// registers one (e.g. `kernel-stub`) is unaffected; an unhandled fault
+/// (no registered handler) falls through to the existing dump-and-halt
+/// path unchanged.
+#[cfg(target_os = "none")]
+pub fn set_fault_handler(handler: FaultHandler) {
+    // SAFETY: single-core boot; set exactly once before any drop to
+    // EL0.
+    unsafe {
+        core::ptr::addr_of_mut!(FAULT_HANDLER).write(Some(handler));
+    }
+}
+
+/// Host (`cargo test`) stub — reached only from the bare-metal
+/// `sync_el0_entry`'s `bl common_sync_entry` above, which (being part of
+/// a `global_asm!` block) is not itself `#[cfg(target_os = "none")]`-
+/// gated and so is present in every build; without this stub the host
+/// build fails to LINK (an unresolved `common_sync_entry` symbol) rather
+/// than merely never executing this dead trampoline — same fix
+/// hal-riscv64's `common_trap_entry` / hal-x86_64's `common_syscall_entry`
+/// host stubs apply for the identical reason.
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_sync_entry(_frame: *mut SyncFrame) {}
+
+/// Called from `sync_el0_entry` with a pointer to the saved `SyncFrame`.
+/// Reads `ESR_EL1.EC` to identify the exception; routes a `svc` (EC =
+/// `ESR_EC_SVC_AARCH64`) to the registered `SyscallHandler` and advances
+/// `ELR_EL1` past it; anything else (this milestone registers no fault/
+/// tick handler yet — same scope decision hal-x86_64's own U-mode+
+/// syscall milestone made) dumps and halts.
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
+    let (esr, elr, far, spsr): (u64, u64, u64, u64);
+    // SAFETY: reading ESR_EL1/ELR_EL1/FAR_EL1/SPSR_EL1 has no
+    // preconditions inside an exception handler, which `sync_el0_entry`
+    // guarantees this runs inside of. `spsr` is captured here, this
+    // early, for the SAME reason `elr` already was (see the `Resume`
+    // arm's own doc comment below) — **real bug found via QEMU**: the
+    // virtio-blk driver's own `DRV_IRQ_WAIT` handling (03-Kernel-
+    // Subsystems-Layer.md §5.1) is the FIRST syscall handler in this
+    // project's aarch64 port that can genuinely take a NESTED interrupt
+    // (the hardware completion IRQ, via `hal_arm64::cpu::wfi`'s own
+    // temporary `DAIF.I` clear) WHILE STILL EXECUTING the outer `svc`
+    // handler, before this function ever returns to `sync_el0_entry`'s
+    // own final `eret`. That nested IRQ lands on the "Current EL, SPx"
+    // vector (`irq_exception_entry`), which hardware enters by
+    // OVERWRITING `ELR_EL1`/`SPSR_EL1` with the interrupted-`wfi`
+    // address/state — there is only ONE such register pair, not a
+    // stack, so this clobbers whatever the ORIGINAL `svc` exception had
+    // there. The `elr` fix already existed (the explicit `msr elr_el1`
+    // in `Resume`/`Resume2` below, from an earlier "double-advance"
+    // bugfix) and happened to ALSO restore `elr` correctly here, but
+    // NOTHING restored `spsr_el1` — the final `eret` therefore ran with
+    // whatever `SPSR_EL1` the nested IRQ's OWN entry had left behind
+    // (`EL1h`, not this thread's real `EL0t`), so the CPU did not drop
+    // privilege at all and kept fetching at the (EL0-only, `PXN`-marked)
+    // resume address — an EL1 instruction-fetch permission fault at
+    // that exact address, confirmed via `common_sync_el1_entry`'s own
+    // diagnostic dump. Fixed by capturing `spsr` here (before the
+    // handler can possibly call `wfi`) and writing it back explicitly,
+    // mirroring `elr`'s own restore exactly.
+    unsafe {
+        core::arch::asm!("mrs {0}, esr_el1", out(reg) esr);
+        core::arch::asm!("mrs {0}, elr_el1", out(reg) elr);
+        core::arch::asm!("mrs {0}, far_el1", out(reg) far);
+        core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr);
+    }
+    let ec = (esr >> 26) & 0x3F;
+
+    if ec == ESR_EC_SVC_AARCH64 {
+        // SAFETY: `frame` is the on-stack register file `sync_el0_entry`
+        // just saved; valid for this call, with no other live reference.
+        let f = unsafe { &mut *frame };
+        // SAFETY: single-core; `SYSCALL_HANDLER` is only written by
+        // `set_syscall_handler` during boot, before any EL0 `svc`.
+        let handler = unsafe { core::ptr::addr_of!(SYSCALL_HANDLER).read() };
+        let Some(h) = handler else {
+            trap_diag(ec, elr, far);
+            halt_on_unexpected_exception();
+        };
+        match h(
+            f.regs[SyncFrame::X8] as usize,
+            f.regs[SyncFrame::X0] as usize,
+            f.regs[SyncFrame::X0 + 1] as usize,
+        ) {
+            TrapOutcome::Resume(ret) => {
+                f.regs[SyncFrame::X0] = ret as u64;
+                // `elr` needs NO adjustment here: per the ARM
+                // Architecture Reference Manual, the preferred return
+                // address for an `SVC` exception is ALREADY the address
+                // of the instruction AFTER the 4-byte `svc` — unlike a
+                // Data/Instruction Abort (which points AT the faulting
+                // instruction). **Real bug found via QEMU** (this
+                // session's P2/device-manager demo — the exact same
+                // class of bug hal-x86_64's own `common_syscall_entry`
+                // had for `int 0x80`): an earlier draft added a manual
+                // `elr + 4` here on top of that already-correct
+                // hardware value, double-advancing past 4 bytes of the
+                // NEXT instruction on every EL0 syscall this project has
+                // ever made on aarch64. This went unnoticed through the
+                // Root Task's own ALIVE/REPORT/two-process round-trip
+                // purely by luck (the skipped instruction happened to be
+                // harmless setup code that got redone anyway) — device-
+                // manager's `subsystem_main` was the first code layout
+                // where the skip corrupted something observable: its
+                // `DM_WAIT_CRASH`/`DM_POLL_CRASH` calls' `svc`s got
+                // skipped over ENTIRELY (each `svc` is exactly 4 bytes,
+                // so a `+4` double-advance from one `svc`'s own trapped
+                // `elr` lands exactly ON the mov/svc pair belonging to
+                // the FOLLOWING syscall, silently replaying earlier
+                // report() logic and reporting `Starting` an extra two
+                // times before genuine "Restarting" — confirmed via
+                // disassembly cross-referenced against a `-d int` trace:
+                // every trapped `elr` was already exactly `svc_addr + 4`
+                // on entry). Fixed: `elr` used AS-IS in both this arm and
+                // `SwitchTo` below.
+                //
+                // SAFETY: writing ELR_EL1/SPSR_EL1 is valid within an
+                // exception handler. `spsr` restored alongside `elr` —
+                // see this function's own top-of-body doc comment for
+                // why a nested IRQ (taken inside the handler call just
+                // above, via `wfi`) can otherwise have clobbered it.
+                unsafe {
+                    core::arch::asm!("msr elr_el1, {0}", in(reg) elr);
+                    core::arch::asm!("msr spsr_el1, {0}", in(reg) spsr);
+                }
+            }
+            TrapOutcome::Resume2(a0, a1) => {
+                f.regs[SyncFrame::X0] = a0 as u64;
+                f.regs[SyncFrame::X0 + 1] = a1 as u64;
+                // SAFETY: same as the `Resume` arm just above. `elr`/
+                // `spsr` unchanged — same reasoning as `Resume`.
+                unsafe {
+                    core::arch::asm!("msr elr_el1, {0}", in(reg) elr);
+                    core::arch::asm!("msr spsr_el1, {0}", in(reg) spsr);
+                }
+            }
+            TrapOutcome::SwitchTo { save, into } => {
+                // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
+                // `HAL_USER_CONTEXT_BYTES` blobs (the trampoline/
+                // `hal_core::UserContext` contract). Snapshot the
+                // outgoing thread — resuming AFTER its `svc` — then
+                // never return: `restore_user_and_eret` abandons this
+                // exception frame's stack and `eret`s into the incoming
+                // thread.
+                //
+                // `elr` (NOT `elr + 4`): same bug/fix as the `Resume`
+                // arm just above.
+                unsafe {
+                    save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                    restore_user_and_eret(into as *const Aarch64UserContext);
+                }
+            }
+            TrapOutcome::SwitchToFast { save, into } => {
+                // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
+                // `HAL_USER_CONTEXT_BYTES` blobs, same contract as
+                // `SwitchTo`. `elr` unchanged — same reasoning as
+                // `SwitchTo` above.
+                unsafe {
+                    save_ipc_fast_context(f, elr, save as *mut Aarch64UserContext);
+                    restore_ipc_fast_context(into as *const Aarch64UserContext);
+                }
+            }
+            TrapOutcome::Terminate { into } => {
+                // No save: this exception frame is simply abandoned,
+                // same as any other terminated thread.
+                // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+                // `HAL_USER_CONTEXT_BYTES` blob.
+                unsafe { restore_user_and_eret(into as *const Aarch64UserContext) };
+            }
+        }
+        return;
+    }
+
+    if ec == ESR_EC_UNKNOWN_AARCH64 {
+        // SAFETY: `frame` is the on-stack register file `sync_el0_entry`
+        // just saved; valid for this call, with no other live reference
+        // (the `svc` branch above already returned by this point).
+        let f = unsafe { &mut *frame };
+        // SAFETY: single-core; `FAULT_HANDLER` is only written by
+        // `set_fault_handler` during boot, before any drop to EL0.
+        let handler = unsafe { core::ptr::addr_of!(FAULT_HANDLER).read() };
+        if let Some(h) = handler {
+            match h(ec as usize, elr as usize, far as usize) {
+                TrapOutcome::Resume(ret) => {
+                    // Not the expected outcome for a fatal exception (the
+                    // faulting instruction is still `udf`, so resuming at
+                    // the SAME `elr` would just re-fault forever), but the
+                    // type is shared with the syscall path, so this arm
+                    // must exist — same as hal-riscv64's/hal-x86_64's own
+                    // fault-handler `Resume` arms.
+                    f.regs[SyncFrame::X0] = ret as u64;
+                    return;
+                }
+                TrapOutcome::Resume2(a0, a1) => {
+                    // Not a real handler outcome for a fatal exception —
+                    // no `FaultHandler` implementation returns this
+                    // today — but `TrapOutcome` is shared with the IPC
+                    // syscall path, so this arm must exist for
+                    // exhaustiveness. Deliver both values the same way
+                    // `Resume` does and return.
+                    f.regs[SyncFrame::X0] = a0 as u64;
+                    f.regs[SyncFrame::X0 + 1] = a1 as u64;
+                    return;
+                }
+                TrapOutcome::SwitchTo { save, into } => {
+                    // SAFETY: `save`/`into` are kernel-owned, 8-byte-
+                    // aligned `HAL_USER_CONTEXT_BYTES` blobs. Resume
+                    // point is `elr` unchanged (the faulting instruction
+                    // never legitimately completes).
+                    unsafe {
+                        save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                        restore_user_and_eret(into as *const Aarch64UserContext);
+                    }
+                }
+                TrapOutcome::SwitchToFast { save, into } => {
+                    // Unreachable in practice — no `FaultHandler`
+                    // implementation returns this — but falls back to a
+                    // FULL save/restore rather than the narrower fast-
+                    // path one, same choice hal-riscv64's/hal-x86_64's
+                    // own fault handlers make for their `SwitchToFast`
+                    // arms: a fault handler has no basis for assuming
+                    // the L4 IPC fast path's register-set narrowing is
+                    // safe here.
+                    // SAFETY: `save`/`into` are kernel-owned, 8-byte-
+                    // aligned `HAL_USER_CONTEXT_BYTES` blobs.
+                    unsafe {
+                        save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                        restore_user_and_eret(into as *const Aarch64UserContext);
+                    }
+                }
+                TrapOutcome::Terminate { into } => {
+                    // The expected outcome: the faulting thread is dead,
+                    // its exception frame abandoned, no save.
+                    // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+                    // `HAL_USER_CONTEXT_BYTES` blob.
+                    unsafe { restore_user_and_eret(into as *const Aarch64UserContext) };
+                }
+            }
+            return;
+        }
+    }
+
+    trap_diag(ec, elr, far);
+    trap_diag_full_esr(esr);
+    halt_on_unexpected_exception();
+}
+
+/// Host (`cargo test`) stub — reached only from the bare-metal
+/// `irq_el0_entry`'s `bl common_irq_el0_entry` above, which (being part
+/// of a `global_asm!` block) is not itself `#[cfg(target_os = "none")]`-
+/// gated at the assembler level — exists purely so the host build
+/// fails to LINK (an unresolved `common_irq_el0_entry` symbol) rather
+/// than silently miscompiling if this file's own `#[cfg]` gating on the
+/// Rust side ever drifted from the assembly's.
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_irq_el0_entry(_frame: *mut SyncFrame) {}
+
+/// Called from `irq_el0_entry` with a pointer to the saved `SyncFrame`
+/// — the timer PPI (or, in principle, any other GIC interrupt) landing
+/// while a U-mode thread was running. Dispatches it exactly like the
+/// EL1-native IRQ path (`interrupt::dispatch_current_irq` — GIC IAR
+/// read, timer callback if it was the timer PPI, EOI), then — ONLY if
+/// it WAS the timer PPI and a `TickHandler` is registered — asks the
+/// preemptive scheduler what to do next (02-Microkernel-Layer.md §4).
+/// Any other INTID (or no registered handler) simply returns: the
+/// trampoline's own epilogue resumes the interrupted thread at the SAME
+/// `elr` unchanged — an IRQ, unlike `svc`, never "completes" an
+/// instruction, so there is nothing to advance past (mirrors
+/// hal-riscv64's `common_trap_entry`'s own tick-interrupt `Resume` arm,
+/// which likewise does not touch `sepc`).
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_irq_el0_entry(frame: *mut SyncFrame) {
+    let elr: u64;
+    // SAFETY: reading ELR_EL1 has no preconditions inside an exception
+    // handler, which `irq_el0_entry` guarantees this runs inside of.
+    unsafe { core::arch::asm!("mrs {0}, elr_el1", out(reg) elr) };
+
+    let intid = crate::interrupt::dispatch_current_irq();
+    if intid != crate::interrupt::TIMER_PPI_INTID {
+        return;
+    }
+
+    // SAFETY: single-core; `TICK_HANDLER` is only written by
+    // `set_tick_handler` during boot, before the timer is armed.
+    let handler = unsafe { core::ptr::addr_of!(TICK_HANDLER).read() };
+    let Some(h) = handler else {
+        return;
+    };
+    match h() {
+        TrapOutcome::Resume(_) => {}
+        TrapOutcome::Resume2(..) => {
+            // Not a real `TickHandler` outcome (no implementation
+            // returns this) — exists only for `TrapOutcome`
+            // exhaustiveness, same as hal-riscv64's/hal-x86_64's own
+            // tick-handler `Resume2` arms. Both values would be
+            // meaningless here (a preemption tick returns no message
+            // registers), so this is treated identically to `Resume`.
+        }
+        TrapOutcome::SwitchTo { save, into } => {
+            // SAFETY: `frame` is the on-stack register file `irq_el0_
+            // entry` just saved, valid for this call with no other live
+            // reference; `save`/`into` are kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blobs. Never returns:
+            // `restore_user_and_eret` abandons this exception frame's
+            // stack and `eret`s into the incoming thread — see its own
+            // doc comment for why that is safe.
+            let f = unsafe { &mut *frame };
+            unsafe {
+                save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                restore_user_and_eret(into as *const Aarch64UserContext);
+            }
+        }
+        TrapOutcome::SwitchToFast { save, into } => {
+            // Unreachable in practice (no `TickHandler` implementation
+            // returns this), but falls back to a FULL save/restore for
+            // the same reason `common_sync_entry`'s own fault-branch
+            // `SwitchToFast` arm does — a preemption tick has no basis
+            // for assuming the fast path's narrower register set is
+            // safe.
+            // SAFETY: same as the `SwitchTo` arm just above.
+            let f = unsafe { &mut *frame };
+            unsafe {
+                save_frame_as_user_context(f, elr, save as *mut Aarch64UserContext);
+                restore_user_and_eret(into as *const Aarch64UserContext);
+            }
+        }
+        TrapOutcome::Terminate { into } => {
+            // Not the expected outcome for a plain preemption tick (the
+            // preempted thread is still perfectly resumable), but the
+            // type is shared with the syscall/fault paths, so this arm
+            // must exist — same as hal-riscv64's own tick-handler
+            // `Terminate` arm.
+            // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+            // `HAL_USER_CONTEXT_BYTES` blob.
+            unsafe { restore_user_and_eret(into as *const Aarch64UserContext) };
+        }
+    }
+}
+
+/// Minimal MMIO dump of an unexpected EL0 exception over QEMU virt's
+/// PL011 (0x0900_0000) so a fault is visible instead of a silent hang —
+/// same diagnostic scope as hal-riscv64's `trap_diag`.
+#[cfg(target_os = "none")]
+fn trap_diag(ec: u64, elr: u64, far: u64) {
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_DR: u64 = 0x000;
+    const PL011_FR: u64 = 0x018;
+    const PL011_FR_TXFF: u32 = 1 << 5;
+    fn putb(b: u8) {
+        // SAFETY: fixed, documented QEMU-virt PL011 MMIO base; poll
+        // FR.TXFF then write DR — the standard polled-transmit sequence.
+        unsafe {
+            while (core::ptr::read_volatile((PL011_BASE + PL011_FR) as *const u32)
+                & PL011_FR_TXFF)
+                != 0
+            {}
+            core::ptr::write_volatile((PL011_BASE + PL011_DR) as *mut u32, b as u32);
+        }
+    }
+    fn puts(s: &str) {
+        for b in s.bytes() {
+            putb(b);
+        }
+    }
+    fn puthex(v: u64) {
+        puts("0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                putb(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+            }
+        }
+    }
+    puts("\r\nUNHANDLED EXCEPTION: esr.ec=");
+    puthex(ec);
+    puts(" elr=");
+    puthex(elr);
+    puts(" far=");
+    puthex(far);
+    puts("\r\n");
+}
+
+/// Dumps the FULL `ESR_EL1` value (not just `trap_diag`'s `ec` field) —
+/// see `common_sync_el1_entry`'s own doc comment for why the ISS bits
+/// this carries (e.g. a Data Abort's DFSC, bits [5:0]) matter here.
+/// Same PL011-direct-write mechanism as `trap_diag`, deliberately
+/// self-contained rather than sharing its `putb`/`puts`/`puthex` (all
+/// `fn` items local to that function's own body, not reusable here).
+#[cfg(target_os = "none")]
+fn trap_diag_full_esr(esr: u64) {
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_DR: u64 = 0x000;
+    const PL011_FR: u64 = 0x018;
+    const PL011_FR_TXFF: u32 = 1 << 5;
+    fn putb(b: u8) {
+        // SAFETY: same fixed, documented QEMU-virt PL011 MMIO base and
+        // polled-transmit sequence as `trap_diag`'s own `putb`.
+        unsafe {
+            while (core::ptr::read_volatile((PL011_BASE + PL011_FR) as *const u32)
+                & PL011_FR_TXFF)
+                != 0
+            {}
+            core::ptr::write_volatile((PL011_BASE + PL011_DR) as *mut u32, b as u32);
+        }
+    }
+    fn puts(s: &str) {
+        for b in s.bytes() {
+            putb(b);
+        }
+    }
+    fn puthex(v: u64) {
+        puts("0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                putb(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+            }
+        }
+    }
+    puts("full esr_el1=");
+    puthex(esr);
+    puts("\r\n");
+}
+
+/// Dumps `TCR_EL1` and `ID_AA64MMFR0_EL1` — for diagnosing an "Address
+/// size fault" (`trap_diag_full_esr`'s DFSC bits [5:0] == 0b0000LL):
+/// confirms whether `TCR_EL1.IPS` (bits [18:16]) actually carries
+/// `activate_address_space`'s intended value, and whether `ID_
+/// AA64MMFR0_EL1.PARange` (bits [3:0]) — the CPU's own max supported
+/// physical address size — is smaller than that, in which case the
+/// IPS write was "constrained unpredictable" per the ARM ARM. Same
+/// self-contained PL011-direct-write mechanism as `trap_diag`/`trap_
+/// diag_full_esr`.
+#[cfg(target_os = "none")]
+fn trap_diag_tcr_mmfr0(tcr: u64, mmfr0: u64) {
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_DR: u64 = 0x000;
+    const PL011_FR: u64 = 0x018;
+    const PL011_FR_TXFF: u32 = 1 << 5;
+    fn putb(b: u8) {
+        // SAFETY: same fixed, documented QEMU-virt PL011 MMIO base and
+        // polled-transmit sequence as `trap_diag`'s own `putb`.
+        unsafe {
+            while (core::ptr::read_volatile((PL011_BASE + PL011_FR) as *const u32)
+                & PL011_FR_TXFF)
+                != 0
+            {}
+            core::ptr::write_volatile((PL011_BASE + PL011_DR) as *mut u32, b as u32);
+        }
+    }
+    fn puts(s: &str) {
+        for b in s.bytes() {
+            putb(b);
+        }
+    }
+    fn puthex(v: u64) {
+        puts("0x");
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nib = ((v >> (i * 4)) & 0xF) as u8;
+            if nib != 0 || started || i == 0 {
+                started = true;
+                putb(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+            }
+        }
+    }
+    puts("tcr_el1=");
+    puthex(tcr);
+    puts(" tcr.ips=");
+    puthex((tcr >> 32) & 0x7);
+    puts(" id_aa64mmfr0_el1=");
+    puthex(mmfr0);
+    puts(" mmfr0.parange=");
+    puthex(mmfr0 & 0xF);
+    puts("\r\n");
+}
+
+/// Called (via `bl`, no register save) from `sync_exception_entry` —
+/// a synchronous exception taken while ALREADY executing at EL1. Never
+/// returns: reads ESR_EL1/ELR_EL1/FAR_EL1, dumps them via `trap_diag`
+/// (safe here for the same reason it is safe from `common_sync_entry`'s
+/// EL0 path — a fixed physical PL011 write, no dependency on whatever
+/// translation state provoked this exception), then halts. No register
+/// save is needed: unlike `common_sync_entry`'s EL0 path (which can
+/// legitimately resume or switch to a different thread), an EL1-taken
+/// exception in this MVP phase has no defined recovery — the aborting
+/// EL1 code's own register state is simply abandoned, exactly like
+/// `generic_trap_halt`'s existing stance for every other unexpected
+/// vector in this table.
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_sync_el1_entry() -> ! {
+    let (esr, elr, far, tcr, mmfr0): (u64, u64, u64, u64, u64);
+    // SAFETY: reading ESR_EL1/ELR_EL1/FAR_EL1/TCR_EL1/ID_AA64MMFR0_EL1
+    // has no preconditions inside an exception handler.
+    unsafe {
+        core::arch::asm!("mrs {0}, esr_el1", out(reg) esr);
+        core::arch::asm!("mrs {0}, elr_el1", out(reg) elr);
+        core::arch::asm!("mrs {0}, far_el1", out(reg) far);
+        core::arch::asm!("mrs {0}, tcr_el1", out(reg) tcr);
+        core::arch::asm!("mrs {0}, id_aa64mmfr0_el1", out(reg) mmfr0);
+    }
+    let ec = (esr >> 26) & 0x3F;
+    trap_diag(ec, elr, far);
+    // Also surface the FULL ESR (not just its EC field, which
+    // `trap_diag` already printed) — the ISS bits (DFSC for a Data
+    // Abort, e.g.) are what actually pin down WHY the translation
+    // failed, which `trap_diag`'s existing line alone does not carry.
+    trap_diag_full_esr(esr);
+    trap_diag_tcr_mmfr0(tcr, mmfr0);
+    halt_on_unexpected_exception();
+}
+
+/// Host (`cargo test`) stub — reached only from the bare-metal
+/// `sync_exception_entry`'s `bl common_sync_el1_entry`, which (being
+/// part of a `global_asm!` block) is not itself `#[cfg(target_os =
+/// "none")]`-gated and so is present in every build; same "unresolved
+/// symbol at link time otherwise" reasoning as `common_sync_entry`'s
+/// own host stub above.
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_sync_el1_entry() -> ! {
+    loop {}
+}
+
+fn halt_on_unexpected_exception() -> ! {
+    loop {
+        // SAFETY: `wfi` is the standard, side-effect-free halt.
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+    }
+}
+
+/// Serialises an interrupted `SyncFrame` into an `Aarch64UserContext` so
+/// it can be `restore_user_and_eret`'d later. `resume_elr` is where the
+/// thread should continue — for a suspended `svc`, the caller passes
+/// `elr` UNCHANGED: the hardware-saved return address for `SVC` already
+/// points past the 4-byte instruction (see `common_sync_entry`'s
+/// `Resume` arm doc comment for the bug this fixes). Captures the
+/// *live* `SP_EL0`/`TTBR0_EL1`, which for an exception taken from EL0
+/// already describe the thread's own stack and address space.
+///
+/// # Safety
+/// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
+/// 8-byte-aligned storage.
+#[cfg(target_os = "none")]
+unsafe fn save_frame_as_user_context(
+    frame: &SyncFrame,
+    resume_elr: u64,
+    dst: *mut Aarch64UserContext,
+) {
+    let (sp_el0, spsr, ttbr0): (u64, u64, u64);
+    // SAFETY: reading SP_EL0/SPSR_EL1/TTBR0_EL1 has no preconditions in
+    // an exception handler.
+    unsafe {
+        core::arch::asm!("mrs {0}, sp_el0", out(reg) sp_el0);
+        core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr);
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0);
+    }
+    // SAFETY: `dst` is valid writable storage of the matching size /
+    // alignment per this function's contract.
+    unsafe {
+        (*dst).regs = frame.regs;
+        (*dst).sp_el0 = sp_el0;
+        (*dst).elr_el1 = resume_elr;
+        (*dst).spsr_el1 = spsr;
+        (*dst).ttbr0_el1 = ttbr0;
+    }
+}
+
+/// Restores a full `Aarch64UserContext` and `eret`s into EL0. Never
+/// returns. Shared by `resume_user` (first entry, from an
+/// `init_user_context` blob) and `common_sync_entry`'s process hand-off
+/// path (from a blob it just serialised out of an exception frame).
+///
+/// # Safety
+/// `blob` must point at a valid, resumable `Aarch64UserContext` whose
+/// `ttbr0_el1` names an address space that maps this core's exception
+/// vector table and the identity-mapped low RAM `blob` itself lives in.
+/// Interrupts must be masked (true throughout — EL1 exception entry
+/// already masks DAIF, same as every other exception here).
+#[cfg(target_os = "none")]
+unsafe fn restore_user_and_eret(blob: *const Aarch64UserContext) -> ! {
+    // SAFETY: contract above. `x30` carries the blob base for the whole
+    // sequence: AArch64 has no spare GPR beyond the 31 a full context
+    // restores, so — exactly like hal-riscv64's `restore_user_and_sret`
+    // uses `t6` and hal-x86_64's `restore_user_and_iretq` uses `r15` —
+    // ONE of the restored registers must double as the pointer, loaded
+    // from its OWN saved slot dead last (here, `x30`/LR — the highest-
+    // numbered GPR, the same "last register in the sequence" choice
+    // hal-riscv64 makes with `x31`/`t6`).
+    // **Real bug found via QEMU** (this session's P2/device-manager
+    // demo — the FIRST thing to ever exercise `resume_user`/this
+    // function for aarch64; the original U-mode+syscall milestone only
+    // ever used `enter_user`'s own named-register fabrication, never
+    // this struct-offset-based restore): these four offsets were
+    // originally listed in the WRONG order relative to
+    // `Aarch64UserContext`'s actual field layout (`regs: [u64; 31]`
+    // ends at offset 248, THEN `sp_el0`, THEN `elr_el1`, THEN
+    // `spsr_el1`, THEN `ttbr0_el1` — the comments below had swapped
+    // `sp_el0` and `spsr_el1`). Loading `spsr_el1`'s value (a fresh
+    // context's is always 0) into `SP_EL0` left every EL0 thread's own
+    // stack pointer at 0 the instant it touched its own stack for the
+    // first time — confirmed via a genuine `#PF`-equivalent `Data
+    // Abort` (`ESR_EL1.EC=0x24`) at `FAR_EL1=0xffff...ffe8`, exactly
+    // `0 - 24` in unsigned 64-bit wraparound, matching the Root Task's
+    // own stack-relative store at `sp - 24` with `sp` genuinely 0.
+    //
+    // **A second real issue found via QEMU, FIXED this session**: this
+    // function diverges straight into `eret` and never runs `sync_el0_
+    // entry`'s own `add sp, sp, #256` epilogue — so the 256+ bytes that
+    // trampoline's prologue (plus every enclosing Rust call frame)
+    // reserved stayed PERMANENTLY consumed every single time a
+    // `SwitchTo`/`Terminate` fired (unlike hal-x86_64, whose hardware
+    // TSS.rsp0 mechanism reloads a FIXED SP on every Ring3->Ring0
+    // transition regardless of what the previous handler left RSP as —
+    // AArch64 has no such automatic reset). Measured leak: 608 bytes
+    // per call (confirmed via instrumented QEMU runs, constant across
+    // calls) — accumulating, unbounded, across repeated process
+    // switches until SP_EL1 ran off the bottom of the boot stack and
+    // the CPU executed garbage.
+    //
+    // Fixed by resetting SP_EL1 to the fixed `__boot_stack_top`
+    // baseline right here, mirroring x86_64's TSS.rsp0 semantics:
+    // unconditionally safe, since every enclosing frame between here
+    // and the original `sync_el0_entry`/cold-boot entry is about to be
+    // abandoned by `eret` below regardless (nothing at EL1 needs THIS
+    // frame's stack contents again), and the NEXT exception into EL1
+    // starts fresh from `sync_el0_entry`'s own `sub sp, sp, #256` off
+    // this same baseline, exactly as it did on the very first exception
+    // after boot. Addressed via `sym` (compiler-verified, distance-
+    // independent `adrp`+`:lo12:`) rather than hand-written `adr` —
+    // `_start` hit a real `adr`-range link error addressing this SAME
+    // symbol from `boot.S` (see `lib.rs`'s own `_start` doc comment).
+    //
+    // TWO earlier attempts at an in-place reset (one in `sync_el0_
+    // entry`'s own prologue; one right here) each independently broke
+    // the cooperative two-process `SwitchTo` round-trip in ways not
+    // root-caused at the time. This session's own attempt hit the SAME
+    // regression — but root-caused it via bisection (instrumented
+    // builds narrowing the hang to a single call, `kernel_main`'s own
+    // `hal.now_ns()`) down to REAL, SEPARATE, pre-existing bugs this
+    // reset merely exposed rather than caused, at TWO layers: (1)
+    // `kernel_main` (`kernel/kernel/src/main.rs`) received `hal:
+    // hal_core::HalInterface` BY VALUE (living in `kernel_main`'s OWN
+    // stack frame, which never returns) and passed `&hal` down into
+    // `kernel_arch_glue::enter`, which stashed that pointer in a static
+    // (`G_HAL`) for the life of the system; (2) ONE LAYER DEEPER, this
+    // crate's own `hal_arm64_rust_entry` (`lib.rs`) built `Arm64Hal`
+    // (holding `cpu`/`timer`/etc.) as a plain local too, and `build_
+    // interface` baked raw pointers into ITS fields (`HalInterface`'s
+    // opaque `cpu_state`/`timer_state`) — copying the `HalInterface`
+    // struct by value into `kernel_main` does not change what those
+    // pointers point AT. Both were silently safe under the ORIGINAL
+    // leaking design (SP only ever descended, so stack memory above the
+    // current frame was never reused) and under riscv64/x86_64 (same
+    // shared `kernel_main`/pattern, but neither resets its own kernel-
+    // mode SP the way this fix does for aarch64) — but once aarch64's
+    // OWN SP_EL1 resets to a fixed top on every switch, LATER exception
+    // handling reuses and overwrites the exact memory this data lived
+    // in, corrupting it the moment a deep-enough call chain reached it
+    // (confirmed via bisection: `G_HAL`'s own stored POINTER survived,
+    // since it is itself a separate, genuinely-static 8-byte slot, but
+    // dereferencing THROUGH it — `hal.now_ns()`'s indirect call via a
+    // function-pointer field — silently jumped to garbage; fixing layer
+    // (1) alone then surfaced layer (2) as a "divide by zero" panic in
+    // `Timer::now_ns` reading a clobbered `frequency_hz`). Fixed at
+    // both sources: `hal` is moved into `.bss` static storage in
+    // `kernel_main` before its first use, and `Arm64Hal` likewise in
+    // `hal_arm64_rust_entry` before `build_interface` ever borrows from
+    // it — both mirror `KernelState::init_global`'s own "no stack
+    // temporary" rationale, making this reset safe regardless of what
+    // any architecture's own SP does afterward. (`boot_info: &BootInfo`
+    // is NOT similarly hazardous — `enter` only reads through it
+    // locally, never storing the pointer past its own call.)
+    unsafe {
+        core::arch::asm!(
+            "ldr x9, [x30, #248]",   // sp_el0 (offset 31*8 = 248)
+            "msr sp_el0, x9",
+            "ldr x9, [x30, #256]",   // elr_el1
+            "msr elr_el1, x9",
+            "ldr x9, [x30, #264]",   // spsr_el1
+            "msr spsr_el1, x9",
+            "ldr x9, [x30, #272]",   // ttbr0_el1
+            "msr ttbr0_el1, x9",
+            "isb",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            // Reset SP_EL1 to the fixed boot-stack baseline — see this
+            // function's own doc comment above for the full story.
+            // `x9` is reused as scratch (free at this point — its last
+            // use above, the ttbr0_el1 load, is already committed via
+            // `msr`) and clobbered again immediately below by the `ldp
+            // x8, x9, [x30, #64]` GPR restore, so nothing here leaks
+            // into the resumed thread's own register state.
+            "adrp x9, {boot_stack_top}",
+            "add x9, x9, :lo12:{boot_stack_top}",
+            "mov sp, x9",
+            "ldp x0, x1,   [x30, #0]",
+            "ldp x2, x3,   [x30, #16]",
+            "ldp x4, x5,   [x30, #32]",
+            "ldp x6, x7,   [x30, #48]",
+            "ldp x8, x9,   [x30, #64]",
+            "ldp x10, x11, [x30, #80]",
+            "ldp x12, x13, [x30, #96]",
+            "ldp x14, x15, [x30, #112]",
+            "ldp x16, x17, [x30, #128]",
+            "ldp x18, x19, [x30, #144]",
+            "ldp x20, x21, [x30, #160]",
+            "ldp x22, x23, [x30, #176]",
+            "ldp x24, x25, [x30, #192]",
+            "ldp x26, x27, [x30, #208]",
+            "ldp x28, x29, [x30, #224]",
+            "ldr x30,      [x30, #240]",
+            "eret",
+            in("x30") blob,
+            boot_stack_top = sym crate::__boot_stack_top,
+            options(noreturn),
+        );
+    }
+}
+
+/// Serialises only the L4-style IPC fast path's minimal register set —
+/// AAPCS64's own callee-saved GPRs (`x19`-`x28`, `x29`/FP, `x30`/LR)
+/// plus this project's own message registers (`x0`=a0, `x1`=a1 — see
+/// `SyscallHandler`'s doc comment), plus the always-mandatory resume
+/// state (`sp_el0`/`elr_el1`/`spsr_el1`/`ttbr0_el1`). Deliberately
+/// narrower than `save_frame_as_user_context`: AAPCS64's CALLER-saved
+/// registers (`x2`-`x18`) are scratch across a call boundary by the
+/// ABI's own contract, and an IPC `svc` is treated as exactly that
+/// boundary — same reasoning as hal-riscv64's/hal-x86_64's identical
+/// `save_ipc_fast_context`, just with AAPCS64's own register split.
+/// Unlike hal-x86_64's port (whose message-input and return-value
+/// registers are physically DIFFERENT, `rdi`/`rsi` vs. `rax` — a real
+/// bug there, see that crate's own doc comment), AAPCS64's `x0`/`x1`
+/// serve as BOTH input and output already, the same shape riscv64's
+/// `a0`/`a1` have — so, unlike x86_64, no extra register beyond the
+/// standard callee-saved set needs to be added to this preserved list
+/// for `poke_saved_a0_a1`/`Resume2` to work correctly. Every field NOT
+/// written here is left at whatever `dst` already held — callers must
+/// pass a blob this function fully owns (never a stale general-purpose
+/// snapshot), exactly as `restore_ipc_fast_context` only ever reads the
+/// fields this function writes.
+///
+/// # Safety
+/// `dst` must point at valid, writable `HAL_USER_CONTEXT_BYTES`-sized,
+/// 8-byte-aligned storage.
+#[cfg(target_os = "none")]
+unsafe fn save_ipc_fast_context(frame: &SyncFrame, resume_elr: u64, dst: *mut Aarch64UserContext) {
+    let (sp_el0, spsr, ttbr0): (u64, u64, u64);
+    // SAFETY: reading SP_EL0/SPSR_EL1/TTBR0_EL1 has no preconditions in
+    // an exception handler.
+    unsafe {
+        core::arch::asm!("mrs {0}, sp_el0", out(reg) sp_el0);
+        core::arch::asm!("mrs {0}, spsr_el1", out(reg) spsr);
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0);
+    }
+    // SAFETY: `dst` is valid writable storage of the matching size /
+    // alignment per this function's contract; each slice write is
+    // in-bounds of `regs: [u64; 31]`.
+    unsafe {
+        (*dst).regs[0] = frame.regs[0];
+        (*dst).regs[1] = frame.regs[1];
+        (*dst).regs[19..29].copy_from_slice(&frame.regs[19..29]);
+        (*dst).regs[29] = frame.regs[29];
+        (*dst).regs[30] = frame.regs[30];
+        (*dst).sp_el0 = sp_el0;
+        (*dst).elr_el1 = resume_elr;
+        (*dst).spsr_el1 = spsr;
+        (*dst).ttbr0_el1 = ttbr0;
+    }
+}
+
+/// Restores the fast-path register set `save_ipc_fast_context` wrote
+/// and `eret`s into EL0. AAPCS64's own CALLER-saved GPRs (`x2`-`x18`)
+/// are explicitly ZEROED rather than left with whatever the previous
+/// occupant of this CPU's registers held — the same deliberate cross-
+/// thread information-disclosure fix hal-riscv64's/hal-x86_64's
+/// `restore_ipc_fast_context` document for their own caller-saved sets:
+/// "don't touch" would leak the PREVIOUS thread's register contents
+/// into the incoming one.
+///
+/// Resets `SP_EL1` to the fixed boot-stack baseline exactly like
+/// `restore_user_and_eret` does, for the identical reason documented on
+/// that function: AArch64 has no hardware mechanism (unlike x86_64's
+/// `TSS.rsp0`) that reloads a fixed kernel-mode stack pointer on every
+/// EL0->EL1 transition, so skipping this reset here would reopen the
+/// SAME unbounded per-switch stack leak that function's own doc comment
+/// describes — this fast path is just as much a "switch" as `SwitchTo`
+/// is, from `SP_EL1`'s point of view.
+///
+/// # Safety
+/// Same contract as `restore_user_and_eret`: `blob` must point at a
+/// valid, resumable fast-path `Aarch64UserContext` (as produced by
+/// `save_ipc_fast_context`) whose `ttbr0_el1` names an address space
+/// that maps this core's exception vector table and the identity-mapped
+/// low RAM `blob` itself lives in.
+#[cfg(target_os = "none")]
+unsafe fn restore_ipc_fast_context(blob: *const Aarch64UserContext) -> ! {
+    // SAFETY: contract above. `x30` carries the blob base throughout,
+    // loaded from its OWN saved slot dead last — same "one restored
+    // register doubles as the pointer" trick `restore_user_and_eret`
+    // uses, for the same reason (AArch64 has no spare GPR). `x9` is
+    // used as PURE SCRATCH while computing `boot_stack_top` (its value
+    // there is irrelevant — it gets explicitly zeroed below, as part of
+    // the `x2`-`x18` caller-saved sweep, so nothing of that scratch use
+    // survives into the resumed thread).
+    unsafe {
+        core::arch::asm!(
+            "ldr x9, [x30, #248]",   // sp_el0
+            "msr sp_el0, x9",
+            "ldr x9, [x30, #256]",   // elr_el1
+            "msr elr_el1, x9",
+            "ldr x9, [x30, #264]",   // spsr_el1
+            "msr spsr_el1, x9",
+            "ldr x9, [x30, #272]",   // ttbr0_el1
+            "msr ttbr0_el1, x9",
+            "isb",
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            // Reset SP_EL1 to the fixed boot-stack baseline — see this
+            // function's own doc comment above.
+            "adrp x9, {boot_stack_top}",
+            "add x9, x9, :lo12:{boot_stack_top}",
+            "mov sp, x9",
+            "ldp x0, x1,   [x30, #0]",  // preserved (message registers)
+            "mov x2,  xzr",             // zeroed (AAPCS64 caller-saved)
+            "mov x3,  xzr",
+            "mov x4,  xzr",
+            "mov x5,  xzr",
+            "mov x6,  xzr",
+            "mov x7,  xzr",
+            "mov x8,  xzr",
+            "mov x9,  xzr",
+            "mov x10, xzr",
+            "mov x11, xzr",
+            "mov x12, xzr",
+            "mov x13, xzr",
+            "mov x14, xzr",
+            "mov x15, xzr",
+            "mov x16, xzr",
+            "mov x17, xzr",
+            "mov x18, xzr",
+            "ldp x19, x20, [x30, #152]", // preserved (AAPCS64 callee-saved)
+            "ldp x21, x22, [x30, #168]",
+            "ldp x23, x24, [x30, #184]",
+            "ldp x25, x26, [x30, #200]",
+            "ldp x27, x28, [x30, #216]",
+            "ldr x29,      [x30, #232]", // preserved (FP)
+            "ldr x30,      [x30, #240]", // preserved (LR) — MUST be
+                                          // last: every prior line still
+                                          // dereferences x30
+            "eret",
+            in("x30") blob,
+            boot_stack_top = sym crate::__boot_stack_top,
+            options(noreturn),
+        );
+    }
+}
+
+/// Writes `a0`/`a1` directly into a saved `Aarch64UserContext`'s
+/// `x0`/`x1` fields — used by `kernel/src/main.rs`'s IPC syscall
+/// handlers to deliver a message INTO a thread that is being woken via
+/// a direct hand-off (a `SwitchToFast`/`SwitchTo` target that never
+/// itself re-enters `common_sync_entry` to pick up a `Resume`/`Resume2`
+/// return value the normal way — see `kernel_arch_glue`'s
+/// `IpcSwitch::poke` field doc comment). `x0`/`x1` are correct here for
+/// the SAME reason `Resume`/`Resume2` write into them: AAPCS64's `x0`
+/// is both the message-input AND the return-value register (unlike
+/// hal-x86_64's port, where the equivalent function must target `rax`,
+/// NOT the message-input `rdi` — see that crate's own doc comment for
+/// the bug this distinction fixes). Mirrors hal-riscv64's identical
+/// `poke_saved_a0_a1`.
+///
+/// # Safety
+/// `ctx` must point at a valid, exclusively-owned `Aarch64UserContext`
+/// (the same blob a `SwitchTo`/`SwitchToFast` `save`/`into` pointer
+/// names) — not currently being read or written by anything else.
+#[cfg(target_os = "none")]
+pub unsafe fn poke_saved_a0_a1(ctx: *mut u8, a0: usize, a1: usize) {
+    // SAFETY: contract above; `Aarch64UserContext` is `#[repr(C)]` and
+    // `ctx` is required to point at one.
+    unsafe {
+        let c = &mut *(ctx as *mut Aarch64UserContext);
+        c.regs[0] = a0 as u64;
+        c.regs[1] = a1 as u64;
+    }
+}
+
+/// `DAIF` bit 1 (IRQ mask) — the GLOBAL gate on whether a pending,
+/// GICv3-enabled interrupt is actually TAKEN while already executing in
+/// EL1, exactly `wfi`'s own situation here (a trap taken from a LOWER
+/// exception level, e.g. EL0, is unaffected by this bit). `boot.S`
+/// never unmasks `DAIF` before `kernel_main` returns (see `hal_arm64_
+/// rust_entry`'s own comment beside its `bootstrap_current_core` call),
+/// so this bit stays set (IRQs masked) for the entire EL1 lifetime —
+/// mirrors hal-riscv64's own `SSTATUS_SIE_BIT` exactly, same root cause.
+const DAIF_IRQ_MASK_BIT: u64 = 1 << 7; // DAIF[7] = I (IRQ mask), per AArch64 DAIF layout.
+
+// The `wfi` instruction and its immediate neighbors, individually
+// labelled so `common_interrupt_entry` (cpu.rs) can compare a nested
+// interrupt's own `ELR_EL1` against them. **Real bug found via QEMU**
+// (the virtio-blk driver's own `DRV_IRQ_WAIT` retry loop,
+// 03-Kernel-Subsystems-Layer.md §5.1 — the SECOND Wait+wfi+IRQ cycle in
+// a row, never the first): per the ARMv8-A Architecture Reference
+// Manual, `wfi` behaves as a NOP if a pending, unmasked interrupt
+// already exists the instant it would execute — QEMU/TCG implements
+// this NOP case by routing straight to the interrupt exception instead
+// of ever retiring `wfi`, but (confirmed via a temporary diagnostic
+// dumping `ELR_EL1` on every nested-IRQ entry, across several runs) the
+// exception's own preferred return address in that case is NOT
+// consistently "the `wfi` instruction's own PC" — it can ALSO land on
+// the address of whatever `bl` most recently transferred control toward
+// `wfi` (observed once each way, same binary, two back-to-back Wait
+// cycles), an artifact of QEMU/TCG's own translation-block granularity
+// for this specific "interrupt already pending, skip an entire no-op'd
+// instruction" case, not anything documented as part of the AArch64
+// exception model itself. A fix that only special-cased the `wfi`
+// opcode's own address (an earlier attempt) therefore still hung on the
+// OTHER shape of the exact same race. Since `wfi()`'s device-completion
+// notify can race ahead of the retry loop reaching `wfi()` at all (the
+// interrupt becomes pending, but stays masked, in the gap between `drv_
+// irq_wait_step`'s own "still Blocked" check and this call), this race
+// is entirely real, not a theoretical corner case — it reproduced on
+// the SECOND driver I/O request in this codebase's very first
+// two-request virtio-pci sequence, and only once the incidental extra
+// serial-I/O latency of an unrelated one-time debug print (removed
+// earlier) stopped widening the "still Blocked" -> `wfi()` gap enough
+// to avoid it. Without a fix, `eret` lands back somewhere that
+// re-attempts (some or all of) `wfi()`'s own body instead of returning
+// to its Rust caller — and since the interrupt that raced ahead is
+// ALREADY fully acknowledged/EOI'd by the time this happens, a genuine
+// SECOND `wfi` blocks forever waiting for an event that will never come
+// again: a silent, total hang with zero further diagnostic output.
+//
+// Fixed by making the ENTIRE function — prologue, `wfi`, epilogue —
+// one single, uninterrupted, label-marked block of `global_asm!` (no
+// nested `bl` anywhere near the `wfi` instruction, unlike an earlier
+// attempt that isolated `wfi` in its own tiny callee specifically to
+// make its address comparable — that extra call boundary is exactly
+// what let QEMU/TCG attribute the race to the CALL SITE instead of the
+// `wfi` instruction in the first place) plus a WIDE recognized range in
+// `common_interrupt_entry`: any `ELR_EL1` from `hal_arm64_wfi_retry`
+// (right before `daifclr`) through `hal_arm64_wfi_at` (the `wfi`
+// mnemonic itself) inclusive is treated as "this `wfi()` call never
+// meaningfully progressed" and redirected straight to `hal_arm64_wfi_
+// done` (`daifset` + restore + `ret`) — `daifclr` and `wfi` are both
+// idempotent/side-effect-free to skip in this exact circumstance, so
+// jumping past either (or both) is always safe, and `wfi()` is
+// guaranteed to return to its OWN caller exactly once per call
+// regardless of which sub-address this race lands on.
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .global hal_arm64_wfi
+    .global hal_arm64_wfi_retry
+    .global hal_arm64_wfi_at
+    .global hal_arm64_wfi_done
+    hal_arm64_wfi:
+        str x30, [sp, #-16]!
+    hal_arm64_wfi_retry:
+        msr daifclr, #2
+    hal_arm64_wfi_at:
+        wfi
+    hal_arm64_wfi_done:
+        msr daifset, #2
+        ldr x30, [sp], #16
+        ret
+    "#
+);
+
+#[cfg(target_os = "none")]
+extern "C" {
+    fn hal_arm64_wfi();
+    /// See `hal_arm64_wfi`'s own doc comment. Address-only markers (never
+    /// called) — `common_interrupt_entry` compares `ELR_EL1` against
+    /// them via `&hal_arm64_wfi_retry as *const _ as u64`, etc.
+    static hal_arm64_wfi_retry: core::ffi::c_void;
+    static hal_arm64_wfi_at: core::ffi::c_void;
+    static hal_arm64_wfi_done: core::ffi::c_void;
+}
+
+/// Halts the core in EL1 until any interrupt fires — `wfi`, ARMv8-A
+/// Architecture Reference Manual §D1.9. Temporarily clears `DAIF.I`
+/// around the instruction itself (see `DAIF_IRQ_MASK_BIT`'s own doc
+/// comment for why this is required here specifically) and restores it
+/// to masked afterward — ordinary EL1 kernel code between exception
+/// entry and `eret` otherwise always runs with IRQs deferred to
+/// well-known points (this call being the first, deliberate exception),
+/// so leaving `DAIF.I` clear past this one instruction would be a real
+/// change to that invariant, not a harmless cleanup left undone.
+/// Mirrors hal-riscv64's own `wfi()` exactly, same rationale. The real
+/// body lives in the labelled `hal_arm64_wfi` `global_asm!` block above
+/// — see ITS doc comment for why (a QEMU/TCG-specific return-address
+/// quirk `common_interrupt_entry` must correct for).
+#[cfg(target_os = "none")]
+pub fn wfi() {
+    // SAFETY: `hal_arm64_wfi` sets/clears exactly the IRQ mask bit of
+    // `DAIF` around `wfi` and otherwise has no preconditions beyond
+    // "valid to execute at the current exception level" (true at EL1);
+    // it always eventually returns to this call site (immediately if an
+    // interrupt is already pending — see its own doc comment for the
+    // return-address subtlety `common_interrupt_entry` handles — or
+    // after a genuine hardware wait) rather than ever deadlocking.
+    unsafe { hal_arm64_wfi() };
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn wfi() {
+    // Host test build: no real EL1/DAIF state exists — a no-op, same
+    // stance hal-riscv64's own non-bare-metal build takes implicitly
+    // (its `wfi` is entirely `#[cfg(target_os = "none")]`-gated with no
+    // host fallback; this crate adds one instead so `hal_arm64::cpu::
+    // wfi` remains callable, unconditionally, by architecture-erased
+    // callers built for the host test target).
 }
 
 #[cfg(test)]
@@ -575,5 +2216,214 @@ mod tests {
     #[test]
     fn arm64_context_matches_declared_size() {
         assert_eq!(size_of::<Arm64Context>(), ARM64_CONTEXT_BYTES);
+    }
+}
+// ============================================================================
+// AArch64 page-table helpers
+//
+// Bare-metal only. `map_ram_identity` / `activate_address_space` (above) plus
+// `map_range` here are the whole page-table surface the microkernel drives
+// through `hal_core::HalInterface` — the AArch64 counterpart of
+// hal-riscv64's `riscv_sv39` module / hal-x86_64's `x86_64_paging` module.
+//
+// Deliberately mirrors `riscv_sv39` almost line-for-line: with
+// `activate_address_space` configuring TCR_EL1.T0SZ=25 (see that method's
+// own doc comment), a 39-bit AArch64 VA splits into three 9-bit indices
+// (L1/L2/L3) + a 12-bit page offset at the SAME bit positions Sv39 uses,
+// and — unlike hal-x86_64's PML4/PDPT — table descriptors here impose NO
+// additional permission restriction of their own (their optional
+// APTable/PXNTable/UXNTable override bits are left at 0 throughout this
+// module), so permission is decided purely at the LEAF, exactly like
+// Sv39 and unlike x86_64's every-level AND. This is also why `root_frame`
+// needs only ONE page here (an L1 table), never x86_64's two-page
+// PML4+PDPT pair.
+// ============================================================================
+#[cfg(target_os = "none")]
+pub(crate) mod aarch64_paging {
+    /// Descriptor valid bit (bit 0), common to block, table, and page
+    /// descriptors alike.
+    pub const VALID: u64 = 1 << 0;
+    /// Bit 1: 1 = table descriptor (L1/L2, pointing at the next level) or
+    /// page descriptor (L3, a leaf) — 0 = block descriptor (a 1 GiB/2 MiB
+    /// leaf at L1/L2). The SAME bit position means a leaf-vs-table check
+    /// at L1/L2 and a valid-page check at L3 are the same test, exactly
+    /// like Sv39's `R|W|X != 0` distinguishing a leaf PTE from a pointer
+    /// to the next table.
+    pub const TABLE_OR_PAGE: u64 = 1 << 1;
+    /// AttrIndx = 0 (MAIR_EL1 index 0, Normal Write-Back — see
+    /// `activate_address_space`'s MAIR_EL1 setup).
+    pub const ATTR_NORMAL: u64 = 0 << 2;
+    /// AP[1] (bit 6): 1 = accessible at EL0 too, 0 = EL1-only. AArch64's
+    /// equivalent of Sv39's leaf-only `U` bit / x86_64's `USER` bit —
+    /// and, like Sv39 (unlike x86_64), ONLY the leaf's own bit matters;
+    /// see this module's own doc comment.
+    pub const AP_USER: u64 = 1 << 6;
+    /// AP[2] (bit 7): 1 = read-only at every EL this descriptor is
+    /// accessible from, 0 = read/write. There is no separate "readable"
+    /// bit on AArch64 either (same as x86_64's `PRESENT`-alone-means-
+    /// readable / Sv39's leaf `R` bit always being set here) — a valid
+    /// descriptor is always readable.
+    pub const AP_RO: u64 = 1 << 7;
+    /// SH[1:0] = 0b11 (inner shareable) — matches the SH0 field
+    /// `activate_address_space` programs into TCR_EL1.
+    pub const SH_INNER: u64 = 0b11 << 8;
+    /// Access flag (bit 10) — pre-set so no hardware Access-Flag fault is
+    /// taken, same rationale as Sv39's pre-set `A` bit.
+    pub const AF: u64 = 1 << 10;
+    /// Privileged execute-never (bit 53): blocks EL1 from executing this
+    /// page. AArch64's execute-permission model is a genuine third
+    /// architectural point (beyond Sv39's single leaf-only `X` and
+    /// x86_64's single every-level-AND `NO_EXECUTE`): PXN and UXN are
+    /// SEPARATE bits, so a page can be executable at EXACTLY ONE
+    /// privilege level in a single descriptor — `map_range` uses this to
+    /// set PXN on every user-executable page (the kernel must never
+    /// execute Root Task code, even by mistake) and UXN on every
+    /// kernel-executable one, something neither Sv39 nor x86_64's single
+    /// execute bit can express in one write.
+    pub const PXN: u64 = 1 << 53;
+    /// User (EL0) execute-never (bit 54) — see `PXN`'s doc comment.
+    pub const UXN: u64 = 1 << 54;
+    /// Output/next-level-table address mask, bits 47:12 (this project's
+    /// IPS = 40-bit choice — see `activate_address_space` — comfortably
+    /// fits within this 48-bit-capable field).
+    const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    /// Zeroes `root_frame` (the L1 table) and installs `bytes_gib` 1 GiB
+    /// BLOCK identity leaves (VA == PA) into it — L1 index `gib` covers
+    /// exactly VA range `[gib * 1 GiB, (gib + 1) * 1 GiB)`, the same "L1
+    /// index == GiB number" property Sv39's root has. Always
+    /// readable/writable/executable (no separate control here — matches
+    /// hal-riscv64's `map_ram_identity`, which always sets `X`, and
+    /// hal-x86_64's, whose leaf flags never include `NO_EXECUTE`); if
+    /// `user_accessible`, `AP_USER` is set too.
+    ///
+    /// # Preconditions
+    /// `root_frame` is a page-aligned, writable physical frame, directly
+    /// addressable via the CURRENTLY active mapping (MMU may be on or
+    /// off — this project's boot.S disables it, so it is normally off
+    /// the first time this runs); single core; called before
+    /// `activate_address_space` switches TTBR0_EL1 to this table.
+    pub fn map_ram_identity(root_frame: usize, bytes_gib: usize, user_accessible: bool) {
+        let root = root_frame as *mut u64;
+        // SAFETY: precondition above.
+        unsafe {
+            for i in 0..512 {
+                root.add(i).write_volatile(0);
+            }
+            let mut leaf = VALID | ATTR_NORMAL | SH_INNER | AF; // bit1=0: block descriptor
+            if user_accessible {
+                leaf |= AP_USER;
+            }
+            for gib in 0..bytes_gib.min(512) {
+                let pa = (gib as u64) << 30; // gib * 1 GiB
+                root.add(gib).write_volatile((pa & ADDR_MASK) | leaf);
+            }
+        }
+    }
+
+    /// Maps `[vaddr, vaddr + len)` -> `[paddr, ...)` at 4 KiB granularity,
+    /// descending from the L1 table at `root_frame` through L2 to L3,
+    /// allocating any missing L2/L3 tables from the pre-zeroed pool at
+    /// `[pool_base, pool_base + pool_len * 4096)`. `perm_bits` is
+    /// `READ=1, WRITE=2, EXECUTE=4, USER=8` (`READ` is a no-op here too —
+    /// see `AP_RO`'s doc comment).
+    ///
+    /// Returns the number of pool frames consumed, or `u32::MAX` on
+    /// error (misaligned args, a block-descriptor leaf already covering
+    /// the range, or the pool running out).
+    ///
+    /// # Preconditions
+    /// `map_ram_identity` has already run on this `root_frame`; the pool
+    /// frames are zeroed; single core; every physical address here
+    /// (root, pool, leaves) is directly addressable via the CURRENTLY
+    /// active mapping.
+    pub fn map_range(
+        root_frame: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+        perm_bits: usize,
+        pool_base: usize,
+        pool_len: usize,
+    ) -> u32 {
+        if root_frame == 0 || len == 0 || ((vaddr | paddr | len) & 0xFFF) != 0 {
+            return u32::MAX;
+        }
+        let mut leaf = VALID | TABLE_OR_PAGE | ATTR_NORMAL | SH_INNER | AF;
+        if perm_bits & 8 != 0 {
+            leaf |= AP_USER;
+        }
+        if perm_bits & 2 == 0 {
+            leaf |= AP_RO;
+        }
+        if perm_bits & 4 == 0 {
+            // Not executable at all: block execution at BOTH privilege
+            // levels — the conservative choice, matching x86_64's single
+            // `NO_EXECUTE` applied uniformly.
+            leaf |= UXN | PXN;
+        } else if perm_bits & 8 != 0 {
+            leaf |= PXN; // user-executable: EL0 only, never EL1 — see PXN's doc comment.
+        } else {
+            leaf |= UXN; // kernel-executable: EL1 only, never EL0.
+        }
+
+        let mut used = 0usize;
+        let pages = len / 4096;
+        for p in 0..pages {
+            let va = vaddr + p * 4096;
+            let pa = paddr + p * 4096;
+            let (l1i, l2i, l3i) =
+                ((va >> 30) & 0x1FF, (va >> 21) & 0x1FF, (va >> 12) & 0x1FF);
+
+            // Descend / build L2.
+            // SAFETY: `root_frame` is a valid, page-aligned L1 table per
+            // this function's precondition.
+            let l2 = unsafe {
+                let slot = (root_frame as *mut u64).add(l1i);
+                let e = slot.read_volatile();
+                if e & VALID == 0 {
+                    if used >= pool_len {
+                        return u32::MAX;
+                    }
+                    let t = pool_base + used * 4096;
+                    used += 1;
+                    slot.write_volatile((t as u64 & ADDR_MASK) | VALID | TABLE_OR_PAGE);
+                    t
+                } else if e & TABLE_OR_PAGE == 0 {
+                    return u32::MAX; // a 1 GiB block leaf already covers this VA
+                } else {
+                    (e & ADDR_MASK) as usize
+                }
+            };
+
+            // Descend / build L3.
+            // SAFETY: `l2` is a valid page-table frame just resolved above.
+            let l3 = unsafe {
+                let slot = (l2 as *mut u64).add(l2i);
+                let e = slot.read_volatile();
+                if e & VALID == 0 {
+                    if used >= pool_len {
+                        return u32::MAX;
+                    }
+                    let t = pool_base + used * 4096;
+                    used += 1;
+                    slot.write_volatile((t as u64 & ADDR_MASK) | VALID | TABLE_OR_PAGE);
+                    t
+                } else if e & TABLE_OR_PAGE == 0 {
+                    return u32::MAX; // a 2 MiB block leaf already covers this VA
+                } else {
+                    (e & ADDR_MASK) as usize
+                }
+            };
+
+            // Install the 4 KiB leaf (a page descriptor: bit1=1, same as
+            // a table descriptor's own bit1 — L3 is always the last
+            // level, so there is no ambiguity).
+            // SAFETY: `l3` is a valid page-table frame just resolved above.
+            unsafe {
+                (l3 as *mut u64).add(l3i).write_volatile((pa as u64 & ADDR_MASK) | leaf);
+            }
+        }
+        used as u32
     }
 }

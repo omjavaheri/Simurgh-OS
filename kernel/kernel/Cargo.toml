@@ -38,14 +38,11 @@ kernel-core      = { path = "../kernel-core" }
 kernel-cap       = { path = "../kernel-cap" }
 kernel-mm        = { path = "../kernel-mm" }
 kernel-arch-glue = { path = "../kernel-arch-glue" }
+elf-loader       = { path = "../../elf-loader" }
 # Layer-3 (subsystems as processes, IMPLEMENTATION-PLAN.md follow-up):
 # `root-task` decides WHAT to launch (`plan_boot`); `device-manager` is
-# the first real subsystem process launched. Both `#![no_std]`,
-# arch-agnostic — `device-manager`'s process entry point is itself
-# riscv64-gated internally, so this compiles cleanly (as a no-op
-# inclusion) on x86_64/aarch64 too, ahead of their own real-kernel boot.
+# the first real subsystem process launched.
 root-task        = { path = "../../subsystems/root-task" }
-device-manager   = { path = "../../subsystems/device-manager" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 hal-x86_64 = { path = "../../hal/hal-x86_64" }
@@ -55,6 +52,14 @@ hal-arm64 = { path = "../../hal/hal-arm64" }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 hal-riscv64 = { path = "../../hal/hal-riscv64" }
+
+# NOTE: no `device-manager` dependency anywhere above, on any
+# architecture: every architecture now spawns Device Manager from its
+# OWN separately-built ELF image (`device-manager-bin`, embedded via
+# `include_bytes!` — see `DEVICE_MANAGER_ELF`'s own doc comment in
+# `src/main.rs`), loaded at runtime by `kernel_arch_glue::
+# spawn_process_from_elf`. This binary links ZERO device-manager code
+# on any target — the only trace of it is the raw embedded ELF bytes.
 
 [package.metadata.hal]
 targets = [

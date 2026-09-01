@@ -295,6 +295,79 @@ unsafe fn acpi_dmar_present(rsdp_phys: u64) -> bool {
     false
 }
 
+const MCFG_SIGNATURE: [u8; 4] = *b"MCFG";
+
+/// One entry of the MCFG table's own "Configuration Space Allocation
+/// Structure" array (PCI Firmware Specification section 4.1.2, Table
+/// 4-3) — the ACPI-standard, firmware-reported way to learn a PCIe
+/// segment's own ECAM physical base address. See `Memory::rsdp_phys`'s
+/// own doc comment for why this replaced an earlier hardcoded-constant
+/// attempt (QEMU-real-hardware evidence, not a style preference).
+#[repr(C, packed)]
+struct McfgAllocation {
+    base_address: u64,
+    _pci_segment_group: u16,
+    _start_bus: u8,
+    _end_bus: u8,
+    _reserved: u32,
+}
+
+/// Scans the ACPI table pointers reachable from `rsdp_phys` for an MCFG
+/// table and returns its FIRST Configuration Space Allocation
+/// Structure's own base address (segment 0's own ECAM window — the only
+/// segment this MVP's single-PCIe-domain QEMU target ever populates).
+/// Returns `None` if no MCFG table is present, or it carries no
+/// allocation entries at all.
+///
+/// # Safety
+/// Same contract as `acpi_dmar_present`.
+pub(crate) unsafe fn acpi_mcfg_ecam_base(rsdp_phys: u64) -> Option<u64> {
+    if rsdp_phys == 0 {
+        return None;
+    }
+
+    // SAFETY: forwarded from this function's own contract; RSDP layout
+    // per the ACPI specification, same offset `acpi_dmar_present`
+    // already reads.
+    let xsdt_addr = unsafe { core::ptr::read_unaligned((rsdp_phys as *const u8).add(24) as *const u64) };
+    if xsdt_addr == 0 {
+        return None;
+    }
+
+    // SAFETY: forwarded; `xsdt_addr` is a trusted XSDT pointer per the
+    // same RSDP contract `acpi_dmar_present` already relies on.
+    let xsdt_header = unsafe { core::ptr::read_unaligned(xsdt_addr as *const AcpiSdtHeader) };
+    let entry_count = (xsdt_header.length as usize - size_of::<AcpiSdtHeader>()) / size_of::<u64>();
+    let entries_ptr = (xsdt_addr as usize + size_of::<AcpiSdtHeader>()) as *const u64;
+
+    for i in 0..entry_count {
+        // SAFETY: `i < entry_count`, computed from the XSDT's own
+        // `length` field per the ACPI spec's table layout.
+        let table_addr = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) };
+        // SAFETY: `table_addr` came from a well-formed XSDT entry.
+        let header = unsafe { core::ptr::read_unaligned(table_addr as *const AcpiSdtHeader) };
+        if header.signature != MCFG_SIGNATURE {
+            continue;
+        }
+        // MCFG's own body (ACPI spec / PCI Firmware Spec section 4.1.2):
+        // the standard `AcpiSdtHeader`, then an 8-byte Reserved field,
+        // then a variable-length array of `McfgAllocation` entries —
+        // this MVP only ever reads the first one (segment 0).
+        let first_entry_addr = table_addr as usize + size_of::<AcpiSdtHeader>() + 8;
+        if (table_addr as usize + header.length as usize) < first_entry_addr + size_of::<McfgAllocation>() {
+            return None; // table present but carries no allocation entries.
+        }
+        // SAFETY: `first_entry_addr` is within the MCFG table's own
+        // `length`-bounded body, just checked above; `McfgAllocation`
+        // is `#[repr(C, packed)]`, matching the spec's own byte layout
+        // exactly, so an unaligned read is the correct access here.
+        let entry = unsafe { core::ptr::read_unaligned(first_entry_addr as *const McfgAllocation) };
+        return Some(entry.base_address);
+    }
+
+    None
+}
+
 // ============================================================================
 // Page table setup (minimal identity/kernel mapping, section 3.2)
 // ============================================================================
@@ -446,6 +519,31 @@ pub struct Memory {
     regions: [MemoryRegion; MAX_TRACKED_REGIONS],
     region_count: usize,
     iommu_present: bool,
+    /// The ACPI RSDP physical address `from_uefi_memory_map` already
+    /// located to answer `acpi_dmar_present` — retained (not just a
+    /// local inside that function) so `peripheral.rs`'s own MCFG lookup
+    /// (`acpi_mcfg_ecam_base`, this file) can reuse the SAME already-
+    /// parsed pointer via the `rsdp_phys()` getter below, instead of
+    /// re-walking UEFI's Configuration Table list a second time.
+    ///
+    /// **Real bug found via QEMU**: this crate's own `compute.rs`
+    /// PCI scan uses the legacy port mechanism (0xCF8/0xCFC), which
+    /// needs no ECAM base at all, so nothing forced this MVP to learn
+    /// the real one until `peripheral.rs`'s virtio-pci discovery
+    /// needed it — an initial attempt hardcoded QEMU q35's own well-
+    /// documented `MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT` (0xB0000000,
+    /// `hw/pci-host/q35.h`), mirroring `hal_arm64::compute::
+    /// QEMU_VIRT_DEFAULT_ECAM_BASE`'s own accepted MVP-phase shortcut.
+    /// On THIS project's actual QEMU/OVMF combination that address
+    /// read back as a clean, non-faulting `0x00000000` (not PCI's own
+    /// "no device" `0xFFFFFFFF` pattern) at bus 0/device 0/function 0
+    /// — where the host bridge unconditionally exists on any q35
+    /// machine — proving the guess was simply wrong for this specific
+    /// OVMF build's own PCIEXBAR placement, not a mapping problem
+    /// (a genuinely unmapped access would have page-faulted instead).
+    /// Real ACPI MCFG table parsing (this field + `acpi_mcfg_ecam_
+    /// base`) replaced the hardcoded guess for exactly this reason.
+    rsdp_phys: u64,
 }
 
 impl Memory {
@@ -516,11 +614,21 @@ impl Memory {
             },
             region_count,
             iommu_present,
+            rsdp_phys,
         }
     }
 
     pub fn region_count(&self) -> usize {
         self.region_count
+    }
+
+    /// The ACPI RSDP physical address this crate located at boot — `0`
+    /// if none was found (same "not present" sentinel `acpi_dmar_
+    /// present`'s own doc comment already establishes for this value).
+    /// See this struct's own `rsdp_phys` field doc comment for why this
+    /// exists.
+    pub fn rsdp_phys(&self) -> u64 {
+        self.rsdp_phys
     }
 }
 
@@ -637,10 +745,12 @@ pub fn built_hardware_manifest(
     cpu: &Cpu,
     interrupt: &InterruptCtrl,
     timer: &Timer,
+    peripheral: &crate::peripheral::PeripheralDiscovery,
 ) -> HardwareManifestRaw {
     use hal_core::compute::ComputeDeviceDiscovery;
     use hal_core::cpu::CpuAbstraction;
     use hal_core::interrupt::InterruptController;
+    use hal_core::peripheral::PeripheralDeviceDiscovery;
     use hal_core::power::PowerThermal;
     use hal_core::timer::TimerAbstraction;
 
@@ -664,6 +774,10 @@ pub fn built_hardware_manifest(
 
     for domain in power.enumerate_power_domains() {
         let _ = manifest.push_power_domain(*domain);
+    }
+
+    for device in peripheral.enumerate_peripheral_devices() {
+        let _ = manifest.push_peripheral_device(*device);
     }
 
     manifest.interrupt_controller = InterruptControllerInfoRaw::new(

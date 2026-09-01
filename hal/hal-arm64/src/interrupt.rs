@@ -110,7 +110,13 @@ unsafe fn enable_cpu_interface() {
 unsafe fn enable_cpu_interface() {
     // SAFETY: forwarded from this function's own contract; these three
     // writes are the documented, well-defined GICv3 CPU interface
-    // bring-up sequence.
+    // bring-up sequence. Requires `ICC_SRE_EL2.SRE` (or EL3's
+    // equivalent) already set by firmware — true for QEMU's `virt`
+    // machine's own EDK2/ArmVirtQemu firmware, which hands this project
+    // off directly at EL1 (see `lib.rs`'s own `_start` doc comment on
+    // why the EL2 branch there never actually runs in practice), so
+    // this project has no opportunity to set it itself even if it
+    // needed to.
     unsafe {
         // ICC_SRE_EL1 bit 0 = SRE (system register enable).
         core::arch::asm!("mrs x0, ICC_SRE_EL1", "orr x0, x0, #1", "msr ICC_SRE_EL1, x0", "isb", out("x0") _);
@@ -127,6 +133,33 @@ unsafe fn enable_cpu_interface() {
 // ============================================================================
 // GIC Distributor (GICD) — MMIO-based, per module docs
 // ============================================================================
+
+mod gicr_reg {
+    /// Redistributor Wake Register (RD_base frame, offset 0x0014): bit 1
+    /// = ProcessorSleep (software clears this to wake the redistributor
+    /// — QEMU's emulated GICv3 defaults to AWAKE for a single-core boot,
+    /// but this is the architecturally-required bring-up step per the
+    /// GICv3 spec's own reference sequence, not something to rely on an
+    /// emulator default for), bit 2 = ChildrenAsleep (read-only,
+    /// software polls this to clear after clearing ProcessorSleep).
+    pub const WAKER: u32 = 0x0014;
+    /// SGI_base frame (RD_base + `SGI_BASE_OFFSET`) Interrupt Set-Enable
+    /// Register for INTID 0-31 (SGIs + PPIs) — the GICv3 REPLACEMENT for
+    /// the Distributor's own `gicd_reg::ISENABLER` covering the SAME
+    /// INTID range, which becomes RES0/ignored for INTID 0-31 once
+    /// `GICD_CTLR.ARE` is enabled (see `bootstrap_current_core`'s own
+    /// doc comment on the real bug this fixes).
+    pub const ISENABLER0: u32 = 0x0100;
+    /// SGI_base frame Interrupt Priority Registers, same one-byte-per-
+    /// INTID layout as `gicd_reg::IPRIORITYR`, for the SAME reason.
+    pub const IPRIORITYR: u32 = 0x0400;
+    /// Redistributors are always allocated in adjacent RD_base+SGI_base
+    /// frame PAIRS (64 KiB each); the SGI_base frame — where PPI/SGI
+    /// enable and priority actually live — is this fixed offset past
+    /// the RD_base frame `bootstrap_current_core` also touches (for
+    /// `WAKER`).
+    pub const SGI_BASE_OFFSET: u64 = 0x1_0000;
+}
 
 mod gicd_reg {
     /// Distributor Control Register.
@@ -184,7 +217,7 @@ unsafe fn gicd_write64(gicd_base: u64, offset: u32, value: u64) {
 /// PPIs, unlike x86_64's freely-assignable vectors, have architecturally
 /// fixed INTIDs (16-31) — this is a hardware convention, not a project
 /// choice.
-const TIMER_PPI_INTID: u32 = 30;
+pub(crate) const TIMER_PPI_INTID: u32 = 30;
 
 /// First INTID available for `register_irq`. INTIDs 0-15 are SGIs
 /// (used internally by `send_ipi`, not exposed via `register_irq`),
@@ -454,17 +487,81 @@ impl InterruptCtrl {
             enable_cpu_interface();
         }
 
-        // Enable the timer PPI (INTID 30) at the distributor — PPIs
-        // live in the same ISENABLER/IPRIORITYR register range as SGIs
-        // (INTID 0-31 => register index 0), just without needing
-        // IROUTER configuration (PPIs are implicitly per-core, no
-        // affinity routing concept applies).
+        // Enable the distributor itself (GICD_CTLR) — a REAL, PRE-
+        // EXISTING gap this session's preemption work found via QEMU:
+        // `gicd_reg::CTLR` was DEFINED but never actually WRITTEN
+        // anywhere in this crate (confirmed via `grep -rn
+        // "gicd_reg::CTLR"` turning up only its own declaration). Per-
+        // INTID enable (ISENABLER) and the CPU interface's own Group 1
+        // enable (ICC_IGRPEN1_EL1, `enable_cpu_interface` above) are
+        // BOTH necessary but NOT sufficient — the distributor has its
+        // OWN top-level "forward Group 1 interrupts at all" gate, off
+        // by default on QEMU's emulated GICv3 (confirmed via
+        // instrumented bisection: the CPU interface enabled cleanly,
+        // ISENABLER/IPRIORITYR writes succeeded, `TimerAbstraction::
+        // set_oneshot` armed a real future deadline, yet the timer PPI
+        // never reached this core at all until this write was added).
+        // Bit 1 = EnableGrp1 (this project's single-security-state GIC
+        // configuration — QEMU's `virt` machine models no Secure world
+        // — per the GICv3 architecture spec's "GICD_CTLR when GICD_
+        // CTLR.DS == 1" register view); bit 4 = ARE (Affinity Routing
+        // Enable), required for `configure_spi`'s own IROUTER writes
+        // (affinity-based SPI routing) to have any effect at all — set
+        // here too since it was equally unwritten before this fix,
+        // though every SPI configured before this fix was configured
+        // moot: no INTID could reach the core regardless without
+        // EnableGrp1 either.
         //
         // SAFETY: ordering contract per this method's own doc comment.
         unsafe {
-            let byte_offset = gicd_reg::IPRIORITYR + TIMER_PPI_INTID;
-            gicd_write32(self.gicd_base, byte_offset & !0x3, 0x8080_8080);
-            gicd_write32(self.gicd_base, gicd_reg::ISENABLER, 1 << TIMER_PPI_INTID);
+            gicd_write32(self.gicd_base, gicd_reg::CTLR, (1 << 0) | (1 << 1) | (1 << 4));
+        }
+
+        // Enable the timer PPI (INTID 30) — via the REDISTRIBUTOR, not
+        // the distributor. A SECOND real, pre-existing bug this
+        // session's preemption work found via QEMU (found only after
+        // fixing GICD_CTLR above, which is what exposed it): PPIs/SGIs
+        // (INTID 0-31) are configured through the Distributor's own
+        // `gicd_reg::ISENABLER`/`IPRIORITYR` ONLY in GICv2 or when
+        // `GICD_CTLR.ARE` is disabled — per the GICv3 architecture
+        // spec, once ARE is enabled (as it now is, required for
+        // `configure_spi`'s own SPI affinity routing), GICD's own
+        // ISENABLER0/IPRIORITYR for INTID 0-31 become RES0/ignored, and
+        // the REDISTRIBUTOR's SGI_base frame carries the real registers
+        // instead — `secondary_base()`'s own doc comment ASSERTED "no
+        // Redistributor MMIO access is needed" for this reason, which
+        // this session's own instrumented bisection disproved (writes
+        // to the distributor path silently had no effect once ARE was
+        // on; the timer PPI still never reached this core). Wakes the
+        // redistributor first (`GICR_WAKER.ProcessorSleep`, cleared per
+        // the GICv3 spec's own reference bring-up sequence — QEMU's
+        // emulated redistributor happens to default to already-awake
+        // for a single-core boot, but this is not something to rely on
+        // an emulator default for), then writes `GICR_IPRIORITYR`/
+        // `GICR_ISENABLER0` in its SGI_base frame. `gicr_base` is a
+        // QEMU-`virt`-machine-default fallback, same MVP-phase
+        // convention as `memory.rs`'s own `QEMU_VIRT_DEFAULT_GICD_BASE`
+        // (full Device Tree/ACPI-based Redistributor discovery is a
+        // tracked follow-up alongside that file's own).
+        //
+        // SAFETY: ordering contract per this method's own doc comment;
+        // `gicr_base` names QEMU virt's fixed, documented single-core
+        // Redistributor MMIO base.
+        unsafe {
+            const QEMU_VIRT_DEFAULT_GICR_BASE: u64 = 0x080A_0000;
+            let gicr_base = QEMU_VIRT_DEFAULT_GICR_BASE;
+
+            let mut waker = gicd_read32(gicr_base, gicr_reg::WAKER);
+            waker &= !(1 << 1); // clear ProcessorSleep
+            gicd_write32(gicr_base, gicr_reg::WAKER, waker);
+            while gicd_read32(gicr_base, gicr_reg::WAKER) & (1 << 2) != 0 {
+                // Poll ChildrenAsleep until it clears.
+            }
+
+            let sgi_base = gicr_base + gicr_reg::SGI_BASE_OFFSET;
+            let byte_offset = gicr_reg::IPRIORITYR + TIMER_PPI_INTID;
+            gicd_write32(sgi_base, byte_offset & !0x3, 0x8080_8080);
+            gicd_write32(sgi_base, gicr_reg::ISENABLER0, 1 << TIMER_PPI_INTID);
         }
 
         Ok(())
@@ -494,15 +591,20 @@ fn global_timer_ref() -> &'static timer::Timer {
     unsafe { &*(ptr as *const timer::Timer) }
 }
 
-/// Called from `cpu.rs`'s `irq_exception_entry` trampoline (via
-/// `common_interrupt_entry`). Unlike x86_64's vector-number-on-stack
-/// approach, this function itself reads the pending INTID from the GIC
-/// (`read_iar`) since AArch64's vector table has no per-IRQ stub to
-/// pre-capture it — see cpu.rs's exception vector table module docs.
-pub fn dispatch_current_irq() {
+/// Called from `cpu.rs`'s `irq_exception_entry` (EL1-native IRQs) and
+/// `irq_el0_entry` (IRQs preempting a running U-mode thread) trampolines
+/// via `common_interrupt_entry`/`common_irq_el0_entry`. Unlike x86_64's
+/// vector-number-on-stack approach, this function itself reads the
+/// pending INTID from the GIC (`read_iar`) since AArch64's vector table
+/// has no per-IRQ stub to pre-capture it — see cpu.rs's exception vector
+/// table module docs. Returns the INTID actually dispatched (or a value
+/// `>= 1020`, the GICv3 spurious-read range, if nothing was pending) so
+/// `common_irq_el0_entry` can tell whether this was specifically the
+/// timer PPI without duplicating the IAR read/EOI sequence itself.
+pub fn dispatch_current_irq() -> u32 {
     let ptr = GLOBAL_CONTROLLER_PTR.load(Ordering::SeqCst);
     if ptr == 0 {
-        return; // mirrors hal-x86_64's dispatch_vector unreachable-in-practice guard
+        return 1023; // mirrors hal-x86_64's dispatch_vector unreachable-in-practice guard
     }
     // SAFETY: same lifetime argument as hal-x86_64's dispatch_vector —
     // `ptr` was stored by set_global_controller from a value living for
@@ -514,13 +616,13 @@ pub fn dispatch_current_irq() {
         // Spurious read (no interrupt actually pending) — per GICv3
         // spec section 4.1, no EOI should be issued for a spurious
         // INTID.
-        return;
+        return intid;
     }
 
     if intid == TIMER_PPI_INTID {
         timer::on_timer_interrupt(global_timer_ref());
         controller.end_of_interrupt(IrqId::new(intid));
-        return;
+        return intid;
     }
 
     if intid >= FIRST_USABLE_INTID {
@@ -534,6 +636,7 @@ pub fn dispatch_current_irq() {
     }
 
     controller.end_of_interrupt(IrqId::new(intid));
+    intid
 }
 
 #[cfg(test)]

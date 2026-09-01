@@ -102,8 +102,23 @@ kernel_id! {
 }
 
 kernel_id! {
+    /// Id of a `SharedRegion` object — a zero-copy bulk-transfer memory
+    /// range (02-Microkernel-Layer.md §5.2).
+    SharedRegionId
+}
+
+kernel_id! {
     /// Id of a scheduler `ChainGroup` — the set of threads participating in
     /// one synchronous IPC chain, charged a shared `vruntime`
     /// (02-Microkernel-Layer.md §4.3).
     ChainGroupId
+}
+
+kernel_id! {
+    /// Id of an `MmioRegion` object — a device's physical MMIO transport
+    /// window plus its IRQ line, granted (not `Retype`d — the physical
+    /// address is a fixed hardware fact, not carved from a pool of
+    /// general `UntypedMemory`) to exactly one driver process
+    /// (03-Kernel-Subsystems-Layer.md §2.1, §5.1).
+    MmioRegionId
 }

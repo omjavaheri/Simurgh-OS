@@ -292,6 +292,14 @@ pub enum TrapOutcome {
     /// advance `sepc` past the 4-byte `ecall`. The ordinary syscall
     /// return.
     Resume(usize),
+    /// Same as `Resume`, but also places `.1` in `a1` — for a syscall
+    /// whose result genuinely does not fit in one register (e.g. `Recv`
+    /// returning both the sender's `ThreadId` and the message label —
+    /// see `kernel/src/main.rs`'s `IPC_RECV` demo opcode). A separate
+    /// variant rather than widening `Resume` itself: every OTHER
+    /// existing caller only ever has one value to return, and this
+    /// keeps them untouched.
+    Resume2(usize, usize),
     /// Serialise the trapping thread's full U-mode context (every GPR,
     /// `sepc` advanced past the `ecall`, `sstatus`, `satp`) into the
     /// `HAL_USER_CONTEXT_BYTES` blob at `save`, then restore the blob at
@@ -302,6 +310,19 @@ pub enum TrapOutcome {
         /// Where to write the outgoing thread's snapshot.
         save: *mut u8,
         /// The incoming thread's context to resume.
+        into: *const u8,
+    },
+    /// Like `SwitchTo`, but only the L4-style IPC fast path's minimal
+    /// register set is saved/restored (`ra`/`sp`/`gp`/`tp`/`s0`-`s11`/
+    /// `a0`/`a1`/`sepc`/`sstatus`/`satp` — see `save_ipc_fast_context`'s
+    /// own doc comment for exactly which and why), not every GPR. Used
+    /// ONLY by `kernel/src/main.rs`'s real `IPC_CALL`/`IPC_RECV`/
+    /// `IPC_REPLY` opcodes — every OTHER switch in this codebase keeps
+    /// using plain `SwitchTo`'s full, unconditional guarantee.
+    SwitchToFast {
+        /// Where to write the outgoing thread's fast-path snapshot.
+        save: *mut u8,
+        /// The incoming thread's fast-path context to resume.
         into: *const u8,
     },
     /// The trapping thread has been TERMINATED by the microkernel (a
@@ -465,12 +486,34 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                 let handler = unsafe { core::ptr::addr_of!(TICK_HANDLER).read() };
                 if let Some(h) = handler {
                     match h() {
-                        TrapOutcome::Resume(_) => return,
+                        TrapOutcome::Resume(_) | TrapOutcome::Resume2(_, _) => return,
                         TrapOutcome::SwitchTo { save, into } => {
                             // SAFETY: `save` / `into` are kernel-owned
                             // aligned `HAL_USER_CONTEXT_BYTES` blobs.
                             // Snapshot the preempted thread at `sepc`
                             // exactly, then never return.
+                            let f = unsafe { &mut *frame };
+                            unsafe {
+                                save_trap_frame_as_user_context(
+                                    f,
+                                    sepc,
+                                    save as *mut RiscvUserContext,
+                                );
+                                restore_user_and_sret(into as *const RiscvUserContext);
+                            }
+                        }
+                        TrapOutcome::SwitchToFast { save, into } => {
+                            // Unreachable in practice — `TickHandler`
+                            // (`kernel/src/main.rs`'s `simurgh_tick`)
+                            // never constructs this; only the SYSCALL
+                            // handler's real IPC opcodes do. Handled
+                            // safely regardless, via the SAME full
+                            // save/restore `SwitchTo` uses just above —
+                            // never the fast one, since a genuinely
+                            // preempted thread (unlike a cooperating IPC
+                            // participant) cannot be assumed to have
+                            // followed the fast path's narrower
+                            // call-boundary convention.
                             let f = unsafe { &mut *frame };
                             unsafe {
                                 save_trap_frame_as_user_context(
@@ -527,6 +570,13 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                 unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
                 return;
             }
+            TrapOutcome::Resume2(a0, a1) => {
+                f.regs[TrapFrame::A0] = a0 as u64;
+                f.regs[TrapFrame::A0 + 1] = a1 as u64;
+                // SAFETY: writing sepc is valid within a trap handler.
+                unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
+                return;
+            }
             TrapOutcome::SwitchTo { save, into } => {
                 // SAFETY: `save` / `into` are kernel-owned, 8-byte-
                 // aligned `HAL_USER_CONTEXT_BYTES` blobs (the trampoline
@@ -541,6 +591,20 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
                         save as *mut RiscvUserContext,
                     );
                     restore_user_and_sret(into as *const RiscvUserContext);
+                }
+            }
+            TrapOutcome::SwitchToFast { save, into } => {
+                // The L4-style IPC fast path (02-Microkernel-Layer.md
+                // §5.3/§8.3) — `kernel/src/main.rs`'s real `IPC_CALL`/
+                // `IPC_RECV`/`IPC_REPLY` opcodes are the ONLY things
+                // that ever construct this. SAFETY: same contract as
+                // `SwitchTo` just above — `save_ipc_fast_context`/
+                // `restore_ipc_fast_context`'s own doc comments cover
+                // exactly which registers this narrower path does (and
+                // does not) touch.
+                unsafe {
+                    save_ipc_fast_context(f, sepc + 4, save as *mut RiscvUserContext);
+                    restore_ipc_fast_context(into as *const RiscvUserContext);
                 }
             }
             TrapOutcome::Terminate { into } => {
@@ -576,13 +640,26 @@ extern "C" fn common_trap_entry(frame: *mut TrapFrame) {
         let handler = unsafe { core::ptr::addr_of!(FAULT_HANDLER).read() };
         if let Some(h) = handler {
             match h(cause_code, sepc, stval) {
-                TrapOutcome::Resume(_) => return,
+                TrapOutcome::Resume(_) | TrapOutcome::Resume2(_, _) => return,
                 TrapOutcome::SwitchTo { save, into } => {
                     // SAFETY: `frame` is the on-stack register file
                     // `trap_entry` just saved; valid here, no other live
                     // reference (the `ecall` branch above already
                     // returned by this point). `save`/`into` as the
                     // `ecall` `SwitchTo` arm above.
+                    let f = unsafe { &mut *frame };
+                    unsafe {
+                        save_trap_frame_as_user_context(f, sepc, save as *mut RiscvUserContext);
+                        restore_user_and_sret(into as *const RiscvUserContext);
+                    }
+                }
+                TrapOutcome::SwitchToFast { save, into } => {
+                    // Unreachable in practice — same reasoning as the
+                    // tick handler's own `SwitchToFast` arm: `FaultHandler`
+                    // (`simurgh_fault`) never constructs this. Handled
+                    // safely via the full save/restore regardless — a
+                    // thread that just took a FAULT cannot be assumed to
+                    // have followed the fast path's narrower convention.
                     let f = unsafe { &mut *frame };
                     unsafe {
                         save_trap_frame_as_user_context(f, sepc, save as *mut RiscvUserContext);
@@ -751,6 +828,107 @@ const _: () = {
     assert!(size_of::<RiscvUserContext>() == hal_core::HAL_USER_CONTEXT_BYTES);
 };
 
+/// Overwrites a SAVED (not currently executing) `UserContext` blob's
+/// `a0`/`a1` fields directly — for a thread being woken via a direct
+/// `TrapOutcome::SwitchTo` hand-off (not its own trap resuming, which
+/// goes through `Resume`/`Resume2` above instead): the target's a0/a1
+/// still hold whatever it originally trapped in WITH (its OWN syscall's
+/// input arguments), and the kernel-core-level delivery it is being
+/// woken for (e.g. `kernel_core::syscall::do_send`'s `Call` fast path
+/// delivering into an already-blocked `Recv`er) needs its RESULT
+/// placed there instead before the switch runs — mirrors `kernel/src/
+/// main.rs`'s own `IPC_RECV` demo opcode, which is the reason this
+/// exists.
+///
+/// # Safety
+/// `ctx` must point at a valid, currently-not-executing
+/// `HAL_USER_CONTEXT_BYTES` blob (the same contract `TrapOutcome::
+/// SwitchTo`'s `into` pointer carries) — typically a TCB's own
+/// `user_context` storage, reached BEFORE the actual switch into it.
+pub unsafe fn poke_saved_a0_a1(ctx: *mut u8, a0: usize, a1: usize) {
+    // SAFETY: forwarded from this function's own contract; `ctx` is
+    // `HAL_USER_CONTEXT_BYTES`-sized and 8-byte-aligned per that
+    // contract, matching `RiscvUserContext`'s own size/alignment (see
+    // the `const _` assertion just above).
+    let c = unsafe { &mut *(ctx as *mut RiscvUserContext) };
+    // `regs[9]`/`regs[10]` = `x10`/`x11` = `a0`/`a1` — see
+    // `RiscvUserContext`'s own doc comment (not `TrapFrame::A0`, which
+    // is only defined `#[cfg(target_os = "none")]` and this function
+    // must compile on host too, for `hal-riscv64`'s own test suite).
+    c.regs[9] = a0 as u64;
+    c.regs[10] = a1 as u64;
+}
+
+/// Halts the core in S-mode until any interrupt fires — `wfi`, RISC-V
+/// Privileged Spec §3.3.3 (interrupts remain enabled and are taken
+/// normally; the instruction simply lets hardware stop clocking the
+/// core between "now" and "the next interrupt", instead of the caller
+/// hot-spinning). Used by `kernel/src/main.rs`'s own `DRV_IRQ_WAIT`
+/// ecall (03-Kernel-Subsystems-Layer.md §2.1/§5.1): once
+/// `kernel_core::syscall::SyscallOp::Wait` reports nothing pending yet,
+/// this is the genuinely-idle alternative to busy-polling for the
+/// virtio-blk IRQ to land. A spurious or unrelated-interrupt wakeup is
+/// always safe — `wfi` merely resumes to the next instruction the
+/// moment ANY interrupt is taken (this core's own trap vector runs
+/// first, as normal, before control returns here); the caller is
+/// expected to re-check its own actual wait condition in a loop, not
+/// assume this call means that condition is now true.
+///
+/// Not part of `hal_core::CpuAbstraction`/`HalInterface`: this is a
+/// riscv64-only demo primitive (`kernel/main.rs`'s own `#[cfg(target_
+/// arch = "riscv64")]` dispatch section already calls `hal_riscv64::
+/// cpu` items directly — see e.g. `poke_saved_a0_a1`'s x86_64/aarch64
+/// siblings for the same established pattern), not a capability every
+/// architecture's boot/scheduling path needs today; growing the
+/// architecture-erased interface for it would be speculative ahead of
+/// a second caller.
+/// `sstatus` bit 1 (Supervisor Interrupt Enable) — the GLOBAL gate on
+/// whether a pending, `sie`-enabled interrupt is actually TAKEN (traps
+/// into a lower privilege level, e.g. U-mode, are always taken
+/// regardless of this bit — RISC-V Privileged Spec §3.1.6.1 — but a
+/// trap taken while ALREADY executing in S-mode, exactly `wfi`'s own
+/// situation here, is gated by it like any other same-level interrupt).
+/// Every trap entry hardware-clears this automatically on entry (into
+/// `SPIE`, restored by `sret`); this project's prior interrupt model
+/// never needed to set it explicitly because every interrupt it ever
+/// serviced was a U-mode-originated one.
+const SSTATUS_SIE_BIT: u64 = 1 << 1;
+
+/// Halts the core in S-mode until any interrupt fires — `wfi`, RISC-V
+/// Privileged Spec §3.3.3. Temporarily sets `sstatus.SIE` around the
+/// instruction itself (see `SSTATUS_SIE_BIT`'s own doc comment for why
+/// this is required here specifically, unlike every other interrupt
+/// this project has serviced so far) and restores it to clear
+/// afterward — ordinary kernel code between trap entry and `sret`
+/// otherwise always runs with interrupts effectively deferred to
+/// well-known points (this call being the first, deliberate exception),
+/// so leaving `SIE` set past this one instruction would be a real
+/// change to that invariant, not a harmless cleanup left undone.
+#[cfg(target_os = "none")]
+pub fn wfi() {
+    // SAFETY: `csrs`/`csrc sstatus, SSTATUS_SIE_BIT` sets/clears exactly
+    // one well-defined `sstatus` bit around `wfi`, matching the pattern
+    // `InterruptCtrl::bootstrap_current_core`'s own `csrs sie, ...` uses
+    // for `sie`. `wfi` itself has no preconditions beyond "valid to
+    // execute in the current privilege mode" (true in S-mode) and no
+    // side effects requiring justification beyond ordinary instruction
+    // execution — it does not touch memory, does not require draining
+    // pending stores it did not itself issue, and always eventually
+    // resumes (immediately if an interrupt is already pending, or is
+    // taken and returns via the trap vector's own `sret`) rather than
+    // ever deadlocking, so there are no additional caller obligations
+    // to describe here.
+    unsafe {
+        core::arch::asm!(
+            "csrs sstatus, {sie}",
+            "wfi",
+            "csrc sstatus, {sie}",
+            sie = in(reg) SSTATUS_SIE_BIT,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 /// SPP is `sstatus` bit 8 (Supervisor Previous Privilege): 0 = the trap
 /// that will be returned from via `sret` came from U-mode, so `sret`
 /// drops to U-mode. Only consumed on the bare-metal target (the host
@@ -864,6 +1042,142 @@ unsafe fn save_trap_frame_as_user_context(
         (*dst).sstatus = sstatus;
         (*dst).satp = satp;
         (*dst)._reserved = [0; 6];
+    }
+}
+
+// ============================================================================
+// L4-style IPC fast path: register-only partial save/restore
+// (02-Microkernel-Layer.md §5.3/§8.3 — `kernel_ipc::fastpath`'s own doc
+// comment names this exact gap: `TrapOutcome::SwitchTo` above always
+// saves/restores the FULL 31-GPR set, and a true register-only fast
+// path needs an architecture primitive that skips the ones the IPC
+// ABI itself does not need).
+//
+// The two functions below treat an `IPC_CALL`/`IPC_RECV`/`IPC_REPLY`
+// `ecall` AS a function-call boundary, not a fully opaque trap — the
+// SAME convention every real L4-family microkernel's own fast path
+// uses: RISC-V's own callee-saved set (`ra`, `sp`, `gp`, `tp`,
+// `s0`-`s11`) plus this project's own message registers (`a0`/`a1`)
+// are saved/restored; RISC-V's own CALLER-saved set (`t0`-`t6`,
+// `a2`-`a7`) is not — a correctly-compiled U-mode program has no
+// business relying on those surviving a call-like boundary in the
+// first place, so skipping them is not a correctness gap for well-
+// behaved code. `sepc`/`sstatus`/`satp` stay mandatory either way
+// (resuming with the wrong address space or privilege state is never
+// safe to skip).
+//
+// This is NOT the general `TrapOutcome::SwitchTo` mechanism narrowed
+// in place — it is a genuinely SEPARATE pair of functions
+// (`TrapOutcome::SwitchToFast` below), used ONLY by the three real IPC
+// opcodes (`kernel/src/main.rs`'s own doc comment on each), so every
+// OTHER switch in this codebase (`P2_YIELD`, preemption, fault
+// hand-off, ...) keeps the FULL, unconditional "every register
+// preserved" guarantee this project's own `raw_syscall` doc comments
+// already promise callers.
+// ============================================================================
+
+/// Like `save_trap_frame_as_user_context`, but only saves the fast
+/// path's minimal register set (see this section's own doc comment for
+/// exactly which, and why). Deliberately does NOT touch `t0`-`t6`/
+/// `a2`-`a7` in `dst` at all — see `restore_ipc_fast_context`'s own doc
+/// comment for why leaving them unwritten here is safe: that function
+/// never reads them back out of this buffer either.
+///
+/// # Safety
+/// Same contract as `save_trap_frame_as_user_context`.
+#[cfg(target_os = "none")]
+unsafe fn save_ipc_fast_context(frame: &TrapFrame, resume_sepc: usize, dst: *mut RiscvUserContext) {
+    let (sstatus, satp): (u64, u64);
+    // SAFETY: reading sstatus/satp has no preconditions in S-mode.
+    unsafe {
+        core::arch::asm!("csrr {}, sstatus", out(reg) sstatus);
+        core::arch::asm!("csrr {}, satp", out(reg) satp);
+    }
+    // SAFETY: `dst` is valid writable storage of the matching size /
+    // alignment per this function's contract.
+    unsafe {
+        let d = &mut *dst;
+        d.regs[0] = frame.regs[0]; // ra (x1)
+        // Same sp correction as `save_trap_frame_as_user_context`'s own
+        // doc comment explains — `frame.regs[1]` is 248 bytes low.
+        d.regs[1] = frame as *const TrapFrame as u64 + core::mem::size_of::<TrapFrame>() as u64;
+        d.regs[2] = frame.regs[2]; // gp (x3)
+        d.regs[3] = frame.regs[3]; // tp (x4)
+        d.regs[7] = frame.regs[7]; // s0 (x8)
+        d.regs[8] = frame.regs[8]; // s1 (x9)
+        d.regs[9] = frame.regs[9]; // a0 (x10) — message register
+        d.regs[10] = frame.regs[10]; // a1 (x11) — message register
+        d.regs[17..27].copy_from_slice(&frame.regs[17..27]); // s2-s11 (x18-x27)
+        d.sepc = resume_sepc as u64;
+        d.sstatus = sstatus;
+        d.satp = satp;
+    }
+}
+
+/// Restores ONLY the fast path's minimal register set (see this
+/// section's own doc comment) and `sret`s. Every register this path
+/// does NOT restore from `blob` (`t0`-`t6`, `a2`-`a7`) is explicitly
+/// ZEROED instead of left holding whatever the OUTGOING thread's own
+/// registers happened to contain when this hand-off began — closing a
+/// real cross-thread information-disclosure gap a naive "just don't
+/// touch them" implementation would otherwise open (a thread resumed
+/// this way must never be able to read a DIFFERENT thread's leftover
+/// register contents, even ones its own correctly-compiled code has no
+/// business reading). `t5`/`t6` (x30/x31) are zeroed dead last, same
+/// "base register loads its own final value last" discipline
+/// `restore_user_and_sret` already uses — `t6` is the base register
+/// for every `ld ...(t6)` above it, so zeroing it any earlier would
+/// corrupt every subsequent load.
+///
+/// # Safety
+/// Same contract as `restore_user_and_sret`.
+#[cfg(target_os = "none")]
+unsafe fn restore_ipc_fast_context(blob: *const RiscvUserContext) -> ! {
+    // SAFETY: contract above.
+    unsafe {
+        core::arch::asm!(
+            "ld  t5, 256(t6)",   // sstatus
+            "csrw sstatus, t5",
+            "ld  t5, 248(t6)",   // sepc
+            "csrw sepc, t5",
+            "ld  t5, 264(t6)",   // satp
+            "csrw satp, t5",
+            "sfence.vma",
+            "ld  x1,  0(t6)",    // ra
+            "ld  x2,  8(t6)",    // sp
+            "ld  x3,  16(t6)",   // gp
+            "ld  x4,  24(t6)",   // tp
+            "li  x5,  0",        // t0 — caller-saved, zeroed not restored
+            "li  x6,  0",        // t1
+            "li  x7,  0",        // t2
+            "ld  x8,  56(t6)",   // s0
+            "ld  x9,  64(t6)",   // s1
+            "ld  x10, 72(t6)",   // a0
+            "ld  x11, 80(t6)",   // a1
+            "li  x12, 0",        // a2 — caller-saved, zeroed
+            "li  x13, 0",        // a3
+            "li  x14, 0",        // a4
+            "li  x15, 0",        // a5
+            "li  x16, 0",        // a6
+            "li  x17, 0",        // a7
+            "ld  x18, 136(t6)",  // s2
+            "ld  x19, 144(t6)",  // s3
+            "ld  x20, 152(t6)",  // s4
+            "ld  x21, 160(t6)",  // s5
+            "ld  x22, 168(t6)",  // s6
+            "ld  x23, 176(t6)",  // s7
+            "ld  x24, 184(t6)",  // s8
+            "ld  x25, 192(t6)",  // s9
+            "ld  x26, 200(t6)",  // s10
+            "ld  x27, 208(t6)",  // s11
+            "li  x28, 0",        // t3 — caller-saved, zeroed
+            "li  x29, 0",        // t4
+            "li  x30, 0",        // t5 — scratch above; safe to zero now
+            "li  x31, 0",        // t6 — MUST be last (was the base register)
+            "sret",
+            in("t6") blob,
+            options(noreturn),
+        );
     }
 }
 

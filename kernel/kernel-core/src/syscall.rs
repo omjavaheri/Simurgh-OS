@@ -24,12 +24,13 @@
 
 use crate::state::KernelState;
 use crate::tcb::ThreadState;
-use hal_core::{HalInterface, MapPermissions, VirtAddr};
+use hal_core::{HalInterface, MapPermissions, PhysAddr, VirtAddr};
 use kernel_cap::{
-    CapId, CapTableError, Capability, CapabilityRights, KernelObjectKind, ObjectId, ObjectRef,
-    PageTableId, ThreadId, UntypedId,
+    CapId, CapTableError, Capability, CapabilityRights, KernelObjectKind, MmioRegionId,
+    NotificationId, ObjectId, ObjectRef, PageTableId, ThreadId, UntypedId,
 };
-use kernel_ipc::{EndpointError, IpcError, RecvOutcome, SendOutcome, SmallMessage};
+use kernel_ipc::fastpath::{fast_path_eligible, FastPathDecision};
+use kernel_ipc::{EndpointError, IpcError, RecvOutcome, SendOutcome, SharedRegion, SmallMessage};
 use kernel_mm::{KernelObjectType, MmError, PAGE_SIZE};
 use kernel_sched::SchedError;
 
@@ -60,6 +61,25 @@ pub enum SyscallOp {
         /// Endpoint capability.
         endpoint: CapId,
         /// The request message.
+        msg: SmallMessage,
+    },
+    /// Wakes `to` (which must currently be `BlockedOnReply` — the
+    /// caller of a prior `Call`) with `msg` as its reply, and hands the
+    /// CPU straight to it. `to` is a raw `ThreadId`, not a capability:
+    /// a receiver already learns it as `Recv`'s own `from` field with
+    /// no separate grant needed, per the deliberate MVP simplification
+    /// this crate's `doc/IMPLEMENTATION-PLAN.md` records ("direct
+    /// `ThreadId` reply", not a seL4-style one-shot reply capability —
+    /// flagged there as an accepted gap: nothing stops a thread that
+    /// merely GUESSES another thread's id from replying to a call it
+    /// never received; closing that needs the capability version this
+    /// MVP explicitly deferred). The one enforced invariant is `to`'s
+    /// `ThreadState` — you cannot "reply" to a thread that both is not
+    /// and was never blocked awaiting exactly this.
+    Reply {
+        /// The `Call`er to wake.
+        to: ThreadId,
+        /// The reply message.
         msg: SmallMessage,
     },
     /// Voluntarily yield the CPU. Always succeeds.
@@ -98,13 +118,62 @@ pub enum SyscallOp {
     Map {
         /// A `PageTable` (address-space-root) capability.
         page_table: CapId,
-        /// The frame to map (an `UntypedMemory` capability in this MVP
-        /// model — one page of it).
+        /// The frame to map: either an `UntypedMemory` capability (one
+        /// page of RAM, the original MVP model) or an `MmioRegion`
+        /// capability (a device's transport window, 03 §2.1) — resolved
+        /// by the capability's actual stored kind, not by a separate
+        /// flag.
         frame: CapId,
         /// Virtual address to map at (page-aligned).
         vaddr: VirtAddr,
         /// Mapping permissions.
         perms: MapPermissions,
+    },
+    /// Signals `notification`, OR-ing `bits` into its sticky signal word
+    /// and waking every thread currently blocked in `Wait` on it (02
+    /// §5.1). Requires `WRITE`. Always succeeds once the capability
+    /// resolves.
+    Signal {
+        /// A `Notification` capability.
+        notification: CapId,
+        /// Bits to OR into the signal word (badge/IRQ-line encoded by
+        /// the caller — the kernel never interprets them).
+        bits: u64,
+    },
+    /// Consumes and returns the current signal bits if any are pending;
+    /// otherwise blocks the caller until the next `Signal` (02 §5.1).
+    /// Requires `READ`.
+    Wait {
+        /// A `Notification` capability.
+        notification: CapId,
+    },
+    /// Consumes and returns the current signal bits without blocking —
+    /// `0` if nothing is pending (02 §5.1). Requires `READ`.
+    Poll {
+        /// A `Notification` capability.
+        notification: CapId,
+    },
+    /// Binds the IRQ line named by the `MmioRegion` capability `mmio` to
+    /// `notification`, and installs `handler` with the platform's
+    /// `InterruptController` so a real hardware interrupt on that line
+    /// signals it (03 §2.1: "صدور Capability محدود به هر درایور: فقط IRQ
+    /// همان دستگاه" — holding `mmio` is what authorizes binding exactly
+    /// its own IRQ, never an arbitrary line number). Requires `WRITE` on
+    /// both `mmio` and `notification`.
+    IrqBind {
+        /// An `MmioRegion` capability — its own `irq` field is the line
+        /// bound, not a separate caller-supplied number.
+        mmio: CapId,
+        /// A `Notification` capability to signal when the line fires.
+        notification: CapId,
+        /// The trampoline the platform's `InterruptController` invokes
+        /// directly from interrupt context. A plain function pointer
+        /// (no captured state, per `hal_core::interrupt::IrqHandler`'s
+        /// own doc comment) supplied by the caller (`kernel-arch-glue`),
+        /// which is the only layer that knows a concrete trampoline
+        /// address — `kernel-core` must not name one itself (that would
+        /// invert the crate dependency direction).
+        handler: hal_core::interrupt::IrqHandler,
     },
 }
 
@@ -185,6 +254,16 @@ pub enum SyscallError {
     Ipc(IpcError),
     /// A scheduler operation failed.
     Sched(SchedError),
+    /// `Reply { to, .. }` named a thread that is not (or is no longer)
+    /// `BlockedOnReply` — nothing to wake.
+    NotBlockedOnReply,
+    /// A `Notification` operation failed (currently only `Wait`'s
+    /// waiter-list-full case).
+    Notify(kernel_ipc::NotificationError),
+    /// `IrqBind`'s `hal.register_irq` call was rejected by the platform
+    /// `InterruptController` (an out-of-range line, or one already
+    /// registered to a different handler).
+    IrqRegistrationFailed,
     /// The requested operation is not implemented in this MVP.
     Unsupported,
 }
@@ -202,6 +281,11 @@ impl From<MmError> for SyscallError {
 impl From<IpcError> for SyscallError {
     fn from(e: IpcError) -> Self {
         SyscallError::Ipc(e)
+    }
+}
+impl From<kernel_ipc::NotificationError> for SyscallError {
+    fn from(e: kernel_ipc::NotificationError) -> Self {
+        SyscallError::Notify(e)
     }
 }
 impl From<EndpointError> for SyscallError {
@@ -306,6 +390,18 @@ impl KernelState {
             SyscallOp::Send { endpoint, msg } => self.do_send(caller, endpoint, msg, false, now_ns),
             SyscallOp::Call { endpoint, msg } => self.do_send(caller, endpoint, msg, true, now_ns),
             SyscallOp::Recv { endpoint } => self.do_recv(caller, endpoint, now_ns),
+            SyscallOp::Reply { to, msg } => self.do_reply(caller, to, msg, now_ns),
+
+            SyscallOp::Signal { notification, bits } => {
+                self.do_signal(caller, notification, bits, now_ns)
+            }
+            SyscallOp::Wait { notification } => self.do_wait(caller, notification, now_ns),
+            SyscallOp::Poll { notification } => self.do_poll(caller, notification),
+            SyscallOp::IrqBind {
+                mmio,
+                notification,
+                handler,
+            } => self.do_irq_bind(caller, mmio, notification, handler, hal),
         }
     }
 
@@ -393,6 +489,19 @@ impl KernelState {
                         .ok_or(SyscallError::ObjectTableFull)?;
                     (KernelObjectKind::UntypedMemory, id.as_u32())
                 }
+                KernelObjectType::SharedRegion => {
+                    // MVP: full RW is always the widest a fresh region
+                    // permits — `Retype` carries no rights argument (same
+                    // "no size/rights argument yet" gap `Untyped`'s own
+                    // arm above already notes); a peer can still be
+                    // GRANTed a narrower derived capability later via the
+                    // ordinary `CapGrant` rights-narrowing path.
+                    let region = SharedRegion::new(PhysAddr::new(obj_phys as usize), per as usize, CapabilityRights::RW);
+                    let id = self
+                        .alloc_shared_region(region)
+                        .ok_or(SyscallError::ObjectTableFull)?;
+                    (KernelObjectKind::SharedRegion, id.as_u32())
+                }
             };
 
             let newcap = Capability::full(ObjectRef::new(kind, ObjectId::new(obj_id)));
@@ -470,8 +579,15 @@ impl KernelState {
             KernelObjectKind::PageTable,
             CapabilityRights::WRITE,
         )?;
-        // In this MVP model a "frame" is one page of an UntypedMemory
-        // object; require rights on it matching the mapping.
+        // In this MVP model a "frame" is either one page of an
+        // UntypedMemory object (RAM) or an entire MmioRegion (a device's
+        // transport window, 03 §2.1) — resolved by the capability's own
+        // stored kind rather than a separate flag; both currently map as
+        // exactly one PAGE_SIZE region (every MmioRegion this kernel
+        // mints today — virtio-mmio on riscv64 — is itself exactly one
+        // page; a multi-page window would need a real generalization
+        // here, not needed by any MVP driver yet). Require rights on it
+        // matching the mapping.
         let need = if perms.executable {
             CapabilityRights::READ | CapabilityRights::EXECUTE
         } else if perms.writable {
@@ -479,12 +595,25 @@ impl KernelState {
         } else {
             CapabilityRights::READ
         };
-        let fr = self.resolve(caller, frame, KernelObjectKind::UntypedMemory, need)?;
-        let uid = UntypedId::new(fr.object.id.as_u32());
-        let frame_phys = self
-            .untyped_mut(uid)
-            .ok_or(SyscallError::BadCap)?
-            .base();
+        let cs_id = self.tcb(caller).ok_or(SyscallError::NoCaller)?.cap_space;
+        let fr = {
+            let cs = self.cap_space(cs_id).ok_or(SyscallError::NoCaller)?;
+            *cs.lookup(frame).ok_or(SyscallError::BadCap)?
+        };
+        if !fr.allows(need) {
+            return Err(SyscallError::InsufficientRights);
+        }
+        let frame_phys = match fr.object.kind {
+            KernelObjectKind::UntypedMemory => {
+                let uid = UntypedId::new(fr.object.id.as_u32());
+                self.untyped_mut(uid).ok_or(SyscallError::BadCap)?.base()
+            }
+            KernelObjectKind::MmioRegion => {
+                let mid = MmioRegionId::new(fr.object.id.as_u32());
+                PhysAddr::new(self.mmio_region(mid).ok_or(SyscallError::BadCap)?.phys_base as usize)
+            }
+            _ => return Err(SyscallError::WrongObjectKind),
+        };
 
         let as_id = PageTableId::new(pt.object.id.as_u32());
         let root_phys = {
@@ -527,6 +656,112 @@ impl KernelState {
         Ok(SyscallReturn::Mapped)
     }
 
+    /// `SyscallOp::Signal`.
+    fn do_signal(
+        &mut self,
+        caller: ThreadId,
+        notification: CapId,
+        bits: u64,
+        now_ns: u64,
+    ) -> Result<SyscallReturn, SyscallError> {
+        let cap = self.resolve(
+            caller,
+            notification,
+            KernelObjectKind::Notification,
+            CapabilityRights::WRITE,
+        )?;
+        let nid = NotificationId::new(cap.object.id.as_u32());
+        let woken = self
+            .notification_mut(nid)
+            .ok_or(SyscallError::BadCap)?
+            .signal(bits);
+        for &tid in woken.as_slice() {
+            self.wake_blocked(tid, now_ns);
+        }
+        Ok(SyscallReturn::Done)
+    }
+
+    /// `SyscallOp::Wait` — consumes and returns pending bits immediately
+    /// if any are set; otherwise blocks the caller (`Notification::wait`'s
+    /// own contract: only call it when `poll` would return `0`).
+    fn do_wait(
+        &mut self,
+        caller: ThreadId,
+        notification: CapId,
+        now_ns: u64,
+    ) -> Result<SyscallReturn, SyscallError> {
+        let cap = self.resolve(
+            caller,
+            notification,
+            KernelObjectKind::Notification,
+            CapabilityRights::READ,
+        )?;
+        let nid = NotificationId::new(cap.object.id.as_u32());
+        let notif = self.notification_mut(nid).ok_or(SyscallError::BadCap)?;
+        let bits = notif.poll();
+        if bits != 0 {
+            return Ok(SyscallReturn::Value(bits));
+        }
+        notif.wait(caller)?;
+        // The caller is now on the notification's own waiter list, but
+        // that alone does not remove it from the SCHEDULER's own Ready
+        // pool — without this, `pick_next` could re-pick a thread that
+        // is not actually resumable (the same "phantom Ready" bug class
+        // `preempt.rs::block_thread`'s own doc comment already
+        // documents for the IPC-block case; `Signal`'s own `wake_blocked`
+        // call is `note_blocked`'s exact counterpart, undoing this).
+        self.sched.account(now_ns);
+        let _ = self.sched.note_blocked(caller);
+        Ok(SyscallReturn::Blocked)
+    }
+
+    /// `SyscallOp::Poll` — never blocks.
+    fn do_poll(
+        &mut self,
+        caller: ThreadId,
+        notification: CapId,
+    ) -> Result<SyscallReturn, SyscallError> {
+        let cap = self.resolve(
+            caller,
+            notification,
+            KernelObjectKind::Notification,
+            CapabilityRights::READ,
+        )?;
+        let nid = NotificationId::new(cap.object.id.as_u32());
+        let bits = self.notification_mut(nid).ok_or(SyscallError::BadCap)?.poll();
+        Ok(SyscallReturn::Value(bits))
+    }
+
+    /// `SyscallOp::IrqBind`.
+    fn do_irq_bind(
+        &mut self,
+        caller: ThreadId,
+        mmio: CapId,
+        notification: CapId,
+        handler: hal_core::interrupt::IrqHandler,
+        hal: &HalInterface,
+    ) -> Result<SyscallReturn, SyscallError> {
+        let mmio_cap = self.resolve(caller, mmio, KernelObjectKind::MmioRegion, CapabilityRights::WRITE)?;
+        let mid = MmioRegionId::new(mmio_cap.object.id.as_u32());
+        let irq = self.mmio_region(mid).ok_or(SyscallError::BadCap)?.irq;
+
+        let notif_cap = self.resolve(
+            caller,
+            notification,
+            KernelObjectKind::Notification,
+            CapabilityRights::WRITE,
+        )?;
+        let nid = NotificationId::new(notif_cap.object.id.as_u32());
+
+        if !self.bind_irq(irq, nid) {
+            return Err(SyscallError::ObjectTableFull);
+        }
+        if !hal.register_irq(irq, handler) {
+            return Err(SyscallError::IrqRegistrationFailed);
+        }
+        Ok(SyscallReturn::Done)
+    }
+
     fn do_send(
         &mut self,
         caller: ThreadId,
@@ -542,6 +777,23 @@ impl KernelState {
             CapabilityRights::WRITE,
         )?;
         let eid = kernel_cap::EndpointId::new(ep_cap.object.id.as_u32());
+
+        // L4-style IPC fast path (02-Microkernel-Layer.md §5.3/§8.3):
+        // predict, via the tested pure predicate in `kernel_ipc::
+        // fastpath`, whether this call is about to synchronously
+        // rendezvous with an ALREADY-blocked receiver — `try_send` below
+        // independently re-derives the identical condition a moment
+        // later via `SendOutcome::DeliveredTo`. Only `is_call` can ever
+        // take the fast branch: a plain `Send`'s own `DeliveredTo` case
+        // (below) already returns immediately without touching the
+        // scheduler's `pick_next` at all, so there is nothing to skip.
+        let fast_path = is_call
+            && matches!(
+                self.endpoint_mut(eid)
+                    .map(|ep| fast_path_eligible(ep, &msg, is_call)),
+                Some(FastPathDecision::Take { .. })
+            );
+
         let outcome = {
             let ep = self.endpoint_mut(eid).ok_or(SyscallError::BadCap)?;
             ep.try_send(caller, msg, true)?
@@ -554,6 +806,14 @@ impl KernelState {
                 if let Some((rx2, m)) = delivered {
                     if let Some(t) = self.tcb_mut(rx2) {
                         t.pending_msg = Some(m);
+                        // `rx2` was already blocked in `Recv` (that is
+                        // exactly why delivery was synchronous) and is
+                        // about to be switched straight back in, not
+                        // returned to via `Recv`'s own synchronous
+                        // `Message { from, .. }` — record `caller` so a
+                        // later `Reply { to: caller, .. }` is possible
+                        // (see `Tcb::pending_from`'s own doc comment).
+                        t.pending_from = Some(caller);
                         t.state = ThreadState::Runnable;
                     }
                     self.sched.note_ready(rx2, now_ns)?;
@@ -564,7 +824,26 @@ impl KernelState {
                         t.state = ThreadState::BlockedOnReply;
                     }
                     self.sched.note_blocked(caller)?;
-                    let next = self.sched.pick_next(now_ns);
+                    let next = if fast_path {
+                        // FAST PATH: `rx` is a confirmed, already-blocked
+                        // receiver taking THIS message right now — hand
+                        // the CPU to it directly instead of re-deriving
+                        // the same answer via `pick_next`'s O(n) scan
+                        // over every `Ready` thread. This is the SAME
+                        // "direct named-thread handoff, not general
+                        // fairness" pattern this crate's own `preempt`
+                        // module already establishes for the fault-
+                        // isolation demo (`terminate_thread_and_handoff`/
+                        // `yield_to_thread`) — not a correctness
+                        // compromise: an IPC rendezvous transfers control
+                        // to the specific party being communicated with
+                        // BY DEFINITION, in every L4-family kernel (the
+                        // fast path is never subject to the general
+                        // scheduler's fairness in the first place).
+                        Some(rx)
+                    } else {
+                        self.sched.pick_next(now_ns)
+                    };
                     return Ok(SyscallReturn::Reschedule { next });
                 }
                 Ok(SyscallReturn::Delivered { woke: rx })
@@ -621,6 +900,59 @@ impl KernelState {
             }
             RecvOutcome::WouldBlock => Ok(SyscallReturn::Blocked),
         }
+    }
+
+    /// `Reply { to, msg }` — see `SyscallOp::Reply`'s own doc comment
+    /// for the accepted MVP simplification (raw `ThreadId`, no reply
+    /// capability) this implements. Always a direct, unconditional
+    /// handoff: unlike `Call`'s fast path (which only sometimes finds
+    /// an already-blocked receiver), `Reply` NAMES its target — there
+    /// is never a "no receiver, fall back to the general path" case, so
+    /// this always skips `pick_next` and switches straight to `to`.
+    fn do_reply(
+        &mut self,
+        caller: ThreadId,
+        to: ThreadId,
+        msg: SmallMessage,
+        now_ns: u64,
+    ) -> Result<SyscallReturn, SyscallError> {
+        if caller == to {
+            return Err(SyscallError::NotBlockedOnReply);
+        }
+        let target_ok = self
+            .tcb(to)
+            .map(|t| t.state == ThreadState::BlockedOnReply)
+            .unwrap_or(false);
+        if !target_ok {
+            return Err(SyscallError::NotBlockedOnReply);
+        }
+        if let Some(t) = self.tcb_mut(to) {
+            t.pending_msg = Some(msg);
+            t.state = ThreadState::Runnable;
+        }
+        self.sched.note_ready(to, now_ns)?;
+        // The replier itself is not blocking, so it must become `Ready`
+        // too, not stay whatever `Scheduler::dispatch` last set it to —
+        // `dispatch` only ever updates the INCOMING thread's own state,
+        // never the outgoing one's (see its own doc comment), so
+        // without this a direct-switch consumer's replier is left
+        // (incorrectly) `Running` forever, invisible to a LATER
+        // `pick_next` even though it is genuinely schedulable again.
+        // **Real bug found via QEMU** (this session's real U-mode Call/
+        // Recv/Reply demo — see `kernel_arch_glue::p2_ipc_demo_start`'s
+        // own "Real bug found via QEMU" doc comment for the sibling bug
+        // that surfaced it): an earlier version of this comment claimed
+        // "the caller of `dispatch` always re-readies the outgoing
+        // thread" — true for `kernel-core::run::yield_to` (the in-kernel
+        // demo's own consumer, which DOES re-ready its outgoing thread),
+        // but NOT for a direct `TrapOutcome::SwitchTo` consumer (a real
+        // U-mode trap boundary), which has no such step at all. Calling
+        // `note_ready` here, unconditionally, fixes it at the source for
+        // EVERY consumer rather than requiring each one to remember to —
+        // idempotent for `yield_to`'s own redundant call (harmless: it
+        // would just re-set the same state/timestamp again).
+        self.sched.note_ready(caller, now_ns)?;
+        Ok(SyscallReturn::Reschedule { next: Some(to) })
     }
 }
 
@@ -686,13 +1018,45 @@ mod tests {
         }
     }
 
-    // `build_interface`'s `cpu`/`timer` refs must outlive the
+    /// Always-succeeds `InterruptController` double: no test in this
+    /// module exercises real IRQ delivery hardware, only `IrqBind`'s
+    /// kernel-side bookkeeping (binding table + the `register_irq` call
+    /// itself succeeding).
+    struct MockInterrupt;
+    impl hal_core::interrupt::InterruptController for MockInterrupt {
+        fn register_irq(
+            &self,
+            _irq: hal_core::interrupt::IrqId,
+            _handler: hal_core::interrupt::IrqHandler,
+        ) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn unregister_irq(&self, _irq: hal_core::interrupt::IrqId) {}
+        fn mask_irq(&self, _irq: hal_core::interrupt::IrqId) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn unmask_irq(&self, _irq: hal_core::interrupt::IrqId) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn send_ipi(&self, _target_core: usize, _vector: u8) -> Result<(), HalError> {
+            Ok(())
+        }
+        fn irq_line_count(&self) -> u32 {
+            64
+        }
+        fn ipi_target_core_count(&self) -> u32 {
+            1
+        }
+        fn end_of_interrupt(&self, _irq: hal_core::interrupt::IrqId) {}
+    }
+
+    // `build_interface`'s `cpu`/`timer`/`interrupt` refs must outlive the
     // `HalInterface` it returns, so this returns owned values for each
     // test to bind as locals before building its own `hal` — kernel-core
     // is `#![no_std]` with no `alloc`, so no `Box::leak` shortcut (same
     // pattern `run.rs`'s tests already use).
-    fn mock_hal_pair() -> (MockCpu, MockTimer) {
-        (MockCpu, MockTimer)
+    fn mock_hal_pair() -> (MockCpu, MockTimer, MockInterrupt) {
+        (MockCpu, MockTimer, MockInterrupt)
     }
 
     fn kernel() -> KernelState {
@@ -721,8 +1085,8 @@ mod tests {
     fn retype_untyped_into_endpoint_gives_new_cap() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         // The Root Task's first capability (slot 0) is an UntypedMemory cap.
         let r = k
             .dispatch(
@@ -753,11 +1117,233 @@ mod tests {
     }
 
     #[test]
+    fn retype_untyped_into_shared_region_gives_new_cap() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let r = k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::SharedRegion,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap();
+        match r {
+            SyscallReturn::NewCaps { cap, count } => {
+                assert_eq!(count, 1);
+                let c = k
+                    .resolve(caller, cap, KernelObjectKind::SharedRegion, CapabilityRights::READ)
+                    .unwrap();
+                let region = k
+                    .shared_region(kernel_cap::SharedRegionId::new(c.object.id.as_u32()))
+                    .unwrap();
+                assert_eq!(region.size, PAGE_SIZE);
+                assert!(region.max_rights.contains(CapabilityRights::RW));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Like `kernel()`, but the manifest also reports one `Block`-kind
+    /// peripheral device, so `populate_from_boot_info`'s Step 3c seeds
+    /// `root_mmio_blk_cap` — the boot-time-only path an `MmioRegion`
+    /// capability can come from (never `Retype`, see
+    /// `MmioRegionDescriptor`'s own doc comment).
+    fn kernel_with_mmio_blk() -> KernelState {
+        let mut m = HardwareManifestRaw::zeroed();
+        m.cpu_core_count = 1;
+        m.push_memory_region(MemoryRegionRaw::new(
+            0x100_0000,
+            32 * 1024 * 1024,
+            MemoryRegionKindRaw::Usable,
+            false,
+        ))
+        .unwrap();
+        m.timer = TimerInfoRaw::new(TimerKindRaw::Tsc, 1_000_000_000, false);
+        let _ = m.push_peripheral_device(hal_manifest::raw::PeripheralDeviceRaw::new(
+            hal_manifest::raw::PeripheralKindRaw::Block,
+            0x1000_1000,
+            0x1000,
+            7,
+        ));
+        let boot = BootInfo::new(
+            BootProtocol::Uefi,
+            m,
+            0x1000,
+            (0x10_0000, 0x20_0000),
+            (0x20_0000, 0x21_0000),
+            0,
+        );
+        KernelState::from_boot_info(&boot).unwrap()
+    }
+
+    #[test]
+    fn boot_seeds_mmio_region_cap_for_the_discovered_block_device() {
+        let k = kernel_with_mmio_blk();
+        assert_ne!(k.root_mmio_blk_cap, CapId::new(u32::MAX));
+        let c = k
+            .resolve(
+                k.root_thread,
+                k.root_mmio_blk_cap,
+                KernelObjectKind::MmioRegion,
+                CapabilityRights::READ,
+            )
+            .unwrap();
+        let region = k
+            .mmio_region(kernel_cap::MmioRegionId::new(c.object.id.as_u32()))
+            .unwrap();
+        assert_eq!(region.phys_base, 0x1000_1000);
+        assert_eq!(region.size, 0x1000);
+        assert_eq!(region.irq, 7);
+    }
+
+    #[test]
+    fn map_accepts_an_mmio_region_frame() {
+        let mut k = kernel_with_mmio_blk();
+        let caller = k.root_thread;
+        let mmio_cap = k.root_mmio_blk_cap;
+        let pt_cap = k.root_page_table_cap;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Map {
+                page_table: pt_cap,
+                frame: mmio_cap,
+                vaddr: VirtAddr::new(0x9000_0000),
+                perms: MapPermissions {
+                    readable: true,
+                    writable: true,
+                    executable: false,
+                    device_uncached: true,
+                },
+            },
+            &hal,
+        );
+        assert_eq!(r, Ok(SyscallReturn::Mapped));
+    }
+
+    #[test]
+    fn signal_wakes_a_waiting_thread() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let notif_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Notification,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // Nothing pending yet: Wait blocks the caller.
+        let r = k.dispatch(caller, 0, SyscallOp::Wait { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Blocked));
+
+        // Signal wakes it: `wake_blocked` marks `caller` Ready again.
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Signal { notification: notif_cap, bits: 0b101 },
+            &hal,
+        );
+        assert_eq!(r, Ok(SyscallReturn::Done));
+        assert_eq!(
+            k.sched.entity(caller).unwrap().state,
+            kernel_sched::RunState::Ready
+        );
+
+        // Now Poll/Wait see the (sticky) bits without blocking, and
+        // consume them.
+        let r = k.dispatch(caller, 0, SyscallOp::Poll { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Value(0b101)));
+        let r = k.dispatch(caller, 0, SyscallOp::Poll { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Value(0)));
+    }
+
+    #[test]
+    fn irq_bind_requires_mmio_and_notification_caps_and_registers_with_hal() {
+        let mut k = kernel_with_mmio_blk();
+        let caller = k.root_thread;
+        let mmio_cap = k.root_mmio_blk_cap;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let notif_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Notification,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::IrqBind {
+                mmio: mmio_cap,
+                notification: notif_cap,
+                handler: dummy_irq_handler,
+            },
+            &hal,
+        );
+        assert_eq!(r, Ok(SyscallReturn::Done));
+        assert_eq!(k.notification_for_irq(7), Some(kernel_cap::NotificationId::new(
+            k.resolve(caller, notif_cap, KernelObjectKind::Notification, CapabilityRights::READ)
+                .unwrap()
+                .object
+                .id
+                .as_u32(),
+        )));
+
+        // Wrong-kind caps are rejected: naming the notification cap as
+        // `mmio` (or vice versa) must not silently succeed.
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::IrqBind {
+                mmio: notif_cap,
+                notification: notif_cap,
+                handler: dummy_irq_handler,
+            },
+            &hal,
+        );
+        assert_eq!(r, Err(SyscallError::WrongObjectKind));
+    }
+
+    fn dummy_irq_handler(_irq: hal_core::interrupt::IrqId) {}
+
+    #[test]
     fn revoke_requires_revoke_right_and_frees_slots() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         // Make an endpoint, then revoke the untyped it came from — the
         // untyped root cap has full rights (incl. REVOKE).
         k.dispatch(
@@ -781,8 +1367,8 @@ mod tests {
     fn bad_cap_is_rejected() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         let e = k.dispatch(caller, 0, SyscallOp::CapRevoke { cap: CapId::new(99) }, &hal);
         assert_eq!(e, Err(SyscallError::BadCap));
     }
@@ -791,8 +1377,8 @@ mod tests {
     fn yield_reports_reschedule() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
         // Root task must be dispatched first for account() to have work.
         k.sched.dispatch(caller, 0).unwrap();
         let r = k.dispatch(caller, 1_000_000, SyscallOp::Yield, &hal).unwrap();
@@ -803,8 +1389,8 @@ mod tests {
     fn map_installs_hardware_ptes_when_a_pool_is_present() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer);
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
 
         // Retype a PageTable and a frame from the Root Task's first untyped.
         let pt_cap = match k
@@ -886,5 +1472,212 @@ mod tests {
             .unwrap()
             .translate(VirtAddr::new(0x5000_0000))
             .is_none());
+    }
+
+    /// The L4-style fast path (02-Microkernel-Layer.md §5.3/§8.3): a
+    /// `Call` that rendezvouses with an already-blocked receiver must
+    /// hand the CPU DIRECTLY to that receiver, bypassing `pick_next`'s
+    /// fairness scan entirely — proven here by making `pick_next` WANT
+    /// to pick a different (`decoy`) thread and confirming the actual
+    /// `Reschedule { next }` names the receiver instead.
+    #[test]
+    fn call_fast_path_hands_off_directly_bypassing_pick_next() {
+        use kernel_sched::{SchedulerMode, MAX_PRIORITY};
+
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        let ep_cap = match k
+            .dispatch(
+                root,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // `rx` blocks in Recv first, becoming the endpoint's queued
+        // receiver — the precondition `fast_path_eligible` checks for.
+        let rx = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(rx, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+        let r = k
+            .dispatch(rx, 0, SyscallOp::Recv { endpoint: ep_cap }, &hal)
+            .unwrap();
+        assert!(matches!(r, SyscallReturn::Reschedule { .. }));
+        assert_eq!(k.tcb(rx).unwrap().state, ThreadState::BlockedOnRecv);
+
+        // `decoy` is Ready — `pick_next`, consulted with `root` about to
+        // block, would return `decoy` (the only OTHER Ready thread; `rx`
+        // itself is `BlockedOnRecv`, never `Ready`, so `pick_next` could
+        // never legitimately return it at all).
+        let decoy = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(decoy, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+        k.sched.note_ready(decoy, 0).unwrap();
+
+        // `root` calls — synchronously rendezvouses with `rx`. The fast
+        // path must switch straight to `rx`: NOT `decoy` (what a
+        // `pick_next`-driven slow path would pick instead), and NOT
+        // anything `pick_next` could have produced at all, since `rx`
+        // is `BlockedOnRecv` rather than `Ready`.
+        let msg = SmallMessage::from_words(0xCAFE, &[7]).unwrap();
+        let r = k
+            .dispatch(root, 0, SyscallOp::Call { endpoint: ep_cap, msg }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Reschedule { next: Some(rx) });
+        // `decoy` was never dispatched by the fast path — still `Ready`
+        // in the scheduler, not `Running`.
+        assert_ne!(k.sched.running(), Some(decoy));
+
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::BlockedOnReply);
+        let delivered = k.tcb(rx).unwrap().pending_msg.expect("message delivered to rx");
+        assert_eq!(delivered.label, 0xCAFE);
+    }
+
+    /// A plain (non-`Call`) `Send` that rendezvouses immediately never
+    /// touches the scheduler at all — there is nothing for the fast
+    /// path to skip, and the caller keeps running (no `Reschedule`).
+    #[test]
+    fn plain_send_does_not_take_the_call_fast_path() {
+        use kernel_sched::{SchedulerMode, MAX_PRIORITY};
+
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        let ep_cap = match k
+            .dispatch(
+                root,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let rx = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(rx, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+        k.dispatch(rx, 0, SyscallOp::Recv { endpoint: ep_cap }, &hal)
+            .unwrap();
+
+        let msg = SmallMessage::new(0xF00D);
+        let r = k
+            .dispatch(root, 0, SyscallOp::Send { endpoint: ep_cap, msg }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Delivered { woke: rx });
+    }
+
+    /// The full round trip `Call` was missing until this session: a
+    /// `Call`er blocks (`BlockedOnReply`); the receiver later `Reply`s
+    /// directly to it (by the `ThreadId` it already learned from its
+    /// own `Recv`); the caller wakes with the reply message. Also
+    /// confirms `Reply` is itself an unconditional direct handoff (no
+    /// `decoy` needed here — `Reply` never has a `pick_next` fallback
+    /// case at all, unlike `Call`'s fast path).
+    #[test]
+    fn call_then_reply_completes_the_round_trip() {
+        use kernel_sched::{SchedulerMode, MAX_PRIORITY};
+
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        let ep_cap = match k
+            .dispatch(
+                root,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // `server` blocks in Recv first.
+        let server = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(server, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+        k.dispatch(server, 0, SyscallOp::Recv { endpoint: ep_cap }, &hal)
+            .unwrap();
+
+        // `root` Calls — rendezvouses immediately (the fast path from
+        // the previous test), becomes `BlockedOnReply`.
+        let request = SmallMessage::from_words(0x1, &[10]).unwrap();
+        let r = k
+            .dispatch(root, 0, SyscallOp::Call { endpoint: ep_cap, msg: request }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Reschedule { next: Some(server) });
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::BlockedOnReply);
+
+        // `server` "processes" the request (it already has it via its
+        // own `Recv`'s `pending_msg`) and replies directly to `root`.
+        let reply_msg = SmallMessage::from_words(0x2, &[20]).unwrap();
+        let r = k
+            .dispatch(server, 0, SyscallOp::Reply { to: root, msg: reply_msg }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Reschedule { next: Some(root) });
+
+        // `root` is runnable again with the reply message waiting.
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::Runnable);
+        let delivered = k.tcb(root).unwrap().pending_msg.expect("reply delivered to root");
+        assert_eq!(delivered.label, 0x2);
+        assert_eq!(delivered.words(), &[20]);
+    }
+
+    /// `Reply` to a thread that is not (or is no longer) `BlockedOnReply`
+    /// is rejected — this is the ONE enforced invariant standing in for
+    /// the reply-capability check this MVP deliberately does not build
+    /// (see `SyscallOp::Reply`'s own doc comment).
+    #[test]
+    fn reply_to_non_blocked_thread_is_rejected() {
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        // `bystander` was never Called nor is it BlockedOnReply.
+        let bystander = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        let r = k.dispatch(
+            root,
+            0,
+            SyscallOp::Reply { to: bystander, msg: SmallMessage::new(0) },
+            &hal,
+        );
+        assert_eq!(r, Err(SyscallError::NotBlockedOnReply));
+
+        // Replying to yourself is rejected too (never a sensible target).
+        let r = k.dispatch(root, 0, SyscallOp::Reply { to: root, msg: SmallMessage::new(0) }, &hal);
+        assert_eq!(r, Err(SyscallError::NotBlockedOnReply));
     }
 }

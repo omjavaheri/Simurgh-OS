@@ -645,6 +645,7 @@ pub fn current_page_table_phys(_memory: &Memory) -> u64 {
 pub fn built_hardware_manifest(
     memory: &Memory,
     compute: &ComputeDiscovery,
+    peripheral: &crate::peripheral::PeripheralDiscovery,
     power: &PowerThermalImpl,
     cpu: &Cpu,
     interrupt: &InterruptCtrl,
@@ -653,6 +654,7 @@ pub fn built_hardware_manifest(
     use hal_core::compute::ComputeDeviceDiscovery;
     use hal_core::cpu::CpuAbstraction;
     use hal_core::interrupt::InterruptController;
+    use hal_core::peripheral::PeripheralDeviceDiscovery;
     use hal_core::power::PowerThermal;
     use hal_core::timer::TimerAbstraction;
 
@@ -666,6 +668,9 @@ pub fn built_hardware_manifest(
     }
     for device in compute.enumerate_compute_devices() {
         let _ = manifest.push_compute_device(*device);
+    }
+    for device in peripheral.enumerate_peripheral_devices() {
+        let _ = manifest.push_peripheral_device(*device);
     }
     for domain in power.enumerate_power_domains() {
         let _ = manifest.push_power_domain(*domain);

@@ -11,6 +11,12 @@
 # IMPLEMENTATION-PLAN.md Q3.
 #
 # `#![no_std] + alloc`. `rlib`.
+#
+# The REAL, separately-built process image (see src/bin/fs-native-bin.rs's
+# own doc comment) — "subsystems as processes" packaging, mirroring
+# device-manager's own `device-manager-bin` exactly, the second real
+# subsystem process and the first driven by the real FsRequest/
+# FsResponse wire protocol over a genuine Call/Recv/Reply round trip.
 # ============================================================================
 [package]
 name        = "fs-native"
@@ -20,9 +26,21 @@ version.workspace    = true
 authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
+build = "build.rs"
 
 [lib]
 crate-type = ["rlib"]
 
+[[bin]]
+name = "fs-native-bin"
+path = "src/bin/fs-native-bin.rs"
+# Same reasoning as device-manager-bin's own `[[bin]]`: a host `cargo
+# test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
 [dependencies]
 ipc-protocol = { path = "../../../ipc-protocol" }
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly (not re-exported by `ipc-protocol` — its own codec module
+# takes/returns it by reference to `kernel_ipc` types).
+kernel-ipc   = { path = "../../../kernel/kernel-ipc" }

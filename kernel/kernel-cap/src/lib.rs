@@ -40,8 +40,8 @@ pub mod cdt;
 
 pub use cdt::{CapSlot, CapTable, CapTableError};
 pub use ids::{
-    CapId, CapSpaceId, ChainGroupId, EndpointId, NotificationId, ObjectId, PageTableId, ThreadId,
-    UntypedId,
+    CapId, CapSpaceId, ChainGroupId, EndpointId, MmioRegionId, NotificationId, ObjectId,
+    PageTableId, SharedRegionId, ThreadId, UntypedId,
 };
 pub use rights::CapabilityRights;
 
@@ -73,6 +73,20 @@ pub use rights::CapabilityRights;
 /// - `CapabilitySpace`: the per-process table of capabilities itself (§3).
 ///   A thread's `CapSpaceId` selects which `CapabilitySpace` its `CapId`
 ///   arguments are resolved against.
+/// - `SharedRegion`: a physical memory range mapped into more than one
+///   process's address space for zero-copy bulk transfer (§5.2). A
+///   capability to a shared region, with `READ`/`WRITE`, bounds the widest
+///   mapping a peer holding it may be granted (`SharedRegion::max_rights`).
+/// - `MmioRegion`: one device's physical MMIO transport window plus its
+///   IRQ line (03-Kernel-Subsystems-Layer.md §2.1, §5.1). Unlike every
+///   other object kind here, `MmioRegion`s are never `Retype`d out of
+///   `UntypedMemory` — a device's physical address is a fixed hardware
+///   fact the boot-time HAL peripheral scan discovers, not RAM drawn from
+///   a general pool — so the kernel mints them directly into the Root
+///   Task's capability space at boot, exactly as it already does for the
+///   Root Task's own initial `PageTable` capability. `READ` on it
+///   authorizes `Map`ping the MMIO window; `WRITE` additionally
+///   authorizes binding its IRQ line to a `Notification` (`IrqBind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelObjectKind {
     /// Untyped physical memory awaiting `retype` (02-Microkernel-Layer.md §3).
@@ -87,6 +101,10 @@ pub enum KernelObjectKind {
     Notification,
     /// A process's capability table (§3).
     CapabilitySpace,
+    /// A zero-copy shared memory region (§5.2).
+    SharedRegion,
+    /// A device's physical MMIO transport window + IRQ line (03 §2.1, §5.1).
+    MmioRegion,
 }
 
 /// An unforgeable reference to one kernel object: its kind plus its

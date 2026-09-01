@@ -74,6 +74,19 @@ fn detect_x2apic(cpuid: &impl CpuidSource) -> bool {
     leaf1.ecx & (1 << 21) != 0
 }
 
+/// CPUID leaf 1, EBX bits 31:24: this core's own initial (x)APIC ID —
+/// same field `cpu.rs`'s own `read_initial_apic_id` reads for
+/// `Cpu::current_core_id`, duplicated here (not made `pub(crate)` and
+/// reused) for the same small-self-contained-helper reasoning
+/// `hal-arm64::peripheral`'s own module doc comment gives for its BAR0
+/// probe: this file already carries its own local `CpuidSource`
+/// machinery for `detect_x2apic`, so a second tiny leaf-1 reader costs
+/// less than a cross-module visibility change.
+fn initial_apic_id(cpuid: &impl CpuidSource) -> u32 {
+    let leaf1 = cpuid.cpuid(1, 0);
+    leaf1.ebx >> 24
+}
+
 // ============================================================================
 // MSR access (x2APIC register access, and reading IA32_APIC_BASE to
 // locate the xAPIC MMIO window)
@@ -177,6 +190,27 @@ mod xapic_reg {
     pub const LVT_TIMER: u32 = 0x320;
     pub const ICR_LOW: u32 = 0x300;
     pub const ICR_HIGH: u32 = 0x310;
+    /// Timer Initial Count Register — writing this starts the timer
+    /// counting down (in whatever mode LVT_TIMER's own bits selected);
+    /// also this project's fallback one-shot arming mechanism for CPUs
+    /// TCG reports as lacking TSC-deadline mode (see timer.rs's own
+    /// module docs on why this fallback exists).
+    pub const INITIAL_COUNT: u32 = 0x380;
+    /// Timer Current Count Register (read-only) — counts down from
+    /// `INITIAL_COUNT` to 0 at the rate `DIVIDE_CONFIGURATION`
+    /// selects; used both to calibrate that rate against a known clock
+    /// (this project uses the TSC, per timer.rs) and, in principle, to
+    /// read remaining time on an armed deadline.
+    pub const CURRENT_COUNT: u32 = 0x390;
+    /// Divide Configuration Register — selects how much to divide the
+    /// bus clock by before it reaches the timer's own counter (Intel
+    /// SDM Table 10-10). This project fixes it at divide-by-16 (encoded
+    /// value `0b0011`) for the fallback one-shot path — see timer.rs's
+    /// own calibration doc comment for why the EXACT bus-clock
+    /// frequency this implies is irrelevant (calibration measures the
+    /// resulting tick rate directly against the TSC, so the choice only
+    /// affects calibration/counter GRANULARITY, not correctness).
+    pub const DIVIDE_CONFIGURATION: u32 = 0x3E0;
 }
 
 // x2APIC MSR register indices, derived from the same offsets above per
@@ -190,17 +224,21 @@ mod x2apic_reg {
     /// x2APIC merges ICR-low/high into a single 64-bit MSR (unlike
     /// xAPIC's two separate 32-bit MMIO registers) — Intel SDM 10.12.9.
     pub const ICR: u32 = super::X2APIC_MSR_BASE + 0x30;
+    pub const INITIAL_COUNT: u32 = super::X2APIC_MSR_BASE + (super::xapic_reg::INITIAL_COUNT >> 4);
+    pub const CURRENT_COUNT: u32 = super::X2APIC_MSR_BASE + (super::xapic_reg::CURRENT_COUNT >> 4);
+    pub const DIVIDE_CONFIGURATION: u32 =
+        super::X2APIC_MSR_BASE + (super::xapic_reg::DIVIDE_CONFIGURATION >> 4);
 }
 
 /// Vector reserved for the Local APIC Timer (TSC-deadline mode), per
 /// this file's module docs. Chosen as the first usable vector after
 /// the 32 CPU-exception vectors (0-31, per cpu.rs's IDT layout).
-const TIMER_VECTOR: u8 = 32;
+pub(crate) const TIMER_VECTOR: u8 = 32;
 
 /// First vector available for `register_irq`. Vectors below this are
 /// reserved: 0-31 for CPU exceptions (cpu.rs), 32 for the timer (this
 /// file).
-const FIRST_USABLE_IRQ_VECTOR: u8 = 33;
+pub(crate) const FIRST_USABLE_IRQ_VECTOR: u8 = 33;
 
 const IRQ_TABLE_SIZE: usize = 256 - FIRST_USABLE_IRQ_VECTOR as usize;
 
@@ -440,6 +478,38 @@ impl InterruptController for InterruptCtrl {
         self.write_reg(xapic_reg::EOI, x2apic_reg::EOI, 0);
     }
 
+    /// x86_64's own override of `InterruptController::msi_message`'s
+    /// default `None` — the only architecture this project targets with
+    /// a real message-signaled-interrupt path (Intel SDM Vol. 3A
+    /// §10.11). Encodes the STANDARD (non-remappable, non-x2APIC-
+    /// extended-destination) MSI/MSI-X address/data format, which every
+    /// destination APIC ID this MVP ever targets (0, this single-core
+    /// phase's only core — see `send_ipi`'s own "1:1 core-index-to-
+    /// APIC-ID" caveat, identical assumption here) fits within: the
+    /// address's own 8-bit destination field.
+    ///
+    /// Message Address (Intel SDM Table 10-1, "Interrupt Address
+    /// Redirection Table"): bits 31:20 fixed `0xFEE`, bits 19:12 =
+    /// destination APIC ID, bit 3 = Redirection Hint (0 = fixed
+    /// destination, not lowest-priority), bit 2 = Destination Mode
+    /// (0 = physical).
+    ///
+    /// Message Data (Intel SDM Table 10-11): bits 7:0 = vector, bits
+    /// 10:8 = delivery mode (000 = Fixed), bit 15 = trigger mode
+    /// (0 = edge — MSI/MSI-X interrupts are always edge-triggered by
+    /// construction, spec-mandated, unlike legacy INTx's level-
+    /// triggered line).
+    fn msi_message(&self, irq: IrqId) -> Option<(u64, u32)> {
+        let vector = irq.as_u32();
+        if vector < FIRST_USABLE_IRQ_VECTOR as u32 || vector > 255 {
+            return None;
+        }
+        let dest_apic_id = initial_apic_id(&RealCpuid);
+        let address = 0xFEE0_0000u64 | ((dest_apic_id as u64) << 12);
+        let data = vector; // delivery mode Fixed (000) and edge trigger are both the all-zero encoding.
+        Some((address, data))
+    }
+
     // Note: `bootstrap_current_core` per hal_core::cpu::CpuAbstraction
     // is a DIFFERENT trait (this file implements
     // hal_core::interrupt::InterruptController only) — this struct's
@@ -457,10 +527,25 @@ impl InterruptCtrl {
     /// Performs one-time, per-core Local APIC bring-up: enables the
     /// APIC (both the xAPIC/x2APIC enable bit in IA32_APIC_BASE and
     /// the software-enable bit in the Spurious Interrupt Vector
-    /// Register), and configures the LVT Timer entry for TSC-deadline
-    /// mode so `timer.rs`'s `Timer::set_oneshot` calls actually
-    /// deliver an interrupt — see timer.rs's `Timer::new` doc comment
-    /// on this exact ordering requirement.
+    /// Register), and configures the LVT Timer entry so `timer.rs`'s
+    /// `Timer::set_oneshot` calls actually deliver an interrupt — see
+    /// timer.rs's `Timer::new` doc comment on this exact ordering
+    /// requirement.
+    ///
+    /// `tsc_deadline_capable` selects WHICH LVT Timer mode: TSC-
+    /// deadline (Intel SDM Table 10-6) if the CPU supports it, or
+    /// plain one-shot count mode otherwise — a REAL, QEMU-confirmed
+    /// gap this session's preemption work found: TCG (this project's
+    /// only tested software-emulation accelerator, no KVM/WHPX
+    /// available in this environment) does not implement TSC-deadline
+    /// mode under ANY CPU model (confirmed via QEMU's own diagnostic:
+    /// `"TCG doesn't support requested feature: CPUID[eax=01h].ECX.
+    /// tsc-deadline"`), so this fallback is not a hypothetical —
+    /// timer.rs's own `Timer::set_oneshot` doc comment has the full
+    /// story of the calibrated one-shot mechanism this enables.
+    /// `DIVIDE_CONFIGURATION` is set to divide-by-16 unconditionally
+    /// (harmless in TSC-deadline mode, where it goes unused) so the
+    /// fallback path is ready the instant `set_oneshot` first needs it.
     ///
     /// # Safety
     /// Must be called once per core, after `Cpu::bootstrap_current_core`
@@ -469,7 +554,7 @@ impl InterruptCtrl {
     /// operating in xAPIC mode — after the xAPIC MMIO region has been
     /// mapped via `MemoryBootstrap::setup_identity_mapping` with
     /// `MapPermissions::DEVICE_MMIO` at this instance's `primary_base()`.
-    pub unsafe fn bootstrap_current_core(&self) -> Result<(), HalError> {
+    pub unsafe fn bootstrap_current_core(&self, tsc_deadline_capable: bool) -> Result<(), HalError> {
         // Ensure the APIC enable bit is set in IA32_APIC_BASE. On
         // every target this project boots on (UEFI-handed-off long
         // mode), the APIC is already globally enabled by firmware —
@@ -503,17 +588,62 @@ impl InterruptCtrl {
             APIC_SOFTWARE_ENABLE | SPURIOUS_VECTOR,
         );
 
-        // Configure LVT Timer for TSC-deadline mode: bits 0-7 =
-        // vector, bits 18-17 = timer mode (10 = TSC-deadline, per
-        // Intel SDM Table 10-6... encoded as bit 18 set).
+        // Configure LVT Timer: bits 0-7 = vector, bits 18-17 = timer
+        // mode (10 = TSC-deadline, per Intel SDM Table 10-6, encoded as
+        // bit 18 set; 00 = one-shot count mode, no bits beyond the
+        // vector) — see this method's own doc comment for why the
+        // choice is conditional.
         const LVT_TIMER_MODE_TSC_DEADLINE: u32 = 1 << 18;
+        let lvt_timer_value = if tsc_deadline_capable {
+            LVT_TIMER_MODE_TSC_DEADLINE | TIMER_VECTOR as u32
+        } else {
+            TIMER_VECTOR as u32
+        };
+        self.write_reg(xapic_reg::LVT_TIMER, x2apic_reg::LVT_TIMER, lvt_timer_value);
+
+        // Divide-by-16 (encoded value `0b0011`, Intel SDM Table 10-10) —
+        // only meaningful for one-shot count mode, but harmless to set
+        // unconditionally (unused in TSC-deadline mode).
+        const DIVIDE_BY_16: u32 = 0b0011;
         self.write_reg(
-            xapic_reg::LVT_TIMER,
-            x2apic_reg::LVT_TIMER,
-            LVT_TIMER_MODE_TSC_DEADLINE | TIMER_VECTOR as u32,
+            xapic_reg::DIVIDE_CONFIGURATION,
+            x2apic_reg::DIVIDE_CONFIGURATION,
+            DIVIDE_BY_16,
         );
 
         Ok(())
+    }
+
+    /// Masks or unmasks the LVT Timer entry (bit 16) without touching
+    /// its vector/mode bits — used by timer.rs's calibration routine to
+    /// keep a stray interrupt from being TAKEN mid-calibration (belt-
+    /// and-suspenders: IF is already clear throughout syscall handling,
+    /// where calibration first runs, but this does not rely on that).
+    pub(crate) fn set_lvt_timer_masked(&self, masked: bool) {
+        const LVT_MASKED: u32 = 1 << 16;
+        let current = self.read_reg(xapic_reg::LVT_TIMER, x2apic_reg::LVT_TIMER);
+        let next = if masked { current | LVT_MASKED } else { current & !LVT_MASKED };
+        self.write_reg(xapic_reg::LVT_TIMER, x2apic_reg::LVT_TIMER, next);
+    }
+
+    /// Writes the Timer Initial Count Register — in one-shot count
+    /// mode (`bootstrap_current_core`'s fallback LVT Timer
+    /// configuration), this both ARMS a countdown of `ticks` (at
+    /// whatever rate `DIVIDE_CONFIGURATION` selects) and, written as 0,
+    /// is this project's cancel mechanism (a 0 initial count stops the
+    /// timer without ever reaching 0 "for real" — Intel SDM 10.5.4).
+    /// Also used directly by timer.rs's own calibration routine (armed
+    /// with `u32::MAX`, measured against the TSC).
+    pub(crate) fn write_initial_count(&self, ticks: u32) {
+        self.write_reg(xapic_reg::INITIAL_COUNT, x2apic_reg::INITIAL_COUNT, ticks);
+    }
+
+    /// Reads the Timer Current Count Register — the countdown's current
+    /// value, used by timer.rs's calibration routine to measure how far
+    /// `INITIAL_COUNT` counted down over a KNOWN (TSC-measured)
+    /// duration.
+    pub(crate) fn read_current_count(&self) -> u32 {
+        self.read_reg(xapic_reg::CURRENT_COUNT, x2apic_reg::CURRENT_COUNT)
     }
 }
 
@@ -545,6 +675,26 @@ pub fn set_global_controller(controller: &InterruptCtrl) {
     GLOBAL_CONTROLLER_PTR.store(controller as *const InterruptCtrl as u64, Ordering::SeqCst);
 }
 
+/// Returns the live `InterruptCtrl` instance `set_global_controller`
+/// registered, or `None` if called before that has happened. Shared by
+/// `dispatch_vector` below and timer.rs's own fallback one-shot path
+/// (`Timer::set_oneshot`'s calibrated-LAPIC-count branch), both of
+/// which need to reach the SAME per-core controller instance from
+/// outside this module.
+pub(crate) fn global_controller() -> Option<&'static InterruptCtrl> {
+    let ptr = GLOBAL_CONTROLLER_PTR.load(Ordering::SeqCst);
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: `ptr` was stored by `set_global_controller` from a valid
+    // `&InterruptCtrl` whose referent (`X86_64Hal::interrupt`, living in
+    // `hal_x86_64_rust_entry`'s own `.bss` static storage — see that
+    // function's own doc comment) lives for the remainder of program
+    // execution — no code in this crate ever moves or drops that value
+    // out from under this pointer.
+    Some(unsafe { &*(ptr as *const InterruptCtrl) })
+}
+
 /// Called by `cpu.rs`'s `common_interrupt_entry` with the vector number
 /// the CPU's ISR stub captured. Special-cases `TIMER_VECTOR` (routing
 /// to `timer::on_timer_interrupt`, since `TimerCallback`'s `fn()` shape
@@ -554,23 +704,15 @@ pub fn set_global_controller(controller: &InterruptCtrl) {
 /// whether a handler was found (a spurious/unregistered vector still
 /// needs EOI so the APIC does not stall future interrupt delivery).
 pub fn dispatch_vector(vector: u8) {
-    let ptr = GLOBAL_CONTROLLER_PTR.load(Ordering::SeqCst);
-    if ptr == 0 {
-        // No controller registered yet — this can only happen if an
-        // interrupt somehow fires before `set_global_controller` ran,
-        // which should be unreachable given interrupts remain
-        // hardware-masked until after boot sequencing completes
-        // (boot.S never issues `sti`, and neither does any code in
-        // this crate prior to `hal_x86_64_rust_entry` finishing setup).
+    // No controller registered yet — this can only happen if an
+    // interrupt somehow fires before `set_global_controller` ran, which
+    // should be unreachable given interrupts remain hardware-masked
+    // until after boot sequencing completes (boot.S never issues `sti`,
+    // and neither does any code in this crate prior to
+    // `hal_x86_64_rust_entry` finishing setup).
+    let Some(controller) = global_controller() else {
         return;
-    }
-    // SAFETY: `ptr` was stored by `set_global_controller` from a valid
-    // `&InterruptCtrl` whose referent (`X86_64Hal::interrupt`, owned by
-    // `hal_x86_64_rust_entry`'s local `hal` and passed by value into
-    // `kernel_main`, per lib.rs) lives for the remainder of program
-    // execution — no code in this crate ever moves or drops that value
-    // out from under this pointer.
-    let controller = unsafe { &*(ptr as *const InterruptCtrl) };
+    };
 
     if vector == TIMER_VECTOR {
         timer::on_timer_interrupt(global_timer_ref());

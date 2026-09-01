@@ -114,6 +114,21 @@ pub enum HalError {
     TooManyComputeDevices,
 
     // ------------------------------------------------------------------
+    // Peripheral Device Discovery errors — not a numbered HAL-Layer.md
+    // section (see `hal_core::peripheral`'s own module doc comment for
+    // why this is a new surface, not part of Compute Device Discovery).
+    // ------------------------------------------------------------------
+    /// Discovery of MMIO peripherals failed at the firmware/bus-
+    /// enumeration level (e.g. the device tree could not be parsed).
+    /// Distinct from "zero devices found", a valid, non-error outcome.
+    PeripheralDiscoveryFailed,
+
+    /// More peripheral devices were discovered than
+    /// `hal_manifest::raw::MAX_PERIPHERAL_DEVICES` can hold. Same
+    /// truncate-and-continue handling as `TooManyComputeDevices`.
+    TooManyPeripheralDevices,
+
+    // ------------------------------------------------------------------
     // Power & Thermal errors (section 3.7)
     // ------------------------------------------------------------------
     /// A DVFS query/set or thermal read was requested for a power
@@ -185,6 +200,8 @@ impl fmt::Display for HalError {
             Self::InvalidIpiTarget => "invalid inter-processor interrupt target core",
             Self::ComputeDiscoveryFailed => "heterogeneous compute device discovery failed",
             Self::TooManyComputeDevices => "more compute devices than manifest capacity allows",
+            Self::PeripheralDiscoveryFailed => "peripheral device discovery failed",
+            Self::TooManyPeripheralDevices => "more peripheral devices than manifest capacity allows",
             Self::InvalidPowerDomain => "invalid power domain id",
             Self::DvfsUnsupported => "power domain does not support DVFS",
             Self::ThermalSensorUnavailable => "power domain has no thermal sensor",
@@ -230,6 +247,8 @@ mod tests {
             HalError::InvalidIpiTarget,
             HalError::ComputeDiscoveryFailed,
             HalError::TooManyComputeDevices,
+            HalError::PeripheralDiscoveryFailed,
+            HalError::TooManyPeripheralDevices,
             HalError::InvalidPowerDomain,
             HalError::DvfsUnsupported,
             HalError::ThermalSensorUnavailable,

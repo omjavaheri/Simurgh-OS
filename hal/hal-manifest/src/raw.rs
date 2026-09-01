@@ -34,6 +34,11 @@
 pub const MAX_MEMORY_REGIONS: usize = 64;
 pub const MAX_COMPUTE_DEVICES: usize = 32;
 pub const MAX_POWER_DOMAINS: usize = 16;
+/// Matches QEMU's aarch64 `virt` machine's own virtio-mmio slot count (32
+/// — confirmed via a device-tree dump of this project's own pinned QEMU
+/// version), the largest of the platforms this discovers today; riscv64
+/// `virt` exposes only 8.
+pub const MAX_PERIPHERAL_DEVICES: usize = 32;
 
 /// Max length for short fixed-width identifier strings embedded in the raw
 /// manifest (e.g. a compute device's human-readable model name fragment).
@@ -219,6 +224,129 @@ impl ComputeDeviceRaw {
         device_index: 0,
         _pad4: [0; 4],
     };
+}
+
+// ============================================================================
+// Generic MMIO peripheral raw type
+//
+// Deliberately NOT part of `ComputeDeviceRaw`/`ComputeKindRaw` above:
+// section 3.6 explicitly frames those as GPU/NPU/TPU/FPGA "first-class
+// compute entities... distinct from ordinary peripherals" — a block-
+// storage or network transport is exactly that "ordinary peripheral"
+// case, so it gets its own discovery surface rather than stretching
+// "compute" to cover it. Not named in any HAL-Layer.md section (§11's
+// own "nothing open in this layer... record new decisions as they
+// arise" note applies here): virtio-mmio device discovery for the
+// project's own MVP acceptance driver (03-Kernel-Subsystems-Layer.md
+// §5.1's virtio-blk), the first consumer of this new surface.
+// ============================================================================
+
+/// What kind of peripheral this MMIO transport carries, per the virtio
+/// spec's own `device_id` register (virtio 1.x §2.1) — kept as this
+/// project's own small, extensible enum (not the raw virtio device_id
+/// integer) so upper layers never need to know virtio's own numbering.
+/// Only the MVP acceptance kind (`Block`) is actually driven by a real
+/// driver today (`subsystems/drivers/driver-virtio-blk`); the rest are
+/// discovered (so the manifest is complete regardless of what layer 3
+/// currently uses, matching section 2's Discovery+Policy split) but
+/// have no driver yet.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeripheralKindRaw {
+    /// virtio device_id not recognised, or a non-virtio peripheral a
+    /// future discovery mechanism (e.g. x86_64 PCI enumeration) reports.
+    Unknown = 0,
+    /// virtio-blk (`device_id` = 2) — 03-Kernel-Subsystems-Layer.md
+    /// §5.1's MVP acceptance driver.
+    Block = 1,
+    /// virtio-net (`device_id` = 1) — `03 §2.3`'s netstack bypass path.
+    Network = 2,
+    /// virtio-gpu (`device_id` = 16) — `03 §2.4`'s compositor, future.
+    Gpu = 3,
+    /// virtio-console (`device_id` = 3).
+    Console = 4,
+}
+
+/// One discovered MMIO-transport peripheral (virtio-mmio on QEMU's
+/// `virt` machines today — see `PeripheralKindRaw`'s own doc comment).
+/// Pure description data, same "boot-time-only, no Capability minted
+/// here" contract `ComputeDeviceRaw` documents: `device_index` is what
+/// the Root Task uses to request a real Capability for this exact
+/// device later (01-HAL-Layer.md section 5).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PeripheralDeviceRaw {
+    pub kind: PeripheralKindRaw,
+    _pad0: [u8; 7],
+
+    /// MMIO register window base (physical address).
+    pub mmio_base: u64,
+    /// MMIO register window size, in bytes.
+    pub mmio_size: u64,
+    /// Interrupt line this device signals completion on — an
+    /// architecture-erased, platform-numbered IRQ id (PLIC interrupt
+    /// source number on riscv64, GIC INTID on aarch64 — NOT a raw SPI
+    /// number; see each `hal-<arch>`'s own discovery code for the
+    /// conversion), consumed the same way `InterruptControllerInfoRaw`'s
+    /// own `irq_line_count` numbering already is.
+    pub irq: u32,
+
+    /// Opaque device index — same contract as `ComputeDeviceRaw::
+    /// device_index`.
+    pub device_index: u32,
+
+    /// PCI Configuration Space physical address (ECAM: `ecam_base +
+    /// ecam_offset(bus, device, function)` — see `hal_arm64::compute::
+    /// ecam_offset`'s own doc comment for the formula), `0` for devices
+    /// with no PCI config space at all (e.g. riscv64's virtio-mmio
+    /// transport, discovered via Device Tree, not PCI). A modern
+    /// virtio-pci device's driver walks this device's OWN capability
+    /// list starting here (spec §4.1.4) to locate its COMMON_CFG/
+    /// NOTIFY_CFG/ISR_CFG/DEVICE_CFG sub-regions — `mmio_base`/
+    /// `mmio_size` above name the BAR those sub-regions live within
+    /// (QEMU's own `virtio-pci-modern` convention: BAR4, all four
+    /// regions in one window), not the config space itself.
+    pub config_space_base: u64,
+}
+
+impl PeripheralDeviceRaw {
+    pub const ZERO: Self = Self {
+        kind: PeripheralKindRaw::Unknown,
+        _pad0: [0; 7],
+        mmio_base: 0,
+        mmio_size: 0,
+        irq: 0,
+        device_index: 0,
+        config_space_base: 0,
+    };
+    pub fn new(kind: PeripheralKindRaw, mmio_base: u64, mmio_size: u64, irq: u32) -> Self {
+        Self {
+            kind,
+            _pad0: [0; 7],
+            mmio_base,
+            mmio_size,
+            irq,
+            device_index: 0,
+            config_space_base: 0,
+        }
+    }
+
+    /// Like `new`, but also names the PCI Configuration Space physical
+    /// address — for a virtio-pci device, where `mmio_base` alone
+    /// (a BAR) is not enough for the driver to even START capability-
+    /// list negotiation (see `config_space_base`'s own doc comment).
+    pub fn new_pci(
+        kind: PeripheralKindRaw,
+        mmio_base: u64,
+        mmio_size: u64,
+        irq: u32,
+        config_space_base: u64,
+    ) -> Self {
+        Self {
+            config_space_base,
+            ..Self::new(kind, mmio_base, mmio_size, irq)
+        }
+    }
 }
 
 // ============================================================================
@@ -427,6 +555,9 @@ pub struct HardwareManifestRaw {
     pub compute_device_count: u32,
     pub compute_devices: [ComputeDeviceRaw; MAX_COMPUTE_DEVICES],
 
+    pub peripheral_device_count: u32,
+    pub peripheral_devices: [PeripheralDeviceRaw; MAX_PERIPHERAL_DEVICES],
+
     pub interrupt_controller: InterruptControllerInfoRaw,
     pub timer: TimerInfoRaw,
 
@@ -452,6 +583,8 @@ impl HardwareManifestRaw {
             memory_regions: [MemoryRegionRaw::ZERO; MAX_MEMORY_REGIONS],
             compute_device_count: 0,
             compute_devices: [ComputeDeviceRaw::ZERO; MAX_COMPUTE_DEVICES],
+            peripheral_device_count: 0,
+            peripheral_devices: [PeripheralDeviceRaw::ZERO; MAX_PERIPHERAL_DEVICES],
             interrupt_controller: InterruptControllerInfoRaw::ZERO,
             timer: TimerInfoRaw::ZERO,
             power_domain_count: 0,
@@ -473,6 +606,13 @@ impl HardwareManifestRaw {
     /// exposing the raw fixed array directly.
     pub fn compute_devices(&self) -> &[ComputeDeviceRaw] {
         &self.compute_devices[..self.compute_device_count as usize]
+    }
+
+    /// Returns the populated slice of peripheral devices. See
+    /// `memory_regions()` for why this accessor exists instead of
+    /// exposing the raw fixed array directly.
+    pub fn peripheral_devices(&self) -> &[PeripheralDeviceRaw] {
+        &self.peripheral_devices[..self.peripheral_device_count as usize]
     }
 
     /// Returns the populated slice of power domains.
@@ -513,6 +653,19 @@ impl HardwareManifestRaw {
         device.device_index = idx as u32;
         self.compute_devices[idx] = device;
         self.compute_device_count += 1;
+        Ok(())
+    }
+
+    /// Appends a peripheral device. Same capacity-error handling and
+    /// device_index-assignment rationale as `push_compute_device`.
+    pub fn push_peripheral_device(&mut self, mut device: PeripheralDeviceRaw) -> Result<(), ()> {
+        let idx = self.peripheral_device_count as usize;
+        if idx >= MAX_PERIPHERAL_DEVICES {
+            return Err(());
+        }
+        device.device_index = idx as u32;
+        self.peripheral_devices[idx] = device;
+        self.peripheral_device_count += 1;
         Ok(())
     }
 
@@ -577,9 +730,11 @@ mod tests {
         let m = HardwareManifestRaw::zeroed();
         assert_eq!(m.memory_region_count, 0);
         assert_eq!(m.compute_device_count, 0);
+        assert_eq!(m.peripheral_device_count, 0);
         assert_eq!(m.power_domain_count, 0);
         assert!(m.memory_regions().is_empty());
         assert!(m.compute_devices().is_empty());
+        assert!(m.peripheral_devices().is_empty());
         assert!(m.power_domains().is_empty());
     }
 
@@ -600,5 +755,23 @@ mod tests {
         m.push_compute_device(ComputeDeviceRaw::ZERO).unwrap();
         assert_eq!(m.compute_devices()[0].device_index, 0);
         assert_eq!(m.compute_devices()[1].device_index, 1);
+    }
+
+    #[test]
+    fn push_peripheral_device_assigns_sequential_index_and_respects_capacity() {
+        let mut m = HardwareManifestRaw::zeroed();
+        let blk = PeripheralDeviceRaw::new(PeripheralKindRaw::Block, 0x1000_1000, 0x1000, 1);
+        m.push_peripheral_device(blk).unwrap();
+        m.push_peripheral_device(blk).unwrap();
+        assert_eq!(m.peripheral_devices()[0].device_index, 0);
+        assert_eq!(m.peripheral_devices()[1].device_index, 1);
+        assert_eq!(m.peripheral_devices()[0].kind, PeripheralKindRaw::Block);
+        assert_eq!(m.peripheral_devices()[0].mmio_base, 0x1000_1000);
+
+        let mut full = HardwareManifestRaw::zeroed();
+        for _ in 0..MAX_PERIPHERAL_DEVICES {
+            assert!(full.push_peripheral_device(PeripheralDeviceRaw::ZERO).is_ok());
+        }
+        assert!(full.push_peripheral_device(PeripheralDeviceRaw::ZERO).is_err());
     }
 }
