@@ -2565,6 +2565,53 @@ const DRV_PCI_MAX_BARS: usize = 4;
 /// config space, root's own EL1 code faulting under its own `root_pt`).
 const KERNEL_PCI_CFG_VA: usize = 0xD800_0000;
 
+/// VA `enable_and_program_msix` maps the MSI-X table's own BAR window
+/// at, in the CALLER's (root's) own address space — the SAME "kernel-
+/// side mapping, not driver-space" reasoning `KERNEL_PCI_CFG_VA`'s own
+/// doc comment gives, and `enable_and_program_msix`'s own doc comment
+/// covers the real bug this constant's existence fixes. Distinct from
+/// both `KERNEL_PCI_CFG_VA` (a single ECAM config-space PAGE, not a
+/// BAR) and `DRV_PCI_BAR_VA_BASE` (driver-space, a DIFFERENT address
+/// space entirely) — headroom sized the same generous way `DRV_PCI_
+/// BAR_VA_STRIDE` already documents.
+const KERNEL_MSIX_BAR_VA: usize = 0xD810_0000;
+
+/// VA `enable_and_program_msix` maps COMMON_CFG's own BAR window at (in
+/// the CALLER's own address space, same "kernel-side, not driver-space"
+/// reasoning as `KERNEL_MSIX_BAR_VA` — see that constant's own doc
+/// comment). A SEPARATE mapping from `KERNEL_MSIX_BAR_VA` because
+/// COMMON_CFG and the MSI-X table are near-universally on DIFFERENT
+/// BARs (QEMU's own virtio-pci-modern devices: COMMON/NOTIFY/ISR/
+/// DEVICE_CFG share one BAR, MSI-X — a PCI-SIG-standard capability, not
+/// virtio's own — lives on a different one), so neither can reuse the
+/// other's mapping.
+const KERNEL_MSIX_COMMON_VA: usize = 0xD811_0000;
+
+/// `struct virtio_pci_common_cfg`'s own `queue_msix_vector` field byte
+/// offset (virtio 1.x spec §4.1.4.3, Table 4-1) — a `le16`, PER-QUEUE
+/// (governed by whatever `queue_select`, offset 0x16, currently names),
+/// that this project's own `driver_virtio_blk::pci_common` module has
+/// NO field for at all: that module was written before MSI-X support
+/// existed in this codebase, and neither virtio-mmio nor legacy-INTx
+/// PCI (aarch64's own choice) ever needs a driver to assign a queue's
+/// completions to a specific vector — INTx fires unconditionally
+/// whenever ANY interrupt condition is pending, no per-queue routing
+/// involved. MSI-X is different: per the virtio spec, an unassigned
+/// queue defaults to `VIRTIO_MSI_NO_VECTOR` (0xFFFF) and the device
+/// will never signal ANYTHING for it until the driver explicitly
+/// programs this register — **the real bug an initial MSI-X attempt
+/// hit via QEMU**: `enable_and_program_msix`'s own table-entry write +
+/// capability Enable bit were BOTH verified correct via direct
+/// register readback, yet the driver's own `DRV_IRQ_WAIT` still hung
+/// forever waiting on the SAME PCI MSI-X vector 44 that was correctly
+/// programmed — because the DEVICE itself was never told to use it for
+/// this queue. Written here (not `driver_virtio_blk`, which stays
+/// transport-detail-free) since only kernel-arch-glue's own PCI
+/// capability-list walk already knows which table index (0, this
+/// MVP's only entry) the interrupt controller resolved.
+const VIRTIO_PCI_COMMON_QUEUE_SELECT: u32 = 0x16;
+const VIRTIO_PCI_COMMON_QUEUE_MSIX_VECTOR: u32 = 0x1a;
+
 /// Raw PCI/PCIe config-space reads, `config_phys` already folding in
 /// bus/device/function (exactly the value `hal_arm64::peripheral::
 /// PeripheralDiscovery::new` assembled into `MmioRegionDescriptor::
@@ -2669,11 +2716,60 @@ struct VirtioPciCapWindow {
     offset: u32,
 }
 
+/// Standard PCI capability id for MSI-X (PCI Local Bus Spec §6.8.2, as
+/// extended by the MSI-X ECN) — a DIFFERENT capability from virtio's
+/// own vendor-specific ones (`PCI_CAP_ID_VENDOR_SPECIFIC`), found on the
+/// SAME capability list `walk_virtio_pci_capabilities` already walks.
+/// Only ever populated on x86_64's own virtio-pci device in this
+/// project (aarch64 uses legacy INTx instead — `hal_core::interrupt::
+/// InterruptController::msi_message`'s own doc comment covers why this
+/// stays purely data-driven, never a `target_arch` check): whether THIS
+/// capability is present, combined with whether `HalInterface::
+/// msi_message` returns `Some` at all, is what `wire_virtio_pci_
+/// transport` below actually branches on.
+const PCI_CAP_ID_MSIX: u8 = 0x11;
+
+/// Byte offset, from an MSI-X capability's own structure start, of the
+/// Table Offset/BIR register (PCI Local Bus Spec, MSI-X ECN §6.8.2.3):
+/// bits 2:0 name the BAR index, bits 31:3 the table's own byte offset
+/// within it (already 8-byte aligned by construction, so masking off
+/// the low 3 bits recovers it exactly).
+const MSIX_TABLE_OFFSET_BIR: u32 = 4;
+/// Message Control lives at capability offset+2 (a u16), sharing the
+/// SAME 32-bit dword as the 1-byte Capability ID (offset+0) and 1-byte
+/// Next Pointer (offset+1) — bit 31 of that dword (Message Control's
+/// own bit 15) is MSI-X Enable; bit 30 (Message Control's own bit 14)
+/// is Function Mask, which must stay CLEAR for an enabled entry to
+/// actually fire.
+const MSIX_ENABLE_BIT: u32 = 1 << 31;
+
+/// One resolved MSI-X table location: which BAR it lives in, plus its
+/// own byte offset within that BAR — the MSI-X counterpart to
+/// `VirtioPciCapWindow`, kept as a separate type since MSI-X's own
+/// capability structure (a fixed, PCI-SIG-standard layout) shares
+/// nothing with virtio's own vendor-specific `struct virtio_pci_cap`
+/// beyond both living on the same capability list.
+#[derive(Clone, Copy, Default)]
+struct MsixLocation {
+    /// The capability structure's own byte offset within config space
+    /// (`walk_virtio_pci_capabilities`'s own list-walk pointer) — needed
+    /// to later write the Message Control register's own MSI-X Enable
+    /// bit, which lives WITHIN this capability structure, not the BAR
+    /// window `bar`/`table_offset` below name.
+    cap_ptr: u8,
+    bar: u8,
+    table_offset: u32,
+}
+
 /// The capability windows a virtio-pci "modern" device's own capability
 /// list carries (virtio 1.x spec §4.1.4) — `notify` additionally needs
 /// `notify_off_multiplier` (`struct virtio_pci_notify_cap`'s own
 /// extension field, spec §4.1.4.4) to locate a specific queue's own
-/// doorbell within the NOTIFY_CFG window.
+/// doorbell within the NOTIFY_CFG window. `msix`, when present, is
+/// resolved (BAR/table offset) but NOT yet enabled — `wire_virtio_pci_
+/// transport` does that, since enabling requires the destination
+/// vector's own Message Address/Data (`HalInterface::msi_message`),
+/// which this purely-data-collecting walk has no access to.
 #[derive(Default)]
 struct VirtioPciCapLayout {
     common: Option<VirtioPciCapWindow>,
@@ -2681,6 +2777,7 @@ struct VirtioPciCapLayout {
     notify_off_multiplier: u32,
     isr: Option<VirtioPciCapWindow>,
     device: Option<VirtioPciCapWindow>,
+    msix: Option<MsixLocation>,
 }
 
 /// Walks the standard PCI capability list (starting at the
@@ -2734,6 +2831,14 @@ unsafe fn walk_virtio_pci_capabilities(config_phys: u64) -> VirtioPciCapLayout {
                 VIRTIO_PCI_CAP_DEVICE_CFG => layout.device = Some(window),
                 _ => {}
             }
+        } else if cap_id == PCI_CAP_ID_MSIX {
+            // SAFETY: forwarded.
+            let bir_dword = unsafe { pci_cfg_read32(config_phys, ptr as u32 + MSIX_TABLE_OFFSET_BIR) };
+            layout.msix = Some(MsixLocation {
+                cap_ptr: ptr,
+                bar: (bir_dword & 0x7) as u8,
+                table_offset: bir_dword & !0x7,
+            });
         }
 
         ptr = cap_next;
@@ -2812,6 +2917,158 @@ unsafe fn map_pci_bar(
     Some(va)
 }
 
+/// Enables MSI-X (Message Control's own Enable bit, Function Mask left
+/// clear) and programs table entry 0 — this MVP's own single-vector
+/// scope, matching `IrqBind`'s own "one Notification per device" model
+/// — with `msi_message`'s Message Address/Data, unmasking that ONE
+/// entry (`vector_control` bit 0 clear). `msix.bar`'s own window is
+/// mapped via `map_pci_bar` exactly like every virtio capability window
+/// already is — MSI-X's table lives in device memory space like any
+/// other BAR-relative structure, nothing about it is config-space-only.
+///
+/// Only ever called when BOTH a real MSI-X capability was found on this
+/// device's own list AND `HalInterface::msi_message` returned `Some`
+/// (this project's x86_64-only interrupt controller) — see `wire_
+/// virtio_pci_transport`'s own call site for the data-driven (never
+/// `target_arch`) branch this stays behind.
+///
+/// # Safety
+/// Same contract as `map_pci_bar`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn enable_and_program_msix(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    caller_root_pt: usize,
+    config_va: u64,
+    msix: MsixLocation,
+    common: VirtioPciCapWindow,
+    msi_message: (u64, u32),
+) -> Option<()> {
+    // **Real bug found via QEMU**: an earlier version of this function
+    // mapped the MSI-X table's own BAR into `drv_root_pt` (the DRIVER
+    // process's own, NOT-YET-ACTIVE page table — reusing `map_pci_bar`
+    // exactly like the virtio capability windows below do) and then
+    // immediately dereferenced the resulting VA from RIGHT HERE — but
+    // this function runs from `spawn_virtio_blk_driver`, still under
+    // the CALLER's (root's) own currently-ACTIVE page table, which has
+    // no such mapping at all. Result: a real `#PF` (write, not-present)
+    // the instant `entry.write_volatile` below ran — confirmed via
+    // `-d int`/exception dump, `cr2` landing exactly at the SECOND
+    // `DRV_PCI_BAR_VA_STRIDE` slot (this device's own MSI-X table lives
+    // in a DIFFERENT BAR than COMMON/NOTIFY/ISR/DEVICE_CFG's shared
+    // BAR4, so it was never already-mapped via the `mapped[]`
+    // memoization either). The virtio capability windows below never
+    // hit this class of bug because kernel-arch-glue never dereferences
+    // THEIR VAs itself — it only writes them into the `PCI_INFO_OFFSET`
+    // header block for the DRIVER PROCESS to read once it is actually
+    // scheduled under `drv_root_pt`. This function is different: it
+    // must write the MSI-X table entry NOW, from kernel-arch-glue's own
+    // currently-running context — so it maps into `caller_root_pt`
+    // instead, at the SAME kind of dedicated, kernel-only VA `KERNEL_
+    // PCI_CFG_VA` already uses for the config-space page, not the
+    // driver-space `DRV_PCI_BAR_VA_BASE` range `map_pci_bar` targets.
+    let msix_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(msix_pool as *mut u8, 0, 4096 * 2) };
+    // SAFETY: forwarded from this function's own contract; `msix.bar`'s
+    // own physical base/size resolved fresh here (not memoized against
+    // the driver-space `mapped[]` table, which tracks a DIFFERENT
+    // address space entirely).
+    let (bar_phys, bar_size) = unsafe { pci_bar_phys(config_va, msix.bar) }?;
+    let map_len = (bar_size as usize).div_ceil(4096) * 4096;
+    let n = hal.map_range(
+        caller_root_pt,
+        KERNEL_MSIX_BAR_VA,
+        bar_phys as usize,
+        map_len,
+        1 | 2, // R+W, kernel-only (no U bit) — EL1/S-mode/Ring-0 code only, same as KERNEL_PCI_CFG_VA's own mapping.
+        msix_pool,
+        2,
+    );
+    if n == u32::MAX {
+        return None;
+    }
+    // Modifying a LIVE, currently-active page table (unlike `map_pci_
+    // bar`'s own driver-space mappings, which target a not-yet-active
+    // one) — flush before relying on the fresh mapping, same insurance
+    // `wire_virtio_pci_transport`'s own config-space mapping already
+    // takes for the identical reason.
+    hal.flush_tlb();
+
+    let table_va = KERNEL_MSIX_BAR_VA + msix.table_offset as usize;
+    let (addr, data) = msi_message;
+    let entry = table_va as *mut u32; // entry 0 — this MVP's only vector.
+    // SAFETY: `entry` is within the just-mapped MSI-X table BAR window
+    // (R+W+U, `map_pci_bar`'s own contract), 16-byte MSI-X table entry
+    // layout per the MSI-X ECN (Message Address Low/High, Message Data,
+    // Vector Control — PCI Local Bus Spec §6.8.2.9).
+    unsafe {
+        entry.write_volatile(addr as u32); // Message Address (low 32 bits).
+        entry.add(1).write_volatile((addr >> 32) as u32); // Message Address (high 32 bits) — always 0, this MVP's address is always < 4 GiB.
+        entry.add(2).write_volatile(data); // Message Data.
+        entry.add(3).write_volatile(0); // Vector Control — bit 0 clear = unmasked.
+    }
+
+    // Message Control's own dword shares byte offsets 0-3 of the
+    // capability structure with Capability ID (byte 0) and Next Pointer
+    // (byte 1) — read-modify-write so those two bytes are never touched.
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let ctrl_dword = pci_cfg_read32(config_va, msix.cap_ptr as u32);
+        pci_cfg_write32(config_va, msix.cap_ptr as u32, ctrl_dword | MSIX_ENABLE_BIT);
+    }
+
+    // Tell the DEVICE to actually use table entry 0 for the request
+    // virtqueue's own completions — see `VIRTIO_PCI_COMMON_QUEUE_MSIX_
+    // VECTOR`'s own doc comment for the full "real bug found via QEMU"
+    // story this fixes. A second kernel-side BAR mapping, exactly the
+    // same shape as the MSI-X table's own above (COMMON_CFG is almost
+    // always a DIFFERENT BAR).
+    let common_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(common_pool as *mut u8, 0, 4096 * 2) };
+    // SAFETY: forwarded from this function's own contract.
+    let (common_bar_phys, common_bar_size) = unsafe { pci_bar_phys(config_va, common.bar) }?;
+    let common_map_len = (common_bar_size as usize).div_ceil(4096) * 4096;
+    let common_n = hal.map_range(
+        caller_root_pt,
+        KERNEL_MSIX_COMMON_VA,
+        common_bar_phys as usize,
+        common_map_len,
+        1 | 2, // R+W, kernel-only — same as KERNEL_MSIX_BAR_VA's own mapping.
+        common_pool,
+        2,
+    );
+    if common_n == u32::MAX {
+        return None;
+    }
+    hal.flush_tlb();
+    let common_cfg_kernel_va = KERNEL_MSIX_COMMON_VA + common.offset as usize;
+    // REQUEST_QUEUE's own index (0 — this driver's only virtqueue,
+    // `driver_virtio_blk`'s own module doc comment) — select it, THEN
+    // write its own `queue_msix_vector` (spec §4.1.4.3: `queue_select`
+    // MUST be written before either register named "About a specific
+    // virtqueue" is read or written, since they alias the CURRENTLY
+    // selected queue's own state).
+    // SAFETY: `common_cfg_kernel_va` is within the just-mapped, just-
+    // flushed COMMON_CFG BAR window (R+W, kernel-only).
+    unsafe {
+        ((common_cfg_kernel_va + VIRTIO_PCI_COMMON_QUEUE_SELECT as usize) as *mut u16)
+            .write_volatile(0);
+        ((common_cfg_kernel_va + VIRTIO_PCI_COMMON_QUEUE_MSIX_VECTOR as usize) as *mut u16)
+            .write_volatile(0); // table entry 0 — this MVP's only vector, matching enable_and_program_msix's own table write above.
+    }
+
+    Some(())
+}
+
 /// Resolves and maps a virtio-pci "modern" device's own 4 capability
 /// windows (COMMON/NOTIFY/ISR/DEVICE_CFG) into the driver process, then
 /// writes the `PCI_INFO_OFFSET` header block (`driver_virtio_blk::
@@ -2838,6 +3095,13 @@ unsafe fn map_pci_bar(
 /// reason (`pci_bar_phys`'s own BAR-register reads/writes live WITHIN
 /// this same config-space page, not the BAR's own target memory).
 ///
+/// `irq` (the SAME value `spawn_virtio_blk_driver`'s own `IrqBind` call
+/// later registers a handler at) is only consulted for MSI-X — see
+/// `enable_and_program_msix`'s own doc comment for the full data-driven
+/// branch this takes on architectures where `HalInterface::msi_message`
+/// and this device's own capability list both cooperate (x86_64 only,
+/// today); ignored entirely otherwise.
+///
 /// # Safety
 /// Same contract as `pci_bar_phys` / `map_pci_bar`.
 unsafe fn wire_virtio_pci_transport(
@@ -2847,6 +3111,7 @@ unsafe fn wire_virtio_pci_transport(
     caller_root_pt: usize,
     config_phys: u64,
     region_phys: usize,
+    irq: u32,
 ) -> Option<()> {
     let cfg_pool = k
         .untyped_mut(kernel_cap::UntypedId::new(0))
@@ -2934,6 +3199,36 @@ unsafe fn wire_virtio_pci_transport(
     let notify_cfg_va = resolve(caps.notify, "NOTIFY_CFG");
     let isr_cfg_va = resolve(caps.isr, "ISR_CFG");
     let device_cfg_va = resolve(caps.device, "DEVICE_CFG");
+
+    // MSI-X (x86_64 only — see `msi_message`'s own doc comment for the
+    // full data-driven, never-`target_arch` rationale): only attempted
+    // when BOTH this device's own capability list actually carries an
+    // MSI-X capability AND the live `InterruptController` reports a
+    // message-signaled path at all. Neither is true for aarch64's own
+    // virtio-pci device (this project's own choice stays legacy INTx
+    // there, resolved at HAL discovery time into `mmio.irq` already —
+    // this whole block is simply never reached in that case, `caps.
+    // msix` being `None`), so this branch changes nothing for the
+    // architecture it was NOT written for.
+    // Table entry index the driver process's own `VirtioBlk::msix_
+    // vector` gets told to assign its queue to (`driver_virtio_blk::
+    // pci_common::QUEUE_MSIX_VECTOR`'s own doc comment) — default
+    // `VIRTIO_MSI_NO_VECTOR`, overwritten below only on success.
+    let mut msix_vector = driver_virtio_blk::VIRTIO_MSI_NO_VECTOR;
+    if let Some(msix) = caps.msix {
+        if let Some(msi_message) = hal.msi_message(irq) {
+            // SAFETY: forwarded from this function's own contract.
+            let enabled = unsafe {
+                enable_and_program_msix(k, hal, caller_root_pt, config_va, msix, common, msi_message)
+            };
+            if enabled.is_none() {
+                klog!("wire_virtio_pci_transport: failed to enable MSI-X\r\n");
+                return None;
+            }
+            msix_vector = 0; // table entry 0 — this MVP's only vector, matching enable_and_program_msix's own table write.
+        }
+    }
+
     // SAFETY: single-core; written once here, before `IrqBind`
     // (`spawn_virtio_blk_driver`'s own caller) installs the trampoline
     // that reads it — see `G_DRV_ISR_CFG_VA`'s own doc comment for why
@@ -2952,6 +3247,7 @@ unsafe fn wire_virtio_pci_transport(
         ((header + 24) as *mut u64).write_volatile(caps.notify_off_multiplier as u64);
         ((header + 32) as *mut u64).write_volatile(isr_cfg_va as u64);
         ((header + 40) as *mut u64).write_volatile(device_cfg_va as u64);
+        ((header + 48) as *mut u64).write_volatile(msix_vector as u64);
     }
 
     Some(())
@@ -3291,6 +3587,7 @@ pub fn spawn_virtio_blk_driver(
                 caller_root_pt,
                 mmio.config_space_base,
                 region_phys,
+                mmio.irq,
             )
         };
         if wired.is_none() {

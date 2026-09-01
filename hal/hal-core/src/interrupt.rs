@@ -164,6 +164,28 @@ pub trait InterruptController {
     /// EOI-after-handler modes) and must remain under the architecture
     /// implementation's explicit control.
     fn end_of_interrupt(&self, irq: IrqId);
+
+    /// Computes the Message Address/Message Data pair (Intel SDM Vol.
+    /// 3A §10.11) a message-signaled-interrupt-capable device should be
+    /// programmed with so that firing it delivers `irq` to this core —
+    /// the MSI/MSI-X counterpart, for a controller that supports it, to
+    /// the physical-wire routing every OTHER interrupt-controller kind
+    /// this project targets (GICv3 INTx swizzle, PLIC source number)
+    /// already resolves before `register_irq` is ever called. `irq`
+    /// must already have been (or be about to be) passed to
+    /// `register_irq` — this method only computes the wire-format
+    /// encoding of that SAME line, it does not itself register anything.
+    ///
+    /// Default `None`: only meaningful on a controller that actually
+    /// supports MSI/MSI-X (x86_64's own APIC/x2APIC, per section 3.4).
+    /// ARM64's GICv3 without an ITS and RISC-V's PLIC have no message-
+    /// signaled path in this project's current scope, so this default
+    /// covers both without either crate needing an explicit override —
+    /// callers must always check for `None` and fall back to their own
+    /// architecture's native (legacy-INTx-style) IRQ routing instead.
+    fn msi_message(&self, _irq: IrqId) -> Option<(u64, u32)> {
+        None
+    }
 }
 
 #[cfg(test)]

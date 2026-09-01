@@ -160,6 +160,18 @@ pub mod pci_common {
     /// `QUEUE_NUM` — the same register serves both roles in the PCI
     /// layout (unlike MMIO's two separate registers).
     pub const QUEUE_SIZE: usize = 0x18;
+    /// le16 — assigns the CURRENTLY selected queue's own completions to
+    /// one entry (by index) of the device's own MSI-X table, or
+    /// `VIRTIO_MSI_NO_VECTOR` (0xffff, this register's own reset
+    /// default) for "no message-signaled interrupt for this queue" —
+    /// MMIO's own transport has no equivalent register at all: legacy-
+    /// INTx-style delivery (MMIO always; PCI too, unless a driver
+    /// explicitly assigns a vector here) fires unconditionally whenever
+    /// ANY interrupt condition is pending, no per-queue routing table
+    /// involved. See `VirtioBlk::write_queue_msix_vector`'s own doc
+    /// comment for why `do_probe` must write this EVERY time (not just
+    /// when a real vector is in use).
+    pub const QUEUE_MSIX_VECTOR: usize = 0x1a;
     /// le16 — write 1 once this queue's addresses below are set, the
     /// PCI equivalent of MMIO's `QUEUE_READY`.
     pub const QUEUE_ENABLE: usize = 0x1c;
@@ -223,6 +235,15 @@ pub enum Transport {
 /// driver negotiates ONLY this bit — no queue-size/indirect/event-idx
 /// extensions — matching its own fixed `QUEUE_SIZE` MVP scope below.
 pub const VIRTIO_F_VERSION_1: u32 = 1 << (32 - 32); // bit 32, word index 1
+
+/// `pci_common::QUEUE_MSIX_VECTOR`'s own reset default and "no vector
+/// assigned" sentinel (virtio 1.x spec §4.1.4.3) — used both as the
+/// value `write_queue_msix_vector` writes for `Transport::Mmio`
+/// (harmless: no such register exists on that transport) and as
+/// `VirtioBlk::msix_vector`'s own default when no real MSI-X vector was
+/// assigned (aarch64's own legacy-INTx `Transport::Pci`, per
+/// `msix_vector`'s own field doc comment).
+pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;
 
 /// Fixed virtqueue size this driver sets up — the next power of 2 above
 /// the smallest legal size that can hold one full virtio-blk request
@@ -330,6 +351,11 @@ pub mod layout {
     ///         field width; the real value always fits `u32`)
     ///   `+32` `isr_cfg_va`
     ///   `+40` `device_cfg_va`
+    ///   `+48` `msix_vector` (widened to `u64`; `VIRTIO_MSI_NO_VECTOR`
+    ///         when this platform's own interrupt controller has no
+    ///         message-signaled path, per `VirtioBlk::msix_vector`'s
+    ///         own field doc comment — MEANINGLESS, like every other
+    ///         field here, when `transport_kind == 0`)
     pub const PCI_INFO_OFFSET: usize = 176;
     /// The `BlkReqHeader` request-header buffer (descriptor 0).
     pub const HEADER_OFFSET: usize = 256;
@@ -396,6 +422,17 @@ pub struct VirtioBlk {
     /// cached — see `Transport::Pci::notify`'s own doc comment. Always
     /// `0` (harmless — never read) for `Transport::Mmio`.
     queue_notify_off: u16,
+    /// `Transport::Pci` only: the MSI-X table entry index (`pci_common::
+    /// QUEUE_MSIX_VECTOR`'s own doc comment) `kernel_arch_glue`'s own
+    /// PCI capability-list walk already programmed the device's table
+    /// entry AND `msi_message` with, or `VIRTIO_MSI_NO_VECTOR` if this
+    /// platform's own interrupt controller has no message-signaled path
+    /// (every architecture except x86_64, today — legacy INTx handles
+    /// delivery instead, needing no per-queue assignment at all). Always
+    /// `VIRTIO_MSI_NO_VECTOR` (harmless — `write_queue_msix_vector`
+    /// writes it unconditionally, restoring the register's own reset
+    /// default) for `Transport::Mmio`, which has no such register.
+    msix_vector: u16,
 }
 
 impl VirtioBlk {
@@ -410,12 +447,16 @@ impl VirtioBlk {
             ready: false,
             next_idx: 0,
             queue_notify_off: 0,
+            msix_vector: VIRTIO_MSI_NO_VECTOR,
         }
     }
 
     /// Creates the driver bound to a virtio-pci "modern" transport
     /// (`Transport::Pci`'s own doc comment covers each sub-region's
     /// role) and a virtqueue/data region mapped at `queue_base`.
+    /// `msix_vector`: see `VirtioBlk::msix_vector`'s own field doc
+    /// comment — pass `VIRTIO_MSI_NO_VECTOR` when this platform's own
+    /// interrupt controller has no message-signaled path.
     #[allow(clippy::too_many_arguments)]
     pub const fn new_pci(
         common: usize,
@@ -424,6 +465,7 @@ impl VirtioBlk {
         isr: usize,
         device_cfg: usize,
         queue_base: usize,
+        msix_vector: u16,
     ) -> Self {
         Self {
             transport: Transport::Pci { common, notify, notify_off_multiplier, isr, device_cfg },
@@ -432,6 +474,7 @@ impl VirtioBlk {
             ready: false,
             next_idx: 0,
             queue_notify_off: 0,
+            msix_vector,
         }
     }
 
@@ -570,6 +613,38 @@ impl VirtioBlk {
             Transport::Pci { common, .. } => unsafe {
                 ((common + pci_common::QUEUE_SIZE) as *mut u16).write_volatile(size as u16)
             },
+        }
+    }
+
+    /// Assigns the CURRENTLY selected queue's own completions to
+    /// `self.msix_vector` (`pci_common::QUEUE_MSIX_VECTOR`'s own doc
+    /// comment). Called unconditionally from `do_probe`, for BOTH
+    /// transports and regardless of whether a real vector is in use —
+    /// **real bug found via QEMU**: `do_probe`'s own `write_status(0)`
+    /// (spec §3.1 step 1, a full device RESET) clears ALL per-queue
+    /// state, including any `queue_msix_vector` assignment `kernel_
+    /// arch_glue`'s own PCI capability-list walk already wrote BEFORE
+    /// this process's first instruction ever ran — the MSI-X table
+    /// entry itself and the capability's own Enable bit were BOTH
+    /// independently confirmed correct via direct register readback,
+    /// yet the driver's own interrupt wait still hung forever, because
+    /// the device was never (again) told which queue that vector
+    /// belonged to. Fixed by re-asserting it here, AFTER reset, as a
+    /// normal part of this transport-generic queue-setup sequence —
+    /// `Transport::Mmio` has no such register, so this is a harmless
+    /// no-op there (kept unconditional, not per-transport-gated, so a
+    /// future transport with the same class of register cannot silently
+    /// reintroduce this exact bug by forgetting to call it).
+    ///
+    /// # Safety
+    /// Same contract as `read_queue_size_max`.
+    unsafe fn write_queue_msix_vector(&self) {
+        if let Transport::Pci { common, .. } = self.transport {
+            // SAFETY: forwarded from this method's own contract.
+            unsafe {
+                ((common + pci_common::QUEUE_MSIX_VECTOR) as *mut u16)
+                    .write_volatile(self.msix_vector)
+            };
         }
     }
 
@@ -753,6 +828,7 @@ impl VirtioBlk {
             // Queue setup (spec §3.1 step 7, §4.2.3.2): queue 0 is
             // virtio-blk's only request queue.
             self.select_queue(REQUEST_QUEUE);
+            self.write_queue_msix_vector();
             let max = self.read_queue_size_max();
             if max == 0 || (max as u16) < QUEUE_SIZE {
                 self.write_status(status::FAILED);
@@ -1108,7 +1184,7 @@ mod tests {
         // Same reasoning as `probe_without_mmio_fails`, `Transport::
         // Pci` side: `common == 0` is `transport_is_bound`'s own "not
         // granted yet" sentinel for this transport too.
-        let mut d = VirtioBlk::new_pci(0, 0, 0, 0, 0, 0);
+        let mut d = VirtioBlk::new_pci(0, 0, 0, 0, 0, 0, VIRTIO_MSI_NO_VECTOR);
         assert_eq!(d.probe(), Err(DriverError::ProbeFailed));
     }
 
@@ -1121,7 +1197,15 @@ mod tests {
         // mirroring `requests_before_ready_are_rejected`'s own MMIO
         // case (constructing with a real-looking-but-fake address is
         // always safe as long as nothing subsequently DEREFERENCES it).
-        let d = VirtioBlk::new_pci(0x4000_0000, 0x4000_1000, 4, 0x4000_2000, 0x4000_3000, 0x5000_0000);
+        let d = VirtioBlk::new_pci(
+            0x4000_0000,
+            0x4000_1000,
+            4,
+            0x4000_2000,
+            0x4000_3000,
+            0x5000_0000,
+            VIRTIO_MSI_NO_VECTOR,
+        );
         assert!(d.transport_is_bound());
     }
 

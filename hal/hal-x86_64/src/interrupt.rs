@@ -74,6 +74,19 @@ fn detect_x2apic(cpuid: &impl CpuidSource) -> bool {
     leaf1.ecx & (1 << 21) != 0
 }
 
+/// CPUID leaf 1, EBX bits 31:24: this core's own initial (x)APIC ID —
+/// same field `cpu.rs`'s own `read_initial_apic_id` reads for
+/// `Cpu::current_core_id`, duplicated here (not made `pub(crate)` and
+/// reused) for the same small-self-contained-helper reasoning
+/// `hal-arm64::peripheral`'s own module doc comment gives for its BAR0
+/// probe: this file already carries its own local `CpuidSource`
+/// machinery for `detect_x2apic`, so a second tiny leaf-1 reader costs
+/// less than a cross-module visibility change.
+fn initial_apic_id(cpuid: &impl CpuidSource) -> u32 {
+    let leaf1 = cpuid.cpuid(1, 0);
+    leaf1.ebx >> 24
+}
+
 // ============================================================================
 // MSR access (x2APIC register access, and reading IA32_APIC_BASE to
 // locate the xAPIC MMIO window)
@@ -225,7 +238,7 @@ pub(crate) const TIMER_VECTOR: u8 = 32;
 /// First vector available for `register_irq`. Vectors below this are
 /// reserved: 0-31 for CPU exceptions (cpu.rs), 32 for the timer (this
 /// file).
-const FIRST_USABLE_IRQ_VECTOR: u8 = 33;
+pub(crate) const FIRST_USABLE_IRQ_VECTOR: u8 = 33;
 
 const IRQ_TABLE_SIZE: usize = 256 - FIRST_USABLE_IRQ_VECTOR as usize;
 
@@ -463,6 +476,38 @@ impl InterruptController for InterruptCtrl {
 
     fn end_of_interrupt(&self, _irq: IrqId) {
         self.write_reg(xapic_reg::EOI, x2apic_reg::EOI, 0);
+    }
+
+    /// x86_64's own override of `InterruptController::msi_message`'s
+    /// default `None` — the only architecture this project targets with
+    /// a real message-signaled-interrupt path (Intel SDM Vol. 3A
+    /// §10.11). Encodes the STANDARD (non-remappable, non-x2APIC-
+    /// extended-destination) MSI/MSI-X address/data format, which every
+    /// destination APIC ID this MVP ever targets (0, this single-core
+    /// phase's only core — see `send_ipi`'s own "1:1 core-index-to-
+    /// APIC-ID" caveat, identical assumption here) fits within: the
+    /// address's own 8-bit destination field.
+    ///
+    /// Message Address (Intel SDM Table 10-1, "Interrupt Address
+    /// Redirection Table"): bits 31:20 fixed `0xFEE`, bits 19:12 =
+    /// destination APIC ID, bit 3 = Redirection Hint (0 = fixed
+    /// destination, not lowest-priority), bit 2 = Destination Mode
+    /// (0 = physical).
+    ///
+    /// Message Data (Intel SDM Table 10-11): bits 7:0 = vector, bits
+    /// 10:8 = delivery mode (000 = Fixed), bit 15 = trigger mode
+    /// (0 = edge — MSI/MSI-X interrupts are always edge-triggered by
+    /// construction, spec-mandated, unlike legacy INTx's level-
+    /// triggered line).
+    fn msi_message(&self, irq: IrqId) -> Option<(u64, u32)> {
+        let vector = irq.as_u32();
+        if vector < FIRST_USABLE_IRQ_VECTOR as u32 || vector > 255 {
+            return None;
+        }
+        let dest_apic_id = initial_apic_id(&RealCpuid);
+        let address = 0xFEE0_0000u64 | ((dest_apic_id as u64) << 12);
+        let data = vector; // delivery mode Fixed (000) and edge trigger are both the all-zero encoding.
+        Some((address, data))
     }
 
     // Note: `bootstrap_current_core` per hal_core::cpu::CpuAbstraction

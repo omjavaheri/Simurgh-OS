@@ -128,6 +128,12 @@ pub mod compute;
 /// MSR-based DVFS and thermal reporting (section 3.7).
 pub mod power;
 
+/// Peripheral (MMIO/PCI transport) Device Discovery
+/// (hal_core::peripheral::PeripheralDeviceDiscovery) for x86_64: ECAM
+/// PCI scan for virtio devices, mirroring `hal_arm64::peripheral`'s own
+/// aarch64 port.
+pub mod peripheral;
+
 /// Optional direct hardware access (hal_direct::HalDirectAccess) for
 /// x86_64, only compiled when this crate's "hal-direct-support"
 /// feature is enabled (see Cargo.toml) — per section 1's requirement
@@ -211,6 +217,7 @@ pub struct X86_64Hal {
     pub interrupt: interrupt::InterruptCtrl,
     pub compute: compute::ComputeDiscovery,
     pub power: power::PowerThermalImpl,
+    pub peripheral: peripheral::PeripheralDiscovery,
 }
 
 /// The fixed size, in bytes, of one x86_64 saved hardware context
@@ -311,6 +318,15 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // ------------------------------------------------------------------
     let compute = compute::ComputeDiscovery::new();
     let power = power::PowerThermalImpl::new(&compute);
+    // SAFETY: `memory.rsdp_phys()` is either `0` or a value obtained
+    // per `Memory::from_uefi_memory_map`'s own boot-protocol guarantees
+    // (the same trust boundary `acpi_dmar_present` already relies on,
+    // Step 2 above) — see `memory::acpi_mcfg_ecam_base`'s own doc
+    // comment and `Memory::rsdp_phys`'s own doc comment for why this
+    // MUST be the real, firmware-reported ECAM base, not a hardcoded
+    // guess.
+    let ecam_base = unsafe { memory::acpi_mcfg_ecam_base(memory.rsdp_phys()) }.unwrap_or(0);
+    let peripheral = peripheral::PeripheralDiscovery::new(ecam_base);
 
     // Built into `.bss` static storage, NOT a plain local — mirrors
     // hal-arm64's own identical fix (`hal_arm64_rust_entry`, this
@@ -343,6 +359,7 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
             interrupt,
             compute,
             power,
+            peripheral,
         });
         &*core::ptr::addr_of!(HAL_STORAGE).cast::<X86_64Hal>()
     };
@@ -400,6 +417,7 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
             &hal.cpu,
             &hal.interrupt,
             &hal.timer,
+            &hal.peripheral,
         ),
         memory::current_page_table_phys(&hal.memory),
         kernel_image_phys_range,

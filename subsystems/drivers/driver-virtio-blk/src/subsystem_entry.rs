@@ -361,6 +361,7 @@ fn new_driver_for_this_transport() -> crate::VirtioBlk {
     let notify_off_multiplier = read_u64_at(24) as u32;
     let isr_cfg_va = read_u64_at(32) as usize;
     let device_cfg_va = read_u64_at(40) as usize;
+    let msix_vector = read_u64_at(48) as u16;
     crate::VirtioBlk::new_pci(
         common_cfg_va,
         notify_cfg_va,
@@ -368,6 +369,7 @@ fn new_driver_for_this_transport() -> crate::VirtioBlk {
         isr_cfg_va,
         device_cfg_va,
         DRV_QUEUE_VA,
+        msix_vector,
     )
 }
 

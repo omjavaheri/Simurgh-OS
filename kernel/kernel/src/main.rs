@@ -1118,6 +1118,12 @@ static mut G_IPC_EP_X86: u32 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut G_FS_EP_X86: u32 = 0;
 
+/// The virtio-blk driver's endpoint capability slot in the caller's
+/// (root's) own capability space — mirrors riscv64's own `G_DRV_EP`
+/// exactly (see that static's own doc comment).
+#[cfg(target_arch = "x86_64")]
+static mut G_DRV_EP_X86: u32 = 0;
+
 /// The x86_64 Root Task entry. Linked into `.user_text` (its own
 /// `U=1` `R+X` pages at the linked VMA, per hal-x86_64's linker.ld) and
 /// run in Ring 3 by `kernel-arch-glue::enter`. Extends the original
@@ -1212,6 +1218,33 @@ extern "C" fn umode_root_x86() -> ! {
         raw_syscall_x86(sys::FS_CLOSE, fs_handle, zero!());
         let fs_closed = raw_syscall_x86(sys::FS_CLOSE_RESULT, zero!(), zero!());
         raw_syscall_x86(sys::REPORT, fs_closed, zero!());
+
+        // 7c. virtio-blk demo (03-Kernel-Subsystems-Layer.md §5.1) —
+        // mirrors aarch64's own `umode_root_aarch64` step 7c exactly
+        // (see its own doc comment), except the device here is
+        // discovered over ECAM PCI same as aarch64 but wired up with
+        // a REAL MSI-X interrupt (`hal_x86_64::interrupt::InterruptCtrl::
+        // msi_message`, `kernel_arch_glue::wire_virtio_pci_transport`'s
+        // own MSI-X branch), not a legacy INTx swizzle — see either's
+        // own doc comment for the full rationale. `DRV_BLK_DEMO_START`
+        // reports `usize::MAX` (mirroring `FS_DEMO_START`'s own
+        // convention) if no Block-kind peripheral was discovered at
+        // boot — the rest of this sequence is skipped in that case
+        // rather than driving IPC against a driver that was never
+        // spawned.
+        let drv_ep = raw_syscall_x86(sys::DRV_BLK_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, drv_ep, zero!());
+        if drv_ep != usize::MAX {
+            raw_syscall_x86(sys::DRV_BLK_PROBE, zero!(), zero!());
+            let drv_sector_size = raw_syscall_x86(sys::DRV_BLK_PROBE_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, drv_sector_size, zero!());
+            raw_syscall_x86(sys::DRV_BLK_WRITE, zero!(), zero!()); // lba=0
+            let drv_written = raw_syscall_x86(sys::DRV_BLK_WRITE_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, drv_written, zero!());
+            raw_syscall_x86(sys::DRV_BLK_READ, zero!(), zero!()); // lba=0
+            let drv_read = raw_syscall_x86(sys::DRV_BLK_READ_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, drv_read, zero!());
+        }
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the LAPIC timer, then loop forever bumping
@@ -1615,6 +1648,111 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         }
         sys::FS_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
+        }
+        // virtio-blk driver: mirrors aarch64's/riscv64's own identical
+        // arms (this file's `sys::DRV_BLK_DEMO_START` doc comment on
+        // riscv64's block) — same `Transport`-erased `kernel_arch_glue::
+        // spawn_virtio_blk_driver` entry point, just `EM_X86_64` and
+        // this architecture's own `G_DRV_EP_X86` slot. Discovered over
+        // ECAM PCI (`hal_x86_64::peripheral`'s own scan) and wired up
+        // with a real MSI-X interrupt rather than legacy INTx — see
+        // `hal_core::interrupt::InterruptController::msi_message`'s own
+        // doc comment for the full rationale — transparently to this
+        // dispatch code, which stays identical either way.
+        sys::DRV_BLK_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_blk_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_BLK_ELF,
+                elf_loader::machine::EM_X86_64,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_EP_X86, before any later DRV_BLK_* call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::DRV_BLK_PROBE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_BLK_DEMO_START,
+            // before any DRV_BLK_PROBE call.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_X86).read() };
+            return match kernel_arch_glue::drv_blk_probe_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_PROBE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_probe_result().0 as usize);
+        }
+        sys::DRV_BLK_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_X86).read() };
+            return match kernel_arch_glue::drv_blk_write_call(hal, caller, ep, a0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_write_result());
+        }
+        sys::DRV_BLK_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_X86).read() };
+            return match kernel_arch_glue::drv_blk_read_call(hal, caller, ep, a0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
+        }
+        sys::DRV_IRQ_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            // Discovered ONCE, before the retry loop below — see
+            // riscv64's own identical `sys::DRV_IRQ_WAIT` arm (this
+            // file) and `kernel_arch_glue::drv_irq_wait_step`'s own doc
+            // comment for why re-discovering it on every iteration is a
+            // real bug, not a harmless simplification.
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // Real interrupt-driven idle wait — mirrors riscv64's/
+            // aarch64's own `sys::DRV_IRQ_WAIT` arm exactly (see either's
+            // own doc comment for the full rationale), substituting
+            // hal-x86_64's own `hlt_wait_for_irq()` (`sti; hlt; cli`,
+            // Ring 0's HLT-based idle) for hal_riscv64/hal_arm64's own
+            // `wfi()` — both gate the SAME class of "trap taken while
+            // already at the target privilege level" case; the LAPIC is
+            // already primed by `hal_x86_64_rust_entry`'s own
+            // `InterruptCtrl::bootstrap_current_core` call (unconditional
+            // at boot, not gated on this driver ever running), and the
+            // MSI-X vector this device's own interrupt uses was
+            // programmed by `wire_virtio_pci_transport` at spawn time.
+            loop {
+                match kernel_arch_glue::drv_irq_wait_step(hal, caller, a0 as u32) {
+                    kernel_arch_glue::IrqWaitOutcome::Ready(bits) => {
+                        return TrapOutcome::Resume(bits as usize);
+                    }
+                    kernel_arch_glue::IrqWaitOutcome::Blocked => {
+                        hal_x86_64::cpu::hlt_wait_for_irq();
+                    }
+                    kernel_arch_glue::IrqWaitOutcome::Error => {
+                        return TrapOutcome::Resume(0);
+                    }
+                }
+            }
         }
         sys::P2_PREEMPT_START => {
             // The cooperative §8.4 round-trip is done; spawn the fault-

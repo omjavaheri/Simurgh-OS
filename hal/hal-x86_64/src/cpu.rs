@@ -2051,6 +2051,47 @@ extern "C" fn common_fault_entry(frame: *mut SyscallFrame) {
     halt_on_unexpected_fault();
 }
 
+/// Halts the core in Ring 0 until any interrupt is serviced — the
+/// x86_64 counterpart to `hal_arm64::cpu::wfi`/`hal_riscv64::cpu::wfi`
+/// (see either's own doc comment for the full cross-architecture
+/// rationale: ordinary kernel code stays interrupt-masked except at
+/// this one deliberate wait point). `sti` unmasks interrupts; the CPU-
+/// guaranteed "STI shadow" (Intel SDM Vol. 2A, `STI`) means an
+/// interrupt that becomes pending between `sti` and `hlt` is never
+/// lost — it is still held off until `hlt` actually executes. `hlt`
+/// (SDM Vol. 2A, `HLT`: "If an enabled interrupt... is received... the
+/// processor resumes execution at the instruction following the HLT
+/// instruction") then halts until that interrupt (or any later one)
+/// fires; its registered handler runs to completion (via the ordinary
+/// `common_interrupt_entry` -> `dispatch_vector` path) and `iretq`s
+/// back to the SAME context, resuming right here — no context switch
+/// happens, unlike a scheduler-driven wake. `cli` immediately restores
+/// the masked-by-default invariant. Unlike ARM64's `wfi`/RISC-V's own
+/// `wfi`, x86_64's HLT-resume address is unconditionally architecture-
+/// guaranteed (not an implementation-defined QEMU/TCG quirk needing a
+/// `global_asm!` retry-label workaround), so no equivalent to
+/// `hal_arm64_wfi`'s own labelled-trampoline fixup is needed here.
+#[cfg(target_os = "none")]
+pub fn hlt_wait_for_irq() {
+    // SAFETY: valid to execute at CPL 0 (true for every caller of this
+    // function — kernel/Ring-0 code only) with no other preconditions;
+    // always eventually returns (immediately if an interrupt is already
+    // pending, per `HLT`'s own architectural guarantee, or after a
+    // genuine hardware wait) rather than ever deadlocking. Not
+    // `options(preserves_flags)`: `sti`/`cli` deliberately DO modify
+    // `RFLAGS.IF`, which is the entire point of this sequence.
+    unsafe {
+        core::arch::asm!("sti", "hlt", "cli", options(nostack));
+    }
+}
+
+/// Host test build: no real Ring-0/IF state exists — a no-op, same
+/// stance `hal_arm64::cpu::wfi`'s own host fallback takes (see its doc
+/// comment) so this function remains callable, unconditionally, by
+/// architecture-erased callers built for the host test target.
+#[cfg(not(target_os = "none"))]
+pub fn hlt_wait_for_irq() {}
+
 #[cfg(target_os = "none")]
 fn halt_on_unexpected_fault() -> ! {
     loop {

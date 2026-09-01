@@ -70,6 +70,21 @@
 //!     `unregister_irq`/`send_ipi` are NOT added — `register_irq` already
 //!     unmasks per its own contract, and this MVP never revokes an IRQ
 //!     grant or targets a second core.
+//!   - v7 (kernel-arch-glue, virtio-blk x86_64 fan-out): `msi_message`
+//!     added, wrapping `hal_core::interrupt::InterruptController::
+//!     msi_message`. x86_64's own virtio-pci device has no fixed
+//!     hardware IRQ line a HAL discovery pass can resolve ahead of time
+//!     the way aarch64's GIC SPI swizzle or riscv64's PLIC source number
+//!     can — MSI-X assigns a vector by the DRIVER (here, kernel-arch-
+//!     glue) writing a Message Address/Data pair into the device's own
+//!     MSI-X table, and this method is how architecture-generic code
+//!     reaches the ONE arch-specific computation (Local APIC ID +
+//!     vector encoding) that pair requires, without ever branching on
+//!     `target_arch` itself: the default `None` (every OTHER
+//!     architecture's own `InterruptController`) simply means "this
+//!     controller has no message-signaled path", and the caller falls
+//!     back to whatever native routing that architecture's own HAL
+//!     discovery already resolved.
 //! ============================================================================
 
 use crate::cpu::CpuAbstraction;
@@ -265,6 +280,32 @@ unsafe fn trampoline_register_irq<I: InterruptController>(
     ctrl.register_irq(IrqId::new(irq), handler).is_ok()
 }
 
+/// `found` is written `true`/`false` (not an `Option` in the return
+/// type) so this trampoline's signature stays plain `unsafe fn(...) ->
+/// (u64, u32)`, matching every other trampoline in this file — the
+/// hand-rolled vtable boundary has no `Option` ABI to lean on.
+unsafe fn trampoline_msi_message<I: InterruptController>(
+    state: *const (),
+    irq: u32,
+    found: *mut bool,
+) -> (u64, u32) {
+    // SAFETY: `state` was produced by `build_interface` from a `&I` and
+    // remains valid per that function's safety contract; `found` is a
+    // valid `*mut bool` owned by `HalInterface::msi_message`'s own call
+    // site below.
+    let ctrl = unsafe { &*(state as *const I) };
+    match ctrl.msi_message(IrqId::new(irq)) {
+        Some((addr, data)) => {
+            unsafe { found.write(true) };
+            (addr, data)
+        }
+        None => {
+            unsafe { found.write(false) };
+            (0, 0)
+        }
+    }
+}
+
 /// Architecture-erased handle to a subset of hal-core's capabilities.
 /// `#[repr(C)]` for a stable layout across the `extern "Rust"`
 /// declaration/definition boundary, matching this project's other
@@ -291,6 +332,7 @@ pub struct HalInterface {
     timer_arm: unsafe fn(*const (), u64) -> bool,
     timer_cancel: unsafe fn(*const ()),
     interrupt_register_irq: unsafe fn(*const (), u32, IrqHandler) -> bool,
+    interrupt_msi_message: unsafe fn(*const (), u32, *mut bool) -> (u64, u32),
 }
 
 impl HalInterface {
@@ -515,6 +557,29 @@ impl HalInterface {
         // produced together by `build_interface`.
         unsafe { (self.interrupt_register_irq)(self.interrupt_state, irq, handler) }
     }
+
+    /// Computes the Message Address/Message Data pair a message-
+    /// signaled-interrupt-capable device should be programmed with to
+    /// deliver `irq` to this core, or `None` if this platform's own
+    /// `InterruptController` has no message-signaled path (every
+    /// architecture except x86_64, in this project's current scope —
+    /// see `hal_core::interrupt::InterruptController::msi_message`'s
+    /// own doc comment). `irq` need not already be registered via
+    /// `register_irq` — callers typically compute the pair FIRST, then
+    /// register, using the same `irq` value for both.
+    pub fn msi_message(&self, irq: u32) -> Option<(u64, u32)> {
+        let mut found = false;
+        // SAFETY: `interrupt_state`/`interrupt_msi_message` were
+        // produced together by `build_interface`; `&mut found` is a
+        // valid `*mut bool` for the duration of this call.
+        let (addr, data) =
+            unsafe { (self.interrupt_msi_message)(self.interrupt_state, irq, &mut found) };
+        if found {
+            Some((addr, data))
+        } else {
+            None
+        }
+    }
 }
 
 /// Builds a `HalInterface` from a concrete CPU/timer implementation.
@@ -561,6 +626,7 @@ where
         timer_arm: trampoline_arm_timer::<T>,
         timer_cancel: trampoline_cancel_timer::<T>,
         interrupt_register_irq: trampoline_register_irq::<I>,
+        interrupt_msi_message: trampoline_msi_message::<I>,
     }
 }
 
