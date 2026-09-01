@@ -26,6 +26,7 @@ members = [
     "subsystems/device-manager",
     "subsystems/drivers/driver-framework",
     "subsystems/drivers/driver-virtio-blk",
+    "subsystems/drivers/driver-virtio-net",
     "subsystems/vfs-service/vfs-router",
     "subsystems/vfs-service/fs-native",
     "subsystems/netstack",
@@ -132,6 +133,34 @@ opt-level = 2
 # and IMPLEMENTATION-PLAN.md's own note on the `-global virtio-mmio.
 # force-legacy=off` QEMU flag this driver requires).
 [profile.dev.package.driver-virtio-blk]
+opt-level = 2
+
+# Same rationale/root-cause class as `driver-virtio-blk`'s own override
+# directly above — a bounded busy-poll on a virtqueue's used ring
+# (`VirtioNet::poll_rx`/the TX completion wait in `submit_tx`,
+# `subsystems/drivers/driver-virtio-net/src/lib.rs`). Applied proactively
+# here rather than re-discovering the identical opt-level-0 miscompile via
+# a fresh QEMU debugging session, since it is the same code shape
+# (`for _ in 0..MAX_SPINS { read_volatile(...) }`) driver-virtio-blk's own
+# comment already documents in full.
+[profile.dev.package.driver-virtio-net]
+opt-level = 2
+
+# `kernel-arch-glue`'s own virtio-net spawn/demo code is one of the
+# largest additions to this crate to date (`spawn_virtio_net_driver` in
+# particular). Applied defensively, alongside the enlarged riscv64 boot
+# stack (`hal/hal-riscv64/src/linker.ld`'s own `__boot_stack_bottom`/
+# `__boot_stack_top` comment) — same "opt-level 0 is sensitive to
+# incidental code-shape changes once a function grows large enough" class
+# this project has hit repeatedly (see `kernel`'s own override comment
+# above). NOT independently confirmed to fix the specific intermittent
+# hang documented in `hal/hal-riscv64/src/linker.ld`'s own comment on its
+# own (see that comment for the full, honest investigation record —
+# neither this override nor the bigger stack, alone or together,
+# reliably reproduced a fix across repeated trials); kept because it is
+# real, harmless hardening in its own right, matching this crate's
+# now-larger call graph.
+[profile.dev.package.kernel-arch-glue]
 opt-level = 2
 
 [profile.release]

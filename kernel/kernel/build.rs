@@ -121,4 +121,37 @@ fn main() {
         "cargo:rustc-env=DRIVER_VIRTIO_BLK_ELF_PATH={}",
         drv_path.canonicalize().unwrap().display()
     );
+
+    // Same as above, for `driver-virtio-net-bin` (03-Kernel-Subsystems-
+    // Layer.md §2.3/§5.4) — the fourth real subsystem process. riscv64
+    // ONLY for now (`driver-virtio-net`'s own module doc comment on why):
+    // aarch64/x86_64 builds skip this entirely (no `DRIVER_VIRTIO_NET_
+    // ELF_PATH` env var is emitted for them, and `kernel/src/main.rs`'s
+    // aarch64/x86_64-gated sections never reference one — same "new
+    // architecture-gated code only touches its own section" pattern the
+    // virtio-blk PCI/MSI-X fan-out sessions already established).
+    if target_arch == "riscv64" {
+        let net_build_alias = "cargo xbuild-subsystem-driver-virtio-net-riscv64".to_string();
+        let net_path = std::path::PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(dm_target_dir_name)
+            .join("debug")
+            .join("driver-virtio-net-bin");
+
+        if !net_path.exists() {
+            panic!(
+                "kernel build.rs: driver-virtio-net-bin binary not found at {} (target_arch = {target_arch}).\n\
+                 Build it first with: {net_build_alias}",
+                net_path.display()
+            );
+        }
+
+        println!("cargo:rerun-if-changed={}", net_path.display());
+        println!(
+            "cargo:rustc-env=DRIVER_VIRTIO_NET_ELF_PATH={}",
+            net_path.canonicalize().unwrap().display()
+        );
+    }
 }

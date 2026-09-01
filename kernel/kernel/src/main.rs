@@ -132,6 +132,18 @@ static FS_NATIVE_ELF: &[u8] = include_bytes!(env!("FS_NATIVE_ELF_PATH"));
 /// third real subsystem process (03-Kernel-Subsystems-Layer.md §5.1).
 static DRIVER_VIRTIO_BLK_ELF: &[u8] = include_bytes!(env!("DRIVER_VIRTIO_BLK_ELF_PATH"));
 
+/// `driver-virtio-net-bin`'s own separately-built ELF image — same
+/// packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), the
+/// fourth real subsystem process (03-Kernel-Subsystems-Layer.md
+/// §2.3/§5.4). riscv64 ONLY for now (`driver-virtio-net`'s own module
+/// doc comment on why) — `build.rs` only emits `DRIVER_VIRTIO_NET_ELF_
+/// PATH` for that one target_arch, so unlike `DEVICE_MANAGER_ELF` above
+/// this one IS `cfg`-gated (an unconditional `include_bytes!(env!(...))`
+/// would fail to compile for aarch64/x86_64, where that env var is never
+/// set).
+#[cfg(target_arch = "riscv64")]
+static DRIVER_VIRTIO_NET_ELF: &[u8] = include_bytes!(env!("DRIVER_VIRTIO_NET_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -524,6 +536,48 @@ mod sys {
     /// wfi`) rather than busy-polling — see this opcode's own riscv64
     /// dispatch arm.
     pub const DRV_IRQ_WAIT: usize = 63;
+
+    /// No arguments. Spawns the virtio-net driver process
+    /// (`kernel_arch_glue::spawn_virtio_net_driver`) and returns its
+    /// endpoint capability slot in `a0`, or `usize::MAX` if no
+    /// `Network`-kind peripheral was discovered at boot. riscv64 only for
+    /// now (`driver_virtio_net`'s own module doc comment, 03-Kernel-
+    /// Subsystems-Layer.md §2.3/§5.4).
+    pub const DRV_NET_DEMO_START: usize = 64;
+    /// No arguments (uses the endpoint `DRV_NET_DEMO_START` cached in
+    /// `G_DRV_NET_EP` — same convention `DRV_BLK_PROBE` etc. already
+    /// use). Builds a REAL `DriverRequest::Probe` and (on success) caches
+    /// the negotiated device MAC —
+    /// `kernel_arch_glue::drv_net_probe_result`'s own doc comment.
+    pub const DRV_NET_PROBE: usize = 65;
+    /// No arguments. Returns `0` on success, `usize::MAX` otherwise.
+    pub const DRV_NET_PROBE_RESULT: usize = 66;
+    /// No arguments. Builds and sends a REAL ARP request for the QEMU
+    /// SLIRP gateway's own address.
+    pub const DRV_NET_ARP_SEND: usize = 67;
+    /// No arguments. Returns `0` on `FrameSent`, `usize::MAX` otherwise.
+    pub const DRV_NET_ARP_SEND_RESULT: usize = 68;
+    /// No arguments. Non-blocking: checks the RX queue ONCE for a
+    /// received frame.
+    pub const DRV_NET_ARP_POLL: usize = 69;
+    /// No arguments. `0` = no frame yet (keep polling), `1` = a frame
+    /// arrived but was not a matching ARP reply, `2` = the gateway's MAC
+    /// was resolved — `kernel_arch_glue::drv_net_arp_poll_result`'s own
+    /// doc comment.
+    pub const DRV_NET_ARP_POLL_RESULT: usize = 70;
+    /// No arguments. Builds and sends a REAL ICMP echo request to the
+    /// gateway, using the MAC `DRV_NET_ARP_POLL` already resolved.
+    pub const DRV_NET_PING_SEND: usize = 71;
+    /// No arguments. Returns `0` on `FrameSent`, `usize::MAX` otherwise.
+    pub const DRV_NET_PING_SEND_RESULT: usize = 72;
+    /// No arguments. Non-blocking: checks the RX queue ONCE for a
+    /// received frame.
+    pub const DRV_NET_PING_POLL: usize = 73;
+    /// No arguments. `0` = no frame yet, `1` = a frame arrived but was
+    /// not a matching ICMP echo reply, `2` = MATCH (real end-to-end
+    /// round trip proven — logs the verdict either way) —
+    /// `kernel_arch_glue::drv_net_ping_poll_result`'s own doc comment.
+    pub const DRV_NET_PING_POLL_RESULT: usize = 74;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -651,6 +705,194 @@ static mut G_FS_EP: u32 = 0;
 /// `DRV_BLK_READ` handler — same role as `G_FS_EP`.
 #[cfg(target_arch = "riscv64")]
 static mut G_DRV_EP: u32 = 0;
+
+/// Same role as `G_DRV_EP`, for the virtio-net driver process — set once
+/// by `DRV_NET_DEMO_START`'s own handler, read by every later
+/// `DRV_NET_*` handler.
+#[cfg(target_arch = "riscv64")]
+static mut G_DRV_NET_EP: u32 = 0;
+
+/// The virtio-net demo (03-Kernel-Subsystems-Layer.md §2.3/§5.4): a real
+/// network driver process, real MMIO handshake, real ARP resolve + ICMP
+/// echo request/reply round trip against QEMU's own SLIRP gateway
+/// (`netstack`'s own module doc comment on why this demo pings ITS OWN
+/// gateway rather than waiting for an externally-initiated ping — a
+/// host-networking-environment limitation, not a mechanism gap).
+/// `DRV_NET_DEMO_START` reports `usize::MAX` if no Network-kind
+/// peripheral was discovered at boot, mirroring `DRV_BLK_DEMO_START`'s
+/// own convention.
+///
+/// `DRV_NET_ARP_POLL`/`DRV_NET_PING_POLL` are each non-blocking
+/// (`driver_virtio_net`'s own module doc comment on why a network reply
+/// cannot use the same `Wait`-for-completion shape a block read can) —
+/// the loops below are the RETRY the driver itself cannot perform,
+/// bounded so a lost/dropped packet cannot wedge boot forever.
+///
+/// A SEPARATE `#[link_section = ".user_text"]` `#[inline(never)]`
+/// function, called once from `umode_root` (`raw_syscall` itself is this
+/// same shape, and `umode_root` already calls IT as a real function —
+/// see its own doc comment for why a call between two `.user_text`
+/// functions is safe: no relocation to anything outside that section).
+///
+/// **Honest investigation record — kept as a structural improvement, NOT
+/// a confirmed fix.** While this section was still written inline inside
+/// `umode_root`, a real, GENUINE spin (confirmed via `Get-Process`: 180+
+/// CPU-seconds burned with zero further serial output, not just slow)
+/// appeared intermittently at the totally unrelated "arm the preemptive
+/// timer" step further down `umode_root`, only on boots where the ARP+
+/// ICMP round trip actually succeeded end to end. Extracting this
+/// section into its own function looked like it fixed the hang on the
+/// FIRST retest afterward — but across many further clean rebuild+boot
+/// trials (with this extraction, with `[profile.dev.package.kernel-
+/// arch-glue] opt-level = 2`, with an enlarged riscv64 kernel boot stack,
+/// and every combination of the three), NO single change reproduced a
+/// reliable fix: the exact same binary passed once and then hung several
+/// times in a row. `hal/hal-riscv64/src/linker.ld`'s own `__boot_stack_
+/// bottom` comment has the fullest account, including the leading theory
+/// by the end of the investigation (QEMU/host timing jitter interacting
+/// with an ALREADY timing-fragile 40-tick preemption demo, not a kernel-
+/// code bug this project can fix by rearranging `.user_text` functions).
+/// This extraction is kept anyway — it is a genuine structural
+/// improvement (a smaller, more focused stack frame, matching this
+/// file's own established one-function-per-concern shape) — but
+/// TODO(omid): do not read its presence as proof the hang is resolved.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_demo_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code — `ecall` from
+    // U-mode traps to the S-mode handler, which preserves every register
+    // except `a0` for an ordinary (non-switching) opcode.
+    unsafe {
+        // Same stack-slot-reuse-defeating macro as `umode_root`'s own —
+        // duplicated per-function rather than shared, matching this
+        // file's own existing convention (`umode_root_x86`/`umode_root_
+        // aarch64` each define their own copy too).
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                // SAFETY: a no-op asm block with no real instructions —
+                // its only purpose is defeating stale-stack-slot reuse.
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let net_ep = raw_syscall(sys::DRV_NET_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::REPORT, net_ep, zero!());
+        if net_ep != usize::MAX {
+            raw_syscall(sys::DRV_NET_PROBE, zero!(), zero!());
+            let net_probed = raw_syscall(sys::DRV_NET_PROBE_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, net_probed, zero!());
+            if net_probed == 0 {
+                raw_syscall(sys::DRV_NET_ARP_SEND, zero!(), zero!());
+                let arp_sent = raw_syscall(sys::DRV_NET_ARP_SEND_RESULT, zero!(), zero!());
+                raw_syscall(sys::REPORT, arp_sent, zero!());
+                if arp_sent == 0 {
+                    // The retry LOOP itself is deliberately or ordinary,
+                    // `asm!`-free safe Rust — see `net_arp_poll_once`'s
+                    // own doc comment for why the actual `ecall`s live in
+                    // a separate, straight-line (no loop) function
+                    // instead of inline here.
+                    const MAX_NET_POLL_ATTEMPTS: usize = 5_000;
+                    let mut arp_verdict = 0usize;
+                    for _ in 0..MAX_NET_POLL_ATTEMPTS {
+                        arp_verdict = net_arp_poll_once();
+                        if arp_verdict == 2 {
+                            break;
+                        }
+                    }
+                    raw_syscall(sys::REPORT, arp_verdict, zero!());
+                    if arp_verdict == 2 {
+                        raw_syscall(sys::DRV_NET_PING_SEND, zero!(), zero!());
+                        let ping_sent = raw_syscall(sys::DRV_NET_PING_SEND_RESULT, zero!(), zero!());
+                        raw_syscall(sys::REPORT, ping_sent, zero!());
+                        if ping_sent == 0 {
+                            let mut ping_verdict = 0usize;
+                            for _ in 0..MAX_NET_POLL_ATTEMPTS {
+                                ping_verdict = net_ping_poll_once();
+                                if ping_verdict == 2 {
+                                    break;
+                                }
+                            }
+                            raw_syscall(sys::REPORT, ping_verdict, zero!());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One ARP-poll attempt: `DRV_NET_ARP_POLL` then `DRV_NET_ARP_POLL_
+/// RESULT` — a straight-line, non-looping pair of `ecall`s, exactly the
+/// shape every OTHER `.user_text` `ecall` sequence in this codebase
+/// already uses (`DRV_BLK_PROBE`+`_RESULT`, `FS_OPEN`+`_RESULT`, …, none
+/// of which ever sit inside a Rust `while`/`for` loop).
+///
+/// A SEPARATE function from `net_demo_riscv64`'s own retry loop —
+/// structurally cleaner (matches every OTHER `.user_text` `ecall`
+/// sequence's own straight-line shape, this doc comment's own opening
+/// line) and kept even though it did NOT turn out to reliably fix the
+/// intermittent hang it was originally introduced to chase. **Honest
+/// investigation record**: a boot that resolved ARP and the ICMP echo on
+/// the first attempt would sometimes hang later — arming the preemptive
+/// timer but never actually switching to device-manager (`-d int`
+/// tracing: an endless, otherwise-ordinary-looking `s_timer` +
+/// `sbi_set_timer` cycle, never a crash or decode error). Several
+/// structural changes were tried in response — this loop/`ecall`
+/// separation, `[profile.dev.package.kernel-arch-glue] opt-level = 2`,
+/// and enlarging the riscv64 kernel boot stack (`hal/hal-riscv64/src/
+/// linker.ld`'s own `__boot_stack_bottom` comment has the fullest,
+/// still-open account) — and each individually looked promising on a
+/// first retest, but NONE reproduced a fix reliably across repeated
+/// clean rebuild+boot trials; the same binary passed once and hung
+/// several times right after. The leading theory shifted to QEMU/host
+/// timing rather than a kernel-code bug — see the linker script comment
+/// for the full reasoning (this exact 40-tick preemption demo was
+/// already flagged elsewhere in this codebase as "too QEMU-timing-
+/// dependent" even without networking involved). This function is kept
+/// on its own genuine merit (matches this codebase's established
+/// straight-line-`ecall` convention) — TODO(omid): do not treat it as a
+/// confirmed fix for the hang; see the linker script comment before
+/// spending further code-level effort on it.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_arp_poll_once() -> usize {
+    // SAFETY: same contract as `net_demo_riscv64`'s own.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall(sys::DRV_NET_ARP_POLL, zero!(), zero!());
+        raw_syscall(sys::DRV_NET_ARP_POLL_RESULT, zero!(), zero!())
+    }
+}
+
+/// Same shape and rationale as `net_arp_poll_once`'s own doc comment, for
+/// `DRV_NET_PING_POLL`/`_RESULT`.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_ping_poll_once() -> usize {
+    // SAFETY: same contract as `net_demo_riscv64`'s own.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall(sys::DRV_NET_PING_POLL, zero!(), zero!());
+        raw_syscall(sys::DRV_NET_PING_POLL_RESULT, zero!(), zero!())
+    }
+}
 
 /// The user-space Root Task entry. Linked into `.user_text` (its own
 /// U=1 R+X pages at VMA 0xC000_0000, per hal-riscv64's linker.ld) and run
@@ -838,6 +1080,12 @@ extern "C" fn umode_root() -> ! {
             let drv_read = raw_syscall(sys::DRV_BLK_READ_RESULT, zero!(), zero!());
             raw_syscall(sys::REPORT, drv_read, zero!());
         }
+
+        // 7c. virtio-net demo (03-Kernel-Subsystems-Layer.md §2.3/§5.4) —
+        // see `net_demo_riscv64`'s own doc comment for what it does and
+        // why it is a SEPARATE `.user_text` function rather than inlined
+        // here.
+        net_demo_riscv64();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
@@ -3364,6 +3612,90 @@ fn simurgh_syscall(
         }
         sys::DRV_BLK_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
+        }
+        sys::DRV_NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_net_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_NET_ELF,
+                elf_loader::machine::EM_RISCV,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_NET_EP, before any later DRV_NET_* call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::DRV_NET_PROBE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_NET_DEMO_START,
+            // before any DRV_NET_PROBE call.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP).read() };
+            return match kernel_arch_glue::drv_net_probe_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PROBE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_probe_result());
+        }
+        sys::DRV_NET_ARP_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP).read() };
+            return match kernel_arch_glue::drv_net_arp_send_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_ARP_SEND_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_arp_send_result());
+        }
+        sys::DRV_NET_ARP_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP).read() };
+            return match kernel_arch_glue::drv_net_arp_poll_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_ARP_POLL_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_arp_poll_result());
+        }
+        sys::DRV_NET_PING_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP).read() };
+            return match kernel_arch_glue::drv_net_ping_send_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PING_SEND_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_ping_send_result());
+        }
+        sys::DRV_NET_PING_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_NET_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP).read() };
+            return match kernel_arch_glue::drv_net_ping_poll_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_NET_PING_POLL_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_net_ping_poll_result());
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
