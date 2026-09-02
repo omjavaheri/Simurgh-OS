@@ -467,6 +467,31 @@ fn handle_bypass_request(req: NetBypassRequest) -> NetBypassResponse {
             ring_len: DRV_QUEUE_SIZE,
         },
         NetBypassRequest::Release { handle: _ } => NetBypassResponse::Released,
+        NetBypassRequest::RelayFrame => {
+            // SAFETY: `stage_frame_for_tx`'s own contract (this
+            // process's own TX region is mapped from process entry
+            // onward, per `spawn_netstack_service`'s own doc comment);
+            // `call_driver`'s own contract (`DRV_ENDPOINT_CAP` likewise
+            // already granted). Stages a fixed, recognizable demo frame
+            // — the SAME shape `kernel_arch_glue::net_bypass_direct_
+            // send`'s own bypass frame uses, so the two paths' own
+            // measured latencies are comparing like-for-like work
+            // (03-Kernel-Subsystems-Layer.md §5.4.1's own "bypass is
+            // ≥30-40% faster than the standard path" claim).
+            unsafe {
+                let mut frame = [0u8; 64];
+                frame[0..6].fill(0xFF); // dest MAC = broadcast
+                frame[6..12].fill(0xB9); // src MAC = fixed sentinel bytes
+                frame[12] = 0xFF;
+                frame[13] = 0xFF; // ethertype 0xFFFF — deliberately unassigned
+                frame[14..].fill(0xB5); // recognizable payload pattern
+                stage_frame_for_tx(&frame);
+                match call_driver(&DriverRequest::SendFrame { len: frame.len() as u32 }) {
+                    Some(DriverResponse::FrameSent) => NetBypassResponse::Relayed,
+                    _ => NetBypassResponse::Denied,
+                }
+            }
+        }
     }
 }
 

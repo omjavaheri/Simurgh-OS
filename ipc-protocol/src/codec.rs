@@ -785,19 +785,23 @@ pub fn decode_mm_response(msg: &SmallMessage) -> Result<MmResponse, DecodeError>
 // NetBypassRequest opcodes (low byte of the label).
 const OP_NB_REQUEST_DIRECT_NIC: u8 = 1;
 const OP_NB_RELEASE: u8 = 2;
+const OP_NB_RELAY_FRAME: u8 = 3;
 
 /// Encodes a `NetBypassRequest` into a `SmallMessage`.
 ///
 /// Word layout by variant:
 /// - `RequestDirectNic`: `[nic_id]`
 /// - `Release`: `[handle]`
+/// - `RelayFrame`: `[]`
 pub fn encode_net_bypass_request(req: &NetBypassRequest) -> SmallMessage {
     let (op, words): (u8, [u64; 1]) = match *req {
         NetBypassRequest::RequestDirectNic { nic_id } => (OP_NB_REQUEST_DIRECT_NIC, [nic_id as u64]),
         NetBypassRequest::Release { handle } => (OP_NB_RELEASE, [handle.0 as u64]),
+        NetBypassRequest::RelayFrame => (OP_NB_RELAY_FRAME, [0]),
     };
-    // `from_words` cannot fail here: 1 word <= MSG_MAX_WORDS.
-    SmallMessage::from_words(Namespace::NetBypass.label(op), &words)
+    let n = if op == OP_NB_RELAY_FRAME { 0 } else { 1 };
+    // `from_words` cannot fail here: n <= 1 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::NetBypass.label(op), &words[..n])
         .unwrap_or_else(|_| SmallMessage::new(Namespace::NetBypass.label(op)))
 }
 
@@ -812,14 +816,22 @@ pub fn decode_net_bypass_request(msg: &SmallMessage) -> Result<NetBypassRequest,
         return Err(DecodeError::VersionMismatch);
     }
     let w = msg.words();
-    if w.is_empty() {
-        return Err(DecodeError::Truncated);
-    }
     match op {
-        OP_NB_REQUEST_DIRECT_NIC => Ok(NetBypassRequest::RequestDirectNic { nic_id: w[0] as u32 }),
-        OP_NB_RELEASE => Ok(NetBypassRequest::Release {
-            handle: DirectNicHandle(w[0] as u32),
-        }),
+        OP_NB_REQUEST_DIRECT_NIC => {
+            if w.is_empty() {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(NetBypassRequest::RequestDirectNic { nic_id: w[0] as u32 })
+        }
+        OP_NB_RELEASE => {
+            if w.is_empty() {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(NetBypassRequest::Release {
+                handle: DirectNicHandle(w[0] as u32),
+            })
+        }
+        OP_NB_RELAY_FRAME => Ok(NetBypassRequest::RelayFrame),
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -830,12 +842,13 @@ pub fn decode_net_bypass_request(msg: &SmallMessage) -> Result<NetBypassRequest,
 const OP_NBR_GRANTED: u8 = 1;
 const OP_NBR_DENIED: u8 = 2;
 const OP_NBR_RELEASED: u8 = 3;
+const OP_NBR_RELAYED: u8 = 4;
 
 /// Encodes a `NetBypassResponse` into a `SmallMessage`.
 ///
 /// Word layout by variant:
 /// - `Granted`: `[handle, rx_ring_cap, tx_ring_cap, ring_len]`
-/// - `Denied`, `Released`: `[]`
+/// - `Denied`, `Released`, `Relayed`: `[]`
 pub fn encode_net_bypass_response(resp: &NetBypassResponse) -> SmallMessage {
     let (op, words): (u8, [u64; 4]) = match *resp {
         NetBypassResponse::Granted {
@@ -849,6 +862,7 @@ pub fn encode_net_bypass_response(resp: &NetBypassResponse) -> SmallMessage {
         ),
         NetBypassResponse::Denied => (OP_NBR_DENIED, [0, 0, 0, 0]),
         NetBypassResponse::Released => (OP_NBR_RELEASED, [0, 0, 0, 0]),
+        NetBypassResponse::Relayed => (OP_NBR_RELAYED, [0, 0, 0, 0]),
     };
     let n = if op == OP_NBR_GRANTED { 4 } else { 0 };
     // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
@@ -881,6 +895,7 @@ pub fn decode_net_bypass_response(msg: &SmallMessage) -> Result<NetBypassRespons
         }
         OP_NBR_DENIED => Ok(NetBypassResponse::Denied),
         OP_NBR_RELEASED => Ok(NetBypassResponse::Released),
+        OP_NBR_RELAYED => Ok(NetBypassResponse::Relayed),
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -1179,6 +1194,7 @@ mod tests {
         net_bypass_request_roundtrip(NetBypassRequest::Release {
             handle: DirectNicHandle(1),
         });
+        net_bypass_request_roundtrip(NetBypassRequest::RelayFrame);
     }
 
     fn net_bypass_response_roundtrip(resp: NetBypassResponse) {
@@ -1196,6 +1212,7 @@ mod tests {
         });
         net_bypass_response_roundtrip(NetBypassResponse::Denied);
         net_bypass_response_roundtrip(NetBypassResponse::Released);
+        net_bypass_response_roundtrip(NetBypassResponse::Relayed);
     }
 
     #[test]

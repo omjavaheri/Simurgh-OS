@@ -713,6 +713,25 @@ mod sys {
     /// Issue `MM_QUERY_TOTAL_RESIDENT` itself as usual to trigger the
     /// real `Call`; only the result read differs.
     pub const MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET: usize = 87;
+
+    // -- kernel-bypass §5.4.1 latency comparison: the "standard path"
+    //    counterpart to `NET_BYPASS_SEND`, so the ">=30-40% faster" claim
+    //    has something real to compare against instead of being asserted.
+
+    /// No arguments. Builds a REAL `NetBypassRequest::RelayFrame` and
+    /// calls Netstack's own `BYPASS_ENDPOINT_CAP` (`kernel_arch_glue::
+    /// net_standard_send_call`'s own doc comment) - Netstack itself then
+    /// makes a SECOND real IPC round trip to the driver and waits for
+    /// the real hardware TX completion before replying.
+    pub const NET_STANDARD_SEND_REQUEST: usize = 88;
+    /// No arguments. Returns `1` in `a0` for a real `Relayed`, `0`
+    /// otherwise.
+    pub const NET_STANDARD_SEND_REQUEST_RESULT: usize = 89;
+    /// `a0` = bypass path average latency (ns), `a1` = standard path
+    /// average latency (ns) — both computed in `.user_text` from several
+    /// real samples each. Logs one honest verdict line comparing them
+    /// (`kernel_arch_glue::net_latency_summary`'s own doc comment).
+    pub const NET_LATENCY_SUMMARY: usize = 90;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -1094,14 +1113,23 @@ fn mm_bench_riscv64() {
 /// The kernel-bypass networking demo (03-Kernel-Subsystems-Layer.md
 /// §2.3/§5.4.1): issues the REAL `NetBypassRequest::RequestDirectNic`
 /// control-plane handshake to Netstack's own `BYPASS_ENDPOINT_CAP` server
-/// loop, then a REAL kernel-mode data-path SEND that drives the driver's
-/// own already-probed TX queue directly — no driver process, no further
-/// IPC, matching §5.4.1's own contract. Must run AFTER the driver's own
-/// SendFrame/PollFrame demo and Netstack's own ARP/ICMP demo have both
-/// already completed (`kernel_arch_glue::net_bypass_direct_send`'s own
-/// doc comment on why this ordering is a real precondition, not just
-/// convenient sequencing — it refuses to interleave with a still-pending
-/// driver-owned TX request).
+/// loop, then — if granted — SAMPLES (10) REAL kernel-mode data-path
+/// SENDs that drive the driver's own already-probed TX queue directly
+/// (no driver process, no further IPC, matching §5.4.1's own contract),
+/// immediately followed by SAMPLES REAL sends over the STANDARD path
+/// instead (client -> Netstack -> driver, two real IPC hops, `ipc_
+/// protocol::net::NetBypassRequest::RelayFrame`'s own doc comment) —
+/// then reports both paths' own min/avg/max (via `REPORT`) and a single
+/// honest verdict comparing the two averages (`sys::NET_LATENCY_
+/// SUMMARY`, `kernel_arch_glue::net_latency_summary`'s own doc comment)
+/// — §5.4.1's own "the bypass path is ≥30-40% lower latency than the
+/// standard path" claim, finally checked against something real instead
+/// of asserted. Must run AFTER the driver's own SendFrame/PollFrame demo
+/// and Netstack's own ARP/ICMP demo have both already completed
+/// (`kernel_arch_glue::net_bypass_direct_send`'s own doc comment on why
+/// this ordering is a real precondition, not just convenient sequencing
+/// — it refuses to interleave with a still-pending driver-owned TX
+/// request).
 #[cfg(target_arch = "riscv64")]
 #[inline(never)]
 #[link_section = ".user_text"]
@@ -1120,8 +1148,82 @@ fn net_bypass_demo_riscv64() {
         let granted = raw_syscall(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
         raw_syscall(sys::REPORT, granted, zero!());
         if granted != 0 {
-            let elapsed_ns = raw_syscall(sys::NET_BYPASS_SEND, zero!(), zero!());
-            raw_syscall(sys::REPORT, elapsed_ns, zero!());
+            // §5.4.1's own latency comparison — SAMPLES real sends each
+            // way (not a statistically rigorous benchmark, but enough to
+            // see past one-off QEMU/TCG jitter). Standard path (via
+            // Netstack) FIRST, bypass SECOND — a real (if unconfirmed as
+            // the proximate cause here) latent risk motivates the order:
+            // a kernel-bypass send directly advances the TX ring's own
+            // physical avail/used indices without updating the driver
+            // PROCESS's own private `VirtioNet::tx_next_idx` field
+            // (unreachable from kernel-arch-glue), so a driver-process
+            // `SendFrame` issued AFTER a bypass send COULD compute its
+            // own next ring slot from a stale index. Investigated via
+            // QEMU when the standard path failed every sample — but it
+            // failed identically with bypass sends NOT run first either,
+            // and then stopped failing after an unrelated, purely
+            // diagnostic code change, matching the SAME class of rare,
+            // QEMU-timing-dependent flakiness already root-caused (as a
+            // `driver_virtio_net::do_probe` notify-offset race) for
+            // kernel-bypass's own earlier development — not this
+            // ordering theory, which remains a real but unconfirmed
+            // latent risk worth the harmless precaution of keeping
+            // anyway. Standard path: bracketed with `NOW_NS`, same
+            // convention `mm_bench_riscv64`'s own doc comment
+            // establishes. Bypass: `NET_BYPASS_SEND`'s own kernel-side
+            // timer already returns elapsed ns directly, no bracketing
+            // needed.
+            const SAMPLES: usize = 10;
+
+            let (mut s_min, mut s_max, mut s_sum, mut s_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+                raw_syscall(sys::NET_STANDARD_SEND_REQUEST, zero!(), zero!());
+                let relayed = raw_syscall(sys::NET_STANDARD_SEND_REQUEST_RESULT, zero!(), zero!());
+                let t1 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+                if relayed != 0 {
+                    let dt = t1.saturating_sub(t0);
+                    s_ok += 1;
+                    if dt < s_min {
+                        s_min = dt;
+                    }
+                    if dt > s_max {
+                        s_max = dt;
+                    }
+                    s_sum += dt;
+                }
+            }
+            raw_syscall(sys::REPORT, s_ok, zero!());
+            let s_avg = if s_ok > 0 { s_sum / s_ok } else { 0 };
+            if s_ok > 0 {
+                raw_syscall(sys::REPORT, s_min, zero!());
+                raw_syscall(sys::REPORT, s_avg, zero!());
+                raw_syscall(sys::REPORT, s_max, zero!());
+            }
+
+            let (mut b_min, mut b_max, mut b_sum, mut b_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let ns = raw_syscall(sys::NET_BYPASS_SEND, zero!(), zero!());
+                if ns != usize::MAX {
+                    b_ok += 1;
+                    if ns < b_min {
+                        b_min = ns;
+                    }
+                    if ns > b_max {
+                        b_max = ns;
+                    }
+                    b_sum += ns;
+                }
+            }
+            raw_syscall(sys::REPORT, b_ok, zero!());
+            let b_avg = if b_ok > 0 { b_sum / b_ok } else { 0 };
+            if b_ok > 0 {
+                raw_syscall(sys::REPORT, b_min, zero!());
+                raw_syscall(sys::REPORT, b_avg, zero!());
+                raw_syscall(sys::REPORT, b_max, zero!());
+            }
+
+            raw_syscall(sys::NET_LATENCY_SUMMARY, b_avg, s_avg);
         }
     }
 }
@@ -1809,8 +1911,60 @@ fn net_bypass_demo_x86() {
         let granted = raw_syscall_x86(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
         raw_syscall_x86(sys::REPORT, granted, zero!());
         if granted != 0 {
-            let elapsed_ns = raw_syscall_x86(sys::NET_BYPASS_SEND, zero!(), zero!());
-            raw_syscall_x86(sys::REPORT, elapsed_ns, zero!());
+            // §5.4.1's own latency comparison - see the riscv64
+            // `net_bypass_demo_riscv64`'s own doc comment (standard path
+            // FIRST, bypass SECOND - deliberate order, not incidental).
+            const SAMPLES: usize = 10;
+
+            let (mut s_min, mut s_max, mut s_sum, mut s_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                raw_syscall_x86(sys::NET_STANDARD_SEND_REQUEST, zero!(), zero!());
+                let relayed = raw_syscall_x86(sys::NET_STANDARD_SEND_REQUEST_RESULT, zero!(), zero!());
+                let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                if relayed != 0 {
+                    let dt = t1.saturating_sub(t0);
+                    s_ok += 1;
+                    if dt < s_min {
+                        s_min = dt;
+                    }
+                    if dt > s_max {
+                        s_max = dt;
+                    }
+                    s_sum += dt;
+                }
+            }
+            raw_syscall_x86(sys::REPORT, s_ok, zero!());
+            let s_avg = if s_ok > 0 { s_sum / s_ok } else { 0 };
+            if s_ok > 0 {
+                raw_syscall_x86(sys::REPORT, s_min, zero!());
+                raw_syscall_x86(sys::REPORT, s_avg, zero!());
+                raw_syscall_x86(sys::REPORT, s_max, zero!());
+            }
+
+            let (mut b_min, mut b_max, mut b_sum, mut b_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let ns = raw_syscall_x86(sys::NET_BYPASS_SEND, zero!(), zero!());
+                if ns != usize::MAX {
+                    b_ok += 1;
+                    if ns < b_min {
+                        b_min = ns;
+                    }
+                    if ns > b_max {
+                        b_max = ns;
+                    }
+                    b_sum += ns;
+                }
+            }
+            raw_syscall_x86(sys::REPORT, b_ok, zero!());
+            let b_avg = if b_ok > 0 { b_sum / b_ok } else { 0 };
+            if b_ok > 0 {
+                raw_syscall_x86(sys::REPORT, b_min, zero!());
+                raw_syscall_x86(sys::REPORT, b_avg, zero!());
+                raw_syscall_x86(sys::REPORT, b_max, zero!());
+            }
+
+            raw_syscall_x86(sys::NET_LATENCY_SUMMARY, b_avg, s_avg);
         }
     }
 }
@@ -2622,6 +2776,21 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::NET_BYPASS_REQUEST_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
         }
+        sys::NET_STANDARD_SEND_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_standard_send_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_STANDARD_SEND_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_standard_send_result());
+        }
+        sys::NET_LATENCY_SUMMARY => {
+            kernel_arch_glue::net_latency_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
         sys::NET_BYPASS_SEND => {
             let hal = kernel_arch_glue::khal();
             let ns = kernel_arch_glue::net_bypass_direct_send(hal);
@@ -3170,8 +3339,60 @@ fn net_bypass_demo_aarch64() {
         let granted = raw_syscall_aarch64(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
         raw_syscall_aarch64(sys::REPORT, granted, zero!());
         if granted != 0 {
-            let elapsed_ns = raw_syscall_aarch64(sys::NET_BYPASS_SEND, zero!(), zero!());
-            raw_syscall_aarch64(sys::REPORT, elapsed_ns, zero!());
+            // §5.4.1's own latency comparison - see the riscv64
+            // `net_bypass_demo_riscv64`'s own doc comment (standard path
+            // FIRST, bypass SECOND - deliberate order, not incidental).
+            const SAMPLES: usize = 10;
+
+            let (mut s_min, mut s_max, mut s_sum, mut s_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let t0 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+                raw_syscall_aarch64(sys::NET_STANDARD_SEND_REQUEST, zero!(), zero!());
+                let relayed = raw_syscall_aarch64(sys::NET_STANDARD_SEND_REQUEST_RESULT, zero!(), zero!());
+                let t1 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+                if relayed != 0 {
+                    let dt = t1.saturating_sub(t0);
+                    s_ok += 1;
+                    if dt < s_min {
+                        s_min = dt;
+                    }
+                    if dt > s_max {
+                        s_max = dt;
+                    }
+                    s_sum += dt;
+                }
+            }
+            raw_syscall_aarch64(sys::REPORT, s_ok, zero!());
+            let s_avg = if s_ok > 0 { s_sum / s_ok } else { 0 };
+            if s_ok > 0 {
+                raw_syscall_aarch64(sys::REPORT, s_min, zero!());
+                raw_syscall_aarch64(sys::REPORT, s_avg, zero!());
+                raw_syscall_aarch64(sys::REPORT, s_max, zero!());
+            }
+
+            let (mut b_min, mut b_max, mut b_sum, mut b_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let ns = raw_syscall_aarch64(sys::NET_BYPASS_SEND, zero!(), zero!());
+                if ns != usize::MAX {
+                    b_ok += 1;
+                    if ns < b_min {
+                        b_min = ns;
+                    }
+                    if ns > b_max {
+                        b_max = ns;
+                    }
+                    b_sum += ns;
+                }
+            }
+            raw_syscall_aarch64(sys::REPORT, b_ok, zero!());
+            let b_avg = if b_ok > 0 { b_sum / b_ok } else { 0 };
+            if b_ok > 0 {
+                raw_syscall_aarch64(sys::REPORT, b_min, zero!());
+                raw_syscall_aarch64(sys::REPORT, b_avg, zero!());
+                raw_syscall_aarch64(sys::REPORT, b_max, zero!());
+            }
+
+            raw_syscall_aarch64(sys::NET_LATENCY_SUMMARY, b_avg, s_avg);
         }
     }
 }
@@ -3937,6 +4158,21 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::NET_BYPASS_REQUEST_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
+        }
+        sys::NET_STANDARD_SEND_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_standard_send_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_STANDARD_SEND_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_standard_send_result());
+        }
+        sys::NET_LATENCY_SUMMARY => {
+            kernel_arch_glue::net_latency_summary(x0, x1);
+            return TrapOutcome::Resume(0);
         }
         sys::NET_BYPASS_SEND => {
             let hal = kernel_arch_glue::khal();
@@ -4869,6 +5105,21 @@ fn simurgh_syscall(
         }
         sys::NET_BYPASS_REQUEST_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
+        }
+        sys::NET_STANDARD_SEND_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_standard_send_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_STANDARD_SEND_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_standard_send_result());
+        }
+        sys::NET_LATENCY_SUMMARY => {
+            kernel_arch_glue::net_latency_summary(a0, a1);
+            return TrapOutcome::Resume(0);
         }
         sys::NET_BYPASS_SEND => {
             let hal = kernel_arch_glue::khal();

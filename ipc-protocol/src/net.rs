@@ -43,6 +43,19 @@ pub enum NetBypassRequest {
         /// The handle to release.
         handle: DirectNicHandle,
     },
+    /// Sends ONE frame via the STANDARD (non-bypass) path: Netstack
+    /// itself relays the request to the driver over its own real
+    /// `DriverRequest::SendFrame` IPC call and waits for the real
+    /// interrupt-driven TX completion (`driver_virtio_net::subsystem_
+    /// entry::handle_send_frame`'s own doc comment) — semantically the
+    /// SAME "real hardware completion confirmed" endpoint `kernel_arch_
+    /// glue::net_bypass_direct_send` waits for, just reached through two
+    /// extra real IPC hops (client -> Netstack, Netstack -> driver) the
+    /// bypass path skips entirely. Exists purely so §5.4.1's own "the
+    /// bypass path is ≥30-40% lower latency than the standard path"
+    /// claim has something real to compare against, rather than being
+    /// asserted. Reply: `Relayed` or `Denied`.
+    RelayFrame,
 }
 
 /// A reply on the kernel-bypass control plane.
@@ -63,4 +76,7 @@ pub enum NetBypassResponse {
     Denied,
     /// `Release` completed.
     Released,
+    /// `RelayFrame` completed — the driver confirmed the real hardware
+    /// TX completion.
+    Relayed,
 }

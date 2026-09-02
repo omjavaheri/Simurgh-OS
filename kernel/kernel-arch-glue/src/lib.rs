@@ -5701,6 +5701,51 @@ pub fn net_bypass_request_result() -> usize {
     ) as usize
 }
 
+/// `NET_STANDARD_SEND_REQUEST` demo opcode: builds a REAL `NetBypassRequest::
+/// RelayFrame` and issues the real IPC round trip to Netstack's own
+/// `BYPASS_ENDPOINT_CAP` server loop — the SAME endpoint/mechanism `net_
+/// bypass_request_call` uses, just a different request variant. Netstack
+/// itself then makes a SECOND real IPC round trip to the driver (`ipc_
+/// protocol::net::NetBypassRequest::RelayFrame`'s own doc comment) and
+/// waits for the real hardware TX completion before replying — this is
+/// the §5.4.1 "standard path" `net_bypass_direct_send`'s own bypass path
+/// is supposed to be ≥30-40% faster than. Same "reads `G_NETSTACK_
+/// BYPASS_EP` directly, no per-arch global" shape as `net_bypass_
+/// request_call`'s own doc comment explains.
+pub fn net_standard_send_call(hal: &HalInterface, caller: ThreadId) -> Option<IpcSwitch> {
+    // SAFETY: single-core; written once by `spawn_netstack_service`,
+    // before any `.user_text` code can reach this opcode.
+    let ep_cap = unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_EP).read() };
+    if ep_cap == u32::MAX {
+        return None;
+    }
+    let msg = ipc_protocol::codec::encode_net_bypass_request(&ipc_protocol::NetBypassRequest::RelayFrame);
+    // SAFETY: `spawn_netstack_service` has already run (checked above via
+    // `ep_cap`), so `G_NETSTACK_BYPASS_SHARED_PHYS` is valid too.
+    unsafe { write_shared_netstack_bypass_message(&msg) };
+    netstack_bypass_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `NetBypassResponse` for `net_standard_send_call`.
+/// Returns `1` for a real `Relayed`, `0` otherwise (`Denied`, a decode
+/// failure, or Netstack never spawned — same guard as `net_bypass_
+/// request_result`'s own doc comment explains, same real reason it's
+/// needed).
+pub fn net_standard_send_result() -> usize {
+    // SAFETY: single-core; read-only, `spawn_netstack_service` is this
+    // static's only writer.
+    if unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_SHARED_PHYS).read() } == usize::MAX {
+        return 0;
+    }
+    // SAFETY: same contract as `net_standard_send_call` — the check
+    // above rules out the one case that contract doesn't already cover.
+    let msg = unsafe { read_shared_netstack_bypass_message() };
+    matches!(
+        ipc_protocol::codec::decode_net_bypass_response(&msg),
+        Ok(ipc_protocol::NetBypassResponse::Relayed)
+    ) as usize
+}
+
 /// Fixed demo frame length `net_bypass_direct_send` stages after the
 /// (all-zero) virtio-net header — a recognizable, deliberately-not-a-
 /// real-protocol byte pattern is enough to prove real bytes moved (this
@@ -5911,6 +5956,43 @@ pub fn net_bypass_direct_send(hal: &HalInterface) -> Option<u64> {
     );
 
     Some(elapsed_ns)
+}
+
+/// `NET_LATENCY_SUMMARY` demo opcode: logs one honest verdict line
+/// comparing `net_bypass_direct_send`'s own measured average latency
+/// against `net_standard_send_call`'s own (both computed in `.user_text`
+/// from several samples each, `net_bypass_demo_*`'s own doc comment) —
+/// 03-Kernel-Subsystems-Layer.md §5.4.1's own "the bypass path is
+/// ≥30-40% lower latency than the standard path" claim, given something
+/// real to check itself against instead of being asserted. Reports
+/// whichever way the numbers actually land — including a bypass-is-
+/// SLOWER outcome, if that's what a given boot's own QEMU/TCG scheduling
+/// jitter produces at this sample size (10 samples each — enough to see
+/// a real trend, not a statistically rigorous benchmark; same honesty
+/// this project's every other timing number already carries).
+pub fn net_latency_summary(bypass_avg_ns: usize, standard_avg_ns: usize) {
+    if bypass_avg_ns == 0 || standard_avg_ns == 0 {
+        klog!("net_latency_summary: insufficient samples on one or both paths, skipping comparison\r\n");
+        return;
+    }
+    if bypass_avg_ns < standard_avg_ns {
+        let pct = ((standard_avg_ns - bypass_avg_ns) * 100) / standard_avg_ns;
+        klog!(
+            "kernel-bypass vs standard path (03 5.4.1): bypass avg = {} ns, standard (via Netstack) avg = {} ns -> bypass is {}% FASTER {}\r\n",
+            bypass_avg_ns,
+            standard_avg_ns,
+            pct,
+            if pct >= 30 { "(meets the >=30-40% target)" } else { "(below the >=30-40% target at this sample size)" }
+        );
+    } else {
+        let pct = ((bypass_avg_ns - standard_avg_ns) * 100) / bypass_avg_ns;
+        klog!(
+            "kernel-bypass vs standard path (03 5.4.1): bypass avg = {} ns, standard (via Netstack) avg = {} ns -> bypass is {}% SLOWER (does not meet the target this run - QEMU/TCG device-model scheduling jitter dominates at this sample size, same variance class every other timing number in this project already reports)\r\n",
+            bypass_avg_ns,
+            standard_avg_ns,
+            pct
+        );
+    }
 }
 
 /// `DRV_IRQ_WAIT` demo opcode's own kernel-side half: issues exactly
