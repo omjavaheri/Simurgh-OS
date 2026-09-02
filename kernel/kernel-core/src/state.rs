@@ -489,21 +489,58 @@ impl KernelState {
         // range (on QEMU virt there is one big RAM region), so those
         // sub-ranges are carved OUT and only the remaining fragments
         // become `UntypedMemory` (§3 / `BootInfo::overlaps_*`).
+        //
+        // The third hole, `(0, kernel_image_phys_start)`, is a blanket
+        // "everything below the kernel image" exclusion kept for ALL
+        // three architectures — **do not remove or narrow this without a
+        // real QEMU boot on x86_64 AND aarch64 proving it is safe**: an
+        // earlier attempt this project made to narrow it to just RISC-V's
+        // own OpenSBI-specific need (reasoning that HAL-level `Reserved`
+        // classification — see below — made the blanket version
+        // redundant) shrank it to a single excluded page on the
+        // assumption that "UEFI's own memory map already classifies
+        // firmware/reserved regions on its own". That assumption was
+        // QEMU-CONFIRMED WRONG on x86_64/OVMF: OVMF's own UEFI memory map
+        // reports low physical memory in this range as ordinary
+        // `ConventionalMemory`, ungated by any HAL-level classification
+        // this project performs — with only the single-page exclusion,
+        // the bump-allocated `UntypedMemory` handed out addresses from
+        // this range for EVERYTHING (page-table roots included), and
+        // `ptr::write_volatile` panicked with "pointer argument is
+        // aligned and non-null" the moment a page-table walker treated
+        // one such address as a genuine root. Restored to the full
+        // blanket range here, architecture-generically, since this
+        // project has no way to positively verify what ELSE in that low
+        // range might be similarly unsafe on x86_64/aarch64 firmware
+        // without exhaustively re-deriving OVMF's/UEFI's own reservations
+        // by hand — not a good use of effort when a single, already-
+        // battle-tested exclusion already handles it correctly on all
+        // three architectures at once.
+        //
         // RISC-V's OpenSBI firmware (PMP-protected against S/U access —
         // handing it out as `UntypedMemory` would produce access faults
-        // the moment anything touched it) no longer needs a blanket
-        // "everything below the kernel image" hole here: `hal-riscv64`'s
-        // `Memory::from_device_tree` now classifies that low sub-range
-        // as `MemoryRegionKindRaw::Reserved` directly in the manifest
-        // (`hal-riscv64/src/memory.rs`'s `split_reserved_prefix`), so the
-        // `region.kind != Usable` check below already excludes it — the
-        // more precise place for a firmware exclusion to live than a
-        // second, architecture-motivated carve at this layer. UEFI
-        // targets (x86_64/aarch64) never needed this hole at all (their
-        // memory maps already classify firmware regions on their own).
+        // the moment anything touched it) is now ALSO classified as
+        // `MemoryRegionKindRaw::Reserved` directly in the manifest by
+        // `hal-riscv64`'s `Memory::from_device_tree` (`hal-riscv64/src/
+        // memory.rs`'s `split_reserved_prefix`), so the `region.kind !=
+        // Usable` check below excludes it independently too — this makes
+        // the blanket hole below REDUNDANT for riscv64 specifically (not
+        // harmful: excluding an already-excluded range a second time is
+        // a no-op), while still being the only thing standing between
+        // x86_64/aarch64 and the exact crash described above. Both layers
+        // are kept deliberately: the manifest-level classification is the
+        // more precise, architecturally "correct" place for a firmware
+        // exclusion to live (and the ONLY thing that helps at all once a
+        // capability space starts handing out capabilities to memory this
+        // exact range covers, since kernel-core's own filter only gates
+        // what becomes `UntypedMemory` in the first place); the blanket
+        // hole is the pragmatic, already-proven-correct safety net for
+        // the two architectures that don't yet have (and may never need)
+        // their own equivalent HAL-level classification.
         let holes = [
             (boot.kernel_image_phys_start, boot.kernel_image_phys_end),
             (boot.boot_reserved_phys_start, boot.boot_reserved_phys_end),
+            (0, boot.kernel_image_phys_start),
         ];
         let page = kernel_mm::PAGE_SIZE as u64;
         let manifest = &boot.hardware_manifest;

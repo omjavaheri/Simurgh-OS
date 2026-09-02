@@ -2010,8 +2010,26 @@ const FS_DATA_SHARED_CAP_SLOT: u32 = 1;
 /// same "one demo, one hardcoded scenario" convention `resolve_path`'s
 /// own `PathId(0)`-only precedent (fs-native's `subsystem_entry.rs`)
 /// already establishes; a real VFS Router would carry caller-supplied
-/// bytes, not a kernel-glue constant.
-const FS_DEMO_WRITE_DATA: &[u8] = b"hello from root, write demo!";
+/// bytes, not a kernel-glue constant. Sized to the FULL shared DATA
+/// page (matching fs-native's own `FS_DATA_LEN` constant) rather than a
+/// short string, so the same buffer doubles as the payload for the
+/// throughput benchmark below (03-Kernel-Subsystems-Layer.md §5, item
+/// 5: "VFS read/write throughput... reported") — a few dozen bytes per
+/// round trip would measure almost pure IPC overhead, not the kind of
+/// transfer size a real `dd`/`fio`-style comparison uses.
+const FS_DEMO_WRITE_DATA_ARR: [u8; 4096] = {
+    let mut data = [0u8; 4096];
+    let mut i = 0;
+    while i < data.len() {
+        // A recognizable, non-constant byte pattern (not all-zero) so
+        // `fs_read_result`'s own MATCH/MISMATCH cross-check still means
+        // something.
+        data[i] = (i % 251) as u8;
+        i += 1;
+    }
+    data
+};
+const FS_DEMO_WRITE_DATA: &[u8] = &FS_DEMO_WRITE_DATA_ARR;
 
 /// One-time setup: creates the endpoint fs-native and its client
 /// (`caller`, always the Root Task in this MVP) rendezvous on, spawns
@@ -2427,6 +2445,63 @@ pub fn fs_read_result() -> usize {
         if matches { "MATCH, zero-copy through the SharedRegion capability" } else { "MISMATCH" }
     );
     bytes
+}
+
+/// Same real round trip as `fs_read_result`, but skips the MATCH/
+/// MISMATCH `klog!` — used by the VFS read-throughput benchmark loop
+/// below so it doesn't spam one near-identical log line per iteration
+/// (same reason `mm_query_total_resident_result_quiet` exists).
+pub fn fs_read_result_quiet() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Read { bytes }) => bytes as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `FS_WRITE_THROUGHPUT_SUMMARY` demo opcode: logs one honest MB/s line
+/// for the VFS write-throughput phase of 03-Kernel-Subsystems-Layer.md
+/// §5's item 5 ("VFS read/write throughput relative to a reference
+/// system... reported"). `total_bytes`/`total_ns` are summed in
+/// `.user_text` across a real `FS_WRITE`/`FS_WRITE_RESULT` loop — each
+/// iteration a genuine `Call`/`Reply` round trip through fs-native's
+/// own isolated process, exactly like every byte transferred in the
+/// single-shot `fs_write_call`/`fs_read_result` demo above, just
+/// repeated and timed. Fixed-point (integer-only, matching this
+/// project's `kernel-sched::weight`-style "no floating point in the
+/// kernel-adjacent path" convention): reports whole KB/s rather than a
+/// fractional MB/s, since `total_bytes * 1000 / total_ns` (nanoseconds
+/// to seconds, bytes to kilobytes) stays comfortably inside `u64`
+/// for any realistic sample size here and needs no float formatting
+/// support in this `no_std` `klog!` path.
+pub fn fs_write_throughput_summary(total_bytes: usize, total_ns: usize) {
+    if total_ns == 0 {
+        klog!("fs_write_throughput_summary: zero elapsed time, skipping\r\n");
+        return;
+    }
+    let kb_per_sec = (total_bytes as u64).saturating_mul(1_000_000) / total_ns as u64;
+    klog!(
+        "vfs write throughput (03 5, item 5): {} bytes in {} ns -> {} KB/s\r\n",
+        total_bytes,
+        total_ns,
+        kb_per_sec
+    );
+}
+
+/// Same shape as `fs_write_throughput_summary`, for the read phase.
+pub fn fs_read_throughput_summary(total_bytes: usize, total_ns: usize) {
+    if total_ns == 0 {
+        klog!("fs_read_throughput_summary: zero elapsed time, skipping\r\n");
+        return;
+    }
+    let kb_per_sec = (total_bytes as u64).saturating_mul(1_000_000) / total_ns as u64;
+    klog!(
+        "vfs read throughput (03 5, item 5): {} bytes in {} ns -> {} KB/s\r\n",
+        total_bytes,
+        total_ns,
+        kb_per_sec
+    );
 }
 
 // ============================================================================

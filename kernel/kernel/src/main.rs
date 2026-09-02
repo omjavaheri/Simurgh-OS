@@ -732,6 +732,27 @@ mod sys {
     /// real samples each. Logs one honest verdict line comparing them
     /// (`kernel_arch_glue::net_latency_summary`'s own doc comment).
     pub const NET_LATENCY_SUMMARY: usize = 90;
+
+    // -- VFS throughput benchmark (03-Kernel-Subsystems-Layer.md §5,
+    //    item 5: "VFS read/write throughput relative to a reference
+    //    system... reported"). `.user_text` loops `FS_WRITE`/`FS_WRITE_
+    //    RESULT` (then `FS_READ`/`FS_READ_RESULT`) many times, bracketing
+    //    each phase with `NOW_NS`, then reports the phase totals here.
+
+    /// `a0` = total bytes written, `a1` = total elapsed ns, both summed
+    /// across a `.user_text` write-throughput loop. Logs one MB/s line
+    /// (`kernel_arch_glue::fs_write_throughput_summary`'s own doc comment).
+    pub const FS_WRITE_THROUGHPUT_SUMMARY: usize = 91;
+    /// Same shape as `FS_WRITE_THROUGHPUT_SUMMARY`, for the read phase.
+    pub const FS_READ_THROUGHPUT_SUMMARY: usize = 92;
+    /// Same real round trip as `FS_READ`/`FS_READ_RESULT`, but skips the
+    /// MATCH/MISMATCH `klog!` (`kernel_arch_glue::fs_read_result_quiet`'s
+    /// own doc comment) — used by the read-throughput loop so it doesn't
+    /// spam one near-identical log line per iteration (same reason
+    /// `MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET` exists). Issue `FS_READ`
+    /// itself as usual to trigger the real `Call`; only the result read
+    /// differs.
+    pub const FS_READ_RESULT_QUIET: usize = 93;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -2060,6 +2081,51 @@ extern "C" fn umode_root_x86() -> ! {
         raw_syscall_x86(sys::FS_READ, fs_handle, fs_written);
         let fs_read = raw_syscall_x86(sys::FS_READ_RESULT, zero!(), zero!());
         raw_syscall_x86(sys::REPORT, fs_read, zero!());
+
+        // 7b(ii). VFS read/write throughput benchmark
+        // (03-Kernel-Subsystems-Layer.md §5, item 5: "VFS read/write
+        // throughput relative to a reference system (currently Linux on
+        // the same QEMU)... reported — must not drop more than 20-30% in
+        // the MVP, due to IPC overhead"). Reuses the SAME open `fs_handle`
+        // and the full `FS_DEMO_WRITE_DATA` (4096-byte) payload the
+        // single-shot demo just proved correct above — fs-native's own
+        // `MemFs::write` always overwrites at offset 0, so repeating this
+        // never grows the file past one page. Write phase and read phase
+        // are timed and reported SEPARATELY (mirroring how `dd` itself
+        // times a write pass and a read pass independently), each
+        // bracketed with real `NOW_NS` timestamps around a real `Call`/
+        // `Reply` round trip through fs-native's own isolated process —
+        // the read phase uses `FS_READ_RESULT_QUIET` so it doesn't spam
+        // one MATCH/MISMATCH log line per iteration.
+        const FS_BENCH_ITERS: usize = 100;
+        let mut w_total_bytes: usize = 0;
+        let mut w_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_x86(sys::FS_WRITE, fs_handle, zero!());
+            let written = raw_syscall_x86(sys::FS_WRITE_RESULT, zero!(), zero!());
+            let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+            if written != usize::MAX {
+                w_total_bytes += written;
+                w_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall_x86(sys::FS_WRITE_THROUGHPUT_SUMMARY, w_total_bytes, w_total_ns);
+
+        let mut r_total_bytes: usize = 0;
+        let mut r_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_x86(sys::FS_READ, fs_handle, 4096);
+            let bytes_read = raw_syscall_x86(sys::FS_READ_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+            if bytes_read != usize::MAX {
+                r_total_bytes += bytes_read;
+                r_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall_x86(sys::FS_READ_THROUGHPUT_SUMMARY, r_total_bytes, r_total_ns);
+
         raw_syscall_x86(sys::FS_CLOSE, fs_handle, zero!());
         let fs_closed = raw_syscall_x86(sys::FS_CLOSE_RESULT, zero!(), zero!());
         raw_syscall_x86(sys::REPORT, fs_closed, zero!());
@@ -2516,6 +2582,9 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::FS_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
         }
+        sys::FS_READ_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result_quiet());
+        }
         // virtio-blk driver: mirrors aarch64's/riscv64's own identical
         // arms (this file's `sys::DRV_BLK_DEMO_START` doc comment on
         // riscv64's block) — same `Transport`-erased `kernel_arch_glue::
@@ -2789,6 +2858,14 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         }
         sys::NET_LATENCY_SUMMARY => {
             kernel_arch_glue::net_latency_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::FS_WRITE_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_write_throughput_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::FS_READ_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_read_throughput_summary(a0, a1);
             return TrapOutcome::Resume(0);
         }
         sys::NET_BYPASS_SEND => {

@@ -1451,6 +1451,96 @@ mod tests {
     }
 
     #[test]
+    fn cap_grant_into_another_space_then_revoke_source_reaches_the_grant() {
+        // The syscall-dispatcher-level counterpart to kernel-cap's own
+        // `revoke_cross_space` unit tests: proves the whole path — a
+        // real `SyscallOp::CapGrant` into a genuinely separate
+        // `CapSpaceId`, then a real `SyscallOp::CapRevoke` on the
+        // capability it was derived from — actually reaches through
+        // `KernelState::dispatch`, not just `kernel_cap::cdt`'s own
+        // lower-level API (02-Microkernel-Layer.md line 65).
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        // An Endpoint capability in the caller's own (root) space — the
+        // thing that will be granted elsewhere, then revoked from here.
+        let src_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // A genuinely separate capability space, with a TCB living in
+        // it, and a capability naming that TCB minted directly into the
+        // caller's own space (`Retype`'s own `ThreadControlBlock` arm
+        // always binds the new TCB to the CALLER's space, so it can't
+        // produce a cross-space target here — this mirrors the same
+        // "mint a TCB cap for a space you didn't create the TCB request
+        // from" shape `kernel-arch-glue::spawn_process` uses at a higher
+        // level, simplified for a unit test).
+        let dst_cs = k.alloc_cap_space().unwrap();
+        let dst_tid = k.alloc_tcb(dst_cs, k.root_addr_space).unwrap();
+        let target_thread = {
+            let tcap = Capability::full(ObjectRef::new(
+                KernelObjectKind::ThreadControlBlock,
+                ObjectId::new(dst_tid.as_u32()),
+            ));
+            k.cap_space_mut(k.root_cap_space)
+                .unwrap()
+                .insert_root(tcap)
+                .unwrap()
+        };
+
+        // Grant a READ-only copy of the endpoint into the destination space.
+        let granted = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::CapGrant {
+                    target_thread,
+                    cap: src_cap,
+                    rights: CapabilityRights::READ,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::Granted { dst } => dst,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(k.cap_space(dst_cs).unwrap().lookup(granted).is_some());
+        // The source is untouched by the grant.
+        assert!(k.cap_space(k.root_cap_space).unwrap().lookup(src_cap).is_some());
+
+        // Revoking the SOURCE capability (still in the caller's own
+        // space) must reach through and free the granted copy in the
+        // OTHER space — the entire point of cross-space CDT.
+        let freed = match k
+            .dispatch(caller, 0, SyscallOp::CapRevoke { cap: src_cap }, &hal)
+            .unwrap()
+        {
+            SyscallReturn::Revoked { freed } => freed,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(freed, 2); // src_cap itself + the cross-space grant
+        assert!(k.cap_space(k.root_cap_space).unwrap().lookup(src_cap).is_none());
+        assert!(k.cap_space(dst_cs).unwrap().lookup(granted).is_none());
+    }
+
+    #[test]
     fn bad_cap_is_rejected() {
         let mut k = kernel();
         let caller = k.root_thread;
