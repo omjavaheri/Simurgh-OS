@@ -3114,6 +3114,23 @@ pub fn mm_query_total_resident_result() -> usize {
     bytes as usize
 }
 
+/// Same decode as `mm_query_total_resident_result`, without the verdict
+/// `klog!` — `mm_bench_*`'s own 200-iteration `.user_text` loop
+/// (02-Microkernel-Layer.md §8.3) reuses `MM_QUERY_TOTAL_RESIDENT` as a
+/// cheap, repeatable real round trip purely to TIME it; logging a MATCH
+/// line on every one of the 200 calls would drown the boot log in
+/// identical noise for no reason (unlike the one-shot `mm_demo_*` call
+/// this quiet variant is NOT a substitute for — that one's own MATCH/
+/// MISMATCH verdict is the real correctness proof and stays as is).
+pub fn mm_query_total_resident_result_quiet() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    match ipc_protocol::codec::decode_mm_response(&msg) {
+        Ok(ipc_protocol::MmResponse::TotalResident { bytes }) => bytes as usize,
+        _ => usize::MAX,
+    }
+}
+
 // ============================================================================
 // driver-virtio-blk: real MMIO + virtqueue block driver process (03 §5.1)
 //
@@ -6178,15 +6195,25 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     //     this branch at all; still true today for `Send`, see
     //     `plain_send_does_not_take_the_call_fast_path`).
     //
-    //     What is NOT yet real: the register-only PARTIAL context
-    //     switch `kernel_ipc::fastpath`'s own doc comment describes —
-    //     `yield_to` below still performs `hal_core::HalInterface::
-    //     context_switch`'s FULL GPR save/restore every time, so
-    //     QEMU/TCG wall-clock numbers stay far from the literal
-    //     <500ns target for that reason alone — same honestly-
-    //     documented emulation gap every other timing-sensitive
-    //     benchmark in this project reports, not a flaw in the fast
-    //     path itself.
+    //     What this benchmark does NOT measure: the register-only
+    //     PARTIAL context switch `kernel_ipc::fastpath`'s own doc
+    //     comment describes. `yield_to` below performs `hal_core::
+    //     HalInterface::context_switch`'s FULL GPR save/restore every
+    //     time — thread 3 is an in-kernel cooperative thread (like
+    //     thread 2's own §8.2 milestone), not a real, isolated U-mode
+    //     process, so the register-only `TrapOutcome::SwitchToFast` +
+    //     `{save,restore}_ipc_fast_context` primitive (built later,
+    //     one real subsystem at a time — mm-service, Compositor,
+    //     Netstack's bypass control-plane all use it today) never
+    //     comes into play here at all. `umode_root`'s own `mm_bench_*`
+    //     (called after the mm-service demo, further down this file)
+    //     times 200 REAL U-mode-to-U-mode round trips over THAT exact
+    //     mechanism instead — see its own doc comment for why that
+    //     number, not this one, is what §8.3 actually asks for. This
+    //     benchmark still has its own honest purpose: isolating `do_
+    //     send`/`do_reply`'s fast_path_eligible dispatch-level saving
+    //     (skipping `pick_next`) from the register-restore cost the
+    //     other one adds on top.
     let t3_cap = match k.dispatch(
         root,
         hal.now_ns(),
@@ -6248,7 +6275,7 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
         }
         let avg_ns = sum_ns / IPC_BENCH_ITERATIONS as u64;
         klog!(
-            "root task: ipc round-trip benchmark (02 8.3, {} iters, REAL Call+Reply fast path - do_send/do_reply skip pick_next; register-only HAL primitive still pending) - min {} ns, avg {} ns, max {} ns\r\n",
+            "root task: in-kernel ipc round-trip benchmark (02 8.3, {} iters, REAL Call+Reply fast path - do_send/do_reply skip pick_next; full GPR yield_to, not the register-only U-mode primitive - see the later mm-service benchmark for that one) - min {} ns, avg {} ns, max {} ns\r\n",
             IPC_BENCH_ITERATIONS,
             min_ns,
             avg_ns,

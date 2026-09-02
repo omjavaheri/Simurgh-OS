@@ -692,6 +692,27 @@ mod sys {
     /// process AND any further IPC. Returns the elapsed nanoseconds in
     /// `a0`, or `usize::MAX` on failure/timeout.
     pub const NET_BYPASS_SEND: usize = 85;
+
+    /// No arguments. Returns `hal.now_ns()` in `a0` - a plain timestamp
+    /// read, no kernel state touched. Exists so `.user_text` benchmark
+    /// loops (`mm_bench_*`, 02-Microkernel-Layer.md §8.3) can bracket a
+    /// REAL cross-process `SwitchToFast` round trip (e.g. `MM_QUERY_
+    /// TOTAL_RESIDENT`/`_RESULT`) with timestamps from the SAME clock
+    /// the kernel's own `now_ns()`-based benchmarks already use, without
+    /// needing an in-kernel timing loop the way the existing §8.3
+    /// harness (`bench_thread_main`) does - that one measures a
+    /// DIFFERENT thing (in-kernel cooperative `yield_to`, not a real
+    /// U-mode `SwitchToFast` restore).
+    pub const NOW_NS: usize = 86;
+
+    /// No arguments. Same real round trip as `MM_QUERY_TOTAL_RESIDENT`/
+    /// `_RESULT`, but the RESULT half skips the MATCH/MISMATCH `klog!`
+    /// (`kernel_arch_glue::mm_query_total_resident_result_quiet`'s own
+    /// doc comment) - used by `mm_bench_*`'s own 200-iteration §8.3
+    /// timing loop so it doesn't spam 200 near-identical log lines.
+    /// Issue `MM_QUERY_TOTAL_RESIDENT` itself as usual to trigger the
+    /// real `Call`; only the result read differs.
+    pub const MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET: usize = 87;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -985,6 +1006,15 @@ fn mm_demo_riscv64() {
             raw_syscall(sys::MM_QUERY_VICTIM, zero!(), zero!());
             let victim = raw_syscall(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
             raw_syscall(sys::REPORT, victim, zero!());
+            // The REAL §8.3 IPC fast-path benchmark (see `mm_bench_
+            // riscv64`'s own doc comment) — deliberately BEFORE
+            // unregistering below: `MM_QUERY_TOTAL_RESIDENT_RESULT`'s
+            // own kernel-side verdict compares against `MM_DEMO_
+            // EXPECTED_TOTAL`, which only holds while both demo
+            // processes are still registered; running this loop after
+            // unregistering would log 200 spurious MISMATCH lines for a
+            // total that's supposed to be different by then.
+            mm_bench_riscv64();
             raw_syscall(sys::MM_UNREGISTER, 100, zero!());
             let unreg0 = raw_syscall(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
             raw_syscall(sys::REPORT, unreg0, zero!());
@@ -992,6 +1022,72 @@ fn mm_demo_riscv64() {
             let unreg1 = raw_syscall(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
             raw_syscall(sys::REPORT, unreg1, zero!());
         }
+    }
+}
+
+/// The REAL §8.3 IPC fast-path benchmark (02-Microkernel-Layer.md §8.3:
+/// "ipc_call fast-path < 500 ns on reference hardware"). `bench_thread_
+/// main`'s own in-kernel benchmark (5b, above, run earlier in `umode_
+/// root`) measures a DIFFERENT thing — a purely in-kernel cooperative
+/// `yield_to` between two kernel threads, using `hal_core::HalInterface::
+/// context_switch`'s full GPR save/restore, never touching a real U-mode
+/// process at all. THIS benchmark instead times 200 REAL round trips
+/// between two genuinely isolated U-mode processes (root and mm-service,
+/// already spawned by `mm_demo_riscv64` above) over the SAME `SyscallOp::
+/// Call`/`Reply` + `TrapOutcome::SwitchToFast` + register-only `hal_
+/// riscv64::cpu::{save,restore}_ipc_fast_context` mechanism every real
+/// subsystem (mm-service, Compositor, Netstack's bypass control-plane)
+/// already uses in production — closing the "register-only HAL primitive
+/// still pending" gap `bench_thread_main`'s own log line has documented
+/// since it was written (the primitive was built, one subsystem at a
+/// time, across several later sessions; this is the first thing to
+/// actually TIME it end to end). Reuses `MM_QUERY_TOTAL_RESIDENT` as the
+/// request (any already-real, repeatable request would do). Called from
+/// `mm_demo_riscv64` itself, deliberately BEFORE its own `MM_UNREGISTER`
+/// calls — `MM_QUERY_TOTAL_RESIDENT_RESULT`'s own kernel-side verdict
+/// compares against `MM_DEMO_EXPECTED_TOTAL`, which only holds while
+/// both demo processes are still registered; running this loop after
+/// unregistering would log 200 spurious MISMATCH lines instead of one
+/// real MATCH per iteration — reads the result via `sys::MM_QUERY_
+/// TOTAL_RESIDENT_RESULT_QUIET` rather than the regular (verdict-
+/// logging) opcode for the same reason: even a MATCH every time would
+/// still be 200 near-identical log lines for no reason. `sys::NOW_NS`
+/// (a trivial `hal.now_ns()` passthrough) brackets each round trip from
+/// `.user_text` itself, since `hal.now_ns()` is not otherwise reachable
+/// from U-mode.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_bench_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        const ITERS: usize = 200;
+        let (mut min_ns, mut max_ns, mut sum_ns) = (usize::MAX, 0usize, 0usize);
+        for _ in 0..ITERS {
+            let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            raw_syscall(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            raw_syscall(sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            let dt = t1.saturating_sub(t0);
+            if dt < min_ns {
+                min_ns = dt;
+            }
+            if dt > max_ns {
+                max_ns = dt;
+            }
+            sum_ns += dt;
+        }
+        raw_syscall(sys::REPORT, min_ns, zero!());
+        raw_syscall(sys::REPORT, sum_ns / ITERS, zero!());
+        raw_syscall(sys::REPORT, max_ns, zero!());
     }
 }
 
@@ -1228,7 +1324,10 @@ extern "C" fn umode_root() -> ! {
         compositor_demo_riscv64();
 
         // 7e. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
-        // `mm_demo_riscv64`'s own doc comment.
+        // `mm_demo_riscv64`'s own doc comment. Also runs the REAL §8.3
+        // IPC fast-path benchmark internally, between the victim query
+        // and the unregister calls (see `mm_bench_riscv64`'s own doc
+        // comment).
         mm_demo_riscv64();
 
         // 7f. Kernel-bypass networking demo (03-Kernel-Subsystems-
@@ -1640,6 +1739,10 @@ fn mm_demo_x86() {
             raw_syscall_x86(sys::MM_QUERY_VICTIM, zero!(), zero!());
             let victim = raw_syscall_x86(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
             raw_syscall_x86(sys::REPORT, victim, zero!());
+            // The REAL §8.3 IPC fast-path benchmark - see the riscv64
+            // `mm_bench_riscv64`'s own doc comment for why this runs
+            // BEFORE unregistering below.
+            mm_bench_x86();
             raw_syscall_x86(sys::MM_UNREGISTER, 100, zero!());
             let unreg0 = raw_syscall_x86(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
             raw_syscall_x86(sys::REPORT, unreg0, zero!());
@@ -1647,6 +1750,43 @@ fn mm_demo_x86() {
             let unreg1 = raw_syscall_x86(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
             raw_syscall_x86(sys::REPORT, unreg1, zero!());
         }
+    }
+}
+
+/// See the riscv64 `mm_bench_riscv64`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_bench_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        const ITERS: usize = 200;
+        let (mut min_ns, mut max_ns, mut sum_ns) = (usize::MAX, 0usize, 0usize);
+        for _ in 0..ITERS {
+            let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_x86(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            raw_syscall_x86(sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+            let dt = t1.saturating_sub(t0);
+            if dt < min_ns {
+                min_ns = dt;
+            }
+            if dt > max_ns {
+                max_ns = dt;
+            }
+            sum_ns += dt;
+        }
+        raw_syscall_x86(sys::REPORT, min_ns, zero!());
+        raw_syscall_x86(sys::REPORT, sum_ns / ITERS, zero!());
+        raw_syscall_x86(sys::REPORT, max_ns, zero!());
     }
 }
 
@@ -1808,7 +1948,9 @@ extern "C" fn umode_root_x86() -> ! {
         compositor_demo_x86();
 
         // 7f. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
-        // `mm_demo_x86`'s own doc comment.
+        // `mm_demo_x86`'s own doc comment. Also runs the REAL §8.3 IPC
+        // fast-path benchmark internally (see `mm_bench_x86`'s own doc
+        // comment).
         mm_demo_x86();
 
         // 7g. Kernel-bypass networking demo (03-Kernel-Subsystems-
@@ -2485,6 +2627,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             let ns = kernel_arch_glue::net_bypass_direct_send(hal);
             return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
         }
+        sys::NOW_NS => {
+            let hal = kernel_arch_glue::khal();
+            return TrapOutcome::Resume(hal.now_ns() as usize);
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -2951,6 +3100,10 @@ fn mm_demo_aarch64() {
             raw_syscall_aarch64(sys::MM_QUERY_VICTIM, zero!(), zero!());
             let victim = raw_syscall_aarch64(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
             raw_syscall_aarch64(sys::REPORT, victim, zero!());
+            // The REAL §8.3 IPC fast-path benchmark - see the riscv64
+            // `mm_bench_riscv64`'s own doc comment for why this runs
+            // BEFORE unregistering below.
+            mm_bench_aarch64();
             raw_syscall_aarch64(sys::MM_UNREGISTER, 100, zero!());
             let unreg0 = raw_syscall_aarch64(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
             raw_syscall_aarch64(sys::REPORT, unreg0, zero!());
@@ -2958,6 +3111,43 @@ fn mm_demo_aarch64() {
             let unreg1 = raw_syscall_aarch64(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
             raw_syscall_aarch64(sys::REPORT, unreg1, zero!());
         }
+    }
+}
+
+/// See the riscv64 `mm_bench_riscv64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_bench_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        const ITERS: usize = 200;
+        let (mut min_ns, mut max_ns, mut sum_ns) = (usize::MAX, 0usize, 0usize);
+        for _ in 0..ITERS {
+            let t0 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_aarch64(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            raw_syscall_aarch64(sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            let dt = t1.saturating_sub(t0);
+            if dt < min_ns {
+                min_ns = dt;
+            }
+            if dt > max_ns {
+                max_ns = dt;
+            }
+            sum_ns += dt;
+        }
+        raw_syscall_aarch64(sys::REPORT, min_ns, zero!());
+        raw_syscall_aarch64(sys::REPORT, sum_ns / ITERS, zero!());
+        raw_syscall_aarch64(sys::REPORT, max_ns, zero!());
     }
 }
 
@@ -3116,7 +3306,9 @@ extern "C" fn umode_root_aarch64() -> ! {
         compositor_demo_aarch64();
 
         // 7f. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
-        // `mm_demo_aarch64`'s own doc comment.
+        // `mm_demo_aarch64`'s own doc comment. Also runs the REAL §8.3
+        // IPC fast-path benchmark internally (see `mm_bench_aarch64`'s
+        // own doc comment).
         mm_demo_aarch64();
 
         // 7g. Kernel-bypass networking demo (03-Kernel-Subsystems-
@@ -3750,6 +3942,13 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             let hal = kernel_arch_glue::khal();
             let ns = kernel_arch_glue::net_bypass_direct_send(hal);
             return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
+        }
+        sys::NOW_NS => {
+            let hal = kernel_arch_glue::khal();
+            return TrapOutcome::Resume(hal.now_ns() as usize);
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
@@ -4675,6 +4874,13 @@ fn simurgh_syscall(
             let hal = kernel_arch_glue::khal();
             let ns = kernel_arch_glue::net_bypass_direct_send(hal);
             return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
+        }
+        sys::NOW_NS => {
+            let hal = kernel_arch_glue::khal();
+            return TrapOutcome::Resume(hal.now_ns() as usize);
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
