@@ -40,7 +40,7 @@ pub use display::{DisplayErrorCode, DisplayRequest, DisplayResponse, SurfaceHand
 pub use driver::{DriverRequest, DriverResponse};
 pub use fs::{FileHandle, FsRequest, FsResponse, OpenFlags, PathId};
 pub use mm::{MmErrorCode, MmRequest, MmResponse, ReclaimClass};
-pub use net::NetBypassRequest;
+pub use net::{DirectNicHandle, NetBypassRequest, NetBypassResponse};
 
 /// Protocol version. Bump on any incompatible change to a message type or
 /// the codec. A peer that decodes a message tagged with an unrecognised

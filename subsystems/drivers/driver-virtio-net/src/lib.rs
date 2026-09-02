@@ -361,6 +361,21 @@ pub mod layout {
     ///         fits `u16` — `VIRTIO_MSI_NO_VECTOR` if MSI-X was not
     ///         enabled, e.g. aarch64's own legacy-INTx choice)
     pub const PCI_INFO_OFFSET: usize = 96;
+    /// RX region only: the TX queue's own `queue_notify_off`
+    /// (`pci_common::QUEUE_NOTIFY_OFF`'s own doc comment) — an EIGHTH
+    /// field, written by `VirtioNet::do_probe` itself (not `kernel_arch_
+    /// glue`'s own spawn-time PCI walk, unlike the seven fields above:
+    /// `enable_queue`'s own return value is only known AFTER `do_probe`
+    /// actually runs, mirroring `layout::MAC_OFFSET`'s own "written by
+    /// `do_probe`, not spawn-time wiring" precedent). `0` and meaningless
+    /// for `Transport::Mmio` (a single fixed `QUEUE_NOTIFY` register
+    /// needs no per-queue offset at all — `notify_queue`'s own doc
+    /// comment). Consumed by `kernel_arch_glue`'s own kernel-bypass
+    /// direct-send path (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1),
+    /// which computes the TX doorbell's own physical address the same
+    /// way `notify_queue`'s own `Transport::Pci` arm does, but from
+    /// kernel-mode, bypassing this driver process entirely.
+    pub const TX_NOTIFY_OFF_OFFSET: usize = 152;
     /// The `virtio_net_hdr` + frame buffer (descriptor slot 0, both
     /// queues).
     pub const BUFFER_OFFSET: usize = 256;
@@ -936,6 +951,11 @@ impl VirtioNet {
             for (i, byte) in self.mac.iter().enumerate() {
                 mac_ptr.add(i).write_volatile(*byte);
             }
+            // Mirror the TX queue's own notify_off too — see `layout::
+            // TX_NOTIFY_OFF_OFFSET`'s own doc comment for why this can
+            // only be written here (post-probe), not at spawn time.
+            ((self.rx_base + layout::TX_NOTIFY_OFF_OFFSET) as *mut u64)
+                .write_volatile(self.tx_notify_off as u64);
         }
 
         // SAFETY: `self.rx_base` is mapped (this method's own contract,

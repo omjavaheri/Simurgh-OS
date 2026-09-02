@@ -28,6 +28,7 @@ use crate::display::{DisplayErrorCode, DisplayRequest, DisplayResponse, SurfaceH
 use crate::driver::{DriverErrorCode, DriverRequest, DriverResponse};
 use crate::fs::{FileHandle, FsErrorCode, FsRequest, FsResponse, OpenFlags, PathId};
 use crate::mm::{MmErrorCode, MmRequest, MmResponse, ReclaimClass};
+use crate::net::{DirectNicHandle, NetBypassRequest, NetBypassResponse};
 use crate::{label_parts, Namespace, PROTOCOL_VERSION};
 use kernel_ipc::SmallMessage;
 
@@ -781,6 +782,109 @@ pub fn decode_mm_response(msg: &SmallMessage) -> Result<MmResponse, DecodeError>
     }
 }
 
+// NetBypassRequest opcodes (low byte of the label).
+const OP_NB_REQUEST_DIRECT_NIC: u8 = 1;
+const OP_NB_RELEASE: u8 = 2;
+
+/// Encodes a `NetBypassRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `RequestDirectNic`: `[nic_id]`
+/// - `Release`: `[handle]`
+pub fn encode_net_bypass_request(req: &NetBypassRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 1]) = match *req {
+        NetBypassRequest::RequestDirectNic { nic_id } => (OP_NB_REQUEST_DIRECT_NIC, [nic_id as u64]),
+        NetBypassRequest::Release { handle } => (OP_NB_RELEASE, [handle.0 as u64]),
+    };
+    // `from_words` cannot fail here: 1 word <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::NetBypass.label(op), &words)
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::NetBypass.label(op)))
+}
+
+/// Decodes a `NetBypassRequest` from a `SmallMessage`.
+pub fn decode_net_bypass_request(msg: &SmallMessage) -> Result<NetBypassRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::NetBypass) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    if w.is_empty() {
+        return Err(DecodeError::Truncated);
+    }
+    match op {
+        OP_NB_REQUEST_DIRECT_NIC => Ok(NetBypassRequest::RequestDirectNic { nic_id: w[0] as u32 }),
+        OP_NB_RELEASE => Ok(NetBypassRequest::Release {
+            handle: DirectNicHandle(w[0] as u32),
+        }),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// NetBypassResponse opcodes — a separate small sequence from the request
+// opcodes above, same "kept sequential-and-distinct for readability"
+// convention every other namespace here already follows.
+const OP_NBR_GRANTED: u8 = 1;
+const OP_NBR_DENIED: u8 = 2;
+const OP_NBR_RELEASED: u8 = 3;
+
+/// Encodes a `NetBypassResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Granted`: `[handle, rx_ring_cap, tx_ring_cap, ring_len]`
+/// - `Denied`, `Released`: `[]`
+pub fn encode_net_bypass_response(resp: &NetBypassResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 4]) = match *resp {
+        NetBypassResponse::Granted {
+            handle,
+            rx_ring_cap,
+            tx_ring_cap,
+            ring_len,
+        } => (
+            OP_NBR_GRANTED,
+            [handle.0 as u64, rx_ring_cap as u64, tx_ring_cap as u64, ring_len as u64],
+        ),
+        NetBypassResponse::Denied => (OP_NBR_DENIED, [0, 0, 0, 0]),
+        NetBypassResponse::Released => (OP_NBR_RELEASED, [0, 0, 0, 0]),
+    };
+    let n = if op == OP_NBR_GRANTED { 4 } else { 0 };
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::NetBypass.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::NetBypass.label(op)))
+}
+
+/// Decodes a `NetBypassResponse` from a `SmallMessage`.
+pub fn decode_net_bypass_response(msg: &SmallMessage) -> Result<NetBypassResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::NetBypass) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    match op {
+        OP_NBR_GRANTED => {
+            if w.len() < 4 {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(NetBypassResponse::Granted {
+                handle: DirectNicHandle(w[0] as u32),
+                rx_ring_cap: w[1] as u32,
+                tx_ring_cap: w[2] as u32,
+                ring_len: w[3] as u32,
+            })
+        }
+        OP_NBR_DENIED => Ok(NetBypassResponse::Denied),
+        OP_NBR_RELEASED => Ok(NetBypassResponse::Released),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,5 +1166,53 @@ mod tests {
     fn mm_response_truncated_payload_is_rejected() {
         let msg = SmallMessage::new(Namespace::Mm.label(OP_MMR_VICTIM));
         assert_eq!(decode_mm_response(&msg), Err(DecodeError::Truncated));
+    }
+
+    fn net_bypass_request_roundtrip(req: NetBypassRequest) {
+        let msg = encode_net_bypass_request(&req);
+        assert_eq!(decode_net_bypass_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_net_bypass_request_variants_roundtrip() {
+        net_bypass_request_roundtrip(NetBypassRequest::RequestDirectNic { nic_id: 0 });
+        net_bypass_request_roundtrip(NetBypassRequest::Release {
+            handle: DirectNicHandle(1),
+        });
+    }
+
+    fn net_bypass_response_roundtrip(resp: NetBypassResponse) {
+        let msg = encode_net_bypass_response(&resp);
+        assert_eq!(decode_net_bypass_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_net_bypass_response_variants_roundtrip() {
+        net_bypass_response_roundtrip(NetBypassResponse::Granted {
+            handle: DirectNicHandle(1),
+            rx_ring_cap: 2,
+            tx_ring_cap: 3,
+            ring_len: 2,
+        });
+        net_bypass_response_roundtrip(NetBypassResponse::Denied);
+        net_bypass_response_roundtrip(NetBypassResponse::Released);
+    }
+
+    #[test]
+    fn net_bypass_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_NB_REQUEST_DIRECT_NIC));
+        assert_eq!(
+            decode_net_bypass_request(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn net_bypass_response_truncated_payload_is_rejected() {
+        let msg = SmallMessage::new(Namespace::NetBypass.label(OP_NBR_GRANTED));
+        assert_eq!(
+            decode_net_bypass_response(&msg),
+            Err(DecodeError::Truncated)
+        );
     }
 }

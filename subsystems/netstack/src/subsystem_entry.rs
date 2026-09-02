@@ -59,9 +59,9 @@
 //! ============================================================================
 
 use alloc::vec::Vec;
-use ipc_protocol::codec::{decode_driver_response, encode_driver_request};
+use ipc_protocol::codec::{decode_driver_response, decode_net_bypass_request, encode_driver_request, encode_net_bypass_response};
 use ipc_protocol::driver::DriverErrorCode;
-use ipc_protocol::{DriverRequest, DriverResponse};
+use ipc_protocol::{DirectNicHandle, DriverRequest, DriverResponse, NetBypassRequest, NetBypassResponse};
 use kernel_ipc::SmallMessage;
 
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_CALL`
@@ -69,9 +69,14 @@ use kernel_ipc::SmallMessage;
 /// opcode, not a new one, is exactly what this process needs.
 const IPC_CALL: usize = 42;
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_RECV`
-/// — `park`'s own doc comment on why this process issues exactly one of
-/// these, right before parking for good.
+/// — `park`'s own doc comment on why this process issues one of these in
+/// a real loop, serving kernel-bypass requests, once its own ARP/ICMP
+/// demo is done.
 const IPC_RECV: usize = 43;
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_REPLY`
+/// — `park`'s own real `Recv`/`Reply` server loop uses this to answer
+/// each `NetBypassRequest` it receives.
+const IPC_REPLY: usize = 44;
 
 /// This process's own capability slot for the (derived-copy) driver
 /// `Endpoint` — `kernel_arch_glue::spawn_netstack_service`'s own first
@@ -81,12 +86,20 @@ const IPC_RECV: usize = 43;
 /// doc comment already gives).
 const DRV_ENDPOINT_CAP: usize = 0;
 
-/// This process's own capability slot for the "park" `Endpoint` —
+/// This process's own capability slot for the "bypass" `Endpoint` —
 /// `kernel_arch_glue::spawn_netstack_service`'s own SECOND grant, slot
-/// 1. Nobody ever holds a capability to `Call` this Endpoint; its only
-/// purpose is `park`'s own final blocking `Recv` — see that function's
-/// own doc comment.
-const PARK_ENDPOINT_CAP: usize = 1;
+/// 1. Originally granted purely as a "park" target (an Endpoint nobody
+/// held a capability to `Call`, so a blocking `Recv` on it always hands
+/// control back to root — see `park`'s own doc comment on why that
+/// matters); now DOUBLES as the real kernel-bypass networking control
+/// plane's own server endpoint (03-Kernel-Subsystems-Layer.md §2.3/
+/// §5.4.1) — `kernel_arch_glue::net_bypass_request_call` is the one
+/// caller that DOES hold (a derived copy of) this capability, granted
+/// alongside the driver endpoint at the SAME spawn time. `park`'s own
+/// loop serves both roles identically: nothing pending yet -> blocks,
+/// falls back to root exactly as before; a real `NetBypassRequest`
+/// arrives later -> handled, replied to, loop continues.
+const BYPASS_ENDPOINT_CAP: usize = 1;
 
 /// VA the driver's own RX `SharedRegion` is pre-mapped at in THIS
 /// process's own address space — must stay numerically equal to
@@ -107,6 +120,23 @@ const DRV_TX_VA: usize = 0xD880_0000;
 /// pointer, kernel-side) once this process has written a terminal
 /// verdict — see `write_status`'s own doc comment for the exact layout.
 const STATUS_VA: usize = 0xD890_0000;
+/// VA the kernel-bypass control-plane's own shared message page is
+/// mapped at in THIS process's own address space — must stay numerically
+/// equal to `kernel_arch_glue::NETSTACK_BYPASS_SHARED_VA`. A SEPARATE
+/// page from `DRV_RX_VA` (which only ever carries `DriverRequest`/
+/// `DriverResponse` messages, this process's own OUTGOING protocol as a
+/// client of the driver) — this one carries `NetBypassRequest`/
+/// `NetBypassResponse` messages, this process's own INCOMING protocol as
+/// a server for whichever process asks for direct NIC access (03-
+/// Kernel-Subsystems-Layer.md §2.3/§5.4.1).
+const BYPASS_SHARED_VA: usize = 0xD8A0_0000;
+/// Mirrors `driver_virtio_net::QUEUE_SIZE` — the real number of
+/// descriptors in each of the driver's two virtqueues, reported verbatim
+/// in `NetBypassResponse::Granted::ring_len` (a genuinely known, fixed
+/// MVP value, not a placeholder — unlike `rx_ring_cap`/`tx_ring_cap`
+/// below, which this process does not resolve — see `handle_bypass_
+/// request`'s own doc comment).
+const DRV_QUEUE_SIZE: u32 = 2;
 
 /// `driver_virtio_net::layout::MAC_OFFSET` — must stay numerically
 /// equal. The negotiated device MAC, written by the driver's own
@@ -183,6 +213,28 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     ret
 }
 
+/// See `fs_native::subsystem_entry::raw_syscall2`'s own doc comment —
+/// needed here (unlike this file's original client-only shape) now that
+/// `park` doubles as a real `Recv`/`Reply` server for kernel-bypass
+/// networking's own control plane (03-Kernel-Subsystems-Layer.md §2.3/
+/// §5.4.1).
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") a7,
+            inlateout("a0") a0 => r0,
+            inlateout("a1") a1 => r1,
+            options(nostack),
+        );
+    }
+    (r0, r1)
+}
+
 /// # Safety
 /// `int 0x80` from Ring 3 traps to `hal_x86_64::cpu`'s dedicated DPL-3
 /// gate, which preserves every register except `rax`/`rsi`.
@@ -201,6 +253,24 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
         );
     }
     ret
+}
+
+/// See the riscv64 `raw_syscall2`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1): (usize, usize);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") a7 => r0,
+            in("rdi") a0,
+            inlateout("rsi") a1 => r1,
+            options(nostack),
+        );
+    }
+    (r0, r1)
 }
 
 /// # Safety
@@ -222,6 +292,23 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
     ret
 }
 
+/// See the riscv64 `raw_syscall2`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1): (usize, usize);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") a7,
+            inlateout("x0") a0 => r0,
+            inlateout("x1") a1 => r1,
+        );
+    }
+    (r0, r1)
+}
+
 /// Host-build stand-in (none of the three `#[cfg(target_arch = ...)]`
 /// blocks above match a non-`{riscv64,x86_64,aarch64}` host, which is
 /// never the case for this project's own CI/dev hosts today, but kept
@@ -232,6 +319,14 @@ unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
 #[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(never)]
 unsafe fn raw_syscall(_a7: usize, _a0: usize, _a1: usize) -> usize {
+    unreachable!("netstack's subsystem_main never runs on a host build")
+}
+
+/// Host-build stand-in — see `raw_syscall`'s own identical stand-in doc
+/// comment.
+#[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(never)]
+unsafe fn raw_syscall2(_a7: usize, _a0: usize, _a1: usize) -> (usize, usize) {
     unreachable!("netstack's subsystem_main never runs on a host build")
 }
 
@@ -304,6 +399,74 @@ unsafe fn read_shared_message() -> SmallMessage {
             *w = base.add(1 + i).read_volatile();
         }
         SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// Reads the `SmallMessage` a bypass-requesting client wrote into the
+/// kernel-bypass control-plane's own shared page — same fixed layout as
+/// `read_shared_message`, just a SEPARATE page (`BYPASS_SHARED_VA`'s own
+/// doc comment on why).
+///
+/// # Safety
+/// `BYPASS_SHARED_VA` must already be mapped (true from process entry
+/// onward — `kernel_arch_glue::spawn_netstack_service`'s own pre-map).
+unsafe fn read_bypass_message() -> SmallMessage {
+    let base = BYPASS_SHARED_VA as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// Writes `msg` into the kernel-bypass control-plane's own shared page
+/// for the caller to read back after `IPC_REPLY` wakes it — same fixed
+/// layout as `read_bypass_message`.
+///
+/// # Safety
+/// Same contract as `read_bypass_message`.
+unsafe fn write_bypass_message(msg: &SmallMessage) {
+    let base = BYPASS_SHARED_VA as *mut u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Handles one REAL `NetBypassRequest` — the kernel-bypass networking
+/// control plane's own server-side logic (03-Kernel-Subsystems-Layer.md
+/// §2.3/§5.4.1). This MVP never checks a real per-client "bypass
+/// capability" (§2.3's own text names the layer-4 Security Broker as the
+/// real issuer of that — out of this repo's own scope, `03-Kernel-
+/// Subsystems-Layer.md`'s own module doc comment) and always grants —
+/// same "one demo, one hardcoded scenario, no real per-connection
+/// resolution yet" simplification `compositor::subsystem_entry::handle_
+/// request`'s own doc comment already establishes for `buffer_cap`.
+/// `rx_ring_cap`/`tx_ring_cap` in the reply are informational
+/// placeholders (`0`) for the SAME reason `shared_cap`/`buffer_cap` are
+/// never resolved elsewhere in this codebase — the REAL capability grant
+/// and region mapping into the requesting client's own address space is
+/// performed by `kernel_arch_glue::net_bypass_request_call` itself (the
+/// TRUSTED glue driving this very round trip), not by this process,
+/// exactly mirroring how `spawn_netstack_service`'s own trusted-
+/// bootstrap mapping needs no `Map` ceremony from Netstack itself either.
+fn handle_bypass_request(req: NetBypassRequest) -> NetBypassResponse {
+    match req {
+        NetBypassRequest::RequestDirectNic { nic_id: _ } => NetBypassResponse::Granted {
+            handle: DirectNicHandle(1),
+            rx_ring_cap: 0,
+            tx_ring_cap: 0,
+            ring_len: DRV_QUEUE_SIZE,
+        },
+        NetBypassRequest::Release { handle: _ } => NetBypassResponse::Released,
     }
 }
 
@@ -431,11 +594,12 @@ fn write_status(verdict: u8, gw_mac: Option<[u8; 6]>) {
 /// The Netstack process's own entry point. Runs the ARP-resolve-then-
 /// ICMP-echo MVP demo (03-Kernel-Subsystems-Layer.md §5.4) exactly once,
 /// driving `driver-virtio-net` over real IPC throughout, then reports
-/// the verdict via `write_status` and parks forever (this MVP has no
-/// further work for it — a real Netstack would loop serving `FsRequest`-
-/// style application traffic instead, `03 §2.3`'s own "extract into a
-/// process a real netstack SERVICE talks to over IPC" follow-up scope,
-/// not yet built).
+/// the verdict via `write_status` and calls `park` — which, despite its
+/// name, is where this process's SECOND real role begins: serving the
+/// kernel-bypass networking control plane (§2.3/§5.4.1) forever on
+/// `BYPASS_ENDPOINT_CAP`. A real Netstack would ALSO loop serving
+/// `FsRequest`-style application traffic on some THIRD endpoint — not
+/// yet built, still future scope.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     // SAFETY: `DRV_RX_VA` is mapped by the time this process's first
@@ -477,41 +641,59 @@ pub extern "C" fn subsystem_main() -> ! {
     park();
 }
 
-/// Parks forever — this MVP's demo has no further work once the verdict
-/// is written (this function's own caller's doc comment). `!` return
-/// type: never actually returns, matching `subsystem_main`'s own
+/// Blocks on `BYPASS_ENDPOINT_CAP`, then serves REAL `NetBypassRequest`s
+/// on it forever (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1) — this
+/// MVP's demo has no OTHER work left for this process once the ARP/ICMP
+/// verdict is written (this function's own caller's doc comment), but
+/// the kernel-bypass control plane is real work, not idle parking. `!`
+/// return type: never actually returns, matching `subsystem_main`'s own
 /// signature.
 ///
-/// **Real starvation bug found via QEMU, fixed here**: a plain busy spin
-/// left this process holding the CPU (and `cr3`) forever once done,
-/// with NO ecall ever issued again — but `kernel_arch_glue::kstate()`'s
-/// `caller` (root), suspended mid-`NET_DEMO_START` since the original
-/// spawn switch, can only ever resume via `p2_ipc_recv`'s own hardcoded
-/// "switch to root" fallback, which fires ONLY when some thread issues a
-/// REAL blocking `Recv` that finds nothing pending. A silent spin loop
-/// never does that, so root's own `NET_STATUS_POLL` retry loop never got
-/// scheduled again after the initial spawn switch, and Netstack's own
-/// real IPC round-trips are far slower than root's bare-`Resume` poll
-/// attempts — root always exhausted its bounded 5000-attempt loop and
-/// moved on to the REST of the boot sequence long before this process
-/// could finish. `PARK_ENDPOINT_CAP` (slot 1, granted by `spawn_netstack_
-/// service` specifically for this) was sitting unused. Issuing one real
-/// `IPC_RECV` on it — an Endpoint nobody ever `Call`s — hands control
-/// back to root via that SAME existing fallback, and since `write_status`
-/// (this function's every caller) already ran, root's very next poll
-/// attempt reads the real, final verdict instead of racing an unfinished
-/// one.
+/// **Real starvation bug found via QEMU, originally fixed here (the
+/// mechanism this function's own loop below still relies on)**: a plain
+/// busy spin left this process holding the CPU (and `cr3`) forever once
+/// done, with NO ecall ever issued again — but `kernel_arch_glue::
+/// kstate()`'s `caller` (root), suspended mid-`NET_DEMO_START` since the
+/// original spawn switch, can only ever resume via `p2_ipc_recv`'s own
+/// hardcoded "switch to root" fallback, which fires ONLY when some
+/// thread issues a REAL blocking `Recv` that finds nothing pending. A
+/// silent spin loop never does that, so root's own `NET_STATUS_POLL`
+/// retry loop never got scheduled again after the initial spawn switch.
+/// `BYPASS_ENDPOINT_CAP` (slot 1, granted by `spawn_netstack_service`)
+/// was originally granted PURELY as a park target for this reason —
+/// blocking `Recv` on it (this function's very first iteration, before
+/// any real client exists yet to `Call` it) hands control back to root
+/// via that SAME fallback, and since `write_status` (this function's
+/// every caller) already ran by then, root's very next poll attempt
+/// reads the real, final verdict instead of racing an unfinished one.
+/// Every iteration AFTER that first one serves a genuine, later `Call`
+/// from a real kernel-bypass client (`kernel_arch_glue::net_bypass_
+/// request_call`) — the SAME Endpoint, now also doing real work.
 ///
 /// # Safety
-/// `PARK_ENDPOINT_CAP` is granted into this process's cap space before
-/// its first instruction ever runs (`spawn_netstack_service`'s own doc
-/// comment).
+/// `BYPASS_ENDPOINT_CAP` and `BYPASS_SHARED_VA` are both granted/mapped
+/// into this process's cap space/address space before its first
+/// instruction ever runs (`spawn_netstack_service`'s own doc comment).
 fn park() -> ! {
-    // SAFETY: `raw_syscall`'s own contract. Always blocks (nobody ever
-    // holds a capability to `Call` this Endpoint) — the switch away to
-    // root happens INSIDE this ecall; nothing after it ever runs again.
-    unsafe { raw_syscall(IPC_RECV, PARK_ENDPOINT_CAP, zero!()) };
     loop {
-        core::hint::spin_loop();
+        // SAFETY: `raw_syscall2`'s own contract. Blocks until a real
+        // `Call` arrives — the FIRST time, nobody holds a capability to
+        // make one yet, so this hands control back to root via `p2_ipc_
+        // recv`'s own fallback (this function's own doc comment); every
+        // later iteration serves a genuine kernel-bypass request.
+        let (from, _label) = unsafe { raw_syscall2(IPC_RECV, BYPASS_ENDPOINT_CAP, zero!()) };
+        // SAFETY: `read_bypass_message`'s own contract.
+        let req_msg = unsafe { read_bypass_message() };
+        let resp = match decode_net_bypass_request(&req_msg) {
+            Ok(req) => handle_bypass_request(req),
+            Err(_) => NetBypassResponse::Denied,
+        };
+        // SAFETY: `write_bypass_message`'s own contract.
+        unsafe { write_bypass_message(&encode_net_bypass_response(&resp)) };
+        // SAFETY: `raw_syscall`'s own contract. `IPC_REPLY` always
+        // switches away on success (see its own doc comment) — the loop
+        // continues here only on the (unreachable in practice) error
+        // case, matching every other real IPC server in this codebase.
+        unsafe { raw_syscall(IPC_REPLY, from, zero!()) };
     }
 }

@@ -4096,6 +4096,26 @@ unsafe fn wire_virtio_pci_transport_net(
     // netstack_service` after this function has already returned.
     unsafe { core::ptr::addr_of_mut!(G_DRV_NET_ISR_CFG_PHYS).write(isr_cfg_phys.unwrap_or(usize::MAX)) };
 
+    // Re-derive the NOTIFY window's own PHYSICAL base (only ever used to
+    // compute the matching page-table VA `spawn_netstack_service` maps
+    // into root's own address space — see `G_DRV_NET_NOTIFY_PHYS`'s own
+    // doc comment for why this can NEVER be dereferenced directly) +
+    // `notify_off_multiplier`. Needed by `net_bypass_direct_send`
+    // (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1) to ring the TX queue's
+    // own doorbell directly from kernel mode, computing the exact same
+    // address `notify_queue`'s own `Transport::Pci` arm would, but
+    // without the driver process's own involvement.
+    // SAFETY: forwarded from this function's own contract; `config_va`
+    // is the mapping installed above.
+    let notify_cfg_phys = caps
+        .notify
+        .and_then(|w| unsafe { pci_bar_phys(config_va, w.bar) }.map(|(base, _)| base as usize + w.offset as usize));
+    // SAFETY: single-core; written once here, read-only by `spawn_
+    // netstack_service` after this function has already returned.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_NOTIFY_PHYS).write(notify_cfg_phys.unwrap_or(usize::MAX)) };
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_NOTIFY_VA).write(notify_cfg_va) };
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_NOTIFY_OFF_MULT).write(caps.notify_off_multiplier) };
+
     let header = region_phys + driver_virtio_net::layout::PCI_INFO_OFFSET;
     // SAFETY: `region_phys` is the driver's own fresh, zeroed RX
     // `SharedRegion`, identity-addressable, single-core — same contract
@@ -4754,6 +4774,43 @@ static mut G_DRV_NET_ISR_CFG_VA: usize = usize::MAX;
 /// becomes virtio-blk's first genuine IPC client.
 static mut G_DRV_NET_ISR_CFG_PHYS: usize = usize::MAX;
 
+/// The NOTIFY_CFG register window's own PHYSICAL base (`bar_phys + w.
+/// offset`), cached the same way as `G_DRV_NET_ISR_CFG_PHYS` — `usize::
+/// MAX` if no NOTIFY capability was found, or for `Transport::Mmio`
+/// (which never sets this; `net_bypass_direct_send` uses `G_DRV_NET_
+/// MMIO_PHYS` + the fixed `mmio::QUEUE_NOTIFY` register instead in that
+/// case).
+///
+/// **NEVER dereferenced directly** (unlike `G_DRV_NET_MMIO_PHYS`, which
+/// genuinely is safe to — see that static's own doc comment): a modern
+/// virtio-pci device's own capability BARs are frequently 64-bit BARs
+/// QEMU's q35 chipset places far outside the low-RAM range the kernel's
+/// own identity map actually covers (**real bug found via QEMU**: a
+/// first version of `net_bypass_direct_send` wrote through this physical
+/// address directly and took a page fault at the exact same address —
+/// `cr2 == G_DRV_NET_NOTIFY_PHYS` — confirming it, while numerically a
+/// real device-assigned physical address, is simply not mapped anywhere
+/// the kernel can reach it as one). This is only the KEY `spawn_netstack_
+/// service` re-derives the matching page-table VA for — see `G_DRV_NET_
+/// NOTIFY_VA`'s own doc comment for the address `net_bypass_direct_send`
+/// actually dereferences.
+static mut G_DRV_NET_NOTIFY_PHYS: usize = usize::MAX;
+
+/// The VA `notify_cfg_va` (`wire_virtio_pci_transport_net`'s own local)
+/// is mapped at in the DRIVER's own address space — `spawn_netstack_
+/// service` maps this exact physical page at this exact numeric VA into
+/// root's own page table too (mirroring `G_DRV_NET_ISR_CFG_VA`'s own
+/// identical "also reachable from root, not just `drv_root_pt`"
+/// treatment), which is what makes it actually safe for `net_bypass_
+/// direct_send` — running on ROOT's own trap, `drv_root_pt` is never the
+/// active page table there — to dereference. `usize::MAX` if no NOTIFY
+/// capability was found, or for `Transport::Mmio`.
+static mut G_DRV_NET_NOTIFY_VA: usize = usize::MAX;
+
+/// `Transport::Pci`'s own `notify_off_multiplier` (spec §4.1.4.4),
+/// cached alongside `G_DRV_NET_NOTIFY_PHYS` for the same reason.
+static mut G_DRV_NET_NOTIFY_OFF_MULT: u32 = 0;
+
 /// VA the virtio-mmio transport window is pre-mapped at in the driver's
 /// own address space — must stay numerically equal to `driver_virtio_
 /// net::subsystem_entry::DRV_MMIO_VA`.
@@ -4791,6 +4848,39 @@ const NETSTACK_STATUS_VA: usize = 0xD890_0000;
 /// session's own extraction, used the identical pattern one region
 /// over).
 static mut G_NETSTACK_STATUS_PHYS: usize = usize::MAX;
+
+/// The Netstack process's own `ThreadId`, cached so `netstack_bypass_ipc_
+/// call` can specialize its own `Call`-then-switch shape exactly like
+/// `mm_ipc_call`'s own `G_MM_TID` — see that function's own doc comment
+/// for the real "phantom scheduler entity" `pick_next` bug class this
+/// sidesteps by switching straight to the known target thread instead of
+/// trusting the general scheduler's own answer.
+static mut G_NETSTACK_TID: Option<ThreadId> = None;
+
+/// Root's (`caller`'s) own capability slot for the SAME Endpoint object
+/// Netstack's own `subsystem_entry::BYPASS_ENDPOINT_CAP` (slot 1) holds a
+/// derived copy of — granted to root FIRST, by the very same `Retype`
+/// that creates the object, before `spawn_netstack_service`'s own slot-1
+/// `grant_cap_into` derives Netstack's copy (same "the retyping caller
+/// always ends up holding the original" convention every other `Retype`
+/// in this file relies on). This is the real control-plane rendezvous
+/// `net_bypass_request_call` (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1)
+/// calls into. `u32::MAX` until `spawn_netstack_service` has run.
+static mut G_NETSTACK_BYPASS_EP: u32 = u32::MAX;
+
+/// Physical address of the page shared between root and Netstack for the
+/// kernel-bypass control-plane handshake (mapped into Netstack's own
+/// address space at `NETSTACK_BYPASS_SHARED_VA` by `spawn_netstack_
+/// service`) — root reads/writes it directly via this physical pointer,
+/// no VA mapping needed on root's own side, same "low RAM is always
+/// identity-mapped for kernel-mode access regardless of which process's
+/// page table is active" pattern as `G_MM_SHARED_PHYS`'s own doc comment.
+static mut G_NETSTACK_BYPASS_SHARED_PHYS: usize = usize::MAX;
+
+/// VA Netstack's own process maps the kernel-bypass control-plane shared
+/// page at — must stay numerically equal to `netstack::subsystem_entry::
+/// BYPASS_SHARED_VA`.
+pub const NETSTACK_BYPASS_SHARED_VA: usize = 0xD8A0_0000;
 
 /// The trampoline `SyscallOp::IrqBind` installs with the platform's
 /// `InterruptController` for the virtio-net device's own IRQ line —
@@ -5227,6 +5317,10 @@ pub fn spawn_netstack_service(
         _ => return None,
     };
     grant_cap_into(k, src_cs, park_ep_cap, ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // SAFETY: single-core; written once here, before any kernel-bypass
+    // call (reached only after this function returns) can read either.
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_TID).write(Some(ns_tid)) };
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_BYPASS_EP).write(park_ep_cap.as_u32()) };
 
     let ns_addr_space = k.tcb(ns_tid)?.addr_space;
     let ns_root_pt = k.addr_space_mut(ns_addr_space)?.root_phys().as_usize();
@@ -5263,6 +5357,35 @@ pub fn spawn_netstack_service(
         return None;
     }
 
+    // Retype + map the kernel-bypass control-plane's own shared message
+    // page (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1) — same shape as
+    // `mm_demo_start`'s own `MM_SHARED_VA` page: a fresh, private
+    // `SharedRegion`, mapped only into Netstack's own address space (root
+    // reaches it via `G_NETSTACK_BYPASS_SHARED_PHYS`'s own physical
+    // pointer, never through a VA mapping of its own).
+    let bypass_shared_phys = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(bypass_shared_phys as *mut u8, 0, 4096) };
+    let bypass_shared_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(bypass_shared_pool as *mut u8, 0, 4096 * 2) };
+    let n_bypass =
+        hal.map_range(ns_root_pt, NETSTACK_BYPASS_SHARED_VA, bypass_shared_phys, 4096, 1 | 2 | 8, bypass_shared_pool, 2);
+    if n_bypass == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (bypass shared page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // kernel-bypass call can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_BYPASS_SHARED_PHYS).write(bypass_shared_phys) };
+
     // Retype + map Netstack's own private status region.
     let status_cap = match k.dispatch(
         caller,
@@ -5296,36 +5419,55 @@ pub fn spawn_netstack_service(
     // `netstack_status` call (reached only after this function returns).
     unsafe { core::ptr::addr_of_mut!(G_NETSTACK_STATUS_PHYS).write(status_phys) };
 
-    // Also map the driver's own ISR_CFG register page into Netstack's
-    // AND root's (`caller`'s) own page tables, at the SAME numeric VA
-    // the driver already has it at — see `G_DRV_NET_ISR_CFG_PHYS`'s own
-    // doc comment for the real, QEMU-found page fault this fixes:
-    // `virtio_net_irq_trampoline` reads this VA unconditionally whenever
-    // the device's IRQ fires, but a genuine hardware IRQ is asynchronous
-    // to the CPU's own instruction stream and can now land while EITHER
-    // of these two OTHER processes is the active address space (Netstack
-    // is this codebase's first real IPC client that actually takes turns
-    // with a driver process). `usize::MAX` (never found an ISR
-    // capability, or `Transport::Mmio`, which never sets this at all) —
-    // skip entirely; the mmio-transport path's own physical-address read
-    // is already identity-mapped and safe from any `cr3`.
-    let isr_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_PHYS).read() };
-    let isr_va = unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read() };
-    if isr_phys != usize::MAX && isr_va != usize::MAX {
-        let isr_va_page = isr_va & !0xFFF;
-        let isr_phys_page = isr_phys & !0xFFF;
-        let caller_addr_space = k.tcb(caller)?.addr_space;
-        let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+    // Also map the driver's own ISR_CFG and NOTIFY_CFG register pages
+    // into Netstack's AND root's (`caller`'s) own page tables, at the
+    // SAME numeric VA the driver already has each at — see `G_DRV_NET_
+    // ISR_CFG_PHYS`'s own doc comment for the real, QEMU-found page
+    // fault this fixes for ISR: `virtio_net_irq_trampoline` reads that VA
+    // unconditionally whenever the device's IRQ fires, but a genuine
+    // hardware IRQ is asynchronous to the CPU's own instruction stream
+    // and can now land while EITHER of these two OTHER processes is the
+    // active address space (Netstack is this codebase's first real IPC
+    // client that actually takes turns with a driver process). NOTIFY_CFG
+    // needs the identical treatment for a DIFFERENT real reason (also
+    // QEMU-found): `net_bypass_direct_send` runs on ROOT's own trap
+    // (`drv_root_pt` is never active there) and rings the TX doorbell
+    // directly — see `G_DRV_NET_NOTIFY_PHYS`'s own doc comment for the
+    // page fault a first version of that function took writing through
+    // the raw physical address instead of a mapped VA. `usize::MAX`
+    // (never found the matching capability, or `Transport::Mmio`, which
+    // never sets either at all) — skip that window entirely; the
+    // mmio-transport path's own physical-address reads/writes are
+    // already identity-mapped and safe from any `cr3`.
+    let caller_addr_space = k.tcb(caller)?.addr_space;
+    let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+    for (name, phys, va) in [
+        (
+            "ISR_CFG",
+            unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_PHYS).read() },
+            unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read() },
+        ),
+        (
+            "NOTIFY_CFG",
+            unsafe { core::ptr::addr_of!(G_DRV_NET_NOTIFY_PHYS).read() },
+            unsafe { core::ptr::addr_of!(G_DRV_NET_NOTIFY_VA).read() },
+        ),
+    ] {
+        if phys == usize::MAX || va == usize::MAX {
+            continue;
+        }
+        let va_page = va & !0xFFF;
+        let phys_page = phys & !0xFFF;
         for target_pt in [ns_root_pt, caller_root_pt] {
-            let isr_pool = k
+            let win_pool = k
                 .untyped_mut(kernel_cap::UntypedId::new(0))
                 .and_then(|u| u.alloc(4096, 4096 * 2).ok())
                 .map(|p| p.as_usize())?;
             // SAFETY: fresh untyped RAM, identity-addressable, single-core.
-            unsafe { core::ptr::write_bytes(isr_pool as *mut u8, 0, 4096 * 2) };
-            let n = hal.map_range(target_pt, isr_va_page, isr_phys_page, 4096, 1 | 2, isr_pool, 2);
+            unsafe { core::ptr::write_bytes(win_pool as *mut u8, 0, 4096 * 2) };
+            let n = hal.map_range(target_pt, va_page, phys_page, 4096, 1 | 2, win_pool, 2);
             if n == u32::MAX {
-                klog!("spawn_netstack_service: map_range error (driver ISR_CFG page)\r\n");
+                klog!("spawn_netstack_service: map_range error (driver {} page)\r\n", name);
                 return None;
             }
             // `caller_root_pt` is the CURRENTLY ACTIVE page table (this
@@ -5408,6 +5550,350 @@ pub fn netstack_status() -> usize {
         }
     );
     verdict as usize
+}
+
+/// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
+/// kernel-bypass control-plane's own shared page — same convention
+/// `write_shared_mm_message`'s own doc comment documents in full.
+///
+/// # Safety
+/// `G_NETSTACK_BYPASS_SHARED_PHYS` must already be a valid,
+/// exclusively-owned, mapped physical frame (`spawn_netstack_service` has
+/// run).
+unsafe fn write_shared_netstack_bypass_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_NETSTACK_BYPASS_SHARED_PHYS` only written
+    // once by `spawn_netstack_service`, before this can ever be called.
+    let base = unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back a `SmallMessage` written by `write_shared_netstack_bypass_
+/// message`.
+///
+/// # Safety
+/// Same contract as `write_shared_netstack_bypass_message`.
+unsafe fn read_shared_netstack_bypass_message() -> SmallMessage {
+    // SAFETY: single-core; same contract as `write_shared_netstack_bypass_message`.
+    let base = unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// `Call`, specialized for the kernel-bypass control-plane's own known,
+/// fixed 2-party (root <-> Netstack) shape — same "bypass `pick_next`'s
+/// answer, switch straight to the known target thread" fix `mm_ipc_call`'s
+/// own doc comment documents in full (identical bug class: Netstack's own
+/// `park()` loop, like mm-service's own server loop, is the only OTHER
+/// runnable thread by the time this demo reaches it).
+fn netstack_bypass_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_NETSTACK_TID` is written once by `spawn_
+    // netstack_service`, before any bypass call (this function) can run.
+    let ns_tid = unsafe { core::ptr::addr_of!(G_NETSTACK_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(ns_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, ns_tid)?;
+            let poke = if n == ns_tid {
+                k.tcb_mut(ns_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `NET_BYPASS_REQUEST` demo opcode: builds a REAL `NetBypassRequest::
+/// RequestDirectNic` for a fixed demo `nic_id` (`0` — this MVP has
+/// exactly one NIC, matching `spawn_virtio_net_driver`'s own
+/// single-device assumption throughout) and issues the real IPC round
+/// trip to Netstack's own `BYPASS_ENDPOINT_CAP` server loop
+/// (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1). Netstack's own `handle_
+/// bypass_request` always grants (this MVP's own documented
+/// simplification: no layer-4 Security Broker exists in this repo yet to
+/// consult — `ipc_protocol::net`'s own doc comment).
+///
+/// Unlike `mm_register_call`/`compositor_commit_call` (which take their
+/// endpoint cap as a per-arch global `kernel/kernel/src/main.rs` itself
+/// caches at `MM_DEMO_START`/spawn time), this reads `G_NETSTACK_BYPASS_
+/// EP` directly — cached once, inside THIS crate, by `spawn_netstack_
+/// service` itself — since Netstack is already spawned (for the ARP/ICMP
+/// demo) long before this opcode's own first use, with no per-arch
+/// wrinkle to thread through `main.rs`. Returns `None` (a `TrapOutcome::
+/// Resume(0)`, matching `mm_register_call`'s own convention) if Netstack
+/// was never spawned.
+pub fn net_bypass_request_call(hal: &HalInterface, caller: ThreadId) -> Option<IpcSwitch> {
+    // SAFETY: single-core; written once by `spawn_netstack_service`,
+    // before any `.user_text` code can reach this opcode.
+    let ep_cap = unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_EP).read() };
+    if ep_cap == u32::MAX {
+        return None;
+    }
+    let req = ipc_protocol::NetBypassRequest::RequestDirectNic { nic_id: 0 };
+    let msg = ipc_protocol::codec::encode_net_bypass_request(&req);
+    // SAFETY: `spawn_netstack_service` has already run (checked above via
+    // `ep_cap`), so `G_NETSTACK_BYPASS_SHARED_PHYS` is valid too.
+    unsafe { write_shared_netstack_bypass_message(&msg) };
+    netstack_bypass_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `NetBypassResponse` for `net_bypass_request_call`.
+/// Returns `1` for a real `Granted`, `0` otherwise (`Denied`, a decode
+/// failure, or — unlike `mm_register_result`, which can assume mm-service
+/// is always spawned by the time it runs — `net_bypass_request_call`
+/// itself never having sent anything at all: **real bug found via QEMU**,
+/// this function used to dereference `G_NETSTACK_BYPASS_SHARED_PHYS`
+/// unconditionally, and `net_bypass_demo_*`'s own call site always reads
+/// this result right after issuing `NET_BYPASS_REQUEST` regardless of
+/// whether Netstack was ever spawned in the first place (no NIC
+/// discovered at boot skips `NET_DEMO_START`, per `net_demo_aarch64`'s
+/// own doc comment) — a debug build's `read_volatile` precondition check
+/// caught the resulting misaligned `usize::MAX` pointer read as a kernel
+/// panic on aarch64).
+pub fn net_bypass_request_result() -> usize {
+    // SAFETY: single-core; read-only, `spawn_netstack_service` is this
+    // static's only writer.
+    if unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_SHARED_PHYS).read() } == usize::MAX {
+        return 0;
+    }
+    // SAFETY: same contract as `net_bypass_request_call` — the check
+    // above rules out the one case that contract doesn't already cover.
+    let msg = unsafe { read_shared_netstack_bypass_message() };
+    matches!(
+        ipc_protocol::codec::decode_net_bypass_response(&msg),
+        Ok(ipc_protocol::NetBypassResponse::Granted { .. })
+    ) as usize
+}
+
+/// Fixed demo frame length `net_bypass_direct_send` stages after the
+/// (all-zero) virtio-net header — a recognizable, deliberately-not-a-
+/// real-protocol byte pattern is enough to prove real bytes moved (this
+/// path has no listener to reply, unlike the ARP/ICMP round trip
+/// `netstack_status` verifies — §5.4.1's own "the client then drives the
+/// NIC directly with NO further IPC on the data path" contract means this
+/// demo proves the SEND mechanism itself, not a round trip).
+const NET_BYPASS_FRAME_LEN: usize = 64;
+
+/// Directly replicates `VirtioNet::submit_tx_request`/`publish_and_
+/// notify`'s own descriptor-publish-plus-doorbell-ring logic
+/// (`driver_virtio_net::VirtioNet`'s own PRIVATE wire-format methods,
+/// necessarily mirrored here byte-for-byte rather than called, since
+/// kernel-arch-glue cannot reach into another process's own address
+/// space or private struct) directly against the driver's already-probed
+/// TX queue's own physical `SharedRegion` — the core of §2.3/§5.4.1's own
+/// "the client then drives the NIC directly with NO further IPC on the
+/// data path" contract. Runs from kernel mode (Ring 0 / EL1 / M-mode's
+/// own already-unrestricted physical memory access — the SAME class of
+/// direct physical read/write every other verification function in this
+/// file already performs), so this MVP needs no separate "bypass client
+/// process": `net_bypass_request_call`'s own control-plane handshake is
+/// the only real IPC on this whole path, exactly matching the spec.
+///
+/// # Preconditions (an honest, undefended MVP simplification)
+/// The driver's own `do_probe` must already have completed (so `TX_
+/// NOTIFY_OFF_OFFSET` — persisted in the RX region, `layout::TX_NOTIFY_
+/// OFF_OFFSET`'s own doc comment on why only there — holds a real value
+/// for PCI transport), and the driver's own last TX request (if any) must
+/// already have completed: `used.idx == avail.idx` on the TX queue,
+/// checked below and refused otherwise rather than silently interleaving
+/// with a request this path has no way to identify. This demo's own call
+/// site (after the driver's own SendFrame/PollFrame demo and Netstack's
+/// own ARP/ICMP demo have both already run to completion) guarantees this
+/// by construction; a general-purpose bypass path would need to actually
+/// wait on it instead of refusing.
+///
+/// Returns the elapsed nanoseconds (`hal.now_ns()` immediately before
+/// publishing the descriptor, to immediately after the busy-poll observes
+/// completion), or `None` if the driver was never probed, its last TX is
+/// still pending, or the busy-poll times out.
+pub fn net_bypass_direct_send(hal: &HalInterface) -> Option<u64> {
+    // SAFETY: single-core; `G_DRV_NET_TX_PHYS` was written once by
+    // `spawn_virtio_net_driver`, already run to completion by the time
+    // this demo function can be reached (`umode_root`'s own ordering).
+    let tx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_TX_PHYS).read() };
+    if tx_phys == usize::MAX {
+        klog!("net_bypass_direct_send: driver was never probed (no TX region)\r\n");
+        return None;
+    }
+    // Refuse to interleave with the driver's own still-in-flight TX —
+    // same `used.idx == next_idx` direction as `VirtioNet::tx_completion_
+    // pending`'s own doc comment, just re-derived from the queue's own
+    // on-wire words directly (no driver-process struct reachable here).
+    // SAFETY: `AVAIL_OFFSET + 2` / `USED_OFFSET + 2` are within the
+    // mapped region (`tx_phys` is a fresh, page-sized `SharedRegion`'s
+    // own physical base, identity-addressable, single-core).
+    let next_idx = unsafe {
+        ((tx_phys + driver_virtio_net::layout::AVAIL_OFFSET + 2) as *const u16).read_volatile()
+    };
+    let used_idx_before = unsafe {
+        ((tx_phys + driver_virtio_net::layout::USED_OFFSET + 2) as *const u16).read_volatile()
+    };
+    if used_idx_before != next_idx {
+        klog!("net_bypass_direct_send: driver's own last TX request is still pending, refusing to interleave\r\n");
+        return None;
+    }
+
+    // Stage the demo frame at `BUFFER_OFFSET`: the virtio-net header
+    // (all-zero — no GSO/checksum offload requested, same convention
+    // `submit_tx_request`'s own doc comment establishes), followed by a
+    // fixed, recognizable Ethernet-shaped payload.
+    let buf = tx_phys + driver_virtio_net::layout::BUFFER_OFFSET;
+    // SAFETY: `BUFFER_OFFSET..+4096-BUFFER_OFFSET` is within the mapped
+    // region — same contract as the ring reads above.
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, driver_virtio_net::VIRTIO_NET_HDR_LEN);
+        let frame = buf + driver_virtio_net::VIRTIO_NET_HDR_LEN;
+        core::ptr::write_bytes(frame as *mut u8, 0xFF, 6); // dest MAC = broadcast
+        core::ptr::write_bytes((frame + 6) as *mut u8, 0xB9, 6); // src MAC = fixed sentinel bytes
+        ((frame + 12) as *mut u8).write_volatile(0xFF);
+        ((frame + 13) as *mut u8).write_volatile(0xFF); // ethertype 0xFFFF — deliberately unassigned
+        core::ptr::write_bytes((frame + 14) as *mut u8, 0xB5, NET_BYPASS_FRAME_LEN - 14); // recognizable payload pattern
+    }
+    let total_len = driver_virtio_net::VIRTIO_NET_HDR_LEN + NET_BYPASS_FRAME_LEN;
+
+    let start_ns = hal.now_ns();
+
+    // Descriptor slot 0 (`VirtqDescRaw`'s own `#[repr(C)]` layout —
+    // `addr: u64, len: u32, flags: u16, next: u16`, spec §2.6.5), device-
+    // readable (TX): mirrors `submit_tx_request`'s own descriptor exactly.
+    // SAFETY: `DESC_OFFSET` (32 bytes, slot 0 only) is within the mapped region.
+    unsafe {
+        let desc = tx_phys + driver_virtio_net::layout::DESC_OFFSET;
+        (desc as *mut u64).write_volatile(buf as u64); // identity-mapped physical RAM.
+        ((desc + 8) as *mut u32).write_volatile(total_len as u32);
+        ((desc + 12) as *mut u16).write_volatile(0); // flags: device-readable, no NEXT
+        ((desc + 14) as *mut u16).write_volatile(0); // next: unused
+    }
+    let ring_slot = driver_virtio_net::layout::AVAIL_OFFSET
+        + 4
+        + (next_idx as usize % driver_virtio_net::QUEUE_SIZE as usize) * 2;
+    let new_avail_idx = next_idx.wrapping_add(1);
+    // SAFETY: within the mapped region.
+    unsafe {
+        ((tx_phys + ring_slot) as *mut u16).write_volatile(0); // head descriptor index (slot 0)
+        ((tx_phys + driver_virtio_net::layout::AVAIL_OFFSET + 2) as *mut u16).write_volatile(new_avail_idx);
+    }
+
+    // Ring the doorbell — MMIO's single fixed register, or PCI's
+    // per-queue notify window, using the SAME `tx_notify_off` the
+    // driver's own `do_probe` already negotiated and persisted
+    // (`layout::TX_NOTIFY_OFF_OFFSET`'s own doc comment on why this can
+    // only be read back post-probe, from the RX region).
+    // SAFETY: single-core; both globals are written once by `spawn_
+    // virtio_net_driver`/`wire_virtio_pci_transport_net`, already run to
+    // completion.
+    let mmio_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_MMIO_PHYS).read() };
+    if mmio_phys != usize::MAX {
+        // SAFETY: `mmio_phys + QUEUE_NOTIFY` is the device's own live MMIO window.
+        unsafe {
+            ((mmio_phys + driver_virtio_net::mmio::QUEUE_NOTIFY) as *mut u32)
+                .write_volatile(driver_virtio_net::TX_QUEUE);
+        }
+    } else {
+        // SAFETY: single-core; `G_DRV_NET_NOTIFY_VA` is written once by
+        // `wire_virtio_pci_transport_net` and mapped into root's own page
+        // table by `spawn_netstack_service` — see `G_DRV_NET_NOTIFY_VA`'s
+        // own doc comment for why a raw `G_DRV_NET_NOTIFY_PHYS`
+        // dereference (a first version of this function's own real bug,
+        // found via QEMU) is never safe: modern virtio-pci capability
+        // BARs are frequently 64-bit BARs QEMU places far outside the
+        // kernel's own low-RAM identity map.
+        let notify_va = unsafe { core::ptr::addr_of!(G_DRV_NET_NOTIFY_VA).read() };
+        let notify_off_mult = unsafe { core::ptr::addr_of!(G_DRV_NET_NOTIFY_OFF_MULT).read() };
+        let rx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read() };
+        if notify_va == usize::MAX || rx_phys == usize::MAX {
+            klog!("net_bypass_direct_send: no notify window cached (neither MMIO nor PCI)\r\n");
+            return None;
+        }
+        // SAFETY: `TX_NOTIFY_OFF_OFFSET` is within the mapped RX region.
+        let tx_notify_off =
+            unsafe { ((rx_phys + driver_virtio_net::layout::TX_NOTIFY_OFF_OFFSET) as *const u64).read_volatile() as u16 };
+        let addr = notify_va + (tx_notify_off as usize) * (notify_off_mult as usize);
+        // SAFETY: `addr` is the PCI NOTIFY_CFG window's own live register,
+        // reached through the VA `spawn_netstack_service` mapped into
+        // root's own (currently active) page table — see `G_DRV_NET_
+        // NOTIFY_VA`'s own doc comment.
+        unsafe { (addr as *mut u16).write_volatile(driver_virtio_net::TX_QUEUE as u16) };
+    }
+
+    // Bounded busy-poll for the used ring to catch up — mirrors
+    // `VirtioNet::tx_completion_pending`'s own `used.idx == next_idx`
+    // check, re-derived from the physical region directly.
+    const MAX_POLL_ITERS: u32 = 20_000_000;
+    let mut i = 0u32;
+    loop {
+        // SAFETY: within the mapped region.
+        let used_idx =
+            unsafe { ((tx_phys + driver_virtio_net::layout::USED_OFFSET + 2) as *const u16).read_volatile() };
+        if used_idx == new_avail_idx {
+            break;
+        }
+        i += 1;
+        if i >= MAX_POLL_ITERS {
+            klog!(
+                "net_bypass_direct_send: TX completion busy-poll timed out (used_idx={:#x} wanted={:#x})\r\n",
+                used_idx, new_avail_idx
+            );
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+
+    let elapsed_ns = hal.now_ns().saturating_sub(start_ns);
+
+    // Acknowledge the interrupt cause at the device — same "always drain
+    // whatever cause is pending, even though this path never waits on the
+    // IRQ line" rationale as `VirtioNet::ack_interrupt`'s own doc comment.
+    if mmio_phys != usize::MAX {
+        // SAFETY: forwarded from `virtio_net_irq_trampoline`'s own
+        // identical MMIO read-then-write-back.
+        unsafe {
+            let cause = ((mmio_phys + driver_virtio_net::mmio::INTERRUPT_STATUS) as *const u32).read_volatile();
+            ((mmio_phys + driver_virtio_net::mmio::INTERRUPT_ACK) as *mut u32).write_volatile(cause);
+        }
+    } else {
+        // SAFETY: single-core; `G_DRV_NET_ISR_CFG_VA` is mapped into
+        // root's own page table by `spawn_netstack_service` (the SAME
+        // mapping `virtio_net_irq_trampoline` already relies on being
+        // reachable from root — see that static's own doc comment) —
+        // unlike `G_DRV_NET_ISR_CFG_PHYS`, which is never safe to
+        // dereference directly (`G_DRV_NET_NOTIFY_PHYS`'s own doc comment
+        // on the identical class of real bug this sidesteps).
+        let isr_va = unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read() };
+        if isr_va != usize::MAX {
+            // SAFETY: PCI ISR is a single read-to-clear byte (spec §4.1.4.5).
+            unsafe {
+                let _ = (isr_va as *const u8).read_volatile();
+            }
+        }
+    }
+
+    klog!(
+        "net_bypass_direct_send: MATCH sent {} bytes in {} ns (kernel-bypass, no driver-process/IPC on data path)\r\n",
+        total_len,
+        elapsed_ns
+    );
+
+    Some(elapsed_ns)
 }
 
 /// `DRV_IRQ_WAIT` demo opcode's own kernel-side half: issues exactly

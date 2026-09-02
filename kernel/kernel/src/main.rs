@@ -669,6 +669,29 @@ mod sys {
     /// (and logs a MATCH/MISMATCH verdict against `kernel_arch_glue::
     /// MM_DEMO_EXPECTED_TOTAL`), or `usize::MAX` on any error.
     pub const MM_QUERY_TOTAL_RESIDENT_RESULT: usize = 82;
+
+    // -- kernel-bypass networking: the REAL NetBypassRequest/
+    //    NetBypassResponse control-plane handshake (03-Kernel-Subsystems-
+    //    Layer.md §2.3/§5.4.1) over Netstack's own `BYPASS_ENDPOINT_CAP`
+    //    server loop, followed by a data-path SEND that goes directly
+    //    from kernel mode to the driver's own already-live TX queue, with
+    //    NO further IPC and NO driver-process involvement at all.
+
+    /// No arguments. Builds a REAL `NetBypassRequest::RequestDirectNic`
+    /// and calls Netstack's own `BYPASS_ENDPOINT_CAP` (`kernel_arch_glue::
+    /// net_bypass_request_call`'s own doc comment on why this needs no
+    /// per-arch endpoint global, unlike `MM_REGISTER`'s own `G_MM_EP_*`).
+    pub const NET_BYPASS_REQUEST: usize = 83;
+    /// No arguments. Returns `1` in `a0` for a real `Granted`, `0`
+    /// otherwise.
+    pub const NET_BYPASS_REQUEST_RESULT: usize = 84;
+    /// No arguments. Directly publishes one descriptor onto the driver's
+    /// own already-probed TX queue and rings its doorbell from KERNEL
+    /// mode (`kernel_arch_glue::net_bypass_direct_send`'s own doc
+    /// comment) — the data-path leg of §5.4.1, bypassing both the driver
+    /// process AND any further IPC. Returns the elapsed nanoseconds in
+    /// `a0`, or `usize::MAX` on failure/timeout.
+    pub const NET_BYPASS_SEND: usize = 85;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -972,6 +995,41 @@ fn mm_demo_riscv64() {
     }
 }
 
+/// The kernel-bypass networking demo (03-Kernel-Subsystems-Layer.md
+/// §2.3/§5.4.1): issues the REAL `NetBypassRequest::RequestDirectNic`
+/// control-plane handshake to Netstack's own `BYPASS_ENDPOINT_CAP` server
+/// loop, then a REAL kernel-mode data-path SEND that drives the driver's
+/// own already-probed TX queue directly — no driver process, no further
+/// IPC, matching §5.4.1's own contract. Must run AFTER the driver's own
+/// SendFrame/PollFrame demo and Netstack's own ARP/ICMP demo have both
+/// already completed (`kernel_arch_glue::net_bypass_direct_send`'s own
+/// doc comment on why this ordering is a real precondition, not just
+/// convenient sequencing — it refuses to interleave with a still-pending
+/// driver-owned TX request).
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_bypass_demo_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall(sys::NET_BYPASS_REQUEST, zero!(), zero!());
+        let granted = raw_syscall(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, granted, zero!());
+        if granted != 0 {
+            let elapsed_ns = raw_syscall(sys::NET_BYPASS_SEND, zero!(), zero!());
+            raw_syscall(sys::REPORT, elapsed_ns, zero!());
+        }
+    }
+}
+
 /// The user-space Root Task entry. Linked into `.user_text` (its own
 /// U=1 R+X pages at VMA 0xC000_0000, per hal-riscv64's linker.ld) and run
 /// in U-mode under Sv39 paging by `kernel-arch-glue::enter`.
@@ -1172,6 +1230,13 @@ extern "C" fn umode_root() -> ! {
         // 7e. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
         // `mm_demo_riscv64`'s own doc comment.
         mm_demo_riscv64();
+
+        // 7f. Kernel-bypass networking demo (03-Kernel-Subsystems-
+        // Layer.md §2.3/§5.4.1) — see `net_bypass_demo_riscv64`'s own
+        // doc comment. Runs LAST among the subsystem demos: it depends
+        // on the virtio-net driver's own TX queue already being idle,
+        // which `net_demo_riscv64` (7c) guarantees by construction.
+        net_bypass_demo_riscv64();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
@@ -1585,6 +1650,31 @@ fn mm_demo_x86() {
     }
 }
 
+/// See the riscv64 `net_bypass_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_bypass_demo_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_x86(sys::NET_BYPASS_REQUEST, zero!(), zero!());
+        let granted = raw_syscall_x86(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, granted, zero!());
+        if granted != 0 {
+            let elapsed_ns = raw_syscall_x86(sys::NET_BYPASS_SEND, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, elapsed_ns, zero!());
+        }
+    }
+}
+
 /// The x86_64 Root Task entry. Linked into `.user_text` (its own
 /// `U=1` `R+X` pages at the linked VMA, per hal-x86_64's linker.ld) and
 /// run in Ring 3 by `kernel-arch-glue::enter`. Extends the original
@@ -1720,6 +1810,12 @@ extern "C" fn umode_root_x86() -> ! {
         // 7f. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
         // `mm_demo_x86`'s own doc comment.
         mm_demo_x86();
+
+        // 7g. Kernel-bypass networking demo (03-Kernel-Subsystems-
+        // Layer.md §2.3/§5.4.1) — see `net_bypass_demo_x86`'s own doc
+        // comment. Runs LAST among the subsystem demos, same ordering
+        // reason as riscv64's own identical call site.
+        net_bypass_demo_x86();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the LAPIC timer, then loop forever bumping
@@ -2373,6 +2469,22 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
         }
+        sys::NET_BYPASS_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_bypass_request_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_BYPASS_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
+        }
+        sys::NET_BYPASS_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let ns = kernel_arch_glue::net_bypass_direct_send(hal);
+            return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -2849,6 +2961,31 @@ fn mm_demo_aarch64() {
     }
 }
 
+/// See the riscv64 `net_bypass_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_bypass_demo_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_aarch64(sys::NET_BYPASS_REQUEST, zero!(), zero!());
+        let granted = raw_syscall_aarch64(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, granted, zero!());
+        if granted != 0 {
+            let elapsed_ns = raw_syscall_aarch64(sys::NET_BYPASS_SEND, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, elapsed_ns, zero!());
+        }
+    }
+}
+
 /// The aarch64 Root Task entry. Linked into `.user_text` (its own
 /// `AP_USER` `R+X` pages at the linked VMA, per hal-arm64's linker.ld)
 /// and run at EL0 by `kernel-arch-glue::enter`. Extends the original
@@ -2981,6 +3118,12 @@ extern "C" fn umode_root_aarch64() -> ! {
         // 7f. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
         // `mm_demo_aarch64`'s own doc comment.
         mm_demo_aarch64();
+
+        // 7g. Kernel-bypass networking demo (03-Kernel-Subsystems-
+        // Layer.md §2.3/§5.4.1) — see `net_bypass_demo_aarch64`'s own
+        // doc comment. Runs LAST among the subsystem demos, same
+        // ordering reason as riscv64's own identical call site.
+        net_bypass_demo_aarch64();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the timer PPI, then loop forever bumping this
@@ -3591,6 +3734,22 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
+        }
+        sys::NET_BYPASS_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_bypass_request_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_BYPASS_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
+        }
+        sys::NET_BYPASS_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let ns = kernel_arch_glue::net_bypass_direct_send(hal);
+            return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
@@ -4500,6 +4659,22 @@ fn simurgh_syscall(
         }
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
+        }
+        sys::NET_BYPASS_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_bypass_request_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_BYPASS_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
+        }
+        sys::NET_BYPASS_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let ns = kernel_arch_glue::net_bypass_direct_send(hal);
+            return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
