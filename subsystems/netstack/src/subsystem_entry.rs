@@ -68,6 +68,10 @@ use kernel_ipc::SmallMessage;
 /// — see this file's own module doc comment for why this generic
 /// opcode, not a new one, is exactly what this process needs.
 const IPC_CALL: usize = 42;
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_RECV`
+/// — `park`'s own doc comment on why this process issues exactly one of
+/// these, right before parking for good.
+const IPC_RECV: usize = 43;
 
 /// This process's own capability slot for the (derived-copy) driver
 /// `Endpoint` — `kernel_arch_glue::spawn_netstack_service`'s own first
@@ -76,6 +80,13 @@ const IPC_CALL: usize = 42;
 /// other subsystem's own `*_ENDPOINT_CAP`/`DRV_ENDPOINT_CAP` constant
 /// doc comment already gives).
 const DRV_ENDPOINT_CAP: usize = 0;
+
+/// This process's own capability slot for the "park" `Endpoint` —
+/// `kernel_arch_glue::spawn_netstack_service`'s own SECOND grant, slot
+/// 1. Nobody ever holds a capability to `Call` this Endpoint; its only
+/// purpose is `park`'s own final blocking `Recv` — see that function's
+/// own doc comment.
+const PARK_ENDPOINT_CAP: usize = 1;
 
 /// VA the driver's own RX `SharedRegion` is pre-mapped at in THIS
 /// process's own address space — must stay numerically equal to
@@ -466,11 +477,40 @@ pub extern "C" fn subsystem_main() -> ! {
     park();
 }
 
-/// Busy-park forever — this MVP's demo has no further work once the
-/// verdict is written (this function's own caller's doc comment). `!`
-/// return type: never actually returns, matching `subsystem_main`'s own
+/// Parks forever — this MVP's demo has no further work once the verdict
+/// is written (this function's own caller's doc comment). `!` return
+/// type: never actually returns, matching `subsystem_main`'s own
 /// signature.
+///
+/// **Real starvation bug found via QEMU, fixed here**: a plain busy spin
+/// left this process holding the CPU (and `cr3`) forever once done,
+/// with NO ecall ever issued again — but `kernel_arch_glue::kstate()`'s
+/// `caller` (root), suspended mid-`NET_DEMO_START` since the original
+/// spawn switch, can only ever resume via `p2_ipc_recv`'s own hardcoded
+/// "switch to root" fallback, which fires ONLY when some thread issues a
+/// REAL blocking `Recv` that finds nothing pending. A silent spin loop
+/// never does that, so root's own `NET_STATUS_POLL` retry loop never got
+/// scheduled again after the initial spawn switch, and Netstack's own
+/// real IPC round-trips are far slower than root's bare-`Resume` poll
+/// attempts — root always exhausted its bounded 5000-attempt loop and
+/// moved on to the REST of the boot sequence long before this process
+/// could finish. `PARK_ENDPOINT_CAP` (slot 1, granted by `spawn_netstack_
+/// service` specifically for this) was sitting unused. Issuing one real
+/// `IPC_RECV` on it — an Endpoint nobody ever `Call`s — hands control
+/// back to root via that SAME existing fallback, and since `write_status`
+/// (this function's every caller) already ran, root's very next poll
+/// attempt reads the real, final verdict instead of racing an unfinished
+/// one.
+///
+/// # Safety
+/// `PARK_ENDPOINT_CAP` is granted into this process's cap space before
+/// its first instruction ever runs (`spawn_netstack_service`'s own doc
+/// comment).
 fn park() -> ! {
+    // SAFETY: `raw_syscall`'s own contract. Always blocks (nobody ever
+    // holds a capability to `Call` this Endpoint) — the switch away to
+    // root happens INSIDE this ecall; nothing after it ever runs again.
+    unsafe { raw_syscall(IPC_RECV, PARK_ENDPOINT_CAP, zero!()) };
     loop {
         core::hint::spin_loop();
     }
