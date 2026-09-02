@@ -137,6 +137,13 @@ pub const RISCV64_CONTEXT_BYTES: usize = 160;
 pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) -> ! {
     let cpu = cpu::Cpu::new(hart_id);
 
+    // Read this early — before `Memory::from_device_tree` — purely
+    // because it's a linker symbol (no runtime dependency ordering),
+    // and `from_device_tree` needs it to know where OpenSBI's own
+    // reservation ends within Device Tree's single coarse `memory`
+    // node range (see `memory::split_reserved_prefix`'s doc comment).
+    let kernel_image_phys_start = unsafe { linker_symbol_addr(&__kernel_image_phys_start) };
+
     // Per-core bootstrap (hal_core::CpuAbstraction::bootstrap_current_core):
     // on RISC-V this installs `stvec` -> `trap_entry`, which the
     // microkernel needs BEFORE it drops the Root Task to U-mode — an
@@ -153,7 +160,7 @@ pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) ->
     // contract above — a valid Device Tree Blob pointer per the SBI
     // boot protocol's mandatory guarantee (01-HAL-Layer.md section
     // 3.2: "Device Tree (اجباری طبق مشخصات SBI)").
-    let memory = unsafe { memory::Memory::from_device_tree(dtb_phys) };
+    let memory = unsafe { memory::Memory::from_device_tree(dtb_phys, kernel_image_phys_start) };
 
     // `Timer::new` takes the SBI TIME extension presence rather than
     // re-probing — see timer.rs's `Timer::new` doc comment. cpu.rs is
@@ -229,7 +236,7 @@ pub extern "C" fn hal_riscv64_rust_entry(hart_id: usize, dtb_phys: *const u8) ->
     interrupt::set_global_controller(&hal.interrupt);
 
     let kernel_image_phys_range = (
-        unsafe { linker_symbol_addr(&__kernel_image_phys_start) },
+        kernel_image_phys_start,
         unsafe { linker_symbol_addr(&__kernel_image_phys_end) },
     );
     let boot_reserved_phys_range = (

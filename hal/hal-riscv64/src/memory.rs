@@ -491,13 +491,50 @@ pub struct Memory {
     plic_base: u64,
 }
 
+/// Splits `[memory_base, memory_base + memory_size)` at
+/// `kernel_image_phys_start` into an optional `Reserved` prefix — the
+/// firmware region below where the kernel image loads (OpenSBI on QEMU
+/// virt, PMP-protected against S/U access; see `boot.S`'s own module
+/// docs) — and the `Usable` remainder above it. Pure and unit-testable
+/// without a real FDT blob; `from_device_tree` is the only caller.
+///
+/// Returns `(reserved, (usable_base, usable_end))`. `reserved` is
+/// `None` when `kernel_image_phys_start` does not fall strictly inside
+/// `[memory_base, memory_base + memory_size)` — a link/firmware
+/// configuration this project has never actually produced, but not
+/// worth panicking over: the safe fallback is "no prefix to reserve,
+/// treat the whole range as usable", exactly this function's pre-split
+/// behavior.
+fn split_reserved_prefix(
+    memory_base: u64,
+    memory_size: u64,
+    kernel_image_phys_start: u64,
+) -> (Option<(u64, u64)>, (u64, u64)) {
+    let memory_end = memory_base.saturating_add(memory_size);
+    if kernel_image_phys_start > memory_base && kernel_image_phys_start < memory_end {
+        (
+            Some((memory_base, kernel_image_phys_start)),
+            (kernel_image_phys_start, memory_end),
+        )
+    } else {
+        (None, (memory_base, memory_end))
+    }
+}
+
 impl Memory {
     /// # Safety
     /// `dtb_phys` must be a valid FDT blob physical address, per this
     /// project's SBI boot protocol (boot.S's module docs) — this
     /// function's only caller (`hal_riscv64_rust_entry`) already
     /// satisfies this.
-    pub unsafe fn from_device_tree(dtb_phys: *const u8) -> Self {
+    ///
+    /// `kernel_image_phys_start` is `hal_riscv64_rust_entry`'s own
+    /// `__kernel_image_phys_start` linker symbol — everything in RAM
+    /// below it (OpenSBI, on QEMU virt) is reported as `Reserved` rather
+    /// than folded into the single `Usable` region DT's coarse `memory`
+    /// node otherwise implies (see `split_reserved_prefix`'s own doc
+    /// comment for why).
+    pub unsafe fn from_device_tree(dtb_phys: *const u8, kernel_image_phys_start: u64) -> Self {
         // SAFETY: forwarded from this function's own contract.
         let dt = unsafe { walk_device_tree(dtb_phys) };
 
@@ -509,27 +546,41 @@ impl Memory {
 
         // Unlike UEFI's rich memory map (dozens of typed regions),
         // Device Tree's `memory` node reports only ONE coarse region:
-        // "this range is RAM". This project therefore records exactly
-        // one Usable region here — there is no equivalent of UEFI's
-        // BootServicesCode/RuntimeServicesData/etc. distinctions to
-        // make on this boot path, since DT simply does not carry that
-        // information the way UEFI's GetMemoryMap() does. Firmware-
-        // reserved sub-ranges within this region (e.g. where OpenSBI
-        // itself resides, per linker.ld's own KERNEL_LMA_BASE
-        // reasoning) are handled separately via the kernel-image/boot-
-        // reserved ranges in BootInfo (hal-core/src/boot.rs), not via
-        // additional memory-map region classification here.
-        // Constructed via `::new` rather than struct-literal + `..ZERO`
-        // because `MemoryRegionRaw`'s padding fields are private to
-        // hal-manifest (FRU across that privacy boundary is E0451) —
-        // same pattern hal-x86_64/memory.rs uses.
-        regions[0] = MemoryRegionRaw::new(
-            memory_base,
-            memory_size,
+        // "this range is RAM" — it carries no equivalent of UEFI's
+        // BootServicesCode/RuntimeServicesData/etc distinctions, so DT
+        // alone cannot tell us where OpenSBI itself sits within that
+        // range. `split_reserved_prefix` uses the ONE piece of
+        // information this boot path DOES have — where the kernel image
+        // was linked to load, always right after OpenSBI's own
+        // reservation per `linker.ld`'s `KERNEL_LMA_BASE` reasoning — to
+        // carve that low sub-range out as `Reserved` here, at the
+        // memory-map level, instead of via a separate kernel-core-level
+        // blanket hole (`02-Microkernel-Layer.md`'s object-table
+        // population logic already skips every non-`Usable` region, so
+        // this is the more precise place for firmware exclusions to
+        // live). Constructed via `::new` rather than struct-literal +
+        // `..ZERO` because `MemoryRegionRaw`'s padding fields are
+        // private to hal-manifest (FRU across that privacy boundary is
+        // E0451) — same pattern hal-x86_64/memory.rs uses.
+        let (reserved, (usable_base, usable_end)) =
+            split_reserved_prefix(memory_base, memory_size, kernel_image_phys_start);
+
+        if let Some((reserved_base, reserved_end)) = reserved {
+            regions[region_count] = MemoryRegionRaw::new(
+                reserved_base,
+                reserved_end - reserved_base,
+                hal_manifest::raw::MemoryRegionKindRaw::Reserved,
+                dt.iommu_present,
+            );
+            region_count += 1;
+        }
+        regions[region_count] = MemoryRegionRaw::new(
+            usable_base,
+            usable_end - usable_base,
             hal_manifest::raw::MemoryRegionKindRaw::Usable,
             dt.iommu_present,
         );
-        region_count = 1;
+        region_count += 1;
 
         Self {
             regions,
@@ -724,5 +775,45 @@ mod tests {
         let result = DtDiscoveryResult::default();
         assert!(result.plic_base.is_none());
         assert!(!result.iommu_present);
+    }
+
+    #[test]
+    fn split_reserved_prefix_carves_out_opensbi_range() {
+        // QEMU virt's real shape: RAM at 0x8000_0000, kernel image
+        // linked to load a couple MiB in (past OpenSBI's own reservation).
+        let (reserved, usable) = split_reserved_prefix(0x8000_0000, 128 * 1024 * 1024, 0x8020_0000);
+        assert_eq!(reserved, Some((0x8000_0000, 0x8020_0000)));
+        assert_eq!(usable, (0x8020_0000, 0x8000_0000 + 128 * 1024 * 1024));
+    }
+
+    #[test]
+    fn split_reserved_prefix_none_when_kernel_loads_at_memory_base() {
+        // No firmware gap to reserve if the kernel image starts exactly
+        // where RAM does.
+        let (reserved, usable) = split_reserved_prefix(0x8000_0000, 64 * 1024 * 1024, 0x8000_0000);
+        assert_eq!(reserved, None);
+        assert_eq!(usable, (0x8000_0000, 0x8000_0000 + 64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn split_reserved_prefix_none_when_kernel_image_outside_ram() {
+        // Defensive fallback for a link/firmware configuration this
+        // project has never produced: don't reserve anything nonsensical.
+        let (reserved, usable) = split_reserved_prefix(0x8000_0000, 64 * 1024 * 1024, 0x9000_0000);
+        assert_eq!(reserved, None);
+        assert_eq!(usable, (0x8000_0000, 0x8000_0000 + 64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn split_reserved_prefix_regions_are_contiguous_and_cover_the_whole_range() {
+        let memory_base = 0x8000_0000u64;
+        let memory_size = 128 * 1024 * 1024u64;
+        let kernel_image_phys_start = 0x8020_0000u64;
+        let (reserved, usable) =
+            split_reserved_prefix(memory_base, memory_size, kernel_image_phys_start);
+        let (rbase, rend) = reserved.unwrap();
+        assert_eq!(rbase, memory_base);
+        assert_eq!(rend, usable.0, "no gap or overlap between reserved and usable");
+        assert_eq!(usable.1, memory_base + memory_size);
     }
 }
