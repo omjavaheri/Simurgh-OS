@@ -42,6 +42,8 @@
 
 extern crate alloc;
 
+pub mod subsystem_entry;
+
 use alloc::vec::Vec;
 
 /// EtherType for IPv4.

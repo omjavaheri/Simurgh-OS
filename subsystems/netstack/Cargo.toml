@@ -17,9 +17,22 @@ version.workspace    = true
 authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
+build = "build.rs"
 
 [lib]
 crate-type = ["rlib"]
 
+[[bin]]
+name = "netstack-bin"
+path = "src/bin/netstack-bin.rs"
+# Same reasoning as driver-virtio-net-bin's own `[[bin]]`: a host `cargo
+# test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
 [dependencies]
 ipc-protocol = { path = "../../ipc-protocol" }
+# `subsystem_entry`'s own shared-region marshalling needs `SmallMessage`
+# directly, same reasoning as every other subsystem process's own
+# dependency on it (driver-virtio-blk/driver-virtio-net's own
+# `subsystem_entry.rs`).
+kernel-ipc   = { path = "../../kernel/kernel-ipc" }

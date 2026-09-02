@@ -589,6 +589,17 @@ const P2_VA_B_CONST: usize = 0xC020_0000;
 /// pool, or a kernel table runs out — the caller then falls back to the
 /// single-process path. On `true` the Root Task is the scheduler's
 /// `running` thread and the caller may `resume_user` its `user_context`.
+/// Process B's own thread id (the §8.4 two-space zero-copy demo's
+/// worker), set once by `setup_two_process`. Read only by `spawn_
+/// netstack_service`'s own stale-thread retirement — see that
+/// function's own doc comment for why: like `G_IPC_SERVER_TID`/`G_FS_
+/// TID`, process B's own one-shot job finishes long before `p2_
+/// preempt_start`'s own identical cleanup normally runs, leaving it
+/// `Ready`-but-never-resumed and a live `pick_next` candidate for
+/// anything that exercises GENERAL (non-fast-path) `pick_next` before
+/// that point — Netstack's own retry loop is the first such caller.
+static mut G_PROCESS_B_TID: Option<ThreadId> = None;
+
 fn setup_two_process(
     hal: &HalInterface,
     state: &mut KernelState,
@@ -699,6 +710,9 @@ fn setup_two_process(
         root_pt_b,
         hal,
     );
+    // SAFETY: single-core; written once here, before any later reader
+    // (`spawn_netstack_service`'s own stale-thread retirement) can run.
+    unsafe { core::ptr::addr_of_mut!(G_PROCESS_B_TID).write(Some(worker_tid)) };
 
     // Process C is deliberately NOT spawned here. `kernel-sched` admits
     // every thread at the same priority with `vruntime = 0`
@@ -3381,6 +3395,21 @@ unsafe fn wire_virtio_pci_transport_net(
     // that reads it — see `G_DRV_NET_ISR_CFG_VA`'s own doc comment.
     unsafe { core::ptr::addr_of_mut!(G_DRV_NET_ISR_CFG_VA).write(isr_cfg_va) };
 
+    // Re-derive the ISR window's own PHYSICAL base — `caps.isr`'s BAR
+    // register hasn't changed since `map_pci_bar` (inside `resolve`)
+    // read it moments ago, so re-reading it here has no side effect
+    // beyond the same harmless BAR-sizing probe every other `pci_bar_
+    // phys` call already performs. See `G_DRV_NET_ISR_CFG_PHYS`'s own
+    // doc comment for why `spawn_netstack_service` needs this.
+    // SAFETY: forwarded from this function's own contract; `config_va`
+    // is the mapping installed above.
+    let isr_cfg_phys = caps
+        .isr
+        .and_then(|w| unsafe { pci_bar_phys(config_va, w.bar) }.map(|(base, _)| base as usize + w.offset as usize));
+    // SAFETY: single-core; written once here, read-only by `spawn_
+    // netstack_service` after this function has already returned.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_ISR_CFG_PHYS).write(isr_cfg_phys.unwrap_or(usize::MAX)) };
+
     let header = region_phys + driver_virtio_net::layout::PCI_INFO_OFFSET;
     // SAFETY: `region_phys` is the driver's own fresh, zeroed RX
     // `SharedRegion`, identity-addressable, single-core — same contract
@@ -3954,30 +3983,23 @@ const DRV_DEMO_WRITE_DATA: &[u8] = b"hello from root, virtio-blk demo!";
 // immediately above.
 // ============================================================================
 
-/// This process's own thread id, set once by `spawn_virtio_net_driver`.
-static mut G_DRV_NET_TID: Option<ThreadId> = None;
-
 /// Physical base of the RX queue's own `SharedRegion` — ALSO carries the
 /// negotiated MAC (`driver_virtio_net::layout::MAC_OFFSET`) and the
 /// `DriverRequest`/`DriverResponse` message area (`layout::MESSAGE_
 /// OFFSET`), same reasoning as `G_DRV_QUEUE_PHYS`'s own doc comment.
+/// Read by `spawn_netstack_service` to trusted-bootstrap-map this SAME
+/// physical region into the Netstack process's own address space too
+/// (`netstack::subsystem_entry`'s own module doc comment) — no longer
+/// peeked directly by kernel-arch-glue itself (that was the pre-
+/// Session-22 shortcut this crate's own module doc comment used to
+/// document; the Netstack process now drives the driver over real IPC
+/// instead).
 static mut G_DRV_NET_RX_PHYS: usize = usize::MAX;
 
-/// Physical base of the TX queue's own `SharedRegion` — where `drv_net_
-/// arp_send_call`/`drv_net_ping_send_call` write the frame bytes they
-/// build before issuing `SendFrame`.
+/// Physical base of the TX queue's own `SharedRegion` — same "also
+/// mapped into the Netstack process's own space" role as `G_DRV_NET_RX_
+/// PHYS`'s own doc comment.
 static mut G_DRV_NET_TX_PHYS: usize = usize::MAX;
-
-/// The negotiated device MAC, read back from `G_DRV_NET_RX_PHYS +
-/// driver_virtio_net::layout::MAC_OFFSET` once `drv_net_probe_call`'s own
-/// `Ready` response confirms `do_probe` has run — used as the source MAC
-/// for every frame this demo builds.
-static mut G_DRV_NET_MAC: [u8; 6] = [0; 6];
-
-/// The gateway's own MAC, resolved by `drv_net_arp_poll_call` once a
-/// matching ARP reply arrives — `None` until then. Used as the
-/// destination MAC for the ICMP echo request.
-static mut G_DRV_NET_GW_MAC: Option<[u8; 6]> = None;
 
 /// `Transport::Mmio`'s own counterpart to `G_DRV_MMIO_PHYS`, for the net
 /// device — same "ack the DEVICE's own registers directly from interrupt
@@ -3988,10 +4010,63 @@ static mut G_DRV_NET_GW_MAC: Option<[u8; 6]> = None;
 static mut G_DRV_NET_MMIO_PHYS: usize = usize::MAX;
 
 /// `Transport::Pci`'s own counterpart to `G_DRV_NET_MMIO_PHYS` — same
-/// role and same "reuse the driver's own already-mapped BAR VA, no new
-/// kernel-side mapping needed" reasoning as `G_DRV_ISR_CFG_VA`'s own doc
-/// comment.
+/// role as `G_DRV_ISR_CFG_VA`'s own doc comment, but see `G_DRV_NET_
+/// ISR_CFG_PHYS`'s own doc comment for why this crate's own copy of
+/// that reasoning ("reuse the driver's own already-mapped BAR VA, no
+/// new kernel-side mapping needed") turned out to be a real, QEMU-found
+/// bug once Netstack existed: this VA is only valid under `drv_root_pt`,
+/// but `spawn_netstack_service` now ALSO maps the same physical page at
+/// this identical VA into Netstack's (and root's) own page tables, so
+/// the trampoline's read below stays correct regardless of whose `cr3`
+/// is active when the IRQ actually lands.
 static mut G_DRV_NET_ISR_CFG_VA: usize = usize::MAX;
+
+/// The ISR_CFG register window's own PHYSICAL base (`bar_phys + w.
+/// offset`, re-derived via `pci_bar_phys` right after `wire_virtio_pci_
+/// transport_net` maps it into `drv_root_pt`) — `usize::MAX` if no ISR
+/// capability was found (or for `Transport::Mmio`, which never sets
+/// this at all).
+///
+/// **Real bug found via QEMU** (this session's Netstack extraction —
+/// `03-Kernel-Subsystems-Layer.md` §2.3/§5.4): `virtio_net_irq_
+/// trampoline`'s own `isr_va` read below was written under the
+/// assumption (documented, at the time correctly, on `G_DRV_ISR_CFG_VA`
+/// — blk's identical field) that this trampoline "only ever fires while
+/// the driver process's own address space is active", because
+/// previously the driver was ALWAYS either the sole active process or
+/// blocked in its own in-place `wfi()` wait whenever an IRQ could land.
+/// Netstack breaks that assumption: it is a REAL, second U-mode process
+/// that now holds the CPU (and `cr3`) for genuine stretches WHILE the
+/// driver is unblocked-but-not-yet-scheduled — a virtio-net TX-
+/// completion IRQ that arrives even slightly late (asynchronous to the
+/// CPU's own instruction stream, entirely QEMU's own device-model
+/// timing) can land while Netstack (or root, polling `NET_STATUS_POLL`)
+/// is the active address space instead. Confirmed via QEMU: `UNHANDLED
+/// CPU EXCEPTION vector=0xe ... cr2(fault_va)=0xd8401000` (exactly
+/// `DRV_NET_MMIO_VA + 0x1000`, i.e. `G_DRV_NET_ISR_CFG_VA` itself) fired
+/// from KERNEL code (`rip` inside the kernel image) immediately after
+/// Netstack's third `PollFrame` round-trip switched control back to it
+/// — a page fault taken by the interrupt trampoline itself, reading a
+/// VA that only `drv_root_pt` has mapped.
+///
+/// This physical page is cached here so `spawn_netstack_service` can
+/// ALSO map it (kernel-only, no `U` bit — same `1 | 2` flags `KERNEL_
+/// PCI_CFG_VA`'s own mapping uses) into Netstack's own page table AND
+/// root's (`caller_root_pt`), at the SAME numeric VA (`G_DRV_NET_ISR_
+/// CFG_VA`) the driver already uses — so `virtio_net_irq_trampoline`'s
+/// existing, unmodified read stays correct no matter which of these
+/// THREE processes' `cr3` happens to be active when the IRQ lands.
+///
+/// **Known remaining gap, honestly not fixed here**: this covers only
+/// the three processes THIS demo's own CPU can ever be executing as
+/// (driver / Netstack / root) — a future process that also contends for
+/// the CPU while this driver is alive would need the same treatment.
+/// `virtio_blk_irq_trampoline`'s own `G_DRV_ISR_CFG_VA` has the
+/// IDENTICAL latent bug (same "only valid under drv_root_pt" mapping),
+/// just never triggered because no real IPC client of the block driver
+/// has been built yet — worth revisiting together with whatever process
+/// becomes virtio-blk's first genuine IPC client.
+static mut G_DRV_NET_ISR_CFG_PHYS: usize = usize::MAX;
 
 /// VA the virtio-mmio transport window is pre-mapped at in the driver's
 /// own address space — must stay numerically equal to `driver_virtio_
@@ -4004,47 +4079,32 @@ const DRV_NET_RX_VA: usize = 0xD850_0000;
 /// numerically equal to `driver_virtio_net::subsystem_entry::DRV_TX_VA`.
 const DRV_NET_TX_VA: usize = 0xD860_0000;
 
-/// This demo's own fixed guest IPv4 address — QEMU's own `-netdev user`
-/// (SLIRP) usermode network NATs any packet whose source falls in its
-/// default `10.0.2.0/24` subnet regardless of whether a DHCP lease was
-/// ever issued, so a static address needs no DHCP client (a real one is
-/// out of scope for this MVP demo — `netstack`'s own module doc comment
-/// on why this demo pings ITS OWN gateway rather than waiting for an
-/// externally-initiated ping covers the same host-environment reasoning).
-const NET_DEMO_OUR_IP: [u8; 4] = [10, 0, 2, 15];
-/// SLIRP's own fixed gateway address (also answers ICMP echo directed at
-/// it, acting as "the host" from the guest's own point of view).
-const NET_DEMO_GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
-/// Fixed ICMP identifier this demo's echo request uses.
-const NET_DEMO_ICMP_IDENT: u16 = 0x5151;
-/// Fixed ICMP sequence this demo's echo request uses.
-const NET_DEMO_ICMP_SEQ: u16 = 1;
-/// Fixed ICMP payload this demo's echo request uses — echoed back
-/// verbatim by a correctly-functioning replier, checked byte-for-byte by
-/// `drv_net_ping_poll_call`.
-const NET_DEMO_ICMP_PAYLOAD: &[u8] = b"simurgh-ping";
+/// VA the driver's own RX `SharedRegion` is ALSO mapped at, in the
+/// Netstack process's own (separate) address space — must stay
+/// numerically equal to `netstack::subsystem_entry::DRV_RX_VA`.
+/// Deliberately a DIFFERENT VA range than `DRV_NET_RX_VA` above even
+/// though nothing would collide if they matched (each process has its
+/// own independent page table) — kept distinct simply so a VA alone
+/// unambiguously identifies which process's own constant it mirrors.
+const NETSTACK_DRV_RX_VA: usize = 0xD870_0000;
+/// Same role as `NETSTACK_DRV_RX_VA`, for the driver's own TX region —
+/// must stay numerically equal to `netstack::subsystem_entry::DRV_TX_VA`.
+const NETSTACK_DRV_TX_VA: usize = 0xD880_0000;
+/// VA the Netstack process's own private status `SharedRegion` is
+/// mapped at — must stay numerically equal to `netstack::subsystem_
+/// entry::STATUS_VA`. `netstack_status` (below) reads it back directly
+/// (physical pointer, kernel-side) — see that function's own doc
+/// comment for the exact layout.
+const NETSTACK_STATUS_VA: usize = 0xD890_0000;
 
-/// The RFC 1071 one's-complement checksum over `data` — the SAME
-/// algorithm `netstack::checksum` implements, duplicated here rather than
-/// depending on that crate (which unconditionally pulls in `alloc` for
-/// its `Vec`-returning builders — this crate stays alloc-free, design
-/// decision D1; `kernel-arch-glue/Cargo.toml`'s own comment on the
-/// `driver-virtio-net` dependency covers the same reasoning).
-fn net_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
-}
+/// Physical base of the Netstack process's own private status
+/// `SharedRegion`, cached at spawn time so `netstack_status` can read it
+/// back directly — same "kernel-arch-glue peeks a shared region
+/// directly, no protocol field needed" pattern this crate has used
+/// throughout (`drv_net_probe_result`'s own MAC read, before this
+/// session's own extraction, used the identical pattern one region
+/// over).
+static mut G_NETSTACK_STATUS_PHYS: usize = usize::MAX;
 
 /// The trampoline `SyscallOp::IrqBind` installs with the platform's
 /// `InterruptController` for the virtio-net device's own IRQ line —
@@ -4151,9 +4211,6 @@ pub fn spawn_virtio_net_driver(
     const DRV_NET_STACK_LEN: usize = 4096 * 16;
     let (drv_tid, drv_cs, _stack_phys) =
         spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_NET_STACK_VMA, DRV_NET_STACK_LEN)?;
-    // SAFETY: single-core; written once here, before any `drv_net_*_call`
-    // (reached only after this function returns) can read it.
-    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_TID).write(Some(drv_tid)) };
 
     grant_cap_into(k, src_cs, ep_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
 
@@ -4336,396 +4393,335 @@ pub fn spawn_virtio_net_driver(
     Some((ep_cap.as_u32(), save, into))
 }
 
-/// # Safety
-/// `G_DRV_NET_RX_PHYS` must already be valid (true from `spawn_virtio_
-/// net_driver` onward).
-unsafe fn write_shared_net_message(msg: &SmallMessage) {
-    // SAFETY: forwarded from this function's own contract.
-    let base = unsafe {
-        (core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read() + driver_virtio_net::layout::MESSAGE_OFFSET) as *mut u64
-    };
-    unsafe {
-        base.write_volatile(msg.label);
-        let words = msg.words();
-        for i in 0..kernel_ipc::MSG_MAX_WORDS {
-            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
-        }
-    }
-}
-
-/// # Safety
-/// Same contract as `write_shared_net_message`.
-unsafe fn read_shared_net_message() -> SmallMessage {
-    let base = unsafe {
-        (core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read() + driver_virtio_net::layout::MESSAGE_OFFSET) as *const u64
-    };
-    unsafe {
-        let label = base.read_volatile();
-        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
-        for (i, w) in words.iter_mut().enumerate() {
-            *w = base.add(1 + i).read_volatile();
-        }
-        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
-    }
-}
-
-/// Same shape as `drv_ipc_call`, targeting `G_DRV_NET_TID` instead.
-fn net_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+/// Spawns the Netstack process from its own separately-built ELF
+/// (`netstack_elf`) — the real replacement for this crate's own,
+/// removed direct-driving of `driver-virtio-net` (`netstack::
+/// subsystem_entry`'s own module doc comment has the full picture).
+/// `driver_ep_cap` is `spawn_virtio_net_driver`'s own return value — the
+/// caller (`kernel/src/main.rs`'s own `NET_DEMO_START` opcode) spawns
+/// the driver FIRST, then this, passing that capability straight
+/// through.
+///
+/// Grants TWO capabilities into this process's fresh cap space: a
+/// DERIVED COPY of `driver_ep_cap` (slot 0 — this process's own IPC
+/// client leg to the driver), and a freshly retyped `Endpoint` NOBODY
+/// else ever holds (slot 1) — this second one is never `Call`ed by
+/// anyone; its only purpose is `netstack::subsystem_entry::subsystem_
+/// main`'s own tail `Recv`ing on it once the ARP/ICMP demo is done,
+/// which blocks forever (nothing ever sends to it) and, via `p2_ipc_
+/// recv`'s own documented fallback ("no immediate sender -> switch to
+/// `k.root_thread` specifically"), hands control back to the ORIGINAL
+/// caller of `NET_DEMO_START` — the SAME mechanism every other
+/// subsystem's own idle `Recv` loop already relies on to yield back to
+/// root, applied here as a one-shot "I'm done" hand-off instead of a
+/// forever-serving loop.
+///
+/// Also trusted-bootstrap-maps the driver's own RX/TX `SharedRegion`s
+/// (`G_DRV_NET_RX_PHYS`/`G_DRV_NET_TX_PHYS`, already valid — this
+/// function is only ever called AFTER `spawn_virtio_net_driver` itself
+/// returned) into THIS process's own address space too (`NETSTACK_DRV_
+/// RX_VA`/`NETSTACK_DRV_TX_VA`) — Netstack needs to read/write the SAME
+/// physical frame-buffer bytes the driver does, zero-copy, exactly the
+/// way `spawn_virtio_net_driver` itself already maps them into the
+/// DRIVER's own space. A THIRD, freshly retyped `SharedRegion` (never
+/// granted as a capability to anyone — same "kernel-arch-glue builds
+/// the page table directly" trusted-bootstrap pattern) is mapped at
+/// `NETSTACK_STATUS_VA` for the ARP/ICMP verdict `netstack_status`
+/// reads back.
+///
+/// Returns `None` (and logs) on any allocation failure.
+pub fn spawn_netstack_service(
+    hal: &HalInterface,
+    caller: ThreadId,
+    netstack_elf: &[u8],
+    expected_machine: u16,
+    driver_ep_cap: u32,
+) -> Option<(*mut u8, *const u8)> {
     let k = kstate();
-    // SAFETY: single-core; `G_DRV_NET_TID` is written once by
-    // `spawn_virtio_net_driver`, before any `drv_net_*_call` can run.
-    let drv_tid = unsafe { core::ptr::addr_of!(G_DRV_NET_TID).read() }?;
-    let msg = SmallMessage::new(0);
-    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
-        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
-            let _ = k.sched.dispatch(drv_tid, hal.now_ns());
-            let (save, into) = k.user_ctx_switch_ptrs(caller, drv_tid)?;
-            let poke = if n == drv_tid {
-                k.tcb_mut(drv_tid)
-                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
-                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
-            } else {
-                None
-            };
-            Some(IpcSwitch { save, into, poke })
+
+    // Retire `p2_ipc_demo_start`'s own one-shot server thread NOW,
+    // rather than waiting for `p2_preempt_start`'s own identical
+    // retirement (which normally handles this, but only runs AFTER the
+    // fs/blk/net demos, all further down `umode_root`'s own sequence).
+    // **Real bug found via QEMU** (this crate's own FIRST real U-mode
+    // client of a REAL subsystem process — Netstack calling `driver-
+    // virtio-net` over genuine `IPC_CALL`s): the driver's own `Reply`
+    // (to Netstack's `SendFrame`) always switches straight back to
+    // Netstack — see `do_reply`'s own doc comment on why — so the
+    // driver itself never gets a scheduled turn to loop back to its own
+    // `Recv` before Netstack's VERY NEXT `IPC_CALL` (`PollFrame`, inside
+    // its own bounded retry loop) fires. That second `Call` therefore
+    // ALWAYS takes the general (queued) path, needing a real `pick_
+    // next` — which, with the IPC demo server's own long-done TCB still
+    // sitting `Ready` (its own `vruntime` far lower than the driver's,
+    // which has been genuinely running), tie-breaks straight to that
+    // STALE thread instead of the driver — exactly the SAME "phantom
+    // scheduler entity" class of bug `G_IPC_SERVER_TID`'s own doc
+    // comment (in `p2_preempt_start`, below) already documents in full,
+    // just reached from a NEW, earlier code path that same fix's own
+    // original scope never anticipated. Confirmed via QEMU: a temporary
+    // `p2_ipc_call` diagnostic showed the SECOND `Call`'s own `pick_
+    // next` resolving to this exact stale thread, which then free-runs
+    // forever (nothing else ever preempts it — the timer isn't armed
+    // yet at this point in the boot), permanently starving Netstack,
+    // the driver, AND `caller` (root) alike.
+    // SAFETY: single-core; only read (and cleared) here or by `p2_
+    // preempt_start`'s own identical block, written once by `p2_ipc_
+    // demo_start` before either can ever run — idempotent if `p2_
+    // preempt_start` already retired it (the `if let Some` below is
+    // simply not taken a second time).
+    if let Some(server_tid) = unsafe { core::ptr::addr_of!(G_IPC_SERVER_TID).read() } {
+        if let Some(t) = k.tcb_mut(server_tid) {
+            t.state = ThreadState::Exited;
         }
-        _ => None,
+        k.sched.remove(server_tid);
+        unsafe { core::ptr::addr_of_mut!(G_IPC_SERVER_TID).write(None) };
     }
-}
+    // fs-native's own thread hits the SAME stale-`Ready`-phantom class
+    // of bug, for the SAME underlying reason `p2_preempt_start`'s own
+    // identical block (below) already documents in full: after its own
+    // LAST reply (`FS_CLOSE`'s, in the fs demo that ran earlier in this
+    // exact boot sequence), `do_reply` leaves it `Ready` but it never
+    // gets CPU time to loop back to `Recv` and block PROPERLY —
+    // `note_blocked` (not `remove`: `fs_ipc_call`'s own direct
+    // `dispatch(fs_tid, ...)` needs the TCB slot to stay valid forever)
+    // removes it from `pick_next`'s own candidate pool without
+    // invalidating it. **Real bug found via QEMU** (this crate's own
+    // FIRST scheduling path to ever call GENERAL `pick_next` — Netstack
+    // driving `driver-virtio-net` over real `IPC_CALL`s — between the
+    // fs demo's own completion and `p2_preempt_start`'s own identical
+    // cleanup, which normally runs first): confirmed the exact same
+    // symptom class as `G_IPC_SERVER_TID`'s own fix just above, just
+    // with fs-native's thread as the stale `pick_next` candidate once
+    // that first one was retired.
+    // SAFETY: single-core; `G_FS_TID` written once by `fs_demo_start`, read-only here.
+    if let Some(fs_tid) = unsafe { core::ptr::addr_of!(G_FS_TID).read() } {
+        let _ = k.sched.note_blocked(fs_tid);
+    }
+    // Process B (the §8.4 two-space zero-copy demo's own worker) hits
+    // the SAME stale-`Ready`-phantom class as `G_IPC_SERVER_TID` above
+    // (a genuine one-shot proof with no ongoing role, unlike fs-native)
+    // — confirmed via QEMU: with `G_IPC_SERVER_TID`/`G_FS_TID` both
+    // fixed, Netstack's own SECOND `PollFrame` retry `pick_next`'d
+    // straight into process B next. `remove` (not `note_blocked`): like
+    // the IPC demo server, nothing will ever `dispatch` it again.
+    // SAFETY: single-core; `G_PROCESS_B_TID` written once by `setup_
+    // two_process`, read-only here.
+    if let Some(b_tid) = unsafe { core::ptr::addr_of!(G_PROCESS_B_TID).read() } {
+        if let Some(t) = k.tcb_mut(b_tid) {
+            t.state = ThreadState::Exited;
+        }
+        k.sched.remove(b_tid);
+        unsafe { core::ptr::addr_of_mut!(G_PROCESS_B_TID).write(None) };
+    }
 
-/// `DRV_NET_PROBE` demo opcode: builds a real `DriverRequest::Probe`.
-pub fn drv_net_probe_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
-    let msg = ipc_protocol::codec::encode_driver_request(&ipc_protocol::DriverRequest::Probe);
-    // SAFETY: `spawn_virtio_net_driver` has already run by the time any
-    // `.user_text` code can reach this opcode.
-    unsafe { write_shared_net_message(&msg) };
-    net_ipc_call(hal, caller, ep_cap)
-}
+    let src_cs = k.tcb(caller)?.cap_space;
 
-/// Reads back the `DriverResponse` for `drv_net_probe_call`. On `Ready`,
-/// ALSO caches the negotiated MAC (`driver_virtio_net::layout::MAC_
-/// OFFSET`, written by the driver's own `do_probe` before it ever replies
-/// — see that constant's own doc comment) into `G_DRV_NET_MAC`. Returns
-/// `0` on success, `usize::MAX` on any error/decode failure.
-pub fn drv_net_probe_result() -> usize {
-    // SAFETY: same contract as `drv_net_probe_call`.
-    let msg = unsafe { read_shared_net_message() };
-    match ipc_protocol::codec::decode_driver_response(&msg) {
-        Ok(ipc_protocol::DriverResponse::Ready { .. }) => {
-            // SAFETY: `G_DRV_NET_RX_PHYS` is valid (this function is only
-            // ever reached after `spawn_virtio_net_driver`); `MAC_OFFSET`
-            // is within the mapped/zeroed RX region.
-            unsafe {
-                let base = (core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read()
-                    + driver_virtio_net::layout::MAC_OFFSET) as *const u8;
-                let mut mac = [0u8; 6];
-                for (i, b) in mac.iter_mut().enumerate() {
-                    *b = base.add(i).read_volatile();
-                }
-                core::ptr::addr_of_mut!(G_DRV_NET_MAC).write(mac);
+    const NETSTACK_STACK_VMA: usize = 0xC0A0_0000;
+    const NETSTACK_STACK_LEN: usize = 4096 * 16;
+    let (ns_tid, ns_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, netstack_elf, expected_machine, NETSTACK_STACK_VMA, NETSTACK_STACK_LEN)?;
+
+    // Slot 0: a derived copy of the driver's own Endpoint.
+    grant_cap_into(k, src_cs, CapId::new(driver_ep_cap), ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Slot 1: the "park" Endpoint — this function's own doc comment on
+    // why NOBODY ever `Call`s it.
+    let park_ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    grant_cap_into(k, src_cs, park_ep_cap, ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    let ns_addr_space = k.tcb(ns_tid)?.addr_space;
+    let ns_root_pt = k.addr_space_mut(ns_addr_space)?.root_phys().as_usize();
+
+    // Map the driver's own RX region into Netstack's address space too.
+    // SAFETY: single-core; `G_DRV_NET_RX_PHYS` was written once by
+    // `spawn_virtio_net_driver`, already run to completion (this
+    // function's own doc comment).
+    let rx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read() };
+    let rx_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 2) };
+    let n_rx = hal.map_range(ns_root_pt, NETSTACK_DRV_RX_VA, rx_phys, 4096, 1 | 2 | 8, rx_pool, 2);
+    if n_rx == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (driver rx region)\r\n");
+        return None;
+    }
+
+    // Same for the driver's own TX region.
+    // SAFETY: same contract as the RX read above.
+    let tx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_TX_PHYS).read() };
+    let tx_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 2) };
+    let n_tx = hal.map_range(ns_root_pt, NETSTACK_DRV_TX_VA, tx_phys, 4096, 1 | 2 | 8, tx_pool, 2);
+    if n_tx == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (driver tx region)\r\n");
+        return None;
+    }
+
+    // Retype + map Netstack's own private status region.
+    let status_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::SharedRegion,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    let status_id = k.cap_space(src_cs)?.lookup(status_cap)?.object.id;
+    let status_phys =
+        k.shared_region(kernel_cap::SharedRegionId::new(status_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(status_phys as *mut u8, 0, 4096) };
+    let status_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    unsafe { core::ptr::write_bytes(status_pool as *mut u8, 0, 4096 * 2) };
+    let n_status = hal.map_range(ns_root_pt, NETSTACK_STATUS_VA, status_phys, 4096, 1 | 2 | 8, status_pool, 2);
+    if n_status == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (status region)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // `netstack_status` call (reached only after this function returns).
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_STATUS_PHYS).write(status_phys) };
+
+    // Also map the driver's own ISR_CFG register page into Netstack's
+    // AND root's (`caller`'s) own page tables, at the SAME numeric VA
+    // the driver already has it at — see `G_DRV_NET_ISR_CFG_PHYS`'s own
+    // doc comment for the real, QEMU-found page fault this fixes:
+    // `virtio_net_irq_trampoline` reads this VA unconditionally whenever
+    // the device's IRQ fires, but a genuine hardware IRQ is asynchronous
+    // to the CPU's own instruction stream and can now land while EITHER
+    // of these two OTHER processes is the active address space (Netstack
+    // is this codebase's first real IPC client that actually takes turns
+    // with a driver process). `usize::MAX` (never found an ISR
+    // capability, or `Transport::Mmio`, which never sets this at all) —
+    // skip entirely; the mmio-transport path's own physical-address read
+    // is already identity-mapped and safe from any `cr3`.
+    let isr_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_PHYS).read() };
+    let isr_va = unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read() };
+    if isr_phys != usize::MAX && isr_va != usize::MAX {
+        let isr_va_page = isr_va & !0xFFF;
+        let isr_phys_page = isr_phys & !0xFFF;
+        let caller_addr_space = k.tcb(caller)?.addr_space;
+        let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+        for target_pt in [ns_root_pt, caller_root_pt] {
+            let isr_pool = k
+                .untyped_mut(kernel_cap::UntypedId::new(0))
+                .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+                .map(|p| p.as_usize())?;
+            // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+            unsafe { core::ptr::write_bytes(isr_pool as *mut u8, 0, 4096 * 2) };
+            let n = hal.map_range(target_pt, isr_va_page, isr_phys_page, 4096, 1 | 2, isr_pool, 2);
+            if n == u32::MAX {
+                klog!("spawn_netstack_service: map_range error (driver ISR_CFG page)\r\n");
+                return None;
             }
-            0
+            // `caller_root_pt` is the CURRENTLY ACTIVE page table (this
+            // whole function runs on `caller`'s own trap) — same "flush
+            // before relying on a fresh mapping into a LIVE table"
+            // insurance `wire_virtio_pci_transport`'s own config-space
+            // mapping already takes; `ns_root_pt` isn't active yet (no
+            // flush needed, matching every other per-process mapping
+            // above).
+            if target_pt == caller_root_pt {
+                hal.flush_tlb();
+            }
         }
-        _ => usize::MAX,
     }
-}
 
-/// Writes an Ethernet+ARP "who has `NET_DEMO_GATEWAY_IP`, tell `NET_DEMO_
-/// OUR_IP`" request (broadcast, RFC 826 — same byte layout `netstack::
-/// build_arp_request` builds and this crate's own host tests already
-/// cover, reimplemented here as a direct physical-memory write, no `Vec`
-/// — `net_checksum`'s own doc comment on why) into the TX region's own
-/// frame buffer, and returns its length (always 42).
-///
-/// # Safety
-/// `G_DRV_NET_TX_PHYS`/`G_DRV_NET_MAC` must already be valid.
-unsafe fn build_arp_request_into_tx() -> u32 {
-    // SAFETY: forwarded from this function's own contract.
-    let tx = unsafe { core::ptr::addr_of!(G_DRV_NET_TX_PHYS).read() };
-    let our_mac = unsafe { core::ptr::addr_of!(G_DRV_NET_MAC).read() };
-    let base = (tx + driver_virtio_net::layout::BUFFER_OFFSET + driver_virtio_net::VIRTIO_NET_HDR_LEN) as *mut u8;
-    // SAFETY: `base..+42` is within the TX region's own frame buffer
-    // (`FRAME_MAX` = 700 bytes, comfortably covers 42) — forwarded from
-    // this function's own contract.
-    unsafe {
-        core::ptr::write_bytes(base, 0xff, 6); // eth dst = broadcast
-        core::ptr::copy_nonoverlapping(our_mac.as_ptr(), base.add(6), 6); // eth src
-        base.add(12).write_volatile(0x08);
-        base.add(13).write_volatile(0x06); // ethertype ARP
-        base.add(14).write_volatile(0x00);
-        base.add(15).write_volatile(0x01); // htype ethernet
-        base.add(16).write_volatile(0x08);
-        base.add(17).write_volatile(0x00); // ptype IPv4
-        base.add(18).write_volatile(6); // hlen
-        base.add(19).write_volatile(4); // plen
-        base.add(20).write_volatile(0x00);
-        base.add(21).write_volatile(0x01); // oper: request
-        core::ptr::copy_nonoverlapping(our_mac.as_ptr(), base.add(22), 6); // sha
-        core::ptr::copy_nonoverlapping(NET_DEMO_OUR_IP.as_ptr(), base.add(28), 4); // spa
-        core::ptr::write_bytes(base.add(32), 0, 6); // tha: unknown
-        core::ptr::copy_nonoverlapping(NET_DEMO_GATEWAY_IP.as_ptr(), base.add(38), 4); // tpa
-    }
-    42
-}
-
-/// `DRV_NET_ARP_SEND` demo opcode: builds the ARP request (`build_arp_
-/// request_into_tx`) and issues `DriverRequest::SendFrame`.
-pub fn drv_net_arp_send_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
-    // SAFETY: `spawn_virtio_net_driver` and `drv_net_probe_result` have
-    // already run by the time any `.user_text` code can reach this
-    // opcode (the demo sequence's own ordering, `kernel/src/main.rs`).
-    let len = unsafe { build_arp_request_into_tx() };
-    let msg = ipc_protocol::codec::encode_driver_request(&ipc_protocol::DriverRequest::SendFrame { len });
-    // SAFETY: same contract as `drv_net_probe_call`.
-    unsafe { write_shared_net_message(&msg) };
-    net_ipc_call(hal, caller, ep_cap)
-}
-
-/// Reads back the `DriverResponse` for `drv_net_arp_send_call`. Returns
-/// `0` on `FrameSent`, `usize::MAX` otherwise.
-pub fn drv_net_arp_send_result() -> usize {
-    // SAFETY: same contract as `drv_net_probe_call`.
-    let msg = unsafe { read_shared_net_message() };
-    match ipc_protocol::codec::decode_driver_response(&msg) {
-        Ok(ipc_protocol::DriverResponse::FrameSent) => 0,
-        _ => usize::MAX,
-    }
-}
-
-/// `DRV_NET_ARP_POLL` demo opcode: builds a real `DriverRequest::
-/// PollFrame`.
-pub fn drv_net_arp_poll_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
-    let msg = ipc_protocol::codec::encode_driver_request(&ipc_protocol::DriverRequest::PollFrame);
-    // SAFETY: same contract as `drv_net_probe_call`.
-    unsafe { write_shared_net_message(&msg) };
-    net_ipc_call(hal, caller, ep_cap)
-}
-
-/// Reads back the `DriverResponse` for `drv_net_arp_poll_call`. If a
-/// frame arrived, parses it as an ARP reply for `NET_DEMO_GATEWAY_IP`
-/// (same byte layout `netstack::parse_arp_reply` parses, reimplemented
-/// here with no `Vec`) directly out of the RX region's own frame buffer,
-/// and caches the resolved MAC in `G_DRV_NET_GW_MAC` on a match. Returns:
-/// `0` = no frame yet (keep polling), `1` = a frame arrived but was not a
-/// matching ARP reply (keep polling — e.g. an unrelated broadcast), `2` =
-/// resolved.
-pub fn drv_net_arp_poll_result() -> usize {
-    // SAFETY: same contract as `drv_net_probe_call`.
-    let msg = unsafe { read_shared_net_message() };
-    let len = match ipc_protocol::codec::decode_driver_response(&msg) {
-        Ok(ipc_protocol::DriverResponse::FrameReceived { len }) => len as usize,
-        _ => return 0,
+    // Switch straight to Netstack — same race-avoidance rationale as
+    // `spawn_virtio_blk_driver`'s own doc comment on why: without this,
+    // the caller's very next `NET_STATUS_POLL` would race a process that
+    // has never yet run at all, always reading an all-zero (never
+    // written) status.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(ns_tid, hal.now_ns());
+    let Some((save, into)) = k.user_ctx_switch_ptrs(caller, ns_tid) else {
+        return None;
     };
-    if len < 42 {
-        return 1;
+
+    Some((save, into))
+}
+
+/// `NET_STATUS_POLL` demo opcode's own kernel-side half: reads the
+/// Netstack process's own status region directly (`spawn_netstack_
+/// service`'s own doc comment — `G_NETSTACK_STATUS_PHYS`, physical
+/// pointer, no IPC needed for this leg) and logs the SAME "real ARP
+/// resolve/ICMP echo" lines this crate's own (now-removed, pre-
+/// extraction) `drv_net_arp_poll_result`/`drv_net_ping_poll_result`
+/// used to print, once a terminal verdict is reached — preserves this
+/// project's own established QEMU-verification log format across the
+/// extraction. Returns `0` while Netstack is still running (verdict byte
+/// still `0`), `1` once ARP failed, `2` once ARP resolved but the ping
+/// failed/mismatched, `3` on full success.
+pub fn netstack_status() -> usize {
+    // SAFETY: single-core; `G_NETSTACK_STATUS_PHYS` was written once by
+    // `spawn_netstack_service`, before any `netstack_status` call.
+    let base = unsafe { core::ptr::addr_of!(G_NETSTACK_STATUS_PHYS).read() };
+    if base == usize::MAX {
+        return 0;
     }
-    // SAFETY: `G_DRV_NET_RX_PHYS` is valid; the RX frame buffer holds at
-    // least `len` bytes (`driver_virtio_net::VirtioNet::poll_rx`'s own
-    // contract — it only ever reports a length the device itself wrote
-    // into that same buffer).
-    let frame = unsafe {
-        let base = (core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read()
-            + driver_virtio_net::layout::BUFFER_OFFSET
-            + driver_virtio_net::VIRTIO_NET_HDR_LEN) as *const u8;
-        core::slice::from_raw_parts(base, len)
-    };
-    if frame[12] != 0x08 || frame[13] != 0x06 {
-        return 1; // not ARP
+    // SAFETY: `base` is the Netstack process's own fresh, zeroed
+    // `SharedRegion`, identity-addressable, single-core.
+    let verdict = unsafe { (base as *const u8).read_volatile() };
+    if verdict == 0 {
+        return 0;
     }
-    let arp = &frame[14..];
-    if arp[0] != 0x00 || arp[1] != 0x01 || arp[2] != 0x08 || arp[3] != 0x00 {
-        return 1; // htype/ptype mismatch
-    }
-    if arp[6] != 0x00 || arp[7] != 0x02 {
-        return 1; // not a reply
-    }
-    if arp[14..18] != NET_DEMO_GATEWAY_IP {
-        return 1; // reply for a different address
-    }
+    // SAFETY: same contract as the verdict read above; the MAC bytes are
+    // only meaningful (written) once `verdict >= 2` — `netstack::
+    // subsystem_entry::write_status`'s own doc comment — but reading
+    // them unconditionally once ANY verdict is set is harmless (still
+    // all-zero otherwise, never uninitialized memory: this whole region
+    // was zeroed at spawn time).
     let mut gw_mac = [0u8; 6];
-    gw_mac.copy_from_slice(&arp[8..14]);
-    // SAFETY: single-core.
-    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_GW_MAC).write(Some(gw_mac)) };
-    klog!(
-        "drv_net_arp_poll_result: real ARP resolve through virtio-net's own virtqueues (03 2.3) -> gateway {:?} is at {:02x?}\r\n",
-        NET_DEMO_GATEWAY_IP, gw_mac
-    );
-    2
-}
-
-/// Writes the Ethernet/IPv4/ICMP echo-request frame (same byte layout
-/// `netstack::build_echo_request` builds, reimplemented here with no
-/// `Vec`) into the TX region's own frame buffer, and returns its length.
-/// `dst_mac` is the gateway's own MAC, resolved by `drv_net_arp_poll_
-/// call`.
-///
-/// # Safety
-/// `G_DRV_NET_TX_PHYS`/`G_DRV_NET_MAC` must already be valid.
-unsafe fn build_echo_request_into_tx(dst_mac: [u8; 6]) -> u32 {
-    // SAFETY: forwarded from this function's own contract.
-    let tx = unsafe { core::ptr::addr_of!(G_DRV_NET_TX_PHYS).read() };
-    let our_mac = unsafe { core::ptr::addr_of!(G_DRV_NET_MAC).read() };
-    let icmp_len = 8 + NET_DEMO_ICMP_PAYLOAD.len();
-    let ip_total = 20 + icmp_len;
-    let base = (tx + driver_virtio_net::layout::BUFFER_OFFSET + driver_virtio_net::VIRTIO_NET_HDR_LEN) as *mut u8;
-    // SAFETY: `base..+14+ip_total` is within the TX region's own frame
-    // buffer (`FRAME_MAX` = 700 bytes, comfortably covers this demo's
-    // fixed short payload) — forwarded from this function's own contract.
     unsafe {
-        core::ptr::copy_nonoverlapping(dst_mac.as_ptr(), base, 6);
-        core::ptr::copy_nonoverlapping(our_mac.as_ptr(), base.add(6), 6);
-        base.add(12).write_volatile(0x08);
-        base.add(13).write_volatile(0x00); // ethertype IPv4
-
-        let ip = base.add(14);
-        ip.write_volatile(0x45);
-        ip.add(1).write_volatile(0x00);
-        let total_be = (ip_total as u16).to_be_bytes();
-        ip.add(2).write_volatile(total_be[0]);
-        ip.add(3).write_volatile(total_be[1]);
-        ip.add(4).write_volatile(0);
-        ip.add(5).write_volatile(0); // identification
-        ip.add(6).write_volatile(0x40);
-        ip.add(7).write_volatile(0x00); // flags: DF
-        ip.add(8).write_volatile(64); // ttl
-        ip.add(9).write_volatile(1); // proto: ICMP
-        ip.add(10).write_volatile(0);
-        ip.add(11).write_volatile(0); // checksum placeholder
-        core::ptr::copy_nonoverlapping(NET_DEMO_OUR_IP.as_ptr(), ip.add(12), 4);
-        core::ptr::copy_nonoverlapping(NET_DEMO_GATEWAY_IP.as_ptr(), ip.add(16), 4);
-        let ip_bytes = core::slice::from_raw_parts(ip, 20);
-        let ip_csum = net_checksum(ip_bytes).to_be_bytes();
-        ip.add(10).write_volatile(ip_csum[0]);
-        ip.add(11).write_volatile(ip_csum[1]);
-
-        let icmp = base.add(14 + 20);
-        icmp.write_volatile(8); // type: echo request
-        icmp.add(1).write_volatile(0); // code
-        icmp.add(2).write_volatile(0);
-        icmp.add(3).write_volatile(0); // checksum placeholder
-        let ident_be = NET_DEMO_ICMP_IDENT.to_be_bytes();
-        icmp.add(4).write_volatile(ident_be[0]);
-        icmp.add(5).write_volatile(ident_be[1]);
-        let seq_be = NET_DEMO_ICMP_SEQ.to_be_bytes();
-        icmp.add(6).write_volatile(seq_be[0]);
-        icmp.add(7).write_volatile(seq_be[1]);
-        core::ptr::copy_nonoverlapping(NET_DEMO_ICMP_PAYLOAD.as_ptr(), icmp.add(8), NET_DEMO_ICMP_PAYLOAD.len());
-        let icmp_bytes = core::slice::from_raw_parts(icmp, icmp_len);
-        let icmp_csum = net_checksum(icmp_bytes).to_be_bytes();
-        icmp.add(2).write_volatile(icmp_csum[0]);
-        icmp.add(3).write_volatile(icmp_csum[1]);
+        let mac_base = (base + 8) as *const u8;
+        for (i, b) in gw_mac.iter_mut().enumerate() {
+            *b = mac_base.add(i).read_volatile();
+        }
     }
-    (14 + ip_total) as u32
-}
-
-/// `DRV_NET_PING_SEND` demo opcode: builds the ICMP echo request
-/// (`build_echo_request_into_tx`, using the gateway MAC `drv_net_arp_
-/// poll_call` already resolved) and issues `DriverRequest::SendFrame`.
-/// Returns `None` if the gateway MAC is not resolved yet (the demo
-/// sequence's own ordering bug, not a hardware failure — `kernel/src/
-/// main.rs`'s own demo only reaches this opcode after `drv_net_arp_poll_
-/// result` returned `2`).
-pub fn drv_net_ping_send_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
-    // SAFETY: single-core.
-    let gw_mac = unsafe { core::ptr::addr_of!(G_DRV_NET_GW_MAC).read() }?;
-    // SAFETY: `spawn_virtio_net_driver` and `drv_net_probe_result` have
-    // already run by the time any `.user_text` code can reach this
-    // opcode (the demo sequence's own ordering).
-    let len = unsafe { build_echo_request_into_tx(gw_mac) };
-    let msg = ipc_protocol::codec::encode_driver_request(&ipc_protocol::DriverRequest::SendFrame { len });
-    // SAFETY: same contract as `drv_net_probe_call`.
-    unsafe { write_shared_net_message(&msg) };
-    net_ipc_call(hal, caller, ep_cap)
-}
-
-/// Reads back the `DriverResponse` for `drv_net_ping_send_call`. Returns
-/// `0` on `FrameSent`, `usize::MAX` otherwise.
-pub fn drv_net_ping_send_result() -> usize {
-    // SAFETY: same contract as `drv_net_probe_call`.
-    let msg = unsafe { read_shared_net_message() };
-    match ipc_protocol::codec::decode_driver_response(&msg) {
-        Ok(ipc_protocol::DriverResponse::FrameSent) => 0,
-        _ => usize::MAX,
+    if verdict >= 2 {
+        klog!(
+            "netstack: real ARP resolve through virtio-net's own virtqueues, over real IPC (03 2.3) -> gateway is at {:02x?}\r\n",
+            gw_mac
+        );
     }
-}
-
-/// `DRV_NET_PING_POLL` demo opcode: builds a real `DriverRequest::
-/// PollFrame`.
-pub fn drv_net_ping_poll_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
-    let msg = ipc_protocol::codec::encode_driver_request(&ipc_protocol::DriverRequest::PollFrame);
-    // SAFETY: same contract as `drv_net_probe_call`.
-    unsafe { write_shared_net_message(&msg) };
-    net_ipc_call(hal, caller, ep_cap)
-}
-
-/// Reads back the `DriverResponse` for `drv_net_ping_poll_call`. If a
-/// frame arrived, parses it as an ICMP echo REPLY (same byte layout
-/// `netstack::parse_echo_reply` parses, reimplemented here with no
-/// `Vec`) and verifies the identifier/sequence/payload this demo sent
-/// (`NET_DEMO_ICMP_IDENT`/`NET_DEMO_ICMP_SEQ`/`NET_DEMO_ICMP_PAYLOAD`)
-/// echo back byte-for-byte — real end-to-end proof, not just "a frame
-/// came back". Returns: `0` = no frame yet, `1` = a frame arrived but
-/// was not a matching echo reply, `2` = MATCH. Logs the verdict either
-/// way once a terminal result (`0` excluded) is reached.
-pub fn drv_net_ping_poll_result() -> usize {
-    // SAFETY: same contract as `drv_net_probe_call`.
-    let msg = unsafe { read_shared_net_message() };
-    let len = match ipc_protocol::codec::decode_driver_response(&msg) {
-        Ok(ipc_protocol::DriverResponse::FrameReceived { len }) => len as usize,
-        _ => return 0,
-    };
-    let min_len = 14 + 20 + 8;
-    if len < min_len {
-        return 1;
-    }
-    // SAFETY: `G_DRV_NET_RX_PHYS` is valid; the RX frame buffer holds at
-    // least `len` bytes (`driver_virtio_net::VirtioNet::poll_rx`'s own
-    // contract).
-    let frame = unsafe {
-        let base = (core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read()
-            + driver_virtio_net::layout::BUFFER_OFFSET
-            + driver_virtio_net::VIRTIO_NET_HDR_LEN) as *const u8;
-        core::slice::from_raw_parts(base, len)
-    };
-    if frame[12] != 0x08 || frame[13] != 0x00 {
-        return 1; // not IPv4
-    }
-    let ip = &frame[14..];
-    let ihl = (ip[0] & 0x0F) as usize * 4;
-    if ihl < 20 || ip.len() < ihl || ip[9] != 1 {
-        return 1; // not ICMP
-    }
-    let icmp = &ip[ihl..];
-    if icmp.len() < 8 || icmp[0] != 0 {
-        return 1; // not an echo reply
-    }
-    let ident = u16::from_be_bytes([icmp[4], icmp[5]]);
-    let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
-    // A PREFIX match, not an exact-length one: Ethernet's own 60-byte
-    // minimum frame size (spec-mandated, enforced by the virtual NIC/
-    // SLIRP below this driver) pads this demo's own short 54-byte
-    // request up to 60 bytes with trailing zeros BEFORE it ever reaches
-    // SLIRP's echo responder — SLIRP then echoes the ENTIRE ICMP payload
-    // it received, padding included, so a correctly-functioning reply
-    // legitimately carries `NET_DEMO_ICMP_PAYLOAD`'s own bytes followed
-    // by zero padding, not `NET_DEMO_ICMP_PAYLOAD` alone. **Confirmed via
-    // QEMU** (not a driver/parsing bug): a temporary diagnostic dump
-    // showed the reply's own 18-byte ICMP payload was `NET_DEMO_ICMP_
-    // PAYLOAD`'s 12 real bytes followed by exactly 6 zero bytes — 14
-    // (eth) + 20 (ip) + 8 (icmp hdr) + 18 = 60, the Ethernet minimum,
-    // exactly.
-    let payload_matches = icmp.len() >= 8 + NET_DEMO_ICMP_PAYLOAD.len()
-        && &icmp[8..8 + NET_DEMO_ICMP_PAYLOAD.len()] == NET_DEMO_ICMP_PAYLOAD;
-    let matched = ident == NET_DEMO_ICMP_IDENT && seq == NET_DEMO_ICMP_SEQ && payload_matches;
     klog!(
-        "drv_net_ping_poll_result: real ICMP echo request->reply round-trip through virtio-net's own virtqueues (03 5.4) -> {}\r\n",
-        if matched { "MATCH, real MMIO + descriptor rings + SLIRP gateway" } else { "MISMATCH" }
+        "netstack: real ICMP echo request->reply round-trip through virtio-net's own virtqueues, driven entirely over real IPC by a real Netstack process (03 2.3/5.4) -> {}\r\n",
+        match verdict {
+            1 => "ARP FAILED",
+            2 => "MISMATCH",
+            3 => "MATCH",
+            _ => "unknown",
+        }
     );
-    if matched {
-        2
-    } else {
-        1
-    }
+    verdict as usize
 }
 
 /// `DRV_IRQ_WAIT` demo opcode's own kernel-side half: issues exactly

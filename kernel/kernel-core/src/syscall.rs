@@ -849,8 +849,37 @@ impl KernelState {
                 Ok(SyscallReturn::Delivered { woke: rx })
             }
             SendOutcome::SenderQueued => {
+                // **Real bug found via QEMU** (Session 22's own Netstack
+                // work — the FIRST caller in this codebase to ever issue
+                // TWO real `Call`s to the same `Endpoint` back-to-back,
+                // in a tight retry loop, with no guarantee the receiver
+                // has already looped back to its own `Recv` between
+                // them): this arm set `BlockedOnSend` UNCONDITIONALLY,
+                // ignoring `is_call` — correct for a plain `Send`, but
+                // wrong for a `Call` whose message could not be
+                // delivered synchronously (the receiver was not yet
+                // blocked in `Recv`). `DeliveredTo`'s own fast-path arm
+                // above already gets this right (`if is_call { ...
+                // BlockedOnReply ... }`); this arm needs the identical
+                // check for the QUEUED case. Left as `BlockedOnSend`,
+                // `do_recv`'s own later pickup of this queued message
+                // (`RecvOutcome::Received`'s own "unless it was a Call
+                // sender" check) misreads a genuine `Call` as an
+                // ordinary `Send`, marking the caller `Runnable`
+                // WITHOUT ever calling `note_ready` on it (invisible to
+                // `pick_next` forever) — and the eventual real `Reply`
+                // then fails its own `state == BlockedOnReply`
+                // precondition (`do_reply`'s own doc comment), silently
+                // dropping the reply. Net effect: the caller never
+                // resumes — a genuine, deterministic, 100%-reproducible
+                // hang (not a QEMU-timing flake) the instant a `Call`'s
+                // own message is queued instead of delivered
+                // synchronously, confirmed via QEMU: a real Netstack
+                // process's SECOND `IPC_CALL` (the first `PollFrame`
+                // retry, immediately following a `SendFrame` reply)
+                // hung forever, every single attempt.
                 if let Some(t) = self.tcb_mut(caller) {
-                    t.state = ThreadState::BlockedOnSend;
+                    t.state = if is_call { ThreadState::BlockedOnReply } else { ThreadState::BlockedOnSend };
                 }
                 self.sched.note_blocked(caller)?;
                 let next = self.sched.pick_next(now_ns);
@@ -1699,6 +1728,96 @@ mod tests {
         assert_eq!(r, SyscallReturn::Reschedule { next: Some(root) });
 
         // `root` is runnable again with the reply message waiting.
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::Runnable);
+        let delivered = k.tcb(root).unwrap().pending_msg.expect("reply delivered to root");
+        assert_eq!(delivered.label, 0x2);
+        assert_eq!(delivered.words(), &[20]);
+    }
+
+    /// A `Call` whose receiver is NOT yet blocked in `Recv` (the message
+    /// gets QUEUED, `SendOutcome::SenderQueued` — the opposite of `call_
+    /// then_reply_completes_the_round_trip`'s own fast-path case above)
+    /// must STILL be correctly replied to once the receiver eventually
+    /// calls `Recv` and picks it up. **Real bug found via QEMU**
+    /// (Session 22's own Netstack work — the first real caller in this
+    /// codebase to ever issue a `Call` that could race ahead of its
+    /// receiver's own `Recv`): `do_send`'s `SenderQueued` arm set
+    /// `BlockedOnSend` unconditionally, ignoring `is_call` — so a queued
+    /// `Call`'s own caller was indistinguishable from a queued plain
+    /// `Send`'s. `do_recv`'s later pickup then (correctly, given that
+    /// wrong state) treated it as an ordinary `Send` and marked it
+    /// `Runnable` WITHOUT ever calling `note_ready` (invisible to `pick_
+    /// next` from then on), and the eventual real `Reply` failed its own
+    /// `state == BlockedOnReply` precondition — the caller never resumed
+    /// (a deterministic hang, reproduced via a real Netstack process's
+    /// second `IPC_CALL` to `driver-virtio-net` hanging every single
+    /// time). This test pins the fix: `SenderQueued` now sets
+    /// `BlockedOnReply` for a queued `Call`, exactly like the fast-path
+    /// `DeliveredTo` arm already does.
+    #[test]
+    fn call_queued_before_receiver_blocks_still_completes_the_round_trip() {
+        use kernel_sched::{SchedulerMode, MAX_PRIORITY};
+
+        let mut k = kernel();
+        let root = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        let ep_cap = match k
+            .dispatch(
+                root,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Endpoint,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let server = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        k.sched
+            .admit(server, SchedulerMode::Interactive, MAX_PRIORITY, None)
+            .unwrap();
+
+        // `root` Calls BEFORE `server` ever blocks in `Recv` — no
+        // receiver waiting yet, so the message is QUEUED
+        // (`SendOutcome::SenderQueued`), not delivered via the fast
+        // path. `root` must still end up `BlockedOnReply`, not
+        // `BlockedOnSend`.
+        let request = SmallMessage::from_words(0x1, &[10]).unwrap();
+        let r = k.dispatch(root, 0, SyscallOp::Call { endpoint: ep_cap, msg: request }, &hal).unwrap();
+        assert!(matches!(r, SyscallReturn::Reschedule { .. }));
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::BlockedOnReply);
+
+        // `server` NOW blocks in `Recv` — picks up the already-queued
+        // message immediately (`RecvOutcome::Received`), synchronously.
+        let r = k.dispatch(server, 0, SyscallOp::Recv { endpoint: ep_cap }, &hal).unwrap();
+        match r {
+            SyscallReturn::Message { from, msg } => {
+                assert_eq!(from, root);
+                assert_eq!(msg.label, 0x1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // `root` must still be `BlockedOnReply` (not incorrectly flipped
+        // to `Runnable` by `do_recv`'s own "unless it was a Call sender"
+        // check) — this is the exact condition `do_reply` requires next.
+        assert_eq!(k.tcb(root).unwrap().state, ThreadState::BlockedOnReply);
+
+        // `server` replies — this must succeed (the real bug made this
+        // fail with `NotBlockedOnReply`).
+        let reply_msg = SmallMessage::from_words(0x2, &[20]).unwrap();
+        let r = k
+            .dispatch(server, 0, SyscallOp::Reply { to: root, msg: reply_msg }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::Reschedule { next: Some(root) });
+
         assert_eq!(k.tcb(root).unwrap().state, ThreadState::Runnable);
         let delivered = k.tcb(root).unwrap().pending_msg.expect("reply delivered to root");
         assert_eq!(delivered.label, 0x2);

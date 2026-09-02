@@ -160,6 +160,13 @@ xbuild-subsystem-driver-virtio-blk-riscv64 = "build -p driver-virtio-blk --bin d
 xbuild-subsystem-driver-virtio-net-x86_64  = "build -p driver-virtio-net --bin driver-virtio-net-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-driver-virtio-net-aarch64 = "build -p driver-virtio-net --bin driver-virtio-net-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-driver-virtio-net-riscv64 = "build -p driver-virtio-net --bin driver-virtio-net-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for netstack's own separately-built ELF (03-Kernel-
+# Subsystems-Layer.md §2.3/§5.4) — the fifth real subsystem process, and
+# the first that is an IPC CLIENT of another subsystem process (driver-
+# virtio-net) rather than a server.
+xbuild-subsystem-netstack-x86_64  = "build -p netstack --bin netstack-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-netstack-aarch64 = "build -p netstack --bin netstack-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-netstack-riscv64 = "build -p netstack --bin netstack-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)

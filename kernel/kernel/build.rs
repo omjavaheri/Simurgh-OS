@@ -150,4 +150,31 @@ fn main() {
         "cargo:rustc-env=DRIVER_VIRTIO_NET_ELF_PATH={}",
         net_path.canonicalize().unwrap().display()
     );
+
+    // Same as above, for `netstack-bin` (03-Kernel-Subsystems-Layer.md
+    // §2.3/§5.4) — the fifth real subsystem process, and the first that
+    // is an IPC CLIENT of another subsystem process (driver-virtio-net)
+    // rather than a server.
+    let netstack_build_alias = format!("cargo xbuild-subsystem-netstack-{target_arch}");
+    let netstack_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("netstack-bin");
+
+    if !netstack_path.exists() {
+        panic!(
+            "kernel build.rs: netstack-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {netstack_build_alias}",
+            netstack_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", netstack_path.display());
+    println!(
+        "cargo:rustc-env=NETSTACK_ELF_PATH={}",
+        netstack_path.canonicalize().unwrap().display()
+    );
 }
