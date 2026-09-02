@@ -25,8 +25,9 @@
 //! Safety/invariants: no heap. All state is fixed-capacity and array-backed
 //! (IMPLEMENTATION-PLAN.md D1). A `CapId` is an index into one `CapTable`; a
 //! capability is valid iff its slot is occupied AND every ancestor slot up to
-//! a root is still occupied (revocation clears whole subtrees — see
-//! `CapTable::revoke`).
+//! a root is still occupied — an ancestor may live in a DIFFERENT `CapTable`
+//! than its descendant (a `CapGrant`ed capability), so revocation clears
+//! whole subtrees across capability spaces (see `cdt::revoke_cross_space`).
 //! ============================================================================
 
 #![no_std]
@@ -38,7 +39,9 @@ pub mod ids;
 pub mod rights;
 pub mod cdt;
 
-pub use cdt::{CapSlot, CapTable, CapTableError};
+pub use cdt::{
+    derive_child_cross_space, revoke_cross_space, CapSlot, CapTable, CapTableError, GlobalCapId,
+};
 pub use ids::{
     CapId, CapSpaceId, ChainGroupId, EndpointId, MmioRegionId, NotificationId, ObjectId,
     PageTableId, SharedRegionId, ThreadId, UntypedId,

@@ -11,9 +11,14 @@
 //!                     × numa_locality_bonus
 //!
 //! Architecture reference: 02-Microkernel-Layer.md §4.3 (formula + starting
-//! constants `aging_factor = 0.02`, `aging_cap_ms = 50`,
-//! `numa_locality_bonus = 0.9`) and §9 (these numbers are benchmark-tuned
-//! later, but the *shape* of the algorithm is fixed).
+//! constants `aging_factor = 0.02`, `aging_cap_ms = 50`) and §9 (these
+//! numbers are benchmark-tuned later, but the *shape* of the algorithm is
+//! fixed). `numa_locality_bonus` is deployed as `1/0.9 ≈ 1.111`, not the
+//! doc's own literal `0.9` — `NUMA_LOCALITY_BONUS_FP`'s own doc comment
+//! has the full resolution (§4.3's formula line and its own explanatory
+//! parenthetical describe two different numbers; the deployed value is
+//! the one that actually satisfies the parenthetical's stated 10%-
+//! reduction-in-vruntime-increment intent).
 //!
 //! Position in the system: called by `sched.rs` whenever a thread yields
 //! or is preempted, to advance its (and its chain group's) `vruntime`.
@@ -42,20 +47,31 @@ pub const AGING_FACTOR_FP: u64 = 20;
 /// stops accruing, so aging cannot fully override base priority (§4.3).
 pub const AGING_CAP_MS: u64 = 50;
 
-/// `numa_locality_bonus = 0.9` in fixed point (`0.9 × 1024 ≈ 921.6`,
-/// rounded to 922). Applied when a thread is scheduled on a core local to
-/// its memory / compute device.
+/// **Q4 resolved** (`IMPLEMENTATION-PLAN.md`'s own open-questions
+/// register — see that entry for the full writeup): §4.3's formula line
+/// (`effective_weight = ... × numa_locality_bonus`, `numa_locality_bonus
+/// = 0.9`) and its own parenthetical ("کاهش ۱۰٪ در vruntime افزایشی برای
+/// دسترسی local" — a 10% REDUCTION of the incremental vruntime) describe
+/// two different numbers if `0.9` is read as a literal multiplier on
+/// `effective_weight`: since `increment = runtime / effective_weight`,
+/// multiplying the WEIGHT by `0.9` (shrinking it) *raises* the
+/// increment — the opposite of the stated 10%-reduction intent, and also
+/// backwards from this module's own established "higher weight ⇒ smaller
+/// increment ⇒ scheduled more often" convention (`base_priority_weight_
+/// fp`'s own doc comment) — a locality "bonus" should behave like extra
+/// priority, i.e. RAISE effective weight, not lower it.
 ///
-// TODO(omid): §4.3 states the formula line `effective_weight = ... ×
-// numa_locality_bonus` with `numa_locality_bonus = 0.9`, but the
-// parenthetical describes it as "کاهش ۱۰٪ در vruntime افزایشی برای دسترسی
-// local" (a 10% REDUCTION of the incremental vruntime). Multiplying
-// `effective_weight` by 0.9 *raises* the increment (increment =
-// runtime / effective_weight), which is the opposite of the parenthetical.
-// This code follows the formula line literally (multiply the weight by
-// 0.9). Needs a decision: does the bonus multiply the weight, or divide
-// the increment? Logged as an open question in IMPLEMENTATION-PLAN.md (Q4).
-pub const NUMA_LOCALITY_BONUS_FP: u64 = 922;
+/// Resolution: keep the formula's own SHAPE exactly as written
+/// (`effective_weight = base × aging × numa_locality_bonus` — no
+/// restructuring), but correct the NUMBER to the value that actually
+/// satisfies the stated behavioral intent. Solving `increment × 0.9 =
+/// runtime / (weight × bonus)` for `bonus` gives `bonus = 1 / 0.9 ≈
+/// 1.1111`, not `0.9` itself — `0.9` is the factor the *increment*
+/// itself should shrink by, and folding a reduction into a value you
+/// then DIVIDE by (as `effective_weight` is always divided into, per
+/// `vruntime_next`) requires its OWN reciprocal, not the value itself.
+/// `1.1111... × 1024 ≈ 1137.98`, rounded to `1138`.
+pub const NUMA_LOCALITY_BONUS_FP: u64 = 1138;
 
 /// Neutral NUMA multiplier (no locality bonus) — exactly `1.0`.
 pub const NUMA_NEUTRAL_FP: u64 = WEIGHT_ONE;
@@ -153,5 +169,32 @@ mod tests {
     #[test]
     fn effective_weight_never_zero() {
         assert!(effective_weight_fp(0, 0, true) >= 1);
+    }
+
+    #[test]
+    fn numa_locality_reduces_vruntime_increment() {
+        // Q4 (IMPLEMENTATION-PLAN.md) resolved: a locality "bonus" must
+        // behave like a priority boost — raise effective_weight, which
+        // in turn LOWERS the vruntime increment (vruntime_next's own
+        // "increment = runtime / effective_weight" relationship), so a
+        // NUMA-local thread accrues vruntime slower and gets scheduled
+        // MORE often than an otherwise-identical non-local thread.
+        let base = base_priority_weight_fp(10);
+        let w_local = effective_weight_fp(base, 0, true);
+        let w_remote = effective_weight_fp(base, 0, false);
+        assert!(w_local > w_remote, "locality bonus should raise effective_weight");
+
+        let inc_local = vruntime_next(0, 1_000_000, w_local);
+        let inc_remote = vruntime_next(0, 1_000_000, w_remote);
+        assert!(
+            inc_local < inc_remote,
+            "a NUMA-local thread should accrue vruntime SLOWER than a remote one"
+        );
+        // The doc's own stated magnitude: ~10% less increment.
+        let ratio = inc_local as f64 / inc_remote as f64;
+        assert!(
+            (0.85..=0.92).contains(&ratio),
+            "expected roughly a 10% reduction, got ratio {ratio}"
+        );
     }
 }
