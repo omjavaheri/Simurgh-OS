@@ -27,6 +27,7 @@
 use crate::display::{DisplayErrorCode, DisplayRequest, DisplayResponse, SurfaceHandle};
 use crate::driver::{DriverErrorCode, DriverRequest, DriverResponse};
 use crate::fs::{FileHandle, FsErrorCode, FsRequest, FsResponse, OpenFlags, PathId};
+use crate::mm::{MmErrorCode, MmRequest, MmResponse, ReclaimClass};
 use crate::{label_parts, Namespace, PROTOCOL_VERSION};
 use kernel_ipc::SmallMessage;
 
@@ -630,6 +631,156 @@ pub fn decode_display_response(msg: &SmallMessage) -> Result<DisplayResponse, De
     }
 }
 
+// MmRequest opcodes (low byte of the label).
+const OP_MM_REGISTER: u8 = 1;
+const OP_MM_UNREGISTER: u8 = 2;
+const OP_MM_QUERY_VICTIM: u8 = 3;
+const OP_MM_QUERY_TOTAL_RESIDENT: u8 = 4;
+
+/// Encodes an `MmRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Register`: `[thread, resident_bytes, class]`
+/// - `Unregister`: `[thread]`
+/// - `QueryVictim`, `QueryTotalResident`: `[]`
+pub fn encode_mm_request(req: &MmRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 3]) = match *req {
+        MmRequest::Register {
+            thread,
+            resident_bytes,
+            class,
+        } => (OP_MM_REGISTER, [thread as u64, resident_bytes, class as u64]),
+        MmRequest::Unregister { thread } => (OP_MM_UNREGISTER, [thread as u64, 0, 0]),
+        MmRequest::QueryVictim => (OP_MM_QUERY_VICTIM, [0, 0, 0]),
+        MmRequest::QueryTotalResident => (OP_MM_QUERY_TOTAL_RESIDENT, [0, 0, 0]),
+    };
+    let n = match op {
+        OP_MM_REGISTER => 3,
+        OP_MM_UNREGISTER => 1,
+        _ => 0,
+    };
+    // `from_words` cannot fail here: n <= 3 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Mm.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Mm.label(op)))
+}
+
+/// Decodes an `MmRequest` from a `SmallMessage`.
+pub fn decode_mm_request(msg: &SmallMessage) -> Result<MmRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Mm) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_MM_REGISTER => {
+            need(3)?;
+            let class = match w[2] {
+                0 => ReclaimClass::Protected,
+                1 => ReclaimClass::Normal,
+                2 => ReclaimClass::Sacrificial,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(MmRequest::Register {
+                thread: w[0] as u32,
+                resident_bytes: w[1],
+                class,
+            })
+        }
+        OP_MM_UNREGISTER => {
+            need(1)?;
+            Ok(MmRequest::Unregister { thread: w[0] as u32 })
+        }
+        OP_MM_QUERY_VICTIM => Ok(MmRequest::QueryVictim),
+        OP_MM_QUERY_TOTAL_RESIDENT => Ok(MmRequest::QueryTotalResident),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// MmResponse opcodes — a separate small sequence from the request
+// opcodes above, same "kept sequential-and-distinct for readability"
+// convention every other namespace here already follows.
+const OP_MMR_REGISTERED: u8 = 1;
+const OP_MMR_UNREGISTERED: u8 = 2;
+const OP_MMR_VICTIM: u8 = 3;
+const OP_MMR_TOTAL_RESIDENT: u8 = 4;
+const OP_MMR_ERROR: u8 = 5;
+
+/// Encodes an `MmResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Registered`, `Unregistered`: `[]`
+/// - `Victim`: `[thread]`
+/// - `TotalResident`: `[bytes]`
+/// - `Error`: `[code]`
+pub fn encode_mm_response(resp: &MmResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 1]) = match *resp {
+        MmResponse::Registered => (OP_MMR_REGISTERED, [0]),
+        MmResponse::Unregistered => (OP_MMR_UNREGISTERED, [0]),
+        MmResponse::Victim { thread } => (OP_MMR_VICTIM, [thread as u64]),
+        MmResponse::TotalResident { bytes } => (OP_MMR_TOTAL_RESIDENT, [bytes]),
+        MmResponse::Error { code } => (OP_MMR_ERROR, [code as u64]),
+    };
+    let n = match op {
+        OP_MMR_REGISTERED | OP_MMR_UNREGISTERED => 0,
+        _ => 1,
+    };
+    // `from_words` cannot fail here: n <= 1 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Mm.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Mm.label(op)))
+}
+
+/// Decodes an `MmResponse` from a `SmallMessage`.
+pub fn decode_mm_response(msg: &SmallMessage) -> Result<MmResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Mm) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_MMR_REGISTERED => Ok(MmResponse::Registered),
+        OP_MMR_UNREGISTERED => Ok(MmResponse::Unregistered),
+        OP_MMR_VICTIM => {
+            need(1)?;
+            Ok(MmResponse::Victim { thread: w[0] as u32 })
+        }
+        OP_MMR_TOTAL_RESIDENT => {
+            need(1)?;
+            Ok(MmResponse::TotalResident { bytes: w[0] })
+        }
+        OP_MMR_ERROR => {
+            need(1)?;
+            let code = match w[0] {
+                1 => MmErrorCode::Unsupported,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(MmResponse::Error { code })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,5 +1010,57 @@ mod tests {
             decode_display_request(&msg),
             Err(DecodeError::Truncated)
         );
+    }
+
+    fn mm_request_roundtrip(req: MmRequest) {
+        let msg = encode_mm_request(&req);
+        assert_eq!(decode_mm_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_mm_request_variants_roundtrip() {
+        mm_request_roundtrip(MmRequest::Register {
+            thread: 3,
+            resident_bytes: 4096,
+            class: ReclaimClass::Sacrificial,
+        });
+        mm_request_roundtrip(MmRequest::Unregister { thread: 3 });
+        mm_request_roundtrip(MmRequest::QueryVictim);
+        mm_request_roundtrip(MmRequest::QueryTotalResident);
+    }
+
+    fn mm_response_roundtrip(resp: MmResponse) {
+        let msg = encode_mm_response(&resp);
+        assert_eq!(decode_mm_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_mm_response_variants_roundtrip() {
+        mm_response_roundtrip(MmResponse::Registered);
+        mm_response_roundtrip(MmResponse::Unregistered);
+        mm_response_roundtrip(MmResponse::Victim { thread: 7 });
+        mm_response_roundtrip(MmResponse::Victim { thread: u32::MAX });
+        mm_response_roundtrip(MmResponse::TotalResident { bytes: 123456 });
+        mm_response_roundtrip(MmResponse::Error {
+            code: MmErrorCode::Unsupported,
+        });
+    }
+
+    #[test]
+    fn mm_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_MM_QUERY_VICTIM));
+        assert_eq!(decode_mm_request(&msg), Err(DecodeError::WrongNamespace));
+    }
+
+    #[test]
+    fn mm_request_bad_field_is_rejected() {
+        let msg = SmallMessage::from_words(Namespace::Mm.label(OP_MM_REGISTER), &[1, 2, 99]).unwrap();
+        assert_eq!(decode_mm_request(&msg), Err(DecodeError::BadField));
+    }
+
+    #[test]
+    fn mm_response_truncated_payload_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Mm.label(OP_MMR_VICTIM));
+        assert_eq!(decode_mm_response(&msg), Err(DecodeError::Truncated));
     }
 }

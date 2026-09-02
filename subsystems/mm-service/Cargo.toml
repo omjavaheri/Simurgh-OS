@@ -8,6 +8,11 @@
 # Hardware Manifest (§2.5).
 #
 # `#![no_std] + alloc`. `rlib`.
+#
+# The REAL, separately-built process image (see src/bin/mm-service-bin.rs's
+# own doc comment) — "subsystems as processes" packaging, mirroring
+# compositor's own `compositor-bin` exactly, a real IPC SERVER (like
+# fs-native/compositor), not a client (unlike netstack).
 # ============================================================================
 [package]
 name        = "mm-service"
@@ -17,9 +22,22 @@ version.workspace    = true
 authors.workspace    = true
 license.workspace    = true
 repository.workspace = true
+build = "build.rs"
 
 [lib]
 crate-type = ["rlib"]
 
+[[bin]]
+name = "mm-service-bin"
+path = "src/bin/mm-service-bin.rs"
+# Same reasoning as compositor-bin's own `[[bin]]`: a host `cargo test`
+# harness would pull in `std` and collide on `panic_impl`.
+test = false
+
 [dependencies]
 hal-manifest = { path = "../../hal/hal-manifest", default-features = false }
+ipc-protocol = { path = "../../ipc-protocol" }
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly (not re-exported by `ipc-protocol` — its own codec module
+# takes/returns it by reference to `kernel_ipc` types).
+kernel-ipc   = { path = "../../kernel/kernel-ipc" }

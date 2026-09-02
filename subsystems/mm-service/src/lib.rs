@@ -35,6 +35,12 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+/// mm-service's real process entry point (03-Kernel-Subsystems-Layer.md
+/// §2.5) — see that module's own doc comment. Mirrors `compositor::
+/// subsystem_entry`'s own unconditional module declaration (per-
+/// architecture gating lives inside the file, not at this level).
+pub mod subsystem_entry;
+
 /// How aggressively a process should be reclaimed from, set per process by
 /// layer-4 Profile Policy.
 ///

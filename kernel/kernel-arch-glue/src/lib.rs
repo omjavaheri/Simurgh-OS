@@ -2820,6 +2820,301 @@ pub fn compositor_destroy_result() -> usize {
 }
 
 // ============================================================================
+// mm-service: real IPC-driven memory-policy service (03 §2.5)
+//
+// Mirrors the fs-native/compositor sections above almost exactly (same
+// "spawn, grant an Endpoint, pre-map a shared page, drive it via a
+// dedicated ecall-per-request-type + shared-message-area protocol,
+// bypass pick_next for the deterministic 2-party shape" pattern). The
+// one simplification relative to those two: `MmRequest`/`MmResponse`
+// never carries genuinely bulk data (a thread id + a byte count fits
+// inside the message itself), so this section needs only ONE shared
+// page — no second `SharedRegion` the way fs-native's `FS_DATA_VA` or
+// Compositor's `COMPOSITOR_FB_VA`/`COMPOSITOR_CONFIRM_VA` do.
+//
+// The demo registers two fixed processes (matching `mm_service`'s own
+// `sacrificial_chosen_before_larger_normal` host test verbatim — a
+// 100 MiB `Normal` process and a 4 MiB `Sacrificial` one), queries the
+// total resident bytes and the OOM victim over REAL IPC, and verifies
+// both against the same expected values that host test already proves
+// the underlying policy produces — the real, end-to-end version of a
+// property already known correct in isolation.
+// ============================================================================
+
+/// This process's own thread id, set once by `mm_demo_start` — same
+/// role as `G_FS_TID`.
+static mut G_MM_TID: Option<ThreadId> = None;
+
+/// Physical address of the page shared between the caller and
+/// mm-service's own process (mapped into ITS address space at
+/// `MM_SHARED_VA` by `mm_demo_start`) — same role as `G_FS_SHARED_PHYS`.
+static mut G_MM_SHARED_PHYS: usize = usize::MAX;
+
+/// VA mm-service's own process maps the shared message page at — must
+/// stay numerically equal to `mm_service::subsystem_entry::SHARED_VA`.
+const MM_SHARED_VA: usize = 0xD870_0000;
+
+/// Fixed MVP demo processes — the SAME `(footprint, class)` pairs
+/// `mm_service`'s own `sacrificial_chosen_before_larger_normal` host
+/// test already proves the underlying policy handles correctly; this
+/// demo drives the identical scenario over REAL IPC instead of calling
+/// `choose_oom_victim` in-process. Index 0 = thread 100 (100 MiB,
+/// `Normal`); index 1 = thread 200 (4 MiB, `Sacrificial` — the expected
+/// victim despite its much smaller footprint).
+const MM_DEMO_PROCS: [(u32, u64, ipc_protocol::mm::ReclaimClass); 2] = [
+    (100, 100 * 1024 * 1024, ipc_protocol::mm::ReclaimClass::Normal),
+    (200, 4 * 1024 * 1024, ipc_protocol::mm::ReclaimClass::Sacrificial),
+];
+/// Expected `QueryTotalResident` result once both `MM_DEMO_PROCS` are
+/// registered — `mm_query_total_resident_result`'s own verify check.
+const MM_DEMO_EXPECTED_TOTAL: u64 = MM_DEMO_PROCS[0].1 + MM_DEMO_PROCS[1].1;
+/// Expected `QueryVictim` result once both `MM_DEMO_PROCS` are
+/// registered — the `Sacrificial` one, thread 200, regardless of its
+/// smaller footprint (`choose_oom_victim`'s own doc comment on why).
+const MM_DEMO_EXPECTED_VICTIM: u32 = 200;
+
+/// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
+/// shared mm page — same convention `write_shared_fs_message`'s own doc
+/// comment documents in full.
+///
+/// # Safety
+/// `G_MM_SHARED_PHYS` must already be a valid, exclusively-owned, mapped
+/// physical frame (`mm_demo_start` has run).
+unsafe fn write_shared_mm_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_MM_SHARED_PHYS` only written once by
+    // `mm_demo_start`, before this can ever be called.
+    let base = unsafe { core::ptr::addr_of!(G_MM_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: forwarded from this function's own contract — low RAM is
+    // always identity-mapped for kernel-mode access regardless of which
+    // process's page table is currently active.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back a `SmallMessage` written by `write_shared_mm_message`.
+///
+/// # Safety
+/// Same contract as `write_shared_mm_message`.
+unsafe fn read_shared_mm_message() -> SmallMessage {
+    // SAFETY: single-core; same contract as `write_shared_mm_message`.
+    let base = unsafe { core::ptr::addr_of!(G_MM_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// One-time setup: creates the endpoint mm-service and its client
+/// (`caller`, always the Root Task in this MVP) rendezvous on, spawns
+/// mm-service as a genuinely isolated process from its own separately-
+/// built ELF image (`mm_elf`), grants it the endpoint plus ONE pre-mapped
+/// message page, and switches straight to it — same "without this, the
+/// caller's first Call races a receiver that has never run" rationale
+/// `fs_demo_start`'s own tail comment documents in full. Returns the
+/// endpoint's capability slot in the CALLER's own cap space plus the
+/// `(save, into)` switch pointers the caller wraps in a
+/// `TrapOutcome::SwitchTo`.
+pub fn mm_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    mm_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+
+    const MM_STACK_VMA: usize = 0xC0B0_0000;
+    const MM_STACK_LEN: usize = 4096 * 16;
+    let (mm_tid, mm_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, mm_elf, expected_machine, MM_STACK_VMA, MM_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any mm-service call
+    // (reached only after this function returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_MM_TID).write(Some(mm_tid)) };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, mm_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    let mm_addr_space = k.tcb(mm_tid)?.addr_space;
+    let mm_root_pt = k.addr_space_mut(mm_addr_space)?.root_phys().as_usize();
+
+    let shared_phys = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+    let shared_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(shared_pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(mm_root_pt, MM_SHARED_VA, shared_phys, 4096, 1 | 2 | 8, shared_pool, 2);
+    if n == u32::MAX {
+        klog!("mm_demo_start: map_range error (shared page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // mm-service call can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_MM_SHARED_PHYS).write(shared_phys) };
+
+    // Switch straight to mm-service — same race-avoidance rationale as
+    // `fs_demo_start`'s own tail comment.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(mm_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, mm_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// `Call`, specialized for the mm-service demo's known, fixed 2-party
+/// (root <-> mm-service) shape — same "bypass `pick_next`'s answer,
+/// switch straight to the known target thread" fix `fs_ipc_call`'s own
+/// doc comment documents in full (identical bug class, identical fix).
+fn mm_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_MM_TID` is written once by `mm_demo_start`,
+    // before any mm-service call (this function) can run.
+    let mm_tid = unsafe { core::ptr::addr_of!(G_MM_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(mm_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, mm_tid)?;
+            let poke = if n == mm_tid {
+                k.tcb_mut(mm_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `MM_REGISTER` demo opcode: builds a REAL `MmRequest::Register` for
+/// `MM_DEMO_PROCS[which]` (`0` or `1` — any other value is clamped to
+/// `0`, matching `resolve_path`'s own "one demo, fixed scenario"
+/// simplification precedent).
+pub fn mm_register_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, which: u32) -> Option<IpcSwitch> {
+    let (thread, resident_bytes, class) = MM_DEMO_PROCS[(which as usize).min(MM_DEMO_PROCS.len() - 1)];
+    let req = ipc_protocol::MmRequest::Register { thread, resident_bytes, class };
+    let msg = ipc_protocol::codec::encode_mm_request(&req);
+    // SAFETY: `mm_demo_start` has already run by the time any `.user_
+    // text` code can reach this opcode (it needs `ep_cap`, which only
+    // `mm_demo_start`'s own return value provides).
+    unsafe { write_shared_mm_message(&msg) };
+    mm_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `MmResponse` for `mm_register_call`. Returns `1` for a
+/// real `Registered`, `0` otherwise.
+pub fn mm_register_result() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    matches!(ipc_protocol::codec::decode_mm_response(&msg), Ok(ipc_protocol::MmResponse::Registered)) as usize
+}
+
+/// `MM_UNREGISTER` demo opcode: builds a REAL `MmRequest::Unregister`.
+pub fn mm_unregister_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, thread: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::MmRequest::Unregister { thread };
+    let msg = ipc_protocol::codec::encode_mm_request(&req);
+    // SAFETY: see `mm_register_call`'s own contract.
+    unsafe { write_shared_mm_message(&msg) };
+    mm_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `MmResponse` for `mm_unregister_call`. Returns `1` for
+/// a real `Unregistered`, `0` otherwise.
+pub fn mm_unregister_result() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    matches!(ipc_protocol::codec::decode_mm_response(&msg), Ok(ipc_protocol::MmResponse::Unregistered)) as usize
+}
+
+/// `MM_QUERY_VICTIM` demo opcode: builds a REAL `MmRequest::QueryVictim`.
+pub fn mm_query_victim_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let msg = ipc_protocol::codec::encode_mm_request(&ipc_protocol::MmRequest::QueryVictim);
+    // SAFETY: see `mm_register_call`'s own contract.
+    unsafe { write_shared_mm_message(&msg) };
+    mm_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `MmResponse` for `mm_query_victim_call`, AND
+/// cross-checks it against `MM_DEMO_EXPECTED_VICTIM` — proving the REAL
+/// `MemRegistry` behind mm-service's own process picks the same victim
+/// its host-tested `choose_oom_victim` logic already proves correct in
+/// isolation (same "real round-trip reproduces the known-correct
+/// answer" verification style `fs_read_result` already established).
+/// Returns the victim thread id (`u32::MAX` as `usize` for none), or
+/// `usize::MAX` on any decode failure.
+pub fn mm_query_victim_result() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    let thread = match ipc_protocol::codec::decode_mm_response(&msg) {
+        Ok(ipc_protocol::MmResponse::Victim { thread }) => thread,
+        _ => return usize::MAX,
+    };
+    klog!(
+        "mm_query_victim_result: real OOM victim query through mm-service's own MemRegistry, over real IPC (03 2.5) -> {}\r\n",
+        if thread == MM_DEMO_EXPECTED_VICTIM { "MATCH (Sacrificial process chosen over the larger Normal one)" } else { "MISMATCH" }
+    );
+    thread as usize
+}
+
+/// `MM_QUERY_TOTAL_RESIDENT` demo opcode: builds a REAL `MmRequest::
+/// QueryTotalResident`.
+pub fn mm_query_total_resident_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let msg = ipc_protocol::codec::encode_mm_request(&ipc_protocol::MmRequest::QueryTotalResident);
+    // SAFETY: see `mm_register_call`'s own contract.
+    unsafe { write_shared_mm_message(&msg) };
+    mm_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `MmResponse` for `mm_query_total_resident_call`, AND
+/// cross-checks it against `MM_DEMO_EXPECTED_TOTAL` — same verification
+/// style as `mm_query_victim_result`'s own doc comment. Returns the
+/// total resident byte count, or `usize::MAX` on any decode failure.
+pub fn mm_query_total_resident_result() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    let bytes = match ipc_protocol::codec::decode_mm_response(&msg) {
+        Ok(ipc_protocol::MmResponse::TotalResident { bytes }) => bytes,
+        _ => return usize::MAX,
+    };
+    klog!(
+        "mm_query_total_resident_result: real resident-byte accounting through mm-service's own MemRegistry, over real IPC (03 2.5) -> {}\r\n",
+        if bytes == MM_DEMO_EXPECTED_TOTAL { "MATCH" } else { "MISMATCH" }
+    );
+    bytes as usize
+}
+
+// ============================================================================
 // driver-virtio-blk: real MMIO + virtqueue block driver process (03 §5.1)
 //
 // Mirrors the fs-native section immediately above almost exactly (same

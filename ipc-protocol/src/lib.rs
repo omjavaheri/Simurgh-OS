@@ -32,12 +32,14 @@ pub mod fs;
 pub mod driver;
 pub mod display;
 pub mod net;
+pub mod mm;
 pub mod codec;
 
 pub use codec::{decode_fs_request, encode_fs_request, DecodeError};
 pub use display::{DisplayErrorCode, DisplayRequest, DisplayResponse, SurfaceHandle};
 pub use driver::{DriverRequest, DriverResponse};
 pub use fs::{FileHandle, FsRequest, FsResponse, OpenFlags, PathId};
+pub use mm::{MmErrorCode, MmRequest, MmResponse, ReclaimClass};
 pub use net::NetBypassRequest;
 
 /// Protocol version. Bump on any incompatible change to a message type or
@@ -57,6 +59,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 ///   §2.1).
 /// - `Display`: a `DisplayRequest` (compositor service, §2.4).
 /// - `NetBypass`: a `NetBypassRequest` (kernel-bypass networking, §2.3).
+/// - `Mm`: an `MmRequest` (memory policy service, §2.5).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Namespace {
@@ -68,6 +71,8 @@ pub enum Namespace {
     Display = 3,
     /// Kernel-bypass networking.
     NetBypass = 4,
+    /// Memory policy service.
+    Mm = 5,
 }
 
 impl Namespace {
@@ -78,6 +83,7 @@ impl Namespace {
             2 => Some(Self::Driver),
             3 => Some(Self::Display),
             4 => Some(Self::NetBypass),
+            5 => Some(Self::Mm),
             _ => None,
         }
     }

@@ -154,6 +154,13 @@ static NETSTACK_ELF: &[u8] = include_bytes!(env!("NETSTACK_ELF_PATH"));
 /// real IPC SERVER (like fs-native), not a client (unlike Netstack).
 static COMPOSITOR_ELF: &[u8] = include_bytes!(env!("COMPOSITOR_ELF_PATH"));
 
+/// `mm-service-bin`'s own separately-built ELF image — same packaging as
+/// `DEVICE_MANAGER_ELF` (see its own doc comment), the seventh real
+/// subsystem process (03-Kernel-Subsystems-Layer.md §2.5), and a real
+/// IPC SERVER (like fs-native/Compositor), not a client (unlike
+/// Netstack).
+static MM_SERVICE_ELF: &[u8] = include_bytes!(env!("MM_SERVICE_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -605,11 +612,11 @@ mod sys {
     /// No arguments. Returns the REAL new surface handle in `a0`, or
     /// `usize::MAX` on any error.
     pub const COMPOSITOR_CREATE_SURFACE_RESULT: usize = 69;
-    /// `a0` = the endpoint slot, `a1` = a surface handle
-    /// `COMPOSITOR_CREATE_SURFACE_RESULT` returned. Writes a fixed MVP
-    /// test frame (`kernel_arch_glue::COMPOSITOR_DEMO_FRAME`, a 2x2
-    /// packed-BGRA8 sentinel) into the shared frame buffer, then builds a
-    /// REAL `DisplayRequest::CommitBuffer` naming it.
+    /// `a0` = a surface handle `COMPOSITOR_CREATE_SURFACE_RESULT`
+    /// returned. Writes a fixed MVP test frame (`kernel_arch_glue::
+    /// COMPOSITOR_DEMO_FRAME`, a 2x2 packed-BGRA8 sentinel) into the
+    /// shared frame buffer, then builds a REAL `DisplayRequest::
+    /// CommitBuffer` naming it.
     pub const COMPOSITOR_COMMIT_BUFFER: usize = 70;
     /// No arguments. Returns `1` in `a0` for a real `Committed` AND a
     /// byte-for-byte confirm-region match proving Compositor genuinely
@@ -617,12 +624,51 @@ mod sys {
     /// arch_glue::compositor_commit_verify`'s own doc comment), `0`
     /// otherwise (logs the exact verdict either way).
     pub const COMPOSITOR_COMMIT_VERIFY: usize = 71;
-    /// `a0` = the endpoint slot, `a1` = a surface handle. Builds a REAL
-    /// `DisplayRequest::DestroySurface`.
+    /// `a0` = a surface handle. Builds a REAL `DisplayRequest::
+    /// DestroySurface`.
     pub const COMPOSITOR_DESTROY_SURFACE: usize = 72;
     /// No arguments. Returns `1` in `a0` for a real `Destroyed`, `0`
     /// otherwise.
     pub const COMPOSITOR_DESTROY_RESULT: usize = 73;
+
+    // -- mm-service: the REAL MmRequest/MmResponse wire protocol over
+    //    the REAL Call/Recv/Reply mechanism above (03-Kernel-Subsystems-
+    //    Layer.md §2.5) — a real IPC SERVER (like fs-native/Compositor).
+
+    /// No arguments. Spawns mm-service as a genuinely isolated process
+    /// (own address + capability space, own separately-built ELF) and
+    /// grants it an Endpoint plus the shared message page (`kernel_arch_
+    /// glue::mm_demo_start`'s own doc comment). Returns the endpoint's
+    /// capability slot in the CALLER's own capability space, or
+    /// `usize::MAX` on any spawn failure.
+    pub const MM_DEMO_START: usize = 74;
+    /// `a0` = `0` or `1` selecting `kernel_arch_glue::MM_DEMO_PROCS[a0]`
+    /// (a fixed MVP demo process — see that constant's own doc comment).
+    /// Builds a REAL `MmRequest::Register` — always blocks until
+    /// mm-service replies.
+    pub const MM_REGISTER: usize = 75;
+    /// No arguments. Returns `1` in `a0` for a real `Registered`, `0`
+    /// otherwise.
+    pub const MM_REGISTER_RESULT: usize = 76;
+    /// `a0` = a thread id (`100` or `200` — `kernel_arch_glue::MM_DEMO_
+    /// PROCS`' own thread ids). Builds a REAL `MmRequest::Unregister`.
+    pub const MM_UNREGISTER: usize = 77;
+    /// No arguments. Returns `1` in `a0` for a real `Unregistered`, `0`
+    /// otherwise.
+    pub const MM_UNREGISTER_RESULT: usize = 78;
+    /// No arguments. Builds a REAL `MmRequest::QueryVictim`.
+    pub const MM_QUERY_VICTIM: usize = 79;
+    /// No arguments. Returns the REAL OOM victim's thread id in `a0`
+    /// (and logs a MATCH/MISMATCH verdict against `kernel_arch_glue::
+    /// MM_DEMO_EXPECTED_VICTIM` — see `kernel_arch_glue::mm_query_
+    /// victim_result`'s own doc comment), or `usize::MAX` on any error.
+    pub const MM_QUERY_VICTIM_RESULT: usize = 80;
+    /// No arguments. Builds a REAL `MmRequest::QueryTotalResident`.
+    pub const MM_QUERY_TOTAL_RESIDENT: usize = 81;
+    /// No arguments. Returns the REAL total resident byte count in `a0`
+    /// (and logs a MATCH/MISMATCH verdict against `kernel_arch_glue::
+    /// MM_DEMO_EXPECTED_TOTAL`), or `usize::MAX` on any error.
+    pub const MM_QUERY_TOTAL_RESIDENT_RESULT: usize = 82;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -752,6 +798,13 @@ static mut G_FS_EP: u32 = 0;
 #[cfg(target_arch = "riscv64")]
 static mut G_COMPOSITOR_EP: u32 = 0;
 
+/// mm-service's own endpoint capability slot IN THE CALLER's (root's)
+/// own capability space, set once by `MM_DEMO_START`'s handler and read
+/// by every later `MM_REGISTER`/`MM_UNREGISTER`/`MM_QUERY_VICTIM`/
+/// `MM_QUERY_TOTAL_RESIDENT` handler — same role as `G_FS_EP`.
+#[cfg(target_arch = "riscv64")]
+static mut G_MM_EP: u32 = 0;
+
 /// The virtio-blk driver's endpoint capability slot IN THE CALLER's
 /// (root's) own capability space, set once by `DRV_BLK_DEMO_START`'s
 /// handler and read by every later `DRV_BLK_PROBE`/`DRV_BLK_WRITE`/
@@ -866,6 +919,55 @@ fn compositor_demo_riscv64() {
                 let destroyed = raw_syscall(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
                 raw_syscall(sys::REPORT, destroyed, zero!());
             }
+        }
+    }
+}
+
+/// The mm-service demo (03-Kernel-Subsystems-Layer.md §2.5): spawns the
+/// real mm-service process, registers the two fixed `MM_DEMO_PROCS`
+/// (a large `Normal` one and a small `Sacrificial` one), queries the
+/// real total resident bytes and the real OOM victim (both verified
+/// against `mm_service`'s own already-host-tested policy answer — see
+/// `kernel_arch_glue::mm_query_victim_result`'s own doc comment), then
+/// unregisters both. A SEPARATE `#[link_section = ".user_text"]`
+/// `#[inline(never)]` function, called once from `umode_root` — same "a
+/// call between two `.user_text` functions is safe" reasoning `net_demo_
+/// riscv64`'s own doc comment gives.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_demo_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall(sys::MM_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall(sys::MM_REGISTER, zero!(), zero!()); // MM_DEMO_PROCS[0]: thread 100, Normal
+            let reg0 = raw_syscall(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, reg0, zero!());
+            raw_syscall(sys::MM_REGISTER, 1, zero!()); // MM_DEMO_PROCS[1]: thread 200, Sacrificial
+            let reg1 = raw_syscall(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, reg1, zero!());
+            raw_syscall(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            let total = raw_syscall(sys::MM_QUERY_TOTAL_RESIDENT_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, total, zero!());
+            raw_syscall(sys::MM_QUERY_VICTIM, zero!(), zero!());
+            let victim = raw_syscall(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, victim, zero!());
+            raw_syscall(sys::MM_UNREGISTER, 100, zero!());
+            let unreg0 = raw_syscall(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, unreg0, zero!());
+            raw_syscall(sys::MM_UNREGISTER, 200, zero!());
+            let unreg1 = raw_syscall(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, unreg1, zero!());
         }
     }
 }
@@ -1066,6 +1168,10 @@ extern "C" fn umode_root() -> ! {
         // 7d. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
         // — see `compositor_demo_riscv64`'s own doc comment.
         compositor_demo_riscv64();
+
+        // 7e. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
+        // `mm_demo_riscv64`'s own doc comment.
+        mm_demo_riscv64();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
@@ -1350,6 +1456,10 @@ static mut G_FS_EP_X86: u32 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut G_COMPOSITOR_EP_X86: u32 = 0;
 
+/// See the riscv64 `G_MM_EP`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+static mut G_MM_EP_X86: u32 = 0;
+
 /// The virtio-blk driver's endpoint capability slot in the caller's
 /// (root's) own capability space — mirrors riscv64's own `G_DRV_EP`
 /// exactly (see that static's own doc comment).
@@ -1431,6 +1541,46 @@ fn compositor_demo_x86() {
                 let destroyed = raw_syscall_x86(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
                 raw_syscall_x86(sys::REPORT, destroyed, zero!());
             }
+        }
+    }
+}
+
+/// See the riscv64 `mm_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_demo_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall_x86(sys::MM_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall_x86(sys::MM_REGISTER, zero!(), zero!()); // MM_DEMO_PROCS[0]: thread 100, Normal
+            let reg0 = raw_syscall_x86(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, reg0, zero!());
+            raw_syscall_x86(sys::MM_REGISTER, 1, zero!()); // MM_DEMO_PROCS[1]: thread 200, Sacrificial
+            let reg1 = raw_syscall_x86(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, reg1, zero!());
+            raw_syscall_x86(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            let total = raw_syscall_x86(sys::MM_QUERY_TOTAL_RESIDENT_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, total, zero!());
+            raw_syscall_x86(sys::MM_QUERY_VICTIM, zero!(), zero!());
+            let victim = raw_syscall_x86(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, victim, zero!());
+            raw_syscall_x86(sys::MM_UNREGISTER, 100, zero!());
+            let unreg0 = raw_syscall_x86(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, unreg0, zero!());
+            raw_syscall_x86(sys::MM_UNREGISTER, 200, zero!());
+            let unreg1 = raw_syscall_x86(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, unreg1, zero!());
         }
     }
 }
@@ -1566,6 +1716,10 @@ extern "C" fn umode_root_x86() -> ! {
         // 7e. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
         // — see `compositor_demo_x86`'s own doc comment.
         compositor_demo_x86();
+
+        // 7f. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
+        // `mm_demo_x86`'s own doc comment.
+        mm_demo_x86();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the LAPIC timer, then loop forever bumping
@@ -2151,6 +2305,74 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::COMPOSITOR_DESTROY_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
         }
+        sys::MM_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::mm_demo_start(hal, caller, MM_SERVICE_ELF, elf_loader::machine::EM_X86_64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_MM_EP_X86, before any later MM_REGISTER/
+                    // MM_UNREGISTER/MM_QUERY_VICTIM/MM_QUERY_TOTAL_
+                    // RESIDENT call.
+                    unsafe { core::ptr::addr_of_mut!(G_MM_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::MM_REGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by MM_DEMO_START, before
+            // any MM_REGISTER call.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_X86).read() };
+            return match kernel_arch_glue::mm_register_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_REGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_register_result());
+        }
+        sys::MM_UNREGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_X86).read() };
+            return match kernel_arch_glue::mm_unregister_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_UNREGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_unregister_result());
+        }
+        sys::MM_QUERY_VICTIM => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_X86).read() };
+            return match kernel_arch_glue::mm_query_victim_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_VICTIM_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_victim_result());
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_X86).read() };
+            return match kernel_arch_glue::mm_query_total_resident_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -2498,6 +2720,10 @@ static mut G_FS_EP_AARCH64: u32 = 0;
 #[cfg(target_arch = "aarch64")]
 static mut G_COMPOSITOR_EP_AARCH64: u32 = 0;
 
+/// See the riscv64 `G_MM_EP`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+static mut G_MM_EP_AARCH64: u32 = 0;
+
 /// The virtio-blk driver's endpoint capability slot in the caller's
 /// (root's) own capability space — mirrors riscv64's own `G_DRV_EP`
 /// exactly (see that static's own doc comment).
@@ -2579,6 +2805,46 @@ fn compositor_demo_aarch64() {
                 let destroyed = raw_syscall_aarch64(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
                 raw_syscall_aarch64(sys::REPORT, destroyed, zero!());
             }
+        }
+    }
+}
+
+/// See the riscv64 `mm_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_demo_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall_aarch64(sys::MM_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall_aarch64(sys::MM_REGISTER, zero!(), zero!()); // MM_DEMO_PROCS[0]: thread 100, Normal
+            let reg0 = raw_syscall_aarch64(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, reg0, zero!());
+            raw_syscall_aarch64(sys::MM_REGISTER, 1, zero!()); // MM_DEMO_PROCS[1]: thread 200, Sacrificial
+            let reg1 = raw_syscall_aarch64(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, reg1, zero!());
+            raw_syscall_aarch64(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            let total = raw_syscall_aarch64(sys::MM_QUERY_TOTAL_RESIDENT_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, total, zero!());
+            raw_syscall_aarch64(sys::MM_QUERY_VICTIM, zero!(), zero!());
+            let victim = raw_syscall_aarch64(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, victim, zero!());
+            raw_syscall_aarch64(sys::MM_UNREGISTER, 100, zero!());
+            let unreg0 = raw_syscall_aarch64(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, unreg0, zero!());
+            raw_syscall_aarch64(sys::MM_UNREGISTER, 200, zero!());
+            let unreg1 = raw_syscall_aarch64(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, unreg1, zero!());
         }
     }
 }
@@ -2711,6 +2977,10 @@ extern "C" fn umode_root_aarch64() -> ! {
         // 7e. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
         // — see `compositor_demo_aarch64`'s own doc comment.
         compositor_demo_aarch64();
+
+        // 7f. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
+        // `mm_demo_aarch64`'s own doc comment.
+        mm_demo_aarch64();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the timer PPI, then loop forever bumping this
@@ -3253,6 +3523,74 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::COMPOSITOR_DESTROY_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
+        }
+        sys::MM_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::mm_demo_start(hal, caller, MM_SERVICE_ELF, elf_loader::machine::EM_AARCH64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_MM_EP_AARCH64, before any later MM_REGISTER/
+                    // MM_UNREGISTER/MM_QUERY_VICTIM/MM_QUERY_TOTAL_
+                    // RESIDENT call.
+                    unsafe { core::ptr::addr_of_mut!(G_MM_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::MM_REGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by MM_DEMO_START, before
+            // any MM_REGISTER call.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_AARCH64).read() };
+            return match kernel_arch_glue::mm_register_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_REGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_register_result());
+        }
+        sys::MM_UNREGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_AARCH64).read() };
+            return match kernel_arch_glue::mm_unregister_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_UNREGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_unregister_result());
+        }
+        sys::MM_QUERY_VICTIM => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_AARCH64).read() };
+            return match kernel_arch_glue::mm_query_victim_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_VICTIM_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_victim_result());
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_AARCH64).read() };
+            return match kernel_arch_glue::mm_query_total_resident_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
@@ -4095,6 +4433,73 @@ fn simurgh_syscall(
         }
         sys::COMPOSITOR_DESTROY_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
+        }
+        sys::MM_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::mm_demo_start(hal, caller, MM_SERVICE_ELF, elf_loader::machine::EM_RISCV) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes G_MM_EP,
+                    // before any later MM_REGISTER/MM_UNREGISTER/MM_
+                    // QUERY_VICTIM/MM_QUERY_TOTAL_RESIDENT call.
+                    unsafe { core::ptr::addr_of_mut!(G_MM_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::MM_REGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by MM_DEMO_START, before
+            // any MM_REGISTER call.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP).read() };
+            return match kernel_arch_glue::mm_register_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_REGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_register_result());
+        }
+        sys::MM_UNREGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP).read() };
+            return match kernel_arch_glue::mm_unregister_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_UNREGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_unregister_result());
+        }
+        sys::MM_QUERY_VICTIM => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP).read() };
+            return match kernel_arch_glue::mm_query_victim_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_VICTIM_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_victim_result());
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP).read() };
+            return match kernel_arch_glue::mm_query_total_resident_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();

@@ -173,6 +173,12 @@ xbuild-subsystem-netstack-riscv64 = "build -p netstack --bin netstack-bin --targ
 xbuild-subsystem-compositor-x86_64  = "build -p compositor --bin compositor-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-compositor-aarch64 = "build -p compositor --bin compositor-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-compositor-riscv64 = "build -p compositor --bin compositor-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the memory-policy service's own separately-built ELF
+# (03-Kernel-Subsystems-Layer.md §2.5) — another real IPC SERVER (like
+# fs-native/compositor).
+xbuild-subsystem-mm-service-x86_64  = "build -p mm-service --bin mm-service-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-mm-service-aarch64 = "build -p mm-service --bin mm-service-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-mm-service-riscv64 = "build -p mm-service --bin mm-service-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)

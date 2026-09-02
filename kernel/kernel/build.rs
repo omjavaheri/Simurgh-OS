@@ -203,4 +203,30 @@ fn main() {
         "cargo:rustc-env=COMPOSITOR_ELF_PATH={}",
         compositor_path.canonicalize().unwrap().display()
     );
+
+    // Same as above, for `mm-service-bin` (03-Kernel-Subsystems-Layer.md
+    // §2.5) — the seventh real subsystem process, and a real IPC SERVER
+    // (like fs-native/compositor-bin), not a client (unlike netstack-bin).
+    let mm_service_build_alias = format!("cargo xbuild-subsystem-mm-service-{target_arch}");
+    let mm_service_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("mm-service-bin");
+
+    if !mm_service_path.exists() {
+        panic!(
+            "kernel build.rs: mm-service-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {mm_service_build_alias}",
+            mm_service_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", mm_service_path.display());
+    println!(
+        "cargo:rustc-env=MM_SERVICE_ELF_PATH={}",
+        mm_service_path.canonicalize().unwrap().display()
+    );
 }

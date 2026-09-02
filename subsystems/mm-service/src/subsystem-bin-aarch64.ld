@@ -1,0 +1,43 @@
+/* ============================================================================
+ * subsystem-bin-aarch64.ld
+ *
+ * Identical to `compositor`'s own `subsystem-bin-aarch64.ld` — same base
+ * address (0x80000000, GiB 2), same rationale, same reason it's copied
+ * rather than shared (see `subsystem-bin-riscv64.ld`'s own doc comment
+ * in THIS crate for the full picture).
+ * ============================================================================ */
+
+ENTRY(_start)
+
+SECTIONS
+{
+    . = 0x80000000;
+
+    .text : ALIGN(4K)
+    {
+        *(.text .text.*)
+    }
+
+    .rodata : ALIGN(4K)
+    {
+        *(.rodata .rodata.*)
+    }
+
+    .data : ALIGN(4K)
+    {
+        *(.data .data.*)
+    }
+
+    .bss : ALIGN(4K)
+    {
+        *(.bss .bss.*)
+        *(COMMON)
+    }
+
+    /DISCARD/ :
+    {
+        *(.comment)
+        *(.eh_frame)
+        *(.note.*)
+    }
+}
