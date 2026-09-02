@@ -489,19 +489,21 @@ impl KernelState {
         // range (on QEMU virt there is one big RAM region), so those
         // sub-ranges are carved OUT and only the remaining fragments
         // become `UntypedMemory` (§3 / `BootInfo::overlaps_*`).
+        // RISC-V's OpenSBI firmware (PMP-protected against S/U access —
+        // handing it out as `UntypedMemory` would produce access faults
+        // the moment anything touched it) no longer needs a blanket
+        // "everything below the kernel image" hole here: `hal-riscv64`'s
+        // `Memory::from_device_tree` now classifies that low sub-range
+        // as `MemoryRegionKindRaw::Reserved` directly in the manifest
+        // (`hal-riscv64/src/memory.rs`'s `split_reserved_prefix`), so the
+        // `region.kind != Usable` check below already excludes it — the
+        // more precise place for a firmware exclusion to live than a
+        // second, architecture-motivated carve at this layer. UEFI
+        // targets (x86_64/aarch64) never needed this hole at all (their
+        // memory maps already classify firmware regions on their own).
         let holes = [
             (boot.kernel_image_phys_start, boot.kernel_image_phys_end),
             (boot.boot_reserved_phys_start, boot.boot_reserved_phys_end),
-            // Everything below where the kernel image was loaded: on
-            // RISC-V/QEMU this is the OpenSBI firmware, which is PMP-
-            // protected against S/U access — handing it out as
-            // `UntypedMemory` produces access faults the moment anything
-            // touches it. On UEFI targets this conservatively drops a
-            // few MiB of low RAM, which is acceptable for the MVP.
-            // TODO(omid): have the HAL memory discovery classify the
-            // firmware region as `Reserved` so this blanket hole is
-            // unnecessary.
-            (0, boot.kernel_image_phys_start),
         ];
         let page = kernel_mm::PAGE_SIZE as u64;
         let manifest = &boot.hardware_manifest;
