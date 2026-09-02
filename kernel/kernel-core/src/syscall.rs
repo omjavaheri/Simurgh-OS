@@ -363,8 +363,15 @@ impl KernelState {
                     CapabilityRights::REVOKE,
                 )?;
                 let cs_id = self.caller_cap_space(caller)?;
-                let cs = self.cap_space_mut(cs_id).ok_or(SyscallError::NoCaller)?;
-                let freed = cs.revoke(cap)?;
+                // Cross-space: `cap`'s subtree may include capabilities a
+                // `CapGrant` moved into OTHER capability spaces, so this
+                // must scan every table, not just the caller's own
+                // (kernel_cap::cdt::revoke_cross_space's whole reason to
+                // exist over the single-table walk it replaced).
+                let freed = kernel_cap::cdt::revoke_cross_space(
+                    self.cap_spaces_mut(),
+                    kernel_cap::GlobalCapId::new(cs_id, cap),
+                )?;
                 Ok(SyscallReturn::Revoked { freed })
             }
 
@@ -538,18 +545,19 @@ impl KernelState {
         let _src = self.resolve(caller, cap, self.cap_kind_of(caller, cap)?, CapabilityRights::GRANT)?;
 
         let src_cs = self.caller_cap_space(caller)?;
-        // Derive a narrowed child in the caller's space, then move it out.
-        let child = {
-            let cs = self.cap_space_mut(src_cs).ok_or(SyscallError::NoCaller)?;
-            cs.derive_child(cap, rights, 0)?
-        };
-        let moved = {
-            let cs = self.cap_space_mut(src_cs).ok_or(SyscallError::NoCaller)?;
-            cs.take(child)?
-        };
+        // Derive the narrowed child directly into the destination space's
+        // table. This is a real CDT edge, not a copy-then-move: `cap`
+        // itself is left untouched in `src_cs`, and the new slot's parent
+        // link points back at it, so a later `CapRevoke` on `cap` (or any
+        // of its ancestors) reaches this grant even though it now lives in
+        // a different capability space (kernel_cap::cdt::
+        // derive_child_cross_space's whole reason to exist over the MVP's
+        // earlier derive-then-take-then-insert_root sequence).
         let dst_slot = {
-            let cs = self.cap_space_mut(dst_cs).ok_or(SyscallError::BadCap)?;
-            cs.insert_root(moved)?
+            let (src, dst) = self
+                .cap_space_pair_mut(src_cs, dst_cs)
+                .ok_or(SyscallError::BadCap)?;
+            kernel_cap::cdt::derive_child_cross_space(src, src_cs, cap, dst, rights, 0)?
         };
         Ok(SyscallReturn::Granted { dst: dst_slot })
     }

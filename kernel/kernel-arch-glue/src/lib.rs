@@ -1957,18 +1957,20 @@ unsafe fn read_shared_fs_message() -> SmallMessage {
     }
 }
 
-/// Copies `cap` (from `src_cs`) into `dst_cs`, narrowed to `rights` —
-/// the SAME derive-then-move sequence `kernel_core::syscall::do_cap_grant`
-/// uses for the real, capability-gated `SyscallOp::CapGrant`, just
-/// called directly on `CapSpaceId`s this trusted glue code already
-/// holds rather than through a `target_thread: CapId` lookup (which
-/// would require the caller to ALREADY hold a `ThreadControlBlock`
-/// capability for the destination — something `spawn_process`/
-/// `spawn_process_from_elf` deliberately do not hand out, matching
-/// every other kernel-arch-glue bootstrap helper's own "trusted glue,
-/// not a real syscall" precedent). `cap` itself is left untouched in
-/// `src_cs` — only the freshly `derive_child`'d COPY is moved out, so
-/// the caller keeps its own capability to the same underlying object.
+/// Derives `cap` (from `src_cs`) directly into `dst_cs`, narrowed to
+/// `rights` — the SAME cross-space CDT derivation
+/// `kernel_core::syscall::do_cap_grant` uses for the real,
+/// capability-gated `SyscallOp::CapGrant`, just called directly on
+/// `CapSpaceId`s this trusted glue code already holds rather than
+/// through a `target_thread: CapId` lookup (which would require the
+/// caller to ALREADY hold a `ThreadControlBlock` capability for the
+/// destination — something `spawn_process`/`spawn_process_from_elf`
+/// deliberately do not hand out, matching every other kernel-arch-glue
+/// bootstrap helper's own "trusted glue, not a real syscall" precedent).
+/// `cap` itself is left untouched in `src_cs`, and the new slot's CDT
+/// parent link points back at it, so a later `CapRevoke` on `cap` (in
+/// `src_cs`) reaches and frees this grant too, even though it lives in
+/// `dst_cs` (`kernel_cap::cdt::derive_child_cross_space`).
 fn grant_cap_into(
     state: &mut KernelState,
     src_cs: kernel_cap::CapSpaceId,
@@ -1976,9 +1978,8 @@ fn grant_cap_into(
     dst_cs: kernel_cap::CapSpaceId,
     rights: CapabilityRights,
 ) -> Option<CapId> {
-    let child = state.cap_space_mut(src_cs)?.derive_child(cap, rights, 0).ok()?;
-    let moved = state.cap_space_mut(src_cs)?.take(child).ok()?;
-    state.cap_space_mut(dst_cs)?.insert_root(moved).ok()
+    let (src, dst) = state.cap_space_pair_mut(src_cs, dst_cs)?;
+    kernel_cap::cdt::derive_child_cross_space(src, src_cs, cap, dst, rights, 0).ok()
 }
 
 /// VA fs-native's own process maps the shared fs page at — an address no

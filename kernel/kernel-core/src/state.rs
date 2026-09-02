@@ -163,8 +163,9 @@ impl KernelState {
     /// Allocates a fresh (empty) `CapabilitySpace`, returning its id.
     pub fn alloc_cap_space(&mut self) -> Option<CapSpaceId> {
         let i = self.cap_spaces.iter().position(|s| s.is_none())?;
-        self.cap_spaces[i] = Some(CapTable::new());
-        Some(CapSpaceId::new(i as u32))
+        let id = CapSpaceId::new(i as u32);
+        self.cap_spaces[i] = Some(CapTable::new(id));
+        Some(id)
     }
 
     /// Allocates an address space (`PageTable` root) rooted at
@@ -272,6 +273,43 @@ impl KernelState {
     /// Borrows a capability space mutably.
     pub fn cap_space_mut(&mut self, id: CapSpaceId) -> Option<&mut RootCapTable> {
         self.cap_spaces.get_mut(id.as_usize()).and_then(|s| s.as_mut())
+    }
+
+    /// Borrows `src` (read-only) and `dst` (mutably) at the same time —
+    /// needed by `kernel_cap::cdt::derive_child_cross_space`, whose
+    /// signature takes exactly that shape. `None` if `src == dst` (granting
+    /// a capability into your own space is not a supported operation — and
+    /// would alias the same table as both `&` and `&mut`), either id is out
+    /// of range, or either space is unallocated.
+    pub fn cap_space_pair_mut(
+        &mut self,
+        src: CapSpaceId,
+        dst: CapSpaceId,
+    ) -> Option<(&RootCapTable, &mut RootCapTable)> {
+        let si = src.as_usize();
+        let di = dst.as_usize();
+        if si == di || si >= self.cap_spaces.len() || di >= self.cap_spaces.len() {
+            return None;
+        }
+        // Split the backing array at the larger index so `src` and `dst`
+        // land in disjoint halves the borrow checker can see are
+        // non-overlapping, then re-borrow whichever half holds `src` as
+        // shared and the one holding `dst` as exclusive.
+        if si < di {
+            let (left, right) = self.cap_spaces.split_at_mut(di);
+            Some((left[si].as_ref()?, right[0].as_mut()?))
+        } else {
+            let (left, right) = self.cap_spaces.split_at_mut(si);
+            Some((right[0].as_ref()?, left[di].as_mut()?))
+        }
+    }
+
+    /// Borrows every capability space at once — needed by
+    /// `kernel_cap::cdt::revoke_cross_space`, which must be able to reach
+    /// into any table a `CapGrant` may have placed a descendant in, not
+    /// just the revoke target's own space.
+    pub fn cap_spaces_mut(&mut self) -> &mut [Option<RootCapTable>; MAX_CAP_SPACES] {
+        &mut self.cap_spaces
     }
 
     /// Borrows an `UntypedMemory` object mutably.

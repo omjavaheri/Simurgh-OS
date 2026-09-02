@@ -14,10 +14,13 @@
 //! `kernel-arch-glue` (scheduler quantum). Tuning these is a
 //! configuration change, not an interface change.
 //!
-// TODO(omid): `KernelState` sized from these constants is ~0.5 MB and is
-// currently returned by value from `from_boot_info`. Before running the
-// real kernel on a constrained boot stack it should be placed in a `static`
-// (via `MaybeUninit` + a one-time init), not moved through a stack frame.
+//! `KernelState` sized from these constants is ~0.25-0.5 MB — too large
+//! for the real kernel's own 64 KiB boot stack to build by value.
+//! Resolved: `KernelState::init_global` builds it in a `.bss` `static`
+//! (zero-initialized at compile time, never moved through a stack
+//! frame) and is the ONLY constructor the bare-metal boot path uses;
+//! `from_boot_info`'s own by-value constructor stays as the host-test
+//! convenience path, where a stack frame this size is unremarkable.
 //! ============================================================================
 
 /// Saved-register-context width, in bytes. Matches every architecture
@@ -35,9 +38,10 @@ const _: () = assert!(CONTEXT_BYTES == hal_core::HAL_CONTEXT_BYTES);
 /// Maximum thread control blocks. Also the `NT` bound of the scheduler
 /// entity table; a `ThreadId` is an index `< MAX_THREADS`.
 ///
-/// Kept modest for the MVP so the whole `KernelState` is ~0.25 MB and
-/// safe to build on a constrained stack (see the module TODO); raise it
-/// once `KernelState` lives in a `static`.
+/// Kept modest for the MVP so the whole `KernelState` stays a manageable
+/// size (see the module doc comment on why that matters — resolved by
+/// `KernelState::init_global`'s own `.bss` static, but still worth
+/// keeping in check as new fixed-capacity tables are added).
 pub const MAX_THREADS: usize = 96;
 
 /// Maximum concurrent synchronous-IPC chain groups (02-Microkernel-Layer.md §4.3).
