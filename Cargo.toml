@@ -30,6 +30,7 @@ members = [
     "subsystems/vfs-service/vfs-router",
     "subsystems/vfs-service/fs-native",
     "subsystems/netstack",
+    "subsystems/compositor",
     "subsystems/mm-service",
     "kernel-stub",
     "uefi-bootloader",

@@ -1,0 +1,43 @@
+# ============================================================================
+# compositor  (03-Kernel-Subsystems-Layer.md §2.4)
+#
+# Simurgh's Compositor Service — the shared UI infrastructure every
+# Window Manager/DE (layer 5) sits on top of (§2.4: a native, capability-
+# aware display protocol, deliberately not Wayland-derived).
+#
+# MVP: tracks surfaces and accepts committed frames over real IPC,
+# proving zero-copy end to end (§5.4.2) — headless/file output is
+# explicitly allowed for the MVP; no real GPU-backed scanout yet.
+#
+# `#![no_std] + alloc`. `rlib`.
+#
+# The REAL, separately-built process image (see src/bin/compositor-bin.rs's
+# own doc comment) — "subsystems as processes" packaging, mirroring
+# fs-native's own `fs-native-bin` exactly.
+# ============================================================================
+[package]
+name        = "compositor"
+description = "Simurgh Compositor Service (03-Kernel-Subsystems-Layer.md §2.4) — MVP surface-tracking form"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "compositor-bin"
+path = "src/bin/compositor-bin.rs"
+# Same reasoning as fs-native-bin's own `[[bin]]`: a host `cargo test`
+# harness would pull in `std` and collide on `panic_impl`.
+test = false
+
+[dependencies]
+ipc-protocol = { path = "../../ipc-protocol" }
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly (not re-exported by `ipc-protocol` — its own codec module
+# takes/returns it by reference to `kernel_ipc` types).
+kernel-ipc   = { path = "../../kernel/kernel-ipc" }

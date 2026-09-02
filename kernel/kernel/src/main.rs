@@ -148,6 +148,12 @@ static DRIVER_VIRTIO_NET_ELF: &[u8] = include_bytes!(env!("DRIVER_VIRTIO_NET_ELF
 /// the full picture.
 static NETSTACK_ELF: &[u8] = include_bytes!(env!("NETSTACK_ELF_PATH"));
 
+/// `compositor-bin`'s own separately-built ELF image — same packaging as
+/// `DEVICE_MANAGER_ELF` (see its own doc comment), the sixth real
+/// subsystem process (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2), and a
+/// real IPC SERVER (like fs-native), not a client (unlike Netstack).
+static COMPOSITOR_ELF: &[u8] = include_bytes!(env!("COMPOSITOR_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -576,6 +582,47 @@ mod sys {
     /// must stop polling once it sees one, not call this again
     /// afterward).
     pub const NET_STATUS_POLL: usize = 66;
+
+    // -- Compositor: the REAL DisplayRequest/DisplayResponse wire
+    //    protocol over the REAL Call/Recv/Reply mechanism above
+    //    (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2) — same "`.user_text`
+    //    passes only plain integers, the real `ipc_protocol` encoding
+    //    happens kernel-side" shape as fs-native's own block above; a
+    //    real IPC SERVER (like fs-native), not a client (unlike
+    //    Netstack). --
+
+    /// No arguments. Spawns Compositor as a genuinely isolated process
+    /// (own address + capability space, own separately-built ELF) and
+    /// grants it an Endpoint plus the frame-buffer/confirm regions
+    /// (`kernel_arch_glue::compositor_demo_start`'s own doc comment).
+    /// Returns the endpoint's capability slot in the CALLER's own
+    /// capability space, or `usize::MAX` on any spawn failure.
+    pub const COMPOSITOR_DEMO_START: usize = 67;
+    /// `a0` = the endpoint slot `COMPOSITOR_DEMO_START` returned. Builds
+    /// a REAL `DisplayRequest::CreateSurface` — always blocks until
+    /// Compositor replies.
+    pub const COMPOSITOR_CREATE_SURFACE: usize = 68;
+    /// No arguments. Returns the REAL new surface handle in `a0`, or
+    /// `usize::MAX` on any error.
+    pub const COMPOSITOR_CREATE_SURFACE_RESULT: usize = 69;
+    /// `a0` = the endpoint slot, `a1` = a surface handle
+    /// `COMPOSITOR_CREATE_SURFACE_RESULT` returned. Writes a fixed MVP
+    /// test frame (`kernel_arch_glue::COMPOSITOR_DEMO_FRAME`, a 2x2
+    /// packed-BGRA8 sentinel) into the shared frame buffer, then builds a
+    /// REAL `DisplayRequest::CommitBuffer` naming it.
+    pub const COMPOSITOR_COMMIT_BUFFER: usize = 70;
+    /// No arguments. Returns `1` in `a0` for a real `Committed` AND a
+    /// byte-for-byte confirm-region match proving Compositor genuinely
+    /// dereferenced the shared frame buffer (zero-copy — see `kernel_
+    /// arch_glue::compositor_commit_verify`'s own doc comment), `0`
+    /// otherwise (logs the exact verdict either way).
+    pub const COMPOSITOR_COMMIT_VERIFY: usize = 71;
+    /// `a0` = the endpoint slot, `a1` = a surface handle. Builds a REAL
+    /// `DisplayRequest::DestroySurface`.
+    pub const COMPOSITOR_DESTROY_SURFACE: usize = 72;
+    /// No arguments. Returns `1` in `a0` for a real `Destroyed`, `0`
+    /// otherwise.
+    pub const COMPOSITOR_DESTROY_RESULT: usize = 73;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -697,6 +744,14 @@ static mut G_IPC_EP: u32 = 0;
 #[cfg(target_arch = "riscv64")]
 static mut G_FS_EP: u32 = 0;
 
+/// Compositor's own endpoint capability slot IN THE CALLER's (root's)
+/// own capability space, set once by `COMPOSITOR_DEMO_START`'s handler
+/// and read by every later `COMPOSITOR_CREATE_SURFACE`/`COMPOSITOR_
+/// COMMIT_BUFFER`/`COMPOSITOR_DESTROY_SURFACE` handler — same role as
+/// `G_FS_EP`.
+#[cfg(target_arch = "riscv64")]
+static mut G_COMPOSITOR_EP: u32 = 0;
+
 /// The virtio-blk driver's endpoint capability slot IN THE CALLER's
 /// (root's) own capability space, set once by `DRV_BLK_DEMO_START`'s
 /// handler and read by every later `DRV_BLK_PROBE`/`DRV_BLK_WRITE`/
@@ -770,6 +825,46 @@ fn net_demo_riscv64() {
                     }
                 }
                 raw_syscall(sys::REPORT, verdict, zero!());
+            }
+        }
+    }
+}
+
+/// The Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2):
+/// spawns the real Compositor process, creates a surface, commits a
+/// fixed test frame (proving Compositor genuinely dereferenced the
+/// shared frame buffer — `kernel_arch_glue::compositor_commit_verify`'s
+/// own doc comment), then destroys the surface. A SEPARATE `#[link_
+/// section = ".user_text"]` `#[inline(never)]` function, called once
+/// from `umode_root` — same "a call between two `.user_text` functions
+/// is safe" reasoning `net_demo_riscv64`'s own doc comment gives.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn compositor_demo_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall(sys::COMPOSITOR_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall(sys::COMPOSITOR_CREATE_SURFACE, zero!(), zero!());
+            let surface = raw_syscall(sys::COMPOSITOR_CREATE_SURFACE_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, surface, zero!());
+            if surface != usize::MAX {
+                raw_syscall(sys::COMPOSITOR_COMMIT_BUFFER, surface, zero!());
+                let committed = raw_syscall(sys::COMPOSITOR_COMMIT_VERIFY, zero!(), zero!());
+                raw_syscall(sys::REPORT, committed, zero!());
+                raw_syscall(sys::COMPOSITOR_DESTROY_SURFACE, surface, zero!());
+                let destroyed = raw_syscall(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
+                raw_syscall(sys::REPORT, destroyed, zero!());
             }
         }
     }
@@ -967,6 +1062,10 @@ extern "C" fn umode_root() -> ! {
         // why it is a SEPARATE `.user_text` function rather than inlined
         // here.
         net_demo_riscv64();
+
+        // 7d. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
+        // — see `compositor_demo_riscv64`'s own doc comment.
+        compositor_demo_riscv64();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
@@ -1247,6 +1346,10 @@ static mut G_IPC_EP_X86: u32 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut G_FS_EP_X86: u32 = 0;
 
+/// See the riscv64 `G_COMPOSITOR_EP`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+static mut G_COMPOSITOR_EP_X86: u32 = 0;
+
 /// The virtio-blk driver's endpoint capability slot in the caller's
 /// (root's) own capability space — mirrors riscv64's own `G_DRV_EP`
 /// exactly (see that static's own doc comment).
@@ -1294,6 +1397,39 @@ fn net_demo_x86() {
                     }
                 }
                 raw_syscall_x86(sys::REPORT, verdict, zero!());
+            }
+        }
+    }
+}
+
+/// See the riscv64 `compositor_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn compositor_demo_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall_x86(sys::COMPOSITOR_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall_x86(sys::COMPOSITOR_CREATE_SURFACE, zero!(), zero!());
+            let surface = raw_syscall_x86(sys::COMPOSITOR_CREATE_SURFACE_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, surface, zero!());
+            if surface != usize::MAX {
+                raw_syscall_x86(sys::COMPOSITOR_COMMIT_BUFFER, surface, zero!());
+                let committed = raw_syscall_x86(sys::COMPOSITOR_COMMIT_VERIFY, zero!(), zero!());
+                raw_syscall_x86(sys::REPORT, committed, zero!());
+                raw_syscall_x86(sys::COMPOSITOR_DESTROY_SURFACE, surface, zero!());
+                let destroyed = raw_syscall_x86(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
+                raw_syscall_x86(sys::REPORT, destroyed, zero!());
             }
         }
     }
@@ -1426,6 +1562,10 @@ extern "C" fn umode_root_x86() -> ! {
         // it is a SEPARATE `.user_text` function rather than inlined
         // here (mirrors riscv64's own `net_demo_riscv64` call site).
         net_demo_x86();
+
+        // 7e. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
+        // — see `compositor_demo_x86`'s own doc comment.
+        compositor_demo_x86();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the LAPIC timer, then loop forever bumping
@@ -1957,6 +2097,60 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::NET_STATUS_POLL => {
             return TrapOutcome::Resume(kernel_arch_glue::netstack_status());
         }
+        sys::COMPOSITOR_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::compositor_demo_start(hal, caller, COMPOSITOR_ELF, elf_loader::machine::EM_X86_64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_COMPOSITOR_EP_X86, before any later COMPOSITOR_
+                    // CREATE_SURFACE/COMMIT_BUFFER/DESTROY_SURFACE call.
+                    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by COMPOSITOR_DEMO_START,
+            // before any COMPOSITOR_CREATE_SURFACE call.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_X86).read() };
+            return match kernel_arch_glue::compositor_create_surface_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_create_surface_result());
+        }
+        sys::COMPOSITOR_COMMIT_BUFFER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_X86).read() };
+            return match kernel_arch_glue::compositor_commit_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_COMMIT_VERIFY => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_commit_verify());
+        }
+        sys::COMPOSITOR_DESTROY_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_X86).read() };
+            return match kernel_arch_glue::compositor_destroy_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_DESTROY_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -2300,6 +2494,10 @@ static mut G_IPC_EP_AARCH64: u32 = 0;
 #[cfg(target_arch = "aarch64")]
 static mut G_FS_EP_AARCH64: u32 = 0;
 
+/// See the riscv64 `G_COMPOSITOR_EP`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+static mut G_COMPOSITOR_EP_AARCH64: u32 = 0;
+
 /// The virtio-blk driver's endpoint capability slot in the caller's
 /// (root's) own capability space — mirrors riscv64's own `G_DRV_EP`
 /// exactly (see that static's own doc comment).
@@ -2347,6 +2545,39 @@ fn net_demo_aarch64() {
                     }
                 }
                 raw_syscall_aarch64(sys::REPORT, verdict, zero!());
+            }
+        }
+    }
+}
+
+/// See the riscv64 `compositor_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn compositor_demo_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall_aarch64(sys::COMPOSITOR_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall_aarch64(sys::COMPOSITOR_CREATE_SURFACE, zero!(), zero!());
+            let surface = raw_syscall_aarch64(sys::COMPOSITOR_CREATE_SURFACE_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, surface, zero!());
+            if surface != usize::MAX {
+                raw_syscall_aarch64(sys::COMPOSITOR_COMMIT_BUFFER, surface, zero!());
+                let committed = raw_syscall_aarch64(sys::COMPOSITOR_COMMIT_VERIFY, zero!(), zero!());
+                raw_syscall_aarch64(sys::REPORT, committed, zero!());
+                raw_syscall_aarch64(sys::COMPOSITOR_DESTROY_SURFACE, surface, zero!());
+                let destroyed = raw_syscall_aarch64(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
+                raw_syscall_aarch64(sys::REPORT, destroyed, zero!());
             }
         }
     }
@@ -2476,6 +2707,10 @@ extern "C" fn umode_root_aarch64() -> ! {
         // why it is a SEPARATE `.user_text` function rather than inlined
         // here (mirrors riscv64's own `net_demo_riscv64` call site).
         net_demo_aarch64();
+
+        // 7e. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
+        // — see `compositor_demo_aarch64`'s own doc comment.
+        compositor_demo_aarch64();
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the timer PPI, then loop forever bumping this
@@ -2963,6 +3198,61 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::NET_STATUS_POLL => {
             return TrapOutcome::Resume(kernel_arch_glue::netstack_status());
+        }
+        sys::COMPOSITOR_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::compositor_demo_start(hal, caller, COMPOSITOR_ELF, elf_loader::machine::EM_AARCH64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_COMPOSITOR_EP_AARCH64, before any later
+                    // COMPOSITOR_CREATE_SURFACE/COMMIT_BUFFER/DESTROY_
+                    // SURFACE call.
+                    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by COMPOSITOR_DEMO_START,
+            // before any COMPOSITOR_CREATE_SURFACE call.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_AARCH64).read() };
+            return match kernel_arch_glue::compositor_create_surface_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_create_surface_result());
+        }
+        sys::COMPOSITOR_COMMIT_BUFFER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_AARCH64).read() };
+            return match kernel_arch_glue::compositor_commit_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_COMMIT_VERIFY => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_commit_verify());
+        }
+        sys::COMPOSITOR_DESTROY_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_AARCH64).read() };
+            return match kernel_arch_glue::compositor_destroy_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_DESTROY_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
@@ -3751,6 +4041,60 @@ fn simurgh_syscall(
         }
         sys::NET_STATUS_POLL => {
             return TrapOutcome::Resume(kernel_arch_glue::netstack_status());
+        }
+        sys::COMPOSITOR_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::compositor_demo_start(hal, caller, COMPOSITOR_ELF, elf_loader::machine::EM_RISCV) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_COMPOSITOR_EP, before any later COMPOSITOR_
+                    // CREATE_SURFACE/COMMIT_BUFFER/DESTROY_SURFACE call.
+                    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by COMPOSITOR_DEMO_START,
+            // before any COMPOSITOR_CREATE_SURFACE call.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP).read() };
+            return match kernel_arch_glue::compositor_create_surface_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_create_surface_result());
+        }
+        sys::COMPOSITOR_COMMIT_BUFFER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP).read() };
+            return match kernel_arch_glue::compositor_commit_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_COMMIT_VERIFY => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_commit_verify());
+        }
+        sys::COMPOSITOR_DESTROY_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP).read() };
+            return match kernel_arch_glue::compositor_destroy_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_DESTROY_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();

@@ -24,6 +24,7 @@
 //! panics.
 //! ============================================================================
 
+use crate::display::{DisplayErrorCode, DisplayRequest, DisplayResponse, SurfaceHandle};
 use crate::driver::{DriverErrorCode, DriverRequest, DriverResponse};
 use crate::fs::{FileHandle, FsErrorCode, FsRequest, FsResponse, OpenFlags, PathId};
 use crate::{label_parts, Namespace, PROTOCOL_VERSION};
@@ -449,6 +450,186 @@ pub fn decode_driver_response(msg: &SmallMessage) -> Result<DriverResponse, Deco
     }
 }
 
+// DisplayRequest opcodes (low byte of the label).
+const OP_DP_CREATE_SURFACE: u8 = 1;
+const OP_DP_COMMIT_BUFFER: u8 = 2;
+const OP_DP_DESTROY_SURFACE: u8 = 3;
+const OP_DP_SUBSCRIBE_INPUT: u8 = 4;
+const OP_DP_QUERY_OUTPUTS: u8 = 5;
+
+/// Encodes a `DisplayRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `CreateSurface`, `SubscribeInput`, `QueryOutputs`: `[]`
+/// - `CommitBuffer`: `[surface, buffer_cap, width, height]`
+/// - `DestroySurface`: `[surface]`
+pub fn encode_display_request(req: &DisplayRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 4]) = match *req {
+        DisplayRequest::CreateSurface => (OP_DP_CREATE_SURFACE, [0, 0, 0, 0]),
+        DisplayRequest::CommitBuffer {
+            surface,
+            buffer_cap,
+            width,
+            height,
+        } => (
+            OP_DP_COMMIT_BUFFER,
+            [surface.0 as u64, buffer_cap as u64, width as u64, height as u64],
+        ),
+        DisplayRequest::DestroySurface { surface } => (OP_DP_DESTROY_SURFACE, [surface.0 as u64, 0, 0, 0]),
+        DisplayRequest::SubscribeInput => (OP_DP_SUBSCRIBE_INPUT, [0, 0, 0, 0]),
+        DisplayRequest::QueryOutputs => (OP_DP_QUERY_OUTPUTS, [0, 0, 0, 0]),
+    };
+    let n = match op {
+        OP_DP_COMMIT_BUFFER => 4,
+        OP_DP_DESTROY_SURFACE => 1,
+        _ => 0,
+    };
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Display.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Display.label(op)))
+}
+
+/// Decodes a `DisplayRequest` from a `SmallMessage`.
+pub fn decode_display_request(msg: &SmallMessage) -> Result<DisplayRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Display) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_DP_CREATE_SURFACE => Ok(DisplayRequest::CreateSurface),
+        OP_DP_COMMIT_BUFFER => {
+            need(4)?;
+            Ok(DisplayRequest::CommitBuffer {
+                surface: SurfaceHandle(w[0] as u32),
+                buffer_cap: w[1] as u32,
+                width: w[2] as u32,
+                height: w[3] as u32,
+            })
+        }
+        OP_DP_DESTROY_SURFACE => {
+            need(1)?;
+            Ok(DisplayRequest::DestroySurface {
+                surface: SurfaceHandle(w[0] as u32),
+            })
+        }
+        OP_DP_SUBSCRIBE_INPUT => Ok(DisplayRequest::SubscribeInput),
+        OP_DP_QUERY_OUTPUTS => Ok(DisplayRequest::QueryOutputs),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// DisplayResponse opcodes — a separate small sequence from the request
+// opcodes above, same "kept sequential-and-distinct for readability"
+// convention every other namespace here already follows.
+const OP_DPR_SURFACE_CREATED: u8 = 1;
+const OP_DPR_COMMITTED: u8 = 2;
+const OP_DPR_DESTROYED: u8 = 3;
+const OP_DPR_INPUT_SUBSCRIBED: u8 = 4;
+const OP_DPR_OUTPUT_TOPOLOGY: u8 = 5;
+const OP_DPR_ERROR: u8 = 6;
+
+/// Encodes a `DisplayResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `SurfaceCreated`: `[surface]`
+/// - `Committed`, `Destroyed`, `InputSubscribed`: `[]`
+/// - `OutputTopology`: `[output_count, primary_width, primary_height, primary_refresh_mhz]`
+/// - `Error`: `[code]`
+pub fn encode_display_response(resp: &DisplayResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 4]) = match *resp {
+        DisplayResponse::SurfaceCreated { surface } => (OP_DPR_SURFACE_CREATED, [surface.0 as u64, 0, 0, 0]),
+        DisplayResponse::Committed => (OP_DPR_COMMITTED, [0, 0, 0, 0]),
+        DisplayResponse::Destroyed => (OP_DPR_DESTROYED, [0, 0, 0, 0]),
+        DisplayResponse::InputSubscribed => (OP_DPR_INPUT_SUBSCRIBED, [0, 0, 0, 0]),
+        DisplayResponse::OutputTopology {
+            output_count,
+            primary_width,
+            primary_height,
+            primary_refresh_mhz,
+        } => (
+            OP_DPR_OUTPUT_TOPOLOGY,
+            [
+                output_count as u64,
+                primary_width as u64,
+                primary_height as u64,
+                primary_refresh_mhz as u64,
+            ],
+        ),
+        DisplayResponse::Error { code } => (OP_DPR_ERROR, [code as u64, 0, 0, 0]),
+    };
+    let n = match op {
+        OP_DPR_OUTPUT_TOPOLOGY => 4,
+        OP_DPR_SURFACE_CREATED | OP_DPR_ERROR => 1,
+        _ => 0,
+    };
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Display.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Display.label(op)))
+}
+
+/// Decodes a `DisplayResponse` from a `SmallMessage`.
+pub fn decode_display_response(msg: &SmallMessage) -> Result<DisplayResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Display) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_DPR_SURFACE_CREATED => {
+            need(1)?;
+            Ok(DisplayResponse::SurfaceCreated {
+                surface: SurfaceHandle(w[0] as u32),
+            })
+        }
+        OP_DPR_COMMITTED => Ok(DisplayResponse::Committed),
+        OP_DPR_DESTROYED => Ok(DisplayResponse::Destroyed),
+        OP_DPR_INPUT_SUBSCRIBED => Ok(DisplayResponse::InputSubscribed),
+        OP_DPR_OUTPUT_TOPOLOGY => {
+            need(4)?;
+            Ok(DisplayResponse::OutputTopology {
+                output_count: w[0] as u32,
+                primary_width: w[1] as u32,
+                primary_height: w[2] as u32,
+                primary_refresh_mhz: w[3] as u32,
+            })
+        }
+        OP_DPR_ERROR => {
+            need(1)?;
+            let code = match w[0] {
+                1 => DisplayErrorCode::BadSurface,
+                2 => DisplayErrorCode::BadBuffer,
+                3 => DisplayErrorCode::Unsupported,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(DisplayResponse::Error { code })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +790,74 @@ mod tests {
     fn driver_response_bad_field_is_rejected() {
         let msg = SmallMessage::from_words(Namespace::Driver.label(OP_DRR_FAILED), &[99]).unwrap();
         assert_eq!(decode_driver_response(&msg), Err(DecodeError::BadField));
+    }
+
+    fn display_request_roundtrip(req: DisplayRequest) {
+        let msg = encode_display_request(&req);
+        assert_eq!(decode_display_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_display_request_variants_roundtrip() {
+        display_request_roundtrip(DisplayRequest::CreateSurface);
+        display_request_roundtrip(DisplayRequest::CommitBuffer {
+            surface: SurfaceHandle(2),
+            buffer_cap: 5,
+            width: 1920,
+            height: 1080,
+        });
+        display_request_roundtrip(DisplayRequest::DestroySurface {
+            surface: SurfaceHandle(2),
+        });
+        display_request_roundtrip(DisplayRequest::SubscribeInput);
+        display_request_roundtrip(DisplayRequest::QueryOutputs);
+    }
+
+    fn display_response_roundtrip(resp: DisplayResponse) {
+        let msg = encode_display_response(&resp);
+        assert_eq!(decode_display_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_display_response_variants_roundtrip() {
+        display_response_roundtrip(DisplayResponse::SurfaceCreated {
+            surface: SurfaceHandle(2),
+        });
+        display_response_roundtrip(DisplayResponse::Committed);
+        display_response_roundtrip(DisplayResponse::Destroyed);
+        display_response_roundtrip(DisplayResponse::InputSubscribed);
+        display_response_roundtrip(DisplayResponse::OutputTopology {
+            output_count: 1,
+            primary_width: 1920,
+            primary_height: 1080,
+            primary_refresh_mhz: 60000,
+        });
+        display_response_roundtrip(DisplayResponse::Error {
+            code: DisplayErrorCode::BadBuffer,
+        });
+    }
+
+    #[test]
+    fn display_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_DP_CREATE_SURFACE));
+        assert_eq!(
+            decode_display_request(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn display_response_bad_field_is_rejected() {
+        let msg = SmallMessage::from_words(Namespace::Display.label(OP_DPR_ERROR), &[99]).unwrap();
+        assert_eq!(decode_display_response(&msg), Err(DecodeError::BadField));
+    }
+
+    #[test]
+    fn display_request_truncated_payload_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Display.label(OP_DP_COMMIT_BUFFER));
+        assert_eq!(
+            decode_display_request(&msg),
+            Err(DecodeError::Truncated)
+        );
     }
 }

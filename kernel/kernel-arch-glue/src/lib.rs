@@ -2429,6 +2429,397 @@ pub fn fs_read_result() -> usize {
 }
 
 // ============================================================================
+// compositor: real IPC-driven Compositor Service (03 §2.4/§5.4.2)
+//
+// Mirrors the fs-native section immediately above almost exactly (same
+// "spawn, grant an Endpoint, pre-map shared pages, drive it via a
+// dedicated ecall-per-request-type + shared-message-area protocol,
+// bypass pick_next for the deterministic 2-party shape" pattern — see
+// that section's own doc comments for the parts that repeat verbatim
+// here). The one addition: a THIRD mapped page (`COMPOSITOR_CONFIRM_VA`)
+// compositor's own `subsystem_entry::copy_frame_to_confirm` writes the
+// committed frame's own bytes into after reading them from
+// `COMPOSITOR_FB_VA` — proof (peeked directly here, the SAME "kernel
+// reads via its own identity map and compares" verification style
+// `fs_read_result`'s own doc comment already establishes) that
+// Compositor genuinely dereferenced the shared frame buffer, not just
+// that the round trip completed. §5.4.2's own acceptance bar ("a client
+// creates a surface, commits a buffer, and it is shown zero-copy — even
+// headless/file output is enough for the MVP") is satisfied by this
+// direct physical-memory proof standing in for real GPU scanout
+// hardware, which does not exist in this codebase yet.
+// ============================================================================
+
+/// This process's own thread id, set once by `compositor_demo_start` —
+/// same role as `G_FS_TID`.
+static mut G_COMPOSITOR_TID: Option<ThreadId> = None;
+
+/// Physical address of the page shared between the caller (accessed via
+/// the kernel's own always-present identity map) and Compositor's own
+/// process (mapped into ITS address space at `COMPOSITOR_SHARED_VA` by
+/// `compositor_demo_start`) — same role as `G_FS_SHARED_PHYS`.
+static mut G_COMPOSITOR_SHARED_PHYS: usize = usize::MAX;
+
+/// Physical address of the page shared for the committed frame's own
+/// pixel bytes — same role as `G_FS_DATA_PHYS`.
+static mut G_COMPOSITOR_FB_PHYS: usize = usize::MAX;
+
+/// Physical address of Compositor's own private "confirm" region — see
+/// this section's own module doc comment for why it exists.
+static mut G_COMPOSITOR_CONFIRM_PHYS: usize = usize::MAX;
+
+/// VA Compositor's own process maps the shared message page at — must
+/// stay numerically equal to `compositor::subsystem_entry::SHARED_VA`.
+const COMPOSITOR_SHARED_VA: usize = 0xD840_0000;
+
+/// VA Compositor's own process maps the committed frame buffer at — must
+/// stay numerically equal to `compositor::subsystem_entry::FB_VA`.
+const COMPOSITOR_FB_VA: usize = 0xD850_0000;
+
+/// VA Compositor's own process maps its private confirm region at — must
+/// stay numerically equal to `compositor::subsystem_entry::CONFIRM_VA`.
+const COMPOSITOR_CONFIRM_VA: usize = 0xD860_0000;
+
+/// Fixed MVP test frame — a 2x2 packed-BGRA8 surface (16 bytes), a
+/// recognizable sentinel pattern (not all-zero, so a MISMATCH from an
+/// unmapped/zeroed page is distinguishable from a genuine round-trip
+/// failure) — same "one demo, one hardcoded scenario" convention
+/// `FS_DEMO_WRITE_DATA`'s own doc comment already establishes.
+const COMPOSITOR_DEMO_FRAME: [u8; 16] = [
+    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+];
+/// Frame width, in pixels, for the fixed demo frame above (`2 * 2 * 4 ==
+/// COMPOSITOR_DEMO_FRAME.len()`).
+const COMPOSITOR_DEMO_WIDTH: u32 = 2;
+/// Frame height, in pixels, for the fixed demo frame above.
+const COMPOSITOR_DEMO_HEIGHT: u32 = 2;
+
+/// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
+/// shared compositor page — same convention `write_shared_fs_message`'s
+/// own doc comment documents in full.
+///
+/// # Safety
+/// `G_COMPOSITOR_SHARED_PHYS` must already be a valid, exclusively-owned,
+/// mapped physical frame (`compositor_demo_start` has run).
+unsafe fn write_shared_compositor_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_COMPOSITOR_SHARED_PHYS` only written once
+    // by `compositor_demo_start`, before this can ever be called.
+    let base = unsafe { core::ptr::addr_of!(G_COMPOSITOR_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: forwarded from this function's own contract — low RAM is
+    // always identity-mapped for kernel-mode access regardless of which
+    // process's page table is currently active.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back a `SmallMessage` written by `write_shared_compositor_message`.
+///
+/// # Safety
+/// Same contract as `write_shared_compositor_message`.
+unsafe fn read_shared_compositor_message() -> SmallMessage {
+    // SAFETY: single-core; same contract as `write_shared_compositor_message`.
+    let base = unsafe { core::ptr::addr_of!(G_COMPOSITOR_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// One-time setup: creates the endpoint Compositor and its client
+/// (`caller`, always the Root Task in this MVP) rendezvous on, spawns
+/// Compositor as a genuinely isolated process from its own separately-
+/// built ELF image (`compositor_elf`), grants it the endpoint plus THREE
+/// pre-mapped pages (message, frame buffer, confirm region — this
+/// section's own module doc comment), and switches straight to it — same
+/// "without this, the caller's first Call races a receiver that has
+/// never run" rationale `fs_demo_start`'s own tail comment documents in
+/// full. Returns the endpoint's capability slot in the CALLER's own cap
+/// space plus the `(save, into)` switch pointers the caller wraps in a
+/// `TrapOutcome::SwitchTo`.
+pub fn compositor_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    compositor_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+
+    const COMPOSITOR_STACK_VMA: usize = 0xC050_0000;
+    const COMPOSITOR_STACK_LEN: usize = 4096 * 16;
+    let (comp_tid, comp_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, compositor_elf, expected_machine, COMPOSITOR_STACK_VMA, COMPOSITOR_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any compositor call
+    // (reached only after this function returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_TID).write(Some(comp_tid)) };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, comp_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    let comp_addr_space = k.tcb(comp_tid)?.addr_space;
+    let comp_root_pt = k.addr_space_mut(comp_addr_space)?.root_phys().as_usize();
+
+    // Shared message page (trusted-bootstrap direct map, no SyscallOp
+    // ceremony — same "carve untyped, map_range directly" pattern
+    // `fs_demo_start`'s own identical block already uses).
+    let shared_phys = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+    let shared_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(shared_pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(comp_root_pt, COMPOSITOR_SHARED_VA, shared_phys, 4096, 1 | 2 | 8, shared_pool, 2);
+    if n == u32::MAX {
+        klog!("compositor_demo_start: map_range error (shared page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // compositor call can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_SHARED_PHYS).write(shared_phys) };
+
+    // Frame buffer page — a REAL `SyscallOp::Retype` into `KernelObjectType::
+    // SharedRegion` (the genuine capability object, not a bare untyped
+    // carve like the message page above), matching `fs_demo_start`'s own
+    // identical second-region precedent.
+    let fb_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::SharedRegion,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    let fb_id = k.cap_space(src_cs)?.lookup(fb_cap)?.object.id;
+    let fb_phys = k.shared_region(kernel_cap::SharedRegionId::new(fb_id.as_u32()))?.phys_base.as_usize();
+    grant_cap_into(k, src_cs, fb_cap, comp_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    let fb_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 2) };
+    let n2 = hal.map_range(comp_root_pt, COMPOSITOR_FB_VA, fb_phys, 4096, 1 | 2 | 8, fb_pool, 2);
+    if n2 == u32::MAX {
+        klog!("compositor_demo_start: map_range error (frame buffer page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_FB_PHYS).write(fb_phys) };
+
+    // Confirm region — Compositor's own PRIVATE `SharedRegion` (no grant
+    // into the caller's cap space needed: the kernel peeks it directly
+    // via its own identity map, same "trusted bootstrap, no Map
+    // ceremony" pattern `netstack::spawn_netstack_service`'s own STATUS_
+    // VA region already established).
+    let confirm_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::SharedRegion,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    let confirm_id = k.cap_space(src_cs)?.lookup(confirm_cap)?.object.id;
+    let confirm_phys =
+        k.shared_region(kernel_cap::SharedRegionId::new(confirm_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(confirm_phys as *mut u8, 0, 4096) };
+    let confirm_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    unsafe { core::ptr::write_bytes(confirm_pool as *mut u8, 0, 4096 * 2) };
+    let n3 = hal.map_range(comp_root_pt, COMPOSITOR_CONFIRM_VA, confirm_phys, 4096, 1 | 2 | 8, confirm_pool, 2);
+    if n3 == u32::MAX {
+        klog!("compositor_demo_start: map_range error (confirm region)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // `compositor_commit_verify` call (reached only after this function
+    // returns).
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_CONFIRM_PHYS).write(confirm_phys) };
+
+    // Switch straight to Compositor — same race-avoidance rationale as
+    // `fs_demo_start`'s own tail comment.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(comp_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, comp_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// `Call`, specialized for the compositor demo's known, fixed 2-party
+/// (root <-> Compositor) shape — same "bypass `pick_next`'s answer,
+/// switch straight to the known target thread" fix `fs_ipc_call`'s own
+/// doc comment documents in full (identical bug class, identical fix).
+fn compositor_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_COMPOSITOR_TID` is written once by
+    // `compositor_demo_start`, before any compositor call (this
+    // function) can run.
+    let comp_tid = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(comp_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, comp_tid)?;
+            let poke = if n == comp_tid {
+                k.tcb_mut(comp_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `COMPOSITOR_CREATE_SURFACE` demo opcode: builds a REAL
+/// `DisplayRequest::CreateSurface`.
+pub fn compositor_create_surface_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let msg = ipc_protocol::codec::encode_display_request(&ipc_protocol::DisplayRequest::CreateSurface);
+    // SAFETY: `compositor_demo_start` has already run by the time any
+    // `.user_text` code can reach this opcode (it needs `ep_cap`, which
+    // only `compositor_demo_start`'s own return value provides).
+    unsafe { write_shared_compositor_message(&msg) };
+    compositor_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DisplayResponse` for `compositor_create_surface_call`.
+/// Returns the new surface handle, or `usize::MAX` on any error/decode
+/// failure.
+pub fn compositor_create_surface_result() -> usize {
+    // SAFETY: same contract as `compositor_create_surface_call`.
+    let msg = unsafe { read_shared_compositor_message() };
+    match ipc_protocol::codec::decode_display_response(&msg) {
+        Ok(ipc_protocol::DisplayResponse::SurfaceCreated { surface }) => surface.0 as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `COMPOSITOR_COMMIT_BUFFER` demo opcode: writes `COMPOSITOR_DEMO_FRAME`
+/// (fixed MVP test pixels — see that constant's own doc comment) into
+/// the shared frame buffer's own physical memory, then builds a REAL
+/// `DisplayRequest::CommitBuffer` naming the fixed demo frame's own
+/// dimensions. `buffer_cap` is always `0` — this MVP demo never resolves
+/// it (`compositor::subsystem_entry::handle_request`'s own doc comment
+/// on why), same simplification `fs_write_call`'s own `shared_cap`
+/// already makes.
+pub fn compositor_commit_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, surface: u32) -> Option<IpcSwitch> {
+    // SAFETY: `G_COMPOSITOR_FB_PHYS` was set once by `compositor_demo_
+    // start`, before any commit call can be reached; identity-mapped for
+    // kernel-mode access like every other physical cross-check in this
+    // file.
+    unsafe {
+        let base = core::ptr::addr_of!(G_COMPOSITOR_FB_PHYS).read() as *mut u8;
+        core::ptr::copy_nonoverlapping(COMPOSITOR_DEMO_FRAME.as_ptr(), base, COMPOSITOR_DEMO_FRAME.len());
+    }
+    let req = ipc_protocol::DisplayRequest::CommitBuffer {
+        surface: ipc_protocol::SurfaceHandle(surface),
+        buffer_cap: 0,
+        width: COMPOSITOR_DEMO_WIDTH,
+        height: COMPOSITOR_DEMO_HEIGHT,
+    };
+    let msg = ipc_protocol::codec::encode_display_request(&req);
+    // SAFETY: see `compositor_create_surface_call`'s own contract.
+    unsafe { write_shared_compositor_message(&msg) };
+    compositor_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DisplayResponse` for `compositor_commit_call`, AND
+/// cross-checks Compositor's own private confirm region's own physical
+/// bytes against `COMPOSITOR_DEMO_FRAME` — proving Compositor genuinely
+/// dereferenced the SAME shared frame buffer the caller wrote into, no
+/// copy through the message (this section's own module doc comment).
+/// Returns `1` for a real `Committed` AND a byte-for-byte confirm-region
+/// match, `0` otherwise (error/decode failure/mismatch — the exact
+/// verdict is logged either way, matching `fs_read_result`'s own
+/// convention).
+pub fn compositor_commit_verify() -> usize {
+    // SAFETY: same contract as `compositor_create_surface_call`.
+    let msg = unsafe { read_shared_compositor_message() };
+    let committed = matches!(
+        ipc_protocol::codec::decode_display_response(&msg),
+        Ok(ipc_protocol::DisplayResponse::Committed)
+    );
+    // SAFETY: same contract as `compositor_commit_call`'s own read of
+    // `G_COMPOSITOR_FB_PHYS`.
+    let confirmed = unsafe {
+        let base = core::ptr::addr_of!(G_COMPOSITOR_CONFIRM_PHYS).read() as *const u8;
+        core::slice::from_raw_parts(base, COMPOSITOR_DEMO_FRAME.len()) == COMPOSITOR_DEMO_FRAME
+    };
+    klog!(
+        "compositor_commit_verify: real CommitBuffer round-trip, frame bytes read back through Compositor's own confirm region (03 2.4/5.4.2) -> {}\r\n",
+        if committed && confirmed { "MATCH, zero-copy through the SharedRegion capability" } else { "MISMATCH" }
+    );
+    (committed && confirmed) as usize
+}
+
+/// `COMPOSITOR_DESTROY_SURFACE` demo opcode: builds a REAL
+/// `DisplayRequest::DestroySurface`.
+pub fn compositor_destroy_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, surface: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::DisplayRequest::DestroySurface {
+        surface: ipc_protocol::SurfaceHandle(surface),
+    };
+    let msg = ipc_protocol::codec::encode_display_request(&req);
+    // SAFETY: see `compositor_create_surface_call`'s own contract.
+    unsafe { write_shared_compositor_message(&msg) };
+    compositor_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DisplayResponse` for `compositor_destroy_call`.
+/// Returns `1` for a real `Destroyed`, `0` otherwise.
+pub fn compositor_destroy_result() -> usize {
+    // SAFETY: same contract as `compositor_create_surface_call`.
+    let msg = unsafe { read_shared_compositor_message() };
+    matches!(
+        ipc_protocol::codec::decode_display_response(&msg),
+        Ok(ipc_protocol::DisplayResponse::Destroyed)
+    ) as usize
+}
+
+// ============================================================================
 // driver-virtio-blk: real MMIO + virtqueue block driver process (03 §5.1)
 //
 // Mirrors the fs-native section immediately above almost exactly (same

@@ -167,6 +167,12 @@ xbuild-subsystem-driver-virtio-net-riscv64 = "build -p driver-virtio-net --bin d
 xbuild-subsystem-netstack-x86_64  = "build -p netstack --bin netstack-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-netstack-aarch64 = "build -p netstack --bin netstack-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-netstack-riscv64 = "build -p netstack --bin netstack-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the Compositor Service's own separately-built ELF
+# (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2) — a real IPC SERVER
+# process (like fs-native), not a client (unlike netstack).
+xbuild-subsystem-compositor-x86_64  = "build -p compositor --bin compositor-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-compositor-aarch64 = "build -p compositor --bin compositor-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-compositor-riscv64 = "build -p compositor --bin compositor-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)

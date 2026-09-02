@@ -35,8 +35,8 @@ pub mod net;
 pub mod codec;
 
 pub use codec::{decode_fs_request, encode_fs_request, DecodeError};
+pub use display::{DisplayErrorCode, DisplayRequest, DisplayResponse, SurfaceHandle};
 pub use driver::{DriverRequest, DriverResponse};
-pub use display::DisplayRequest;
 pub use fs::{FileHandle, FsRequest, FsResponse, OpenFlags, PathId};
 pub use net::NetBypassRequest;
 

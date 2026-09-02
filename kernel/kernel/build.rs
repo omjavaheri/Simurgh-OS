@@ -177,4 +177,30 @@ fn main() {
         "cargo:rustc-env=NETSTACK_ELF_PATH={}",
         netstack_path.canonicalize().unwrap().display()
     );
+
+    // Same as above, for `compositor-bin` (03-Kernel-Subsystems-Layer.md
+    // §2.4/§5.4.2) — the sixth real subsystem process, and a real IPC
+    // SERVER (like fs-native), not a client (unlike netstack-bin).
+    let compositor_build_alias = format!("cargo xbuild-subsystem-compositor-{target_arch}");
+    let compositor_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("compositor-bin");
+
+    if !compositor_path.exists() {
+        panic!(
+            "kernel build.rs: compositor-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {compositor_build_alias}",
+            compositor_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", compositor_path.display());
+    println!(
+        "cargo:rustc-env=COMPOSITOR_ELF_PATH={}",
+        compositor_path.canonicalize().unwrap().display()
+    );
 }
