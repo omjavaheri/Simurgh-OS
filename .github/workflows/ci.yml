@@ -127,15 +127,20 @@ jobs:
           name: target-${{ matrix.arch }}
           path: target
       # actions/upload-artifact + download-artifact round-trip target/
-      # through a zip archive that does not preserve the executable bit on
-      # compiled build-script binaries - a fresh `cargo build` that needs
-      # to actually re-invoke one (not every crate does, depending on
-      # fingerprint/cache state) fails with "Permission denied (os error
-      # 13)" on `.../build/<crate>-<hash>/build-script-build`. Restore it
-      # explicitly; harmless no-op for any build script cargo doesn't
-      # need to re-run.
-      - name: Restore executable bit on cached build-script binaries
-        run: find target -type f -name build-script-build -exec chmod +x {} +
+      # through an archive that does not preserve permission bits - a fresh
+      # `cargo build` that needs to actually re-invoke a build script (not
+      # every crate does, depending on fingerprint/cache state) fails with
+      # "Permission denied (os error 13)" on
+      # `.../build/<crate>-<hash>/build-script-build`. Restoring only the
+      # file's own +x was NOT enough (confirmed by a real CI run still
+      # failing identically after that fix) - a DIRECTORY along the path
+      # can just as easily lose its own execute/traverse bit in the same
+      # round-trip, which also manifests as EPERM on exec. Restore both;
+      # harmless no-op wherever a bit wasn't actually lost.
+      - name: Restore executable/traverse bits lost by the artifact round-trip
+        run: |
+          find target -type d -exec chmod +x {} +
+          find target -type f -name build-script-build -exec chmod +x {} +
       - name: Install QEMU + UEFI firmware
         run: |
           sudo apt-get update
@@ -161,15 +166,20 @@ jobs:
           name: target-${{ matrix.arch }}
           path: target
       # actions/upload-artifact + download-artifact round-trip target/
-      # through a zip archive that does not preserve the executable bit on
-      # compiled build-script binaries - a fresh `cargo build` that needs
-      # to actually re-invoke one (not every crate does, depending on
-      # fingerprint/cache state) fails with "Permission denied (os error
-      # 13)" on `.../build/<crate>-<hash>/build-script-build`. Restore it
-      # explicitly; harmless no-op for any build script cargo doesn't
-      # need to re-run.
-      - name: Restore executable bit on cached build-script binaries
-        run: find target -type f -name build-script-build -exec chmod +x {} +
+      # through an archive that does not preserve permission bits - a fresh
+      # `cargo build` that needs to actually re-invoke a build script (not
+      # every crate does, depending on fingerprint/cache state) fails with
+      # "Permission denied (os error 13)" on
+      # `.../build/<crate>-<hash>/build-script-build`. Restoring only the
+      # file's own +x was NOT enough (confirmed by a real CI run still
+      # failing identically after that fix) - a DIRECTORY along the path
+      # can just as easily lose its own execute/traverse bit in the same
+      # round-trip, which also manifests as EPERM on exec. Restore both;
+      # harmless no-op wherever a bit wasn't actually lost.
+      - name: Restore executable/traverse bits lost by the artifact round-trip
+        run: |
+          find target -type d -exec chmod +x {} +
+          find target -type f -name build-script-build -exec chmod +x {} +
       - name: Install QEMU + UEFI firmware
         run: |
           sudo apt-get update
