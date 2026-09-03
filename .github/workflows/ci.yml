@@ -61,7 +61,7 @@ jobs:
       # `cargo build` below).
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup show
-      - name: cargo build (default-members: hal-manifest, hal-core, hal-direct)
+      - name: "cargo build (default-members: hal-manifest, hal-core, hal-direct)"
         run: cargo build
       - name: cargo test (default-members)
         run: cargo test
