@@ -1,0 +1,10 @@
+# Every file in this repository requires a review from the owner before
+# a pull request can be merged into `main`.
+#
+# This file only takes effect once branch protection on `main` has
+# "Require a pull request before merging" + "Require review from Code
+# Owners" both enabled (Settings -> Branches -> Branch protection rules
+# -> main) — GitHub's own branch-protection UI is not something a file
+# in the repository can configure; see the repository's own CONTRIBUTING
+# doc for the exact settings this project uses.
+* @omjavaheri
