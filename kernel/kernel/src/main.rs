@@ -1410,6 +1410,41 @@ extern "C" fn umode_root() -> ! {
         raw_syscall(sys::FS_READ, fs_handle, fs_written);
         let fs_read = raw_syscall(sys::FS_READ_RESULT, zero!(), zero!());
         raw_syscall(sys::REPORT, fs_read, zero!());
+
+        // VFS read/write throughput benchmark (03-Kernel-Subsystems-
+        // Layer.md §5, item 5) — riscv64's own copy of x86_64's
+        // `umode_root_x86` benchmark loop (see that one's own doc
+        // comment for the full rationale); identical shape, just this
+        // architecture's own `raw_syscall`.
+        const FS_BENCH_ITERS: usize = 100;
+        let mut w_total_bytes: usize = 0;
+        let mut w_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            raw_syscall(sys::FS_WRITE, fs_handle, zero!());
+            let written = raw_syscall(sys::FS_WRITE_RESULT, zero!(), zero!());
+            let t1 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            if written != usize::MAX {
+                w_total_bytes += written;
+                w_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall(sys::FS_WRITE_THROUGHPUT_SUMMARY, w_total_bytes, w_total_ns);
+
+        let mut r_total_bytes: usize = 0;
+        let mut r_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            raw_syscall(sys::FS_READ, fs_handle, 4096);
+            let bytes_read = raw_syscall(sys::FS_READ_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            if bytes_read != usize::MAX {
+                r_total_bytes += bytes_read;
+                r_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall(sys::FS_READ_THROUGHPUT_SUMMARY, r_total_bytes, r_total_ns);
+
         raw_syscall(sys::FS_CLOSE, fs_handle, zero!());
         let fs_closed = raw_syscall(sys::FS_CLOSE_RESULT, zero!(), zero!());
         raw_syscall(sys::REPORT, fs_closed, zero!());
@@ -3563,6 +3598,41 @@ extern "C" fn umode_root_aarch64() -> ! {
         raw_syscall_aarch64(sys::FS_READ, fs_handle, fs_written);
         let fs_read = raw_syscall_aarch64(sys::FS_READ_RESULT, zero!(), zero!());
         raw_syscall_aarch64(sys::REPORT, fs_read, zero!());
+
+        // VFS read/write throughput benchmark (03-Kernel-Subsystems-
+        // Layer.md §5, item 5) — aarch64's own copy of x86_64's
+        // `umode_root_x86` benchmark loop (see that one's own doc
+        // comment for the full rationale); identical shape, just this
+        // architecture's own `raw_syscall_aarch64`.
+        const FS_BENCH_ITERS: usize = 100;
+        let mut w_total_bytes: usize = 0;
+        let mut w_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_aarch64(sys::FS_WRITE, fs_handle, zero!());
+            let written = raw_syscall_aarch64(sys::FS_WRITE_RESULT, zero!(), zero!());
+            let t1 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            if written != usize::MAX {
+                w_total_bytes += written;
+                w_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall_aarch64(sys::FS_WRITE_THROUGHPUT_SUMMARY, w_total_bytes, w_total_ns);
+
+        let mut r_total_bytes: usize = 0;
+        let mut r_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_aarch64(sys::FS_READ, fs_handle, 4096);
+            let bytes_read = raw_syscall_aarch64(sys::FS_READ_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            if bytes_read != usize::MAX {
+                r_total_bytes += bytes_read;
+                r_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall_aarch64(sys::FS_READ_THROUGHPUT_SUMMARY, r_total_bytes, r_total_ns);
+
         raw_syscall_aarch64(sys::FS_CLOSE, fs_handle, zero!());
         let fs_closed = raw_syscall_aarch64(sys::FS_CLOSE_RESULT, zero!(), zero!());
         raw_syscall_aarch64(sys::REPORT, fs_closed, zero!());
@@ -3985,6 +4055,17 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::FS_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
+        }
+        sys::FS_READ_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result_quiet());
+        }
+        sys::FS_WRITE_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_write_throughput_summary(x0, x1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::FS_READ_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_read_throughput_summary(x0, x1);
+            return TrapOutcome::Resume(0);
         }
         // virtio-blk driver: mirrors riscv64's own identical arms (this
         // file's `sys::DRV_BLK_DEMO_START` doc comment) — same
@@ -4944,6 +5025,17 @@ fn simurgh_syscall(
         }
         sys::FS_READ_RESULT => {
             return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
+        }
+        sys::FS_READ_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result_quiet());
+        }
+        sys::FS_WRITE_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_write_throughput_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::FS_READ_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_read_throughput_summary(a0, a1);
+            return TrapOutcome::Resume(0);
         }
         sys::DRV_BLK_DEMO_START => {
             let hal = kernel_arch_glue::khal();
