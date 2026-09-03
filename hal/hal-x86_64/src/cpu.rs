@@ -1108,6 +1108,52 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
     }
 
     fn bootstrap_current_core(&self) -> Result<(), HalError> {
+        // `IA32_EFER.NXE` (bit 11, MSR 0xC0000080): UEFI hands off with
+        // long mode already active (`LME`/`LMA` set) but has no reason to
+        // set `NXE` on this kernel's behalf — it is a pure OS policy
+        // choice. Without it, bit 63 of every paging-structure entry is
+        // ARCHITECTURALLY RESERVED (Intel SDM: "If IA32_EFER.NXE = 0, the
+        // XD bit is reserved in all paging-structure entries"), yet
+        // `x86_64_paging::map_range`'s own `NO_EXECUTE` constant (`1 <<
+        // 63`) is unconditionally OR'd into every non-executable leaf's
+        // flags — every `map_range` call requesting `perm_bits` without
+        // `EXECUTE` (the common case: almost all data mappings) has been
+        // setting a reserved bit since this mechanism was first built.
+        // **Real, QEMU-confirmed bug** (found via WHPX hardware-
+        // accelerated boot testing, not TCG): TCG's software CPU model
+        // silently tolerates the reserved bit and just treats it as NX
+        // regardless of `EFER.NXE` — a non-architectural leniency that
+        // masked this for every prior TCG-only boot this project has
+        // ever run — but WHPX (backed by real Intel VT-x, which enforces
+        // this reservation during CR3-load / paging-structure validation)
+        // rejected it outright: `activate_address_space`'s `mov cr3`
+        // caused an immediate `WHvRunVpExitReasonInvalidVpRegisterValue`
+        // the instant a table built by `map_range` with any non-
+        // executable leaf became CR3's target. Fixed at the true root:
+        // enable `NXE` here, once, before ANY page table this crate
+        // builds can ever be activated — not by removing the `NO_EXECUTE`
+        // bit from `map_range` (which would make every "non-executable"
+        // mapping this kernel creates silently executable instead, a
+        // real W^X regression, not merely a cosmetic one).
+        //
+        // SAFETY: `RDMSR`/`WRMSR` on `IA32_EFER` have no preconditions
+        // beyond Ring 0 execution (always true in this crate) and
+        // require no prior paging/GDT/IDT state — safe to do first, here,
+        // before anything else in this function.
+        unsafe {
+            let low: u32;
+            let high: u32;
+            core::arch::asm!("rdmsr", in("ecx") 0xC000_0080u32, out("eax") low, out("edx") high);
+            let efer = ((high as u64) << 32) | low as u64;
+            let efer = efer | (1 << 11); // NXE
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") 0xC000_0080u32,
+                in("eax") efer as u32,
+                in("edx") (efer >> 32) as u32,
+            );
+        }
+
         // SAFETY: single-core boot, before any trap can fire. `TSS.rsp0`
         // must be valid before ANY Ring 3 -> Ring 0 transition can
         // happen (see the TSS's own module doc comment) — set up before
