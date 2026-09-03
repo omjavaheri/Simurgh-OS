@@ -1,3 +1,8 @@
 # Keep shell scripts LF-only so `scripts/*.sh` runs under bash on the
 # Linux CI runners regardless of a contributor's core.autocrlf setting.
 *.sh text eol=lf
+
+# Same reasoning for git hooks under .githooks/ - these have no file
+# extension (git hooks must be named exactly e.g. `pre-commit`) so the
+# `*.sh` pattern above doesn't match them.
+.githooks/* text eol=lf
