@@ -92,22 +92,32 @@ riscv64)
 	;;
 
 x86_64 | aarch64)
-	OVMF_CODE_DEFAULT_x86_64="/usr/share/OVMF/OVMF_CODE.fd"
-	OVMF_VARS_DEFAULT_x86_64="/usr/share/OVMF/OVMF_VARS.fd"
-	OVMF_CODE_DEFAULT_aarch64="/usr/share/AAVMF/AAVMF_CODE.fd"
-	OVMF_VARS_DEFAULT_aarch64="/usr/share/AAVMF/AAVMF_VARS.fd"
+	# See `scripts/qemu-smoke.sh`'s own identical comment: the Debian/
+	# Ubuntu `ovmf` package's firmware file names have changed across
+	# releases (Ubuntu 24.04 ships `OVMF_CODE_4M.fd`/`OVMF_VARS_4M.fd`,
+	# not the older plain names) - try every known name in order.
+	first_existing() {
+		for f in "$@"; do
+			[[ -f "$f" ]] && printf '%s\n' "$f" && return 0
+		done
+		return 1
+	}
+	OVMF_CODE_CANDIDATES_x86_64=(/usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd)
+	OVMF_VARS_CANDIDATES_x86_64=(/usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd)
+	OVMF_CODE_CANDIDATES_aarch64=(/usr/share/AAVMF/AAVMF_CODE.fd /usr/share/AAVMF/AAVMF_CODE_4M.fd)
+	OVMF_VARS_CANDIDATES_aarch64=(/usr/share/AAVMF/AAVMF_VARS.fd /usr/share/AAVMF/AAVMF_VARS_4M.fd)
 
 	if [[ "$ARCH" == "x86_64" ]]; then
 		UEFI_TARGET="x86_64-unknown-uefi"
 		BOOT_NAME="BOOTX64.EFI"
-		CODE="${OVMF_CODE:-$OVMF_CODE_DEFAULT_x86_64}"
-		VARS="${OVMF_VARS:-$OVMF_VARS_DEFAULT_x86_64}"
+		CODE="${OVMF_CODE:-$(first_existing "${OVMF_CODE_CANDIDATES_x86_64[@]}" || printf '%s' "${OVMF_CODE_CANDIDATES_x86_64[0]}")}"
+		VARS="${OVMF_VARS:-$(first_existing "${OVMF_VARS_CANDIDATES_x86_64[@]}" || printf '%s' "${OVMF_VARS_CANDIDATES_x86_64[0]}")}"
 		QEMU=(qemu-system-x86_64 -machine q35 -m 256M)
 	else
 		UEFI_TARGET="aarch64-unknown-uefi"
 		BOOT_NAME="BOOTAA64.EFI"
-		CODE="${OVMF_CODE:-$OVMF_CODE_DEFAULT_aarch64}"
-		VARS="${OVMF_VARS:-$OVMF_VARS_DEFAULT_aarch64}"
+		CODE="${OVMF_CODE:-$(first_existing "${OVMF_CODE_CANDIDATES_aarch64[@]}" || printf '%s' "${OVMF_CODE_CANDIDATES_aarch64[0]}")}"
+		VARS="${OVMF_VARS:-$(first_existing "${OVMF_VARS_CANDIDATES_aarch64[@]}" || printf '%s' "${OVMF_VARS_CANDIDATES_aarch64[0]}")}"
 		# gic-version=3 explicit - see `.cargo/config.toml`'s own runner
 		# comment for why QEMU's own default isn't reliable across versions.
 		QEMU=(qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 256M)

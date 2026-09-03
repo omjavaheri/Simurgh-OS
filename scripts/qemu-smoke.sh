@@ -80,24 +80,39 @@ riscv64)
 	;;
 
 x86_64 | aarch64)
-	OVMF_CODE_DEFAULT_x86_64="/usr/share/OVMF/OVMF_CODE.fd"
-	OVMF_VARS_DEFAULT_x86_64="/usr/share/OVMF/OVMF_VARS.fd"
-	OVMF_CODE_DEFAULT_aarch64="/usr/share/AAVMF/AAVMF_CODE.fd"
-	OVMF_VARS_DEFAULT_aarch64="/usr/share/AAVMF/AAVMF_VARS.fd"
+	# The Debian/Ubuntu `ovmf` package's own firmware file names have
+	# changed across releases (Ubuntu 24.04's `ovmf` ships
+	# `OVMF_CODE_4M.fd`/`OVMF_VARS_4M.fd`, not the older plain-named
+	# `OVMF_CODE.fd`/`OVMF_VARS.fd` this script originally assumed — a
+	# real CI failure on a fresh ubuntu-latest runner, never reproduced
+	# locally because this dev machine's own OVMF install predates the
+	# rename). Try every known name in order rather than hardcoding one;
+	# `qemu-efi-aarch64`'s AAVMF names have stayed stable, but the same
+	# fallback list costs nothing and future-proofs it too.
+	first_existing() {
+		for f in "$@"; do
+			[[ -f "$f" ]] && printf '%s\n' "$f" && return 0
+		done
+		return 1
+	}
+	OVMF_CODE_CANDIDATES_x86_64=(/usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd)
+	OVMF_VARS_CANDIDATES_x86_64=(/usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd)
+	OVMF_CODE_CANDIDATES_aarch64=(/usr/share/AAVMF/AAVMF_CODE.fd /usr/share/AAVMF/AAVMF_CODE_4M.fd)
+	OVMF_VARS_CANDIDATES_aarch64=(/usr/share/AAVMF/AAVMF_VARS.fd /usr/share/AAVMF/AAVMF_VARS_4M.fd)
 
 	if [[ "$ARCH" == "x86_64" ]]; then
 		cargo xbuild-kernel-x86_64
 		UEFI_TARGET="x86_64-unknown-uefi"
 		BOOT_NAME="BOOTX64.EFI"
-		CODE="${OVMF_CODE:-$OVMF_CODE_DEFAULT_x86_64}"
-		VARS="${OVMF_VARS:-$OVMF_VARS_DEFAULT_x86_64}"
+		CODE="${OVMF_CODE:-$(first_existing "${OVMF_CODE_CANDIDATES_x86_64[@]}" || printf '%s' "${OVMF_CODE_CANDIDATES_x86_64[0]}")}"
+		VARS="${OVMF_VARS:-$(first_existing "${OVMF_VARS_CANDIDATES_x86_64[@]}" || printf '%s' "${OVMF_VARS_CANDIDATES_x86_64[0]}")}"
 		QEMU=(qemu-system-x86_64 -machine q35 -m 256M)
 	else
 		cargo xbuild-kernel-aarch64
 		UEFI_TARGET="aarch64-unknown-uefi"
 		BOOT_NAME="BOOTAA64.EFI"
-		CODE="${OVMF_CODE:-$OVMF_CODE_DEFAULT_aarch64}"
-		VARS="${OVMF_VARS:-$OVMF_VARS_DEFAULT_aarch64}"
+		CODE="${OVMF_CODE:-$(first_existing "${OVMF_CODE_CANDIDATES_aarch64[@]}" || printf '%s' "${OVMF_CODE_CANDIDATES_aarch64[0]}")}"
+		VARS="${OVMF_VARS:-$(first_existing "${OVMF_VARS_CANDIDATES_aarch64[@]}" || printf '%s' "${OVMF_VARS_CANDIDATES_aarch64[0]}")}"
 		# gic-version=3 explicit: harmless for kernel-stub (which never
 		# touches the GIC), but matches the `.cargo/config.toml` runner's
 		# own fix — see that file's comment on why QEMU's own default
