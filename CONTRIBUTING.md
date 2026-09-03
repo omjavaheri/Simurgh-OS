@@ -60,6 +60,22 @@ In short: **issue + label → branch (auto) → PR → CI → owner approval →
 merge → branch deleted → automatic release.** No step is skippable by
 design.
 
+## Local setup: catch a `main` commit before you even try to push
+
+GitHub's branch-protection ruleset on `main` only controls the server
+side (a rejected `push`) — it cannot stop a *local* commit made
+directly on your own local `main` branch, since git is distributed and
+no server is involved in `git commit`. Point git at this repo's tracked
+hooks once per clone to catch that locally too, immediately, instead of
+only at push time:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-commit` then refuses any commit made while on `main`,
+with a pointer back to the issue → branch → PR flow above.
+
 ## Everything else
 
 See `CLAUDE.md` (local, not checked into this repository) for coding

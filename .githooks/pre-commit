@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# ============================================================================
+# .githooks/pre-commit
+#
+# Refuses a commit made directly on `main`. GitHub's own branch-protection
+# ruleset on `main` (see CONTRIBUTING.md) blocks a PUSH straight to main —
+# but that is a SERVER-side check; nothing stops a LOCAL commit on a local
+# `main` branch, since git is distributed and no server is involved in
+# `git commit`. This hook closes that local gap so the mistake is caught
+# immediately, before it ever reaches a push attempt.
+#
+# Not active by default — a hook under `.githooks/` only runs once a
+# contributor points git at this directory (one-time, per clone):
+#
+#     git config core.hooksPath .githooks
+#
+# See CONTRIBUTING.md for that setup step and the full issue -> branch ->
+# PR flow this hook exists to protect.
+# ============================================================================
+set -euo pipefail
+
+current_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+
+if [[ "$current_branch" == "main" ]]; then
+	cat >&2 <<'EOF'
+ERROR: refusing to commit directly on `main`.
+
+Every change goes through its own branch and a pull request - see
+CONTRIBUTING.md. File (or pick) a GitHub issue labeled bug/enhancement/
+hotfix, let `.github/workflows/branch-from-issue.yml` create the matching
+branch automatically, then commit there instead:
+
+    git checkout <the auto-created branch>
+
+(GitHub's own branch-protection ruleset on `main` would reject this same
+commit at push time regardless - this hook just catches it earlier.)
+EOF
+	exit 1
+fi
+
+exit 0
