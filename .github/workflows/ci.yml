@@ -141,6 +141,23 @@ jobs:
         run: |
           find target -type d -exec chmod +x {} +
           find target -type f -name build-script-build -exec chmod +x {} +
+      # TEMPORARY - the two chmod passes above have NOT resolved the
+      # "Permission denied (os error 13)" seen on a real run for both of
+      # them already (build-script-build itself and its parent
+      # directories were both explicitly re-chmod'd, and the exact same
+      # error still occurred). `namei -l` prints the permissions of every
+      # component of the path in one shot - the fastest way to see what's
+      # actually going on directly on the runner instead of guessing
+      # again. Remove once the real cause is found and fixed.
+      - name: DIAGNOSTIC - inspect build-script-build after chmod
+        run: |
+          find target -name build-script-build -print0 | while IFS= read -r -d '' f; do
+            echo "=== $f ==="
+            namei -l "$f" || true
+            ls -la "$f" || true
+            file "$f" || true
+            stat "$f" || true
+          done
       - name: Install QEMU + UEFI firmware
         run: |
           sudo apt-get update
@@ -180,6 +197,23 @@ jobs:
         run: |
           find target -type d -exec chmod +x {} +
           find target -type f -name build-script-build -exec chmod +x {} +
+      # TEMPORARY - the two chmod passes above have NOT resolved the
+      # "Permission denied (os error 13)" seen on a real run for both of
+      # them already (build-script-build itself and its parent
+      # directories were both explicitly re-chmod'd, and the exact same
+      # error still occurred). `namei -l` prints the permissions of every
+      # component of the path in one shot - the fastest way to see what's
+      # actually going on directly on the runner instead of guessing
+      # again. Remove once the real cause is found and fixed.
+      - name: DIAGNOSTIC - inspect build-script-build after chmod
+        run: |
+          find target -name build-script-build -print0 | while IFS= read -r -d '' f; do
+            echo "=== $f ==="
+            namei -l "$f" || true
+            ls -la "$f" || true
+            file "$f" || true
+            stat "$f" || true
+          done
       - name: Install QEMU + UEFI firmware
         run: |
           sudo apt-get update
