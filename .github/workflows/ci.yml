@@ -83,8 +83,11 @@ jobs:
         run: cargo xbuild-${{ matrix.arch }}
       - name: kernel-stub cross-build
         run: cargo xbuild-kernel-${{ matrix.arch }}
-      - name: Real microkernel cross-build
-        run: cargo xbuild-microkernel-${{ matrix.arch }}
+      # Must run BEFORE "Real microkernel cross-build": kernel/kernel/build.rs
+      # locates each subsystem's already-built ELF under target/<arch>-hal/
+      # debug/ via include_bytes!(env!(...)) and panics if it's missing. On a
+      # fresh runner (no pre-existing target/ cache) the microkernel build
+      # fails unless the subsystems are built first.
       - name: Subsystem cross-builds
         run: |
           set -euo pipefail
@@ -93,6 +96,8 @@ jobs:
             cargo "xbuild-subsystem-${subsystem}-${{ matrix.arch }}"
             echo "::endgroup::"
           done
+      - name: Real microkernel cross-build
+        run: cargo xbuild-microkernel-${{ matrix.arch }}
       # `kernel` and every `subsystems/*` binary for this architecture are
       # needed again, unmodified, by the two QEMU jobs below — caching the
       # whole `target/` tree here avoids a second full cross-build there.
