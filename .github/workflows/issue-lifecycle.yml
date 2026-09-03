@@ -1,0 +1,73 @@
+# ============================================================================
+# Issue lifecycle — two small, related automations around
+# `.github/workflows/branch-from-issue.yml`'s own auto-created branches:
+#
+# 1. Lock a closed issue immediately (closest available approximation to
+#    "closed issues stay as a permanent record" — GitHub has no way to make
+#    an issue unreopenable even by the repository owner; locking only
+#    restricts further comments/reopening, it does not forbid it outright).
+#
+# 2. If an issue is DELETED (not just closed) rather than resolved via a
+#    merged PR, its own auto-created branch never got cleaned up by
+#    "Automatically delete head branches" (that only fires on a PR merge) —
+#    find and delete it directly, searching all three prefixes since the
+#    issue's own labels are gone the instant it's deleted.
+# ============================================================================
+name: Issue lifecycle
+
+on:
+  issues:
+    types: [closed, deleted]
+
+permissions:
+  issues: write
+  contents: write
+
+jobs:
+  lock-on-close:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lock the closed issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.lock({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              lock_reason: 'resolved',
+            });
+
+  delete-branch-on-issue-delete:
+    if: github.event.action == 'deleted'
+    runs-on: ubuntu-latest
+    steps:
+      # `context.payload.issue` is still the full issue object as it was
+      # right before deletion, but its own labels can't be trusted to
+      # still match how the branch was originally named (a label can
+      # change after the branch already exists) - search all three
+      # possible prefixes via the "matching refs" search instead of
+      # recomputing one name from the issue's current labels.
+      - name: Find and delete this issue's own branch, if any
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.payload.issue.number;
+            for (const prefix of ['feature', 'fix', 'hotfix']) {
+              const search = `heads/${prefix}/${issueNumber}-`;
+              const { data: refs } = await github.rest.git.listMatchingRefs({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: search,
+              });
+              for (const ref of refs) {
+                const branchName = ref.ref.replace('refs/heads/', '');
+                core.info(`Deleting orphaned branch ${branchName} (issue #${issueNumber} was deleted)`);
+                await github.rest.git.deleteRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `heads/${branchName}`,
+                });
+              }
+            }

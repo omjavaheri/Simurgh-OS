@@ -60,6 +60,28 @@ In short: **issue + label → branch (auto) → PR → CI → owner approval →
 merge → branch deleted → automatic release.** No step is skippable by
 design.
 
+Write `Closes #<issue-number>` in the PR description so merging it also
+closes the issue automatically — this is a native GitHub behavior, not
+something a workflow needs to implement.
+
+## Issue lifecycle
+
+`.github/workflows/issue-lifecycle.yml` handles two related edges:
+
+- **Closed issues are locked immediately** (closest available
+  approximation to "closed issues stay as a permanent record" — GitHub
+  has no way to make an issue truly unreopenable, not even by the
+  repository owner; locking only restricts further comments/reopening,
+  it does not forbid it outright).
+- **A deleted issue's own auto-created branch is deleted too** —
+  "Automatically delete head branches" only fires on a PR merge, so an
+  issue removed before its branch ever reached a PR would otherwise
+  leave that branch behind forever. The workflow searches all three
+  `feature/<N>-`/`fix/<N>-`/`hotfix/<N>-` prefixes for the deleted
+  issue's number and removes whatever it finds. If that branch still
+  had an open PR, deleting it also closes that PR (GitHub's own normal
+  behavior when a PR's head branch disappears).
+
 ## Local setup: catch a `main` commit before you even try to push
 
 GitHub's branch-protection ruleset on `main` only controls the server
