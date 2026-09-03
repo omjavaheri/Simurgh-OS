@@ -1,5 +1,7 @@
 # Simurgh-OS
 
+[![CI](https://github.com/omjavaheri/Simurgh-OS/actions/workflows/ci.yml/badge.svg)](https://github.com/omjavaheri/Simurgh-OS/actions/workflows/ci.yml)
+
 The kernel repository of Simurgh OS: a capability-based operating system built
 from the bottom up for **x86_64, ARM64/AArch64, and RISC-V (RV64GC)**, written
 in Rust (`no_std`), with minimal architecture-specific assembly confined to the
@@ -39,7 +41,7 @@ Simurgh-OS/
 │   └── kernel/          the bootable Phase-2 microkernel image
 │
 ├── ipc-protocol/        the layer-2 <-> layer-3 message contract (03 §3)
-├── subsystems/          root-task, device-manager, drivers/, vfs-service/, netstack, mm-service (03 §4)
+├── subsystems/          root-task, device-manager, drivers/, vfs-service/, netstack, compositor, mm-service (03 §4)
 │
 ├── kernel-stub/         minimal microkernel stand-in for the pure HAL (01 §8) smoke test
 ├── targets/             custom no_std JSON target specs
@@ -80,67 +82,71 @@ cargo xbuild-x86_64        cargo xbuild-aarch64        cargo xbuild-riscv64
 
 # kernel-stub (the pure HAL boot image, 01-HAL-Layer.md §8):
 cargo xbuild-kernel-{x86_64,aarch64,riscv64}
-scripts/qemu-smoke.sh riscv64        # boot + assert the HAL handoff markers
+scripts/qemu-smoke.sh <x86_64|aarch64|riscv64>   # boot + assert the HAL handoff markers
 
-# the real microkernel image (Phase 2):
+# each subsystem, per architecture (must be built before the real kernel,
+# which embeds their ELFs via include_bytes!):
+cargo xbuild-subsystem-<device-manager|fs-native|driver-virtio-blk|driver-virtio-net|netstack|compositor|mm-service>-<arch>
+
+# the real microkernel image (Phase 2/3):
 cargo xbuild-microkernel-{x86_64,aarch64,riscv64}
 cargo xrun-microkernel-riscv64       # build + boot under QEMU
+scripts/qemu-fault-isolation-test.sh <x86_64|aarch64|riscv64>   # real fault-injection + supervision, asserted end to end
 ```
+
+Exactly what CI runs on every push/PR is `.github/workflows/ci.yml` — the
+same commands above, for all three architectures.
 
 ## Current status (honest)
 
-**Working and verified:**
+The layer-2 MVP (`02-Microkernel-Layer.md §8`, all six acceptance criteria)
+and the layer-3 fault-isolation criterion (`03-Kernel-Subsystems-Layer.md §5`)
+are both met. CI (see badge above) builds and boot-tests all three
+architectures on every push.
 
-- Whole workspace compiles for all three architectures. ~262 host unit tests pass.
-- **HAL (layer 1):** boots on QEMU for all three architectures via `kernel-stub`;
-  produces a valid Hardware Manifest (CPU cores, ≥1 memory region, live timer);
-  hands control to a microkernel via a direct call. `HalInterface` (the
-  architecture-erased boundary) provides `context_switch`, `init_context`,
-  `enter_user`, `now_ns`, cpu id / feature bits. `scripts/qemu-smoke.sh riscv64`
-  passes.
-- **Microkernel (layer 2)** — verified end to end **on riscv64 only**:
-  - HAL → kernel handoff and creation of the first `UntypedMemory` objects
-    (carved around the kernel image / boot-reserved ranges of usable RAM) —
-    `02-Microkernel-Layer.md §8.1`.
-  - The Root Task runs, retypes an `Endpoint` and a second thread, and completes
-    a synchronous IPC round-trip — `§8.2`.
-  - Capability revocation: revoking a CDT node frees its whole derived subtree
-    and leaves the parent intact — `§8.5`.
-  - The user/kernel privilege boundary: the Root Task is dropped to U-mode via
-    `sret` and reaches the kernel only through `ecall`, routed through the HAL
-    trap vector to a registered S-mode syscall handler — `02 §0`.
-  - MMU-enforced isolation: the Root Task's code and stack live in their own
-    `.user_text` / `.user_stack` pages, mapped `U=1` while the kernel stays
-    `U=0`, and Sv39 paging stays active while it runs — `02 §0`, `01 §3.2`.
-  - The `Map` syscall installs a genuine Sv39 leaf in the Root Task's live page
-    table (not just the software model); mapping a second virtual address onto
-    the same frame and reading a value written through the first is served by
-    the MMU — the intra-address-space half of `§5.2` / `§8.4`.
-  - Zero-copy across isolation boundaries: the kernel builds two independent
-    Sv39 page tables that map one physical frame at different virtual
-    addresses, and a write through one table is visible through the other after
-    a `satp` switch — the kernel-mechanism half of `§8.4`.
-- **Layer 3:** `ipc-protocol` (message contract + FsRequest codec) and every
-  `subsystems/*` crate build and unit-test their pure service logic (mount-table
-  routing, an in-memory filesystem, ICMP echo build/parse, the driver-restart
-  policy, the OOM victim policy, the root-task boot-memory plan).
+**Working and verified, on all three architectures (x86_64, aarch64,
+riscv64) unless noted:**
 
-**Not yet implemented:**
+- **HAL (layer 1):** boots via `kernel-stub`, produces a valid Hardware
+  Manifest, hands off to a microkernel via a direct call.
+  `scripts/qemu-smoke.sh <arch>` passes for all three.
+- **Microkernel (layer 2):** memory (`UntypedMemory`/retype carved around the
+  boot-reserved image), a synchronous IPC round-trip, capability derivation +
+  revocation, a capability-gated `Map` syscall that installs real hardware
+  page-table entries (Sv39 / 4-level x86_64 / 39-bit AArch64, depending on
+  arch), and cross-space capability revocation (`CapGrant`/`CapRevoke`
+  exercised at the syscall boundary across two separate address spaces) are
+  all QEMU-verified. The Root Task runs in U-mode (`sret`/Ring 3/EL0),
+  reaching the kernel only through the architecture's own syscall
+  instruction; a preemptive, timer-driven scheduler runs multiple processes
+  concurrently in separate, MMU-isolated address spaces, including zero-copy
+  sharing of a single physical frame across two spaces.
+- **Layer 3 subsystems:** `device-manager`, `fs-native`,
+  `driver-virtio-blk`, `driver-virtio-net`, `netstack`, `compositor`, and
+  `mm-service` are each a real, separately-built ELF process (not a linked-in
+  library) spawned via the generic `kernel_arch_glue::spawn_process`/
+  `spawn_process_from_elf` path, exercised by the real `kernel` binary on all
+  three architectures.
+- **Real per-process fault isolation** (`03 §5.2`): a deliberately faulting
+  driver process is terminated by the kernel without affecting any other
+  process; `device-manager` supervises it end to end — starts it, detects the
+  crash via real IPC, restarts it, and reaches a terminal `Failed` state after
+  its restart-window policy trips. This exact cycle is asserted automatically
+  in CI via `scripts/qemu-fault-isolation-test.sh` on every push.
+- A VFS read-throughput benchmark and an `02 §8.3` IPC round-trip benchmark
+  both run as part of the real boot sequence and report real numbers (not
+  hardcoded).
 
-- A capability-gated `Map` (`§6` wants a `Frame` + `PageTable` capability; the
-  MVP path picks the frame in-kernel and acts on the Root Task's space
-  directly), and `kernel-mm::AddressSpace::map` itself driving `map_range` so
-  the software model and the hardware table cannot drift.
-- `02 §8.3` (`ipc_call` fast-path benchmark); `§8.4` as a *cross-process*
-  proof — two U-mode threads running concurrently in separate address spaces
-  that share a frame (the kernel-side mechanism is done; this needs a HAL
-  primitive that can resume a user context); `§8.6` (syscall fuzzing).
-- Preemptive scheduling (no timer-tick / IRQ routing into the kernel yet).
-- All of `03-Kernel-Subsystems-Layer.md §5`: no subsystem runs as a real process
-  yet (they are libraries pending the process-load path).
-- x86_64 / aarch64 boot of the *real* microkernel — those still boot
-  `kernel-stub`; the UEFI bootloader currently embeds `kernel-stub`, not `kernel`.
-- CI.
+**Known open issue:**
+
+- **riscv64 only:** the `compositor` process faults (an instruction page
+  fault, not an illegal instruction) shortly after its first resume. Deep
+  investigation across several sessions narrowed the search space
+  considerably (ruled out corrupted resume data, stack/heap sizing, and
+  confirmed it reproduces identically on two independent QEMU builds) but the
+  root cause is not yet found. x86_64 and aarch64 are unaffected;
+  `scripts/qemu-fault-isolation-test.sh riscv64` runs with a documented
+  `--allow-fail` in CI so this stays visible without blocking the pipeline.
 
 ## Repository scope
 
@@ -153,15 +159,27 @@ compatibility runtime, and applications.
 
 ## Documentation
 
-The architecture specification (Persian) lives in `.claude/` in this working
-tree: `00-Overview.md`, `01-HAL-Layer.md`, `02-Microkernel-Layer.md`,
-`03-Kernel-Subsystems-Layer.md`, plus `CONTRIBUTING.md` and `REPO-Simurgh-OS.md`.
+The Persian architecture specification (`00-Overview.md`,
+`01-HAL-Layer.md`, `02-Microkernel-Layer.md`,
+`03-Kernel-Subsystems-Layer.md`, and `REPO-Simurgh-OS.md`) is the project's
+internal design reference and is not part of this public repository (it lives
+in a gitignored `.claude/` working directory, not tracked in git). This
+`README.md` and [`CONTRIBUTING.md`](CONTRIBUTING.md) are the up-to-date public
+documentation.
 
 ## MVP Definition of Done
 
 Combined acceptance criteria of `01-HAL-Layer.md §8`, `02-Microkernel-Layer.md §8`,
-and `03-Kernel-Subsystems-Layer.md §5`. Progress against them is summarised under
-**Current status** above.
+and `03-Kernel-Subsystems-Layer.md §5` — **met**, on all three architectures
+except the one open riscv64 issue noted under **Current status** above.
+
+## Contributing
+
+Every change goes through its own branch and a pull request — `main` is
+protected, requires a passing CI run and an approving review, and a merge
+triggers an automatically numbered GitHub Release. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the full flow and branch-naming
+convention.
 
 ## License
 
