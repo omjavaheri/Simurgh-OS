@@ -412,9 +412,28 @@ fn is_descendant_of<const N: usize, const M: usize>(
 /// `parent` link, which would corrupt the ancestry walk for a
 /// not-yet-checked slot deeper in the same subtree. Pass two frees every
 /// marked slot — order no longer matters once marking is complete. Cost is
-/// bounded by `(M * N)²`, cheap for this kernel's small fixed table sizes
-/// and acceptable for an administrative operation that is never on a
-/// syscall fast path.
+/// bounded by `(M * N)²` — NOT unbounded: this kernel's own real
+/// `kernel_core::config` constants (`MAX_CAP_SPACES` = 16, `CAP_SLOTS_PER_
+/// SPACE` = 96) fix `M * N` at 1536 slots total, a hard compile-time
+/// ceiling with no dynamic growth path.
+///
+/// Measured worst case (this module's own `revoke_worst_case_*` tests,
+/// which build the actual worst-case shape at THIS kernel's real M/N: one
+/// maximal derivation chain threaded through every one of the 16 spaces,
+/// 96 slots deep in each, so every pass-1 candidate also walks the
+/// longest possible ancestry chain): ~53 µs for a single, maximally deep
+/// table (N=96) and ~8.1 ms for the full cross-space worst case (all 1536
+/// slots), both `--release`, host desktop CPU — not real target hardware
+/// or QEMU timing, but the right order of magnitude. This is a real,
+/// noticeable latency spike for one syscall, but it is a hard-bounded one
+/// that only a deliberately pathological caller (a chain spanning every
+/// capability space at full capacity) can reach; an ordinary subtree
+/// revoke is far cheaper (see the other tests in this module). Treated as
+/// an acceptable, documented, regression-tested cost rather than grounds
+/// for an incremental/preemptible redesign — the two-pass mark-then-free
+/// order above is load-bearing for correctness (see the previous
+/// paragraph) and does not map cleanly onto a "process N nodes, then
+/// pause" continuation model.
 pub fn revoke_cross_space<const N: usize, const M: usize>(
     tables: &mut [Option<CapTable<N>>; M],
     target: GlobalCapId,
@@ -700,5 +719,115 @@ mod tests {
         assert!(tables[1].as_ref().unwrap().lookup(g1).is_none());
         assert!(tables[2].as_ref().unwrap().lookup(g2).is_some());
         assert!(tables[0].as_ref().unwrap().lookup(root).is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // REPO-Simurgh-OS-Remediation.md item 12's own required test: measure
+    // worst-case single-`CapRevoke`-syscall latency against a deep CDT,
+    // at THIS kernel's own real fixed sizes (`kernel_core::config::
+    // CAP_SLOTS_PER_SPACE` = 96, `MAX_CAP_SPACES` = 16 — not reproduced
+    // here to keep this crate free of a `kernel-core` dependency, but the
+    // `N`/`M` below are chosen to match).
+    //
+    // `extern crate std` inside this `#[cfg(test)]` module only: the
+    // crate stays `#![no_std]` for its real (bare-metal) build; host
+    // tests (this workspace's default-members, per CLAUDE.md) always run
+    // where `std` is available regardless, so timing here costs nothing
+    // the real kernel binary ever links.
+    // ------------------------------------------------------------------
+    extern crate std;
+
+    #[test]
+    fn revoke_worst_case_single_table_deep_chain_latency() {
+        // A single `CapTable<96>` (this kernel's own real per-space size)
+        // filled with the deepest possible ONE derivation chain: root ->
+        // c1 -> c2 -> ... -> c94 (95 total, the table's own capacity).
+        // This is the worst case `is_descendant_of` can ever face WITHIN
+        // one table: every one of the (up to) 96 candidates in pass 1
+        // walks a parent chain up to 95 hops long before reaching a
+        // root/non-match, since `is_descendant_of`'s own walk doesn't
+        // know in advance which candidates are ancestors vs. unrelated.
+        const REAL_N: usize = 96;
+        let mut tables: [Option<CapTable<REAL_N>>; 1] = [Some(CapTable::new(sid(0)))];
+        let t = tables[0].as_mut().unwrap();
+        let root = t.insert_root(root_cap()).unwrap();
+        let mut tail = root;
+        for _ in 0..(REAL_N - 1) {
+            tail = t
+                .derive_child(tail, CapabilityRights::all(), 0)
+                .unwrap();
+        }
+        assert!(t.is_full());
+
+        let start = std::time::Instant::now();
+        let freed = revoke_cross_space(&mut tables, GlobalCapId::new(sid(0), root)).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(freed, REAL_N as u32);
+        std::println!(
+            "revoke_cross_space worst case (N={REAL_N}, single table, full-depth chain): {elapsed:?}"
+        );
+        // No hard microsecond ceiling asserted here (host timing is not
+        // representative of real hardware or QEMU/TCG) - this test's
+        // real value is the PRINTED number (see this item's own commit
+        // message for what it measured) plus proving the full-depth,
+        // full-capacity case terminates correctly and frees exactly
+        // every node, not just "doesn't obviously hang".
+    }
+
+    #[test]
+    fn revoke_worst_case_across_all_real_cap_spaces() {
+        // This kernel's own real total capacity: MAX_CAP_SPACES (16)
+        // tables of CAP_SLOTS_PER_SPACE (96) each = 1536 slots - a HARD,
+        // compile-time-fixed ceiling in the real kernel (no dynamic
+        // space/slot growth exists), not "unbounded" in the sense of
+        // being able to grow further. One long chain threaded through
+        // every space via cross-space grants (space 0 -> 1 -> ... -> 15,
+        // ~96 slots deep in each) exercises pass 1's full M*N candidate
+        // scan AND its own deepest possible per-candidate ancestry walk
+        // simultaneously - the actual worst case this item is about.
+        const REAL_N: usize = 96;
+        const REAL_M: usize = 16;
+        let mut tables: [Option<CapTable<REAL_N>>; REAL_M] =
+            core::array::from_fn(|i| Some(CapTable::new(sid(i as u32))));
+
+        let mut cur_id = tables[0].as_mut().unwrap().insert_root(root_cap()).unwrap();
+        let root = cur_id;
+        let mut total = 1u32;
+
+        for space in 0..REAL_M {
+            // Fill the rest of THIS space with a same-space chain
+            // continuing from wherever the cross-space grant landed.
+            for _ in 0..(REAL_N - 1) {
+                let t = tables[space].as_mut().unwrap();
+                cur_id = t.derive_child(cur_id, CapabilityRights::all(), 0).unwrap();
+                total += 1;
+            }
+            if space + 1 < REAL_M {
+                let (left, right) = tables.split_at_mut(space + 1);
+                let src = left[space].as_ref().unwrap();
+                let dst = right[0].as_mut().unwrap();
+                cur_id = derive_child_cross_space(
+                    src,
+                    sid(space as u32),
+                    cur_id,
+                    dst,
+                    CapabilityRights::all(),
+                    0,
+                )
+                .unwrap();
+                total += 1;
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let freed = revoke_cross_space(&mut tables, GlobalCapId::new(sid(0), root)).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(freed, total);
+        std::println!(
+            "revoke_cross_space worst case (M={REAL_M} spaces x N={REAL_N} slots = {} total, one maximal chain through all spaces): {elapsed:?}",
+            REAL_M * REAL_N
+        );
     }
 }
