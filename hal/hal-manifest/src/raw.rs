@@ -31,7 +31,14 @@
 // covers multi-GPU + multi-NPU setups) while keeping the struct small
 // enough to live comfortably on the boot stack before any heap exists.
 // ----------------------------------------------------------------------------
-pub const MAX_MEMORY_REGIONS: usize = 64;
+/// 64 was NOT generous enough in practice: this project's own reference
+/// QEMU/OVMF x86_64 UEFI memory map reports 104 descriptors (confirmed
+/// via a real boot, once REPO-Simurgh-OS-Remediation.md item 04's own
+/// truncation counter existed to actually reveal it — 40 were being
+/// silently dropped on every single x86_64 boot this project has ever
+/// done). 256 leaves real headroom above that on this project's own
+/// hardware, not just a guess.
+pub const MAX_MEMORY_REGIONS: usize = 256;
 pub const MAX_COMPUTE_DEVICES: usize = 32;
 pub const MAX_POWER_DOMAINS: usize = 16;
 /// Matches QEMU's aarch64 `virt` machine's own virtio-mmio slot count (32
@@ -563,6 +570,24 @@ pub struct HardwareManifestRaw {
 
     pub power_domain_count: u32,
     pub power_domains: [PowerDomainRaw; MAX_POWER_DOMAINS],
+
+    /// How many memory regions were DROPPED because `push_memory_region`
+    /// was called after `MAX_MEMORY_REGIONS` was already reached —
+    /// incremented by `push_memory_region` itself, not by call sites, so
+    /// this can never go silently unrecorded regardless of whether a
+    /// given `hal-<arch>` discovery call site bothers to check the
+    /// `Result` (most don't, and can't be required to without touching
+    /// every architecture's own discovery code — the counter makes that
+    /// safe). Zero means nothing was dropped. See `push_memory_region`'s
+    /// own doc comment.
+    pub truncated_memory_regions: u32,
+    /// Same accounting for `push_compute_device`/`MAX_COMPUTE_DEVICES`.
+    pub truncated_compute_devices: u32,
+    /// Same accounting for `push_peripheral_device`/
+    /// `MAX_PERIPHERAL_DEVICES`.
+    pub truncated_peripheral_devices: u32,
+    /// Same accounting for `push_power_domain`/`MAX_POWER_DOMAINS`.
+    pub truncated_power_domains: u32,
 }
 
 impl HardwareManifestRaw {
@@ -589,7 +614,22 @@ impl HardwareManifestRaw {
             timer: TimerInfoRaw::ZERO,
             power_domain_count: 0,
             power_domains: [PowerDomainRaw::ZERO; MAX_POWER_DOMAINS],
+            truncated_memory_regions: 0,
+            truncated_compute_devices: 0,
+            truncated_peripheral_devices: 0,
+            truncated_power_domains: 0,
         }
+    }
+
+    /// Whether ANY category dropped entries due to hitting its fixed
+    /// capacity during discovery — the single check a consumer (e.g.
+    /// `kernel-stub`'s own boot-time summary) needs before deciding
+    /// whether to print a truncation warning at all.
+    pub fn has_truncation(&self) -> bool {
+        self.truncated_memory_regions > 0
+            || self.truncated_compute_devices > 0
+            || self.truncated_peripheral_devices > 0
+            || self.truncated_power_domains > 0
     }
 
     /// Returns the populated slice of memory regions, ignoring unused
@@ -632,6 +672,7 @@ impl HardwareManifestRaw {
     pub fn push_memory_region(&mut self, region: MemoryRegionRaw) -> Result<(), ()> {
         let idx = self.memory_region_count as usize;
         if idx >= MAX_MEMORY_REGIONS {
+            self.truncated_memory_regions += 1;
             return Err(());
         }
         self.memory_regions[idx] = region;
@@ -644,6 +685,7 @@ impl HardwareManifestRaw {
     pub fn push_compute_device(&mut self, mut device: ComputeDeviceRaw) -> Result<(), ()> {
         let idx = self.compute_device_count as usize;
         if idx >= MAX_COMPUTE_DEVICES {
+            self.truncated_compute_devices += 1;
             return Err(());
         }
         // The device's own index must match its final slot so that
@@ -661,6 +703,7 @@ impl HardwareManifestRaw {
     pub fn push_peripheral_device(&mut self, mut device: PeripheralDeviceRaw) -> Result<(), ()> {
         let idx = self.peripheral_device_count as usize;
         if idx >= MAX_PERIPHERAL_DEVICES {
+            self.truncated_peripheral_devices += 1;
             return Err(());
         }
         device.device_index = idx as u32;
@@ -674,6 +717,7 @@ impl HardwareManifestRaw {
     pub fn push_power_domain(&mut self, domain: PowerDomainRaw) -> Result<(), ()> {
         let idx = self.power_domain_count as usize;
         if idx >= MAX_POWER_DOMAINS {
+            self.truncated_power_domains += 1;
             return Err(());
         }
         self.power_domains[idx] = domain;
@@ -736,6 +780,7 @@ mod tests {
         assert!(m.compute_devices().is_empty());
         assert!(m.peripheral_devices().is_empty());
         assert!(m.power_domains().is_empty());
+        assert!(!m.has_truncation());
     }
 
     #[test]
@@ -746,6 +791,46 @@ mod tests {
         }
         assert!(m.push_memory_region(MemoryRegionRaw::ZERO).is_err());
         assert_eq!(m.memory_region_count as usize, MAX_MEMORY_REGIONS);
+    }
+
+    /// REPO-Simurgh-OS-Remediation.md item 04's own required test: a mock
+    /// memory map with more entries than `MAX_MEMORY_REGIONS` must not
+    /// panic, must keep exactly the capacity, and must record precisely
+    /// how many were dropped — not silently, per that item's whole point.
+    #[test]
+    fn overflowing_memory_regions_are_counted_not_silently_dropped() {
+        let mut m = HardwareManifestRaw::zeroed();
+        let extra = 17;
+        for _ in 0..(MAX_MEMORY_REGIONS + extra) {
+            // Deliberately ignoring the `Result`, same as every real
+            // `hal-<arch>/src/memory.rs` call site does - the whole
+            // point of this test is that doing so is now safe.
+            let _ = m.push_memory_region(MemoryRegionRaw::ZERO);
+        }
+        assert_eq!(m.memory_region_count as usize, MAX_MEMORY_REGIONS);
+        assert_eq!(m.truncated_memory_regions as usize, extra);
+        assert!(m.has_truncation());
+        // The other three categories are untouched by this - truncation
+        // accounting is per-category, not a single shared flag.
+        assert_eq!(m.truncated_compute_devices, 0);
+        assert_eq!(m.truncated_peripheral_devices, 0);
+        assert_eq!(m.truncated_power_domains, 0);
+    }
+
+    #[test]
+    fn overflowing_compute_devices_and_power_domains_are_counted_independently() {
+        let mut m = HardwareManifestRaw::zeroed();
+        for _ in 0..(MAX_COMPUTE_DEVICES + 3) {
+            let _ = m.push_compute_device(ComputeDeviceRaw::ZERO);
+        }
+        for _ in 0..(MAX_POWER_DOMAINS + 5) {
+            let _ = m.push_power_domain(PowerDomainRaw::ZERO);
+        }
+        assert_eq!(m.truncated_compute_devices, 3);
+        assert_eq!(m.truncated_power_domains, 5);
+        assert_eq!(m.truncated_memory_regions, 0);
+        assert_eq!(m.truncated_peripheral_devices, 0);
+        assert!(m.has_truncation());
     }
 
     #[test]

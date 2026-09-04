@@ -139,15 +139,24 @@ SECTIONS
         *(.bss .bss.*)
 
         /* Boot-time stack for the bootstrap processor (BSP), used by
-         * boot.S between `_start` and the first call into Rust. Sized
-         * generously (64 KiB) since this stack briefly hosts firmware
-         * memory-map parsing (hal-core/src/memory.rs) before the
-         * microkernel's own per-thread stacks (layer 2 concern) take
-         * over entirely. 16-byte aligned per the x86_64 System V ABI's
-         * stack alignment requirement at function-call boundaries. */
+         * boot.S between `_start` and the first call into Rust. 256 KiB
+         * (bumped from 64 KiB - REPO-Simurgh-OS-Remediation.md item 04:
+         * raising HardwareManifestRaw's MAX_MEMORY_REGIONS 64->256 grew
+         * that struct to ~10.5 KiB, and a real QEMU boot panicked with
+         * "internally inconsistent BootInfo" at 64 KiB - an unoptimized
+         * `dev`-profile build copies this struct by value through
+         * several nested constructor calls with no guaranteed elision,
+         * silently overflowing the stack and corrupting BootInfo's own
+         * magic field. 256 KiB matches hal-riscv64's own already-
+         * generous sizing for the identical struct). This stack briefly
+         * hosts firmware memory-map parsing (hal-core/src/memory.rs)
+         * before the microkernel's own per-thread stacks (layer 2
+         * concern) take over entirely. 16-byte aligned per the x86_64
+         * System V ABI's stack alignment requirement at function-call
+         * boundaries. */
         . = ALIGN(16);
         __boot_stack_bottom = .;
-        . += 64K;
+        . += 256K;
         __boot_stack_top = .;
 
         __bss_end = .;
