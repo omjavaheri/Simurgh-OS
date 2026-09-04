@@ -225,6 +225,26 @@ pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInf
     let _ = writeln!(serial, "compute devices: {}", boot_info.hardware_manifest.compute_device_count);
     let _ = writeln!(serial, "power domains: {}", boot_info.hardware_manifest.power_domain_count);
 
+    // REPO-Simurgh-OS-Remediation.md item 04: overflowing one of the
+    // Hardware Manifest's fixed-capacity arrays during discovery is
+    // truncate-and-continue, never a panic - but it must never be
+    // completely silent either. `hal-manifest`'s own `push_*` functions
+    // count what they drop regardless of whether the `hal-<arch>` call
+    // site checks the `Result` (most don't, deliberately - see that
+    // struct's own doc comments); this is the one place that accounting
+    // actually gets surfaced, so a real overflow is never invisible.
+    if boot_info.hardware_manifest.has_truncation() {
+        let m = &boot_info.hardware_manifest;
+        let _ = writeln!(
+            serial,
+            "WARNING: hardware manifest truncated - regions:{} compute:{} peripherals:{} power:{}",
+            m.truncated_memory_regions,
+            m.truncated_compute_devices,
+            m.truncated_peripheral_devices,
+            m.truncated_power_domains,
+        );
+    }
+
     match boot_info.validate() {
         Ok(()) => { let _ = writeln!(serial, "BootInfo validation: OK"); }
         Err(err) => { let _ = writeln!(serial, "BootInfo validation FAILED: {err}"); }

@@ -467,6 +467,10 @@ const MAX_TRACKED_REGIONS: usize = hal_manifest::raw::MAX_MEMORY_REGIONS;
 pub struct Memory {
     regions: [MemoryRegion; MAX_TRACKED_REGIONS],
     region_count: usize,
+    /// See hal-x86_64's `Memory::dropped_region_count` field doc comment
+    /// — same rationale, same fix (REPO-Simurgh-OS-Remediation.md item
+    /// 04).
+    dropped_region_count: usize,
     iommu_present: bool,
     gicd_base: u64,
 }
@@ -488,10 +492,12 @@ impl Memory {
 
         let mut regions = [MemoryRegionRaw::ZERO; MAX_TRACKED_REGIONS];
         let mut region_count = 0usize;
+        let mut dropped_region_count = 0usize;
 
         for descriptor in iter {
             if region_count >= MAX_TRACKED_REGIONS {
-                break;
+                dropped_region_count += 1;
+                continue;
             }
             regions[region_count] = MemoryRegionRaw::new(
                 descriptor.physical_start,
@@ -515,9 +521,15 @@ impl Memory {
         Self {
             regions,
             region_count,
+            dropped_region_count,
             iommu_present: acpi_result.smmu_present,
             gicd_base: acpi_result.gicd_base.unwrap_or(QEMU_VIRT_DEFAULT_GICD_BASE),
         }
+    }
+
+    /// See this struct's `dropped_region_count` field doc comment.
+    pub fn dropped_region_count(&self) -> usize {
+        self.dropped_region_count
     }
 
     /// Read by `hal_arm64_rust_entry` (lib.rs) to construct
@@ -666,6 +678,10 @@ pub fn built_hardware_manifest(
     for region in memory.physical_memory_map() {
         let _ = manifest.push_memory_region(*region);
     }
+    // See hal-x86_64's identical fold-in for why this is needed
+    // separately from the loop above (REPO-Simurgh-OS-Remediation.md
+    // item 04).
+    manifest.truncated_memory_regions += memory.dropped_region_count() as u32;
     for device in compute.enumerate_compute_devices() {
         let _ = manifest.push_compute_device(*device);
     }

@@ -76,16 +76,32 @@ SECTIONS
          * semantics — see that function's own doc comment for the full
          * story of the leak this fixes and the real, separate bug the
          * fix exposed and required fixing too), so this stack no longer
-         * accumulates unbounded consumption across process switches;
-         * 64 KiB matches the other two architectures again. (A real
-         * link error — `adr`'s encoding only reaching ±1 MiB from its
-         * own address — was hit here first, since `boot.S`'s `_start`
-         * addressed `__boot_stack_top`/`__bss_end` that way; fixed by
-         * switching those two references to `adrp`+`add :lo12:`, which
-         * has no such range limit — see `lib.rs`'s own `_start`.) */
+         * accumulates unbounded consumption across process switches.
+         * (A real link error — `adr`'s encoding only reaching ±1 MiB from
+         * its own address — was hit here first, since `boot.S`'s
+         * `_start` addressed `__boot_stack_top`/`__bss_end` that way;
+         * fixed by switching those two references to `adrp`+
+         * `add :lo12:`, which has no such range limit — see `lib.rs`'s
+         * own `_start`.)
+         *
+         * 256 KiB (bumped from 64 KiB again, for an UNRELATED new
+         * reason - not a resurrection of the old per-switch-accumulation
+         * bug the paragraph above already fixed):
+         * REPO-Simurgh-OS-Remediation.md item 04 raised HardwareManifest
+         * Raw's MAX_MEMORY_REGIONS 64->256, growing that struct to
+         * ~10.5 KiB; a real x86_64 QEMU boot panicked with "internally
+         * inconsistent BootInfo" at 64 KiB (an unoptimized `dev`-profile
+         * build copies the struct by value through several nested
+         * constructor calls with no guaranteed elision, silently
+         * overflowing the stack and corrupting BootInfo's own magic
+         * field) - this crate builds the identical struct, so it needs
+         * the same headroom even though aarch64's own real memory maps
+         * (observed: 33 regions) never came close to the OLD 64-region
+         * cap. 256 KiB matches hal-riscv64's own already-generous
+         * sizing for this same struct. */
         . = ALIGN(16);
         __boot_stack_bottom = .;
-        . += 64K;
+        . += 256K;
         __boot_stack_top = .;
 
         __bss_end = .;

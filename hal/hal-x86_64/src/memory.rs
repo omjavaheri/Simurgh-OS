@@ -518,6 +518,17 @@ const MAX_TRACKED_REGIONS: usize = hal_manifest::raw::MAX_MEMORY_REGIONS;
 pub struct Memory {
     regions: [MemoryRegion; MAX_TRACKED_REGIONS],
     region_count: usize,
+    /// How many UEFI memory-map descriptors were dropped because
+    /// `MAX_TRACKED_REGIONS` (== `hal_manifest::raw::MAX_MEMORY_REGIONS`)
+    /// was already reached while parsing — a SEPARATE, earlier
+    /// truncation point from `HardwareManifestRaw::push_memory_region`'s
+    /// own capacity check (REPO-Simurgh-OS-Remediation.md item 04):
+    /// by construction this array can never hold more than the
+    /// manifest's own capacity, so `push_memory_region` can never
+    /// observe an overflow for memory regions specifically - this
+    /// counter is what actually catches it. See `build_manifest`'s own
+    /// use of this via `dropped_region_count()`.
+    dropped_region_count: usize,
     iommu_present: bool,
     /// The ACPI RSDP physical address `from_uefi_memory_map` already
     /// located to answer `acpi_dmar_present` — retained (not just a
@@ -569,14 +580,18 @@ impl Memory {
 
         let mut regions = [MemoryRegionRaw::ZERO; MAX_TRACKED_REGIONS];
         let mut region_count = 0usize;
+        let mut dropped_region_count = 0usize;
 
         for descriptor in iter {
             if region_count >= MAX_TRACKED_REGIONS {
                 // Per hal-manifest's push_memory_region capacity
                 // rationale (raw.rs): truncate and continue rather
-                // than fail boot over a rare excess of firmware-
-                // reported regions.
-                break;
+                // than fail boot over an excess of firmware-reported
+                // regions - but keep counting instead of `break`ing, so
+                // `dropped_region_count` is exact, not just "at least
+                // one" (REPO-Simurgh-OS-Remediation.md item 04).
+                dropped_region_count += 1;
+                continue;
             }
             regions[region_count] = MemoryRegionRaw::new(
                 descriptor.physical_start,
@@ -613,6 +628,7 @@ impl Memory {
                 typed
             },
             region_count,
+            dropped_region_count,
             iommu_present,
             rsdp_phys,
         }
@@ -620,6 +636,11 @@ impl Memory {
 
     pub fn region_count(&self) -> usize {
         self.region_count
+    }
+
+    /// See this struct's `dropped_region_count` field doc comment.
+    pub fn dropped_region_count(&self) -> usize {
+        self.dropped_region_count
     }
 
     /// The ACPI RSDP physical address this crate located at boot — `0`
@@ -767,6 +788,13 @@ pub fn built_hardware_manifest(
         // rather than assuming.
         let _ = manifest.push_memory_region(*region);
     }
+    // `push_memory_region` above can never itself observe an overflow
+    // for memory regions (the array it reads from is already capped to
+    // the same MAX_MEMORY_REGIONS) - fold in whatever `from_uefi_memory_
+    // map` already dropped so the boot-time truncation warning
+    // (REPO-Simurgh-OS-Remediation.md item 04) actually fires for this
+    // category, not just the other three.
+    manifest.truncated_memory_regions += memory.dropped_region_count() as u32;
 
     for device in compute.enumerate_compute_devices() {
         let _ = manifest.push_compute_device(*device);
