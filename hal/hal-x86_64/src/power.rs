@@ -42,10 +42,13 @@ fn rdmsr(msr: u32) -> u64 {
     // `rapl_supported`/presence checks this file performs before
     // relying on their values — reading an unsupported MSR on real
     // hardware raises #GP, which this MVP phase does not yet catch via
-    // a recoverable fault handler (a tracked follow-up alongside
-    // cpu.rs's IST/double-fault TODO); every call site below is gated
-    // by a prior CPUID/vendor check making the read valid in practice
-    // for this project's supported target CPUs.
+    // a recoverable fault handler (a separate, still-open follow-up —
+    // distinct from cpu.rs's own double-fault IST hardening, which is
+    // done: that only isolates the double-fault handler's OWN stack,
+    // it doesn't add #GP recovery for arbitrary callers like this one);
+    // every call site below is gated by a prior CPUID/vendor check
+    // making the read valid in practice for this project's supported
+    // target CPUs.
     unsafe {
         core::arch::asm!(
             "rdmsr",
