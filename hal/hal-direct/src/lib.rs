@@ -68,6 +68,13 @@
 
 use hal_core::{HalError, PhysAddr, VirtAddr};
 
+/// Concrete Ed25519 `TokenVerifier` (Issue #29's resolved algorithm
+/// decision). Feature-gated so a build that never needs a real
+/// (non-mock) verifier never pulls in the crypto dependency — see
+/// this crate's `Cargo.toml` and `ed25519.rs`'s own module docs.
+#[cfg(feature = "ed25519")]
+pub mod ed25519;
+
 // ============================================================================
 // CapabilityToken (section 5)
 // ============================================================================

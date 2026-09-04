@@ -46,9 +46,32 @@ repository.workspace = true
 # directly rather than defining a parallel error type.
 hal-core = { path = "../hal-core" }
 
+# Ed25519 `TokenVerifier` implementation (Issue #29): only public keys
+# ever need to live in a hal-<arch> image (the Security Broker, layer
+# 4, is the sole holder of the signing/private key) — asymmetric
+# signing means a leaked/dumped kernel image reveals nothing an
+# attacker could use to forge a token, unlike a shared HMAC secret
+# that would have to be embedded identically in all three hal-<arch>
+# crates. `default-features = false` drops ed25519-dalek's own
+# defaults (`fast` + `zeroize`) so nothing here is accidental; `fast`
+# is re-enabled explicitly (precomputed-table verification — larger
+# `.rodata`, no allocation). `zeroize` stays off: it exists to scrub
+# SECRET key material, and this crate only ever holds the PUBLIC key
+# (verification-only, no signing). Every transitive dependency
+# (ed25519-dalek, ed25519, curve25519-dalek, sha2, subtle) is itself
+# `default-features = false` and `#![no_std]` at this feature set —
+# confirmed by reading their published Cargo.toml/lib.rs, not assumed.
+ed25519-dalek = { version = "3", default-features = false, features = ["fast"], optional = true }
+
 [dev-dependencies]
 # No extra crates needed for the same reason as hal-core: host-target
 # unit tests use std implicitly, the crate under test stays no_std.
 
 [features]
 default = []
+# Enables the concrete Ed25519 TokenVerifier (Issue #29's algorithm
+# decision). Off by default so a build that never needs hal-direct at
+# all (section 1's separation requirement) never pulls in the crypto
+# dependency either; a hal-<arch> crate that wants a real (non-mock)
+# verifier turns this on alongside its own hal-direct-support feature.
+ed25519 = ["dep:ed25519-dalek"]

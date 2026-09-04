@@ -59,6 +59,38 @@ rustflags = [
     # broke as soon as the project's own directory name/location
     # changed (see git history around the "cannot find linker script"
     # build failure).
+    #
+    # curve25519-dalek/sha2 (Issue #29's Ed25519 TokenVerifier,
+    # hal-direct's optional "ed25519" feature) auto-select a
+    # runtime-CPUID-detected SIMD backend by default. On this custom
+    # target that codegen path hits a real LLVM back-end crash
+    # ("rustc-LLVM ERROR: Do not know how to split the result of this
+    # operator!") — confirmed by building `cargo build -p hal-direct
+    # --features ed25519 --target targets/x86_64-hal.json` without
+    # these cfgs. Forcing both crates' portable, non-SIMD backends
+    # instead fixes that crash and is the right choice anyway for a
+    # `#[panic_handler]`-only, allocator-optional bare-metal image — no
+    # runtime CPU-feature detection surface, no dependence on this
+    # target spec ever gaining AVX2/SHA-NI support.
+    #
+    # `serial`, not `fiat`: curve25519-dalek 5.0.0's `fiat` backend
+    # (its formally-verified, fiat-crypto-generated field arithmetic)
+    # is itself unbuildable on this project's pinned nightly
+    # (nightly-2025-01-15) — `fiat_u64/field.rs` calls
+    # `slice::copy_from_slice` as a const fn, which was not yet stable
+    # on that toolchain (confirmed by direct build attempt: "error:
+    # `slice::<impl [T]>::copy_from_slice` is not yet stable as a const
+    # fn"). `serial` is curve25519-dalek's other portable, no-SIMD,
+    # no-CPU-feature-detection backend (predates `fiat`, hand-written
+    # rather than formally-verified-and-generated) and does not hit
+    # this const-fn requirement. Revisit this choice if the pinned
+    # nightly is ever bumped past whatever release stabilized
+    # `const_copy_from_slice` — `fiat` may become buildable again then.
+    #
+    # A no-op for any build that doesn't enable the "ed25519" feature
+    # (the cfgs are simply unused).
+    "--cfg", 'curve25519_dalek_backend="serial"',
+    "--cfg", 'sha2_backend="soft"',
 ]
 
 [target.aarch64-hal]
