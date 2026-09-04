@@ -29,6 +29,7 @@ use crate::driver::{DriverErrorCode, DriverRequest, DriverResponse};
 use crate::fs::{FileHandle, FsErrorCode, FsRequest, FsResponse, OpenFlags, PathId};
 use crate::mm::{ComputeKind, MmErrorCode, MmRequest, MmResponse, ReclaimClass};
 use crate::net::{DirectNicHandle, NetBypassRequest, NetBypassResponse};
+use crate::security::{SecurityErrorCode, SecurityRequest, SecurityResponse};
 use crate::{label_parts, Namespace, PROTOCOL_VERSION};
 use kernel_ipc::SmallMessage;
 
@@ -1035,6 +1036,119 @@ pub fn decode_net_bypass_response(msg: &SmallMessage) -> Result<NetBypassRespons
     }
 }
 
+// SecurityRequest opcodes (low byte of the label).
+const OP_SEC_CAP_GRANT: u8 = 1;
+const OP_SEC_CAP_REVOKE: u8 = 2;
+
+/// Encodes a `SecurityRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `CapGrant`: `[target_service, cap, rights]`
+/// - `CapRevoke`: `[cap]`
+pub fn encode_security_request(req: &SecurityRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 3]) = match *req {
+        SecurityRequest::CapGrant {
+            target_service,
+            cap,
+            rights,
+        } => (
+            OP_SEC_CAP_GRANT,
+            [target_service as u64, cap as u64, rights as u64],
+        ),
+        SecurityRequest::CapRevoke { cap } => (OP_SEC_CAP_REVOKE, [cap as u64, 0, 0]),
+    };
+    let n = if op == OP_SEC_CAP_GRANT { 3 } else { 1 };
+    // `from_words` cannot fail here: n <= 3 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Security.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Security.label(op)))
+}
+
+/// Decodes a `SecurityRequest` from a `SmallMessage`.
+pub fn decode_security_request(msg: &SmallMessage) -> Result<SecurityRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Security) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    match op {
+        OP_SEC_CAP_GRANT => {
+            if w.len() < 3 {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(SecurityRequest::CapGrant {
+                target_service: w[0] as u32,
+                cap: w[1] as u32,
+                rights: w[2] as u32,
+            })
+        }
+        OP_SEC_CAP_REVOKE => {
+            if w.is_empty() {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(SecurityRequest::CapRevoke { cap: w[0] as u32 })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// SecurityResponse opcodes — a separate small sequence from the request
+// opcodes above, same "kept sequential-and-distinct for readability"
+// convention every other namespace here already follows.
+const OP_SECR_GRANTED: u8 = 1;
+const OP_SECR_REVOKED: u8 = 2;
+const OP_SECR_ERROR: u8 = 3;
+
+/// Encodes a `SecurityResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Granted`: `[dst]`
+/// - `Revoked`: `[freed]`
+/// - `Error`: `[code]`
+pub fn encode_security_response(resp: &SecurityResponse) -> SmallMessage {
+    let (op, word): (u8, u64) = match *resp {
+        SecurityResponse::Granted { dst } => (OP_SECR_GRANTED, dst as u64),
+        SecurityResponse::Revoked { freed } => (OP_SECR_REVOKED, freed as u64),
+        SecurityResponse::Error { code } => (OP_SECR_ERROR, code as u64),
+    };
+    // `from_words` cannot fail here: 1 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Security.label(op), &[word])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Security.label(op)))
+}
+
+/// Decodes a `SecurityResponse` from a `SmallMessage`.
+pub fn decode_security_response(msg: &SmallMessage) -> Result<SecurityResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Security) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    if w.is_empty() {
+        return Err(DecodeError::Truncated);
+    }
+    match op {
+        OP_SECR_GRANTED => Ok(SecurityResponse::Granted { dst: w[0] as u32 }),
+        OP_SECR_REVOKED => Ok(SecurityResponse::Revoked { freed: w[0] as u32 }),
+        OP_SECR_ERROR => {
+            let code = match w[0] {
+                1 => SecurityErrorCode::Unsupported,
+                2 => SecurityErrorCode::UnknownService,
+                3 => SecurityErrorCode::KernelRejected,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(SecurityResponse::Error { code })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,5 +1541,65 @@ mod tests {
             decode_net_bypass_response(&msg),
             Err(DecodeError::Truncated)
         );
+    }
+
+    fn security_request_roundtrip(req: SecurityRequest) {
+        let msg = encode_security_request(&req);
+        assert_eq!(decode_security_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_security_request_variants_roundtrip() {
+        security_request_roundtrip(SecurityRequest::CapGrant {
+            target_service: 7,
+            cap: 3,
+            rights: 0b0011,
+        });
+        security_request_roundtrip(SecurityRequest::CapRevoke { cap: 3 });
+    }
+
+    fn security_response_roundtrip(resp: SecurityResponse) {
+        let msg = encode_security_response(&resp);
+        assert_eq!(decode_security_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_security_response_variants_roundtrip() {
+        security_response_roundtrip(SecurityResponse::Granted { dst: 9 });
+        security_response_roundtrip(SecurityResponse::Revoked { freed: 4 });
+        security_response_roundtrip(SecurityResponse::Error {
+            code: SecurityErrorCode::Unsupported,
+        });
+        security_response_roundtrip(SecurityResponse::Error {
+            code: SecurityErrorCode::UnknownService,
+        });
+        security_response_roundtrip(SecurityResponse::Error {
+            code: SecurityErrorCode::KernelRejected,
+        });
+    }
+
+    #[test]
+    fn security_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_SEC_CAP_GRANT));
+        assert_eq!(
+            decode_security_request(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn security_request_truncated_payload_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Security.label(OP_SEC_CAP_GRANT));
+        assert_eq!(
+            decode_security_request(&msg),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn security_response_bad_field_is_rejected() {
+        let msg =
+            SmallMessage::from_words(Namespace::Security.label(OP_SECR_ERROR), &[99]).unwrap();
+        assert_eq!(decode_security_response(&msg), Err(DecodeError::BadField));
     }
 }
