@@ -33,6 +33,7 @@ pub mod driver;
 pub mod display;
 pub mod net;
 pub mod mm;
+pub mod security;
 pub mod codec;
 
 pub use codec::{decode_fs_request, encode_fs_request, DecodeError};
@@ -41,6 +42,7 @@ pub use driver::{DriverRequest, DriverResponse};
 pub use fs::{FileHandle, FsRequest, FsResponse, OpenFlags, PathId};
 pub use mm::{MmErrorCode, MmRequest, MmResponse, ReclaimClass};
 pub use net::{DirectNicHandle, NetBypassRequest, NetBypassResponse};
+pub use security::{SecurityErrorCode, SecurityRequest, SecurityResponse};
 
 /// Protocol version. Bump on any incompatible change to a message type or
 /// the codec. A peer that decodes a message tagged with an unrecognised
@@ -60,6 +62,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// - `Display`: a `DisplayRequest` (compositor service, §2.4).
 /// - `NetBypass`: a `NetBypassRequest` (kernel-bypass networking, §2.3).
 /// - `Mm`: an `MmRequest` (memory policy service, §2.5).
+/// - `Security`: a `SecurityRequest` (the Security Broker's CapGrant/
+///   CapRevoke intermediary process, Issue #28 — 02-Microkernel-Layer.md
+///   §6).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Namespace {
@@ -73,6 +78,8 @@ pub enum Namespace {
     NetBypass = 4,
     /// Memory policy service.
     Mm = 5,
+    /// Security Broker's CapGrant/CapRevoke intermediary.
+    Security = 6,
 }
 
 impl Namespace {
@@ -84,6 +91,7 @@ impl Namespace {
             3 => Some(Self::Display),
             4 => Some(Self::NetBypass),
             5 => Some(Self::Mm),
+            6 => Some(Self::Security),
             _ => None,
         }
     }

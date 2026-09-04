@@ -44,15 +44,36 @@ pub enum Service {
     VfsService,
     /// A single block driver (virtio-blk on QEMU) for the MVP (§5.1).
     BlockDriver,
+    /// The Security Broker's CapGrant/CapRevoke intermediary (Issue #28,
+    /// 02-Microkernel-Layer.md §2.1/§6). The ONLY process Root Task
+    /// grants authority to issue real `CapGrant`/`CapRevoke` syscalls on
+    /// the Security Broker's (layer 4) behalf — the Security Broker
+    /// itself never holds a kernel capability directly. Speaks
+    /// `ipc_protocol::security::{SecurityRequest, SecurityResponse}`
+    /// (`Namespace::Security`) to the Security Broker and issues real
+    /// `SyscallOp::CapGrant`/`CapRevoke` to the kernel on its behalf,
+    /// resolving each request's `target_service` to a destination
+    /// `CapId` via its own internal, boot-time mapping (Issue #30's
+    /// decision — see `02-Microkernel-Layer.md` §2.1: this mapping is
+    /// deliberately NOT a kernel concept). Requires Root Task to grant it
+    /// a destination-TCB `CapId` for every other service it might need to
+    /// grant capabilities into — which is why it boots LAST in
+    /// `BOOT_ORDER`, after every such destination already exists.
+    SecurityBrokerIntermediary,
 }
 
 impl Service {
     /// Boot order — Device Manager first (drivers need it), then VFS,
-    /// then the block driver (VFS mounts it).
-    pub const BOOT_ORDER: [Service; 3] = [
+    /// then the block driver (VFS mounts it), then the Security Broker
+    /// intermediary last: it needs a destination-TCB `CapId` for every
+    /// other service it might later be asked to grant a capability into,
+    /// so those services must already exist for Root Task to grant it
+    /// those `CapId`s at spawn time.
+    pub const BOOT_ORDER: [Service; 4] = [
         Service::DeviceManager,
         Service::VfsService,
         Service::BlockDriver,
+        Service::SecurityBrokerIntermediary,
     ];
 
     /// Rough working-set budget for this service, in bytes — how much
@@ -63,6 +84,11 @@ impl Service {
             Service::DeviceManager => 4 * 1024 * 1024,
             Service::VfsService => 8 * 1024 * 1024,
             Service::BlockDriver => 2 * 1024 * 1024,
+            // Small and fixed: this service holds no bulk data, just a
+            // service-id -> CapId lookup table and in-flight request
+            // bookkeeping — closer to BlockDriver's footprint than
+            // VfsService's.
+            Service::SecurityBrokerIntermediary => 2 * 1024 * 1024,
         }
     }
 }
@@ -140,7 +166,7 @@ mod tests {
     #[test]
     fn plan_fits_in_reasonable_ram() {
         let plan = plan_boot(128 * 1024 * 1024).unwrap();
-        assert_eq!(plan.grants.len(), 3);
+        assert_eq!(plan.grants.len(), 4);
         let committed: u64 = plan.root_reserve_bytes
             + plan.grants.iter().map(|g| g.bytes).sum::<u64>();
         assert_eq!(committed + plan.free_bytes, 128 * 1024 * 1024);
@@ -155,5 +181,16 @@ mod tests {
     #[test]
     fn boot_order_is_device_manager_first() {
         assert_eq!(Service::BOOT_ORDER[0], Service::DeviceManager);
+    }
+
+    #[test]
+    fn boot_order_ends_with_security_broker_intermediary() {
+        // It needs a destination-TCB CapId for every other service it
+        // might grant a capability into (Issue #28/#30), so those
+        // services must already exist when it starts.
+        assert_eq!(
+            Service::BOOT_ORDER[Service::BOOT_ORDER.len() - 1],
+            Service::SecurityBrokerIntermediary
+        );
     }
 }
