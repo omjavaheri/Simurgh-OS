@@ -35,7 +35,11 @@ path = "src/bin/mm-service-bin.rs"
 test = false
 
 [dependencies]
-hal-manifest = { path = "../../hal/hal-manifest", default-features = false }
+# `features = ["alloc"]`: mm-service is a fully spawned layer-3 process
+# with its own heap (unlike root-task's boot-time-only use of hal-manifest's
+# `raw` module) — needs the alloc-gated dynamic module for `ComputeKind`,
+# used by the CXL/unified-memory pool policy below.
+hal-manifest = { path = "../../hal/hal-manifest", default-features = false, features = ["alloc"] }
 ipc-protocol = { path = "../../ipc-protocol" }
 # `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
 # directly (not re-exported by `ipc-protocol` — its own codec module

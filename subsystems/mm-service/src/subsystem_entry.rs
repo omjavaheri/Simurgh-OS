@@ -11,14 +11,16 @@
 //! Purpose: mm-service's real process entry point. Serves the REAL
 //! `ipc_protocol::mm::{MmRequest,MmResponse}` wire protocol over the
 //! REAL `SyscallOp::Call/Recv/Reply` mechanism (02-Microkernel-Layer.md
-//! §5.3/§8.3), driving a genuine `mm_service::MemRegistry` — the SAME
-//! real-IPC-server shape `fs_native`/`compositor` already established
-//! (03-Kernel-Subsystems-Layer.md §2.5).
+//! §5.3/§8.3), driving genuine `mm_service::{MemRegistry,SwapRegistry,
+//! PoolRegistry}` state — the SAME real-IPC-server shape `fs_native`/
+//! `compositor` already established (03-Kernel-Subsystems-Layer.md
+//! §2.5).
 //!
-//! Architecture reference: 03-Kernel-Subsystems-Layer.md §2.5 (the OOM
-//! victim-selection policy this MVP wire protocol covers — swap and CXL
-//! unified-memory coordination are `// TODO(omid)` in `mm_service`'s own
-//! doc comment, out of scope here too).
+//! Architecture reference: 03-Kernel-Subsystems-Layer.md §2.5 (all three
+//! of this service's responsibilities — OOM, swap, and CXL/unified-
+//! memory pool coordination — as DECISION queries; see `mm_service`'s
+//! own doc comment for why the actual I/O each decision leads to is out
+//! of scope here too).
 //!
 //! Position in the system: `kernel_arch_glue::mm_demo_start` spawns this
 //! process via `spawn_process_from_elf` — its own isolated address space
@@ -39,9 +41,13 @@
 //! are completely safe here.
 //! ============================================================================
 
-use crate::{MemRegistry, ProcMemInfo, ReclaimClass as ServiceReclaimClass};
+use crate::{
+    ComputePool, MemRegistry, PoolRegistry, ProcMemInfo, ReclaimClass as ServiceReclaimClass,
+    SwapRegion, SwapRegistry,
+};
+use hal_manifest::ComputeKind as ServiceComputeKind;
 use ipc_protocol::codec::{decode_mm_request, encode_mm_response};
-use ipc_protocol::mm::{MmErrorCode, ReclaimClass as WireReclaimClass};
+use ipc_protocol::mm::{ComputeKind as WireComputeKind, MmErrorCode, ReclaimClass as WireReclaimClass};
 use ipc_protocol::{MmRequest, MmResponse};
 use kernel_ipc::SmallMessage;
 
@@ -235,15 +241,37 @@ fn from_wire_class(c: WireReclaimClass) -> ServiceReclaimClass {
     }
 }
 
-/// Handles one REAL `MmRequest`, driving a REAL `MemRegistry`.
-fn handle_request(reg: &mut MemRegistry, req: MmRequest) -> MmResponse {
+/// Wire `ComputeKind` -> `hal_manifest::ComputeKind` (same "kept
+/// separate wire-level copy" convention as `from_wire_class` above).
+fn from_wire_kind(k: WireComputeKind) -> ServiceComputeKind {
+    match k {
+        WireComputeKind::Cpu => ServiceComputeKind::Cpu,
+        WireComputeKind::Gpu => ServiceComputeKind::Gpu,
+        WireComputeKind::Npu => ServiceComputeKind::Npu,
+        WireComputeKind::Tpu => ServiceComputeKind::Tpu,
+        WireComputeKind::Fpga => ServiceComputeKind::Fpga,
+    }
+}
+
+/// The service-side registries this process owns for the lifetime of
+/// `subsystem_main` — bundled together since `handle_request` needs all
+/// three for different opcodes, mirroring the single `MemRegistry` this
+/// function used to take alone.
+struct State {
+    mem: MemRegistry,
+    swap: SwapRegistry,
+    pools: PoolRegistry,
+}
+
+/// Handles one REAL `MmRequest`, driving REAL `mm_service` registries.
+fn handle_request(state: &mut State, req: MmRequest) -> MmResponse {
     match req {
         MmRequest::Register {
             thread,
             resident_bytes,
             class,
         } => {
-            reg.upsert(ProcMemInfo {
+            state.mem.upsert(ProcMemInfo {
                 thread,
                 resident_bytes,
                 class: from_wire_class(class),
@@ -251,14 +279,62 @@ fn handle_request(reg: &mut MemRegistry, req: MmRequest) -> MmResponse {
             MmResponse::Registered
         }
         MmRequest::Unregister { thread } => {
-            reg.remove(thread);
+            state.mem.remove(thread);
             MmResponse::Unregistered
         }
         MmRequest::QueryVictim => MmResponse::Victim {
-            thread: reg.oom_victim().unwrap_or(u32::MAX),
+            thread: state.mem.oom_victim().unwrap_or(u32::MAX),
         },
         MmRequest::QueryTotalResident => MmResponse::TotalResident {
-            bytes: reg.total_resident(),
+            bytes: state.mem.total_resident(),
+        },
+        MmRequest::RegisterSwapRegion {
+            thread,
+            region_id,
+            bytes,
+            last_touched_ns,
+        } => {
+            state.swap.upsert(SwapRegion {
+                thread,
+                region_id,
+                bytes,
+                last_touched_ns,
+            });
+            MmResponse::SwapRegionRegistered
+        }
+        MmRequest::UnregisterSwapRegion { thread, region_id } => {
+            state.swap.remove(thread, region_id);
+            MmResponse::SwapRegionUnregistered
+        }
+        MmRequest::QuerySwapVictim => match state.swap.swap_victim() {
+            Some((thread, region_id)) => MmResponse::SwapVictim { thread, region_id },
+            None => MmResponse::SwapVictim {
+                thread: u32::MAX,
+                region_id: u32::MAX,
+            },
+        },
+        MmRequest::RegisterComputePool {
+            pool_id,
+            kind,
+            capacity_bytes,
+            used_bytes,
+        } => {
+            state.pools.upsert(ComputePool {
+                pool_id,
+                kind: from_wire_kind(kind),
+                capacity_bytes,
+                used_bytes,
+            });
+            MmResponse::ComputePoolRegistered
+        }
+        MmRequest::QueryComputePool {
+            bytes,
+            preferred_kind,
+        } => MmResponse::ComputePoolChosen {
+            pool_id: state
+                .pools
+                .choose(bytes, preferred_kind.map(from_wire_kind))
+                .unwrap_or(u32::MAX),
         },
     }
 }
@@ -269,7 +345,11 @@ fn handle_request(reg: &mut MemRegistry, req: MmRequest) -> MmResponse {
 /// `Reply`'s own doc comment in `kernel_core::syscall`).
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
-    let mut reg = MemRegistry::new();
+    let mut state = State {
+        mem: MemRegistry::new(),
+        swap: SwapRegistry::new(),
+        pools: PoolRegistry::new(),
+    };
 
     // Same stack-slot-reuse miscompilation `fs_native::subsystem_entry::
     // subsystem_main`'s own identical loop hits (full investigation in
@@ -291,7 +371,7 @@ pub extern "C" fn subsystem_main() -> ! {
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, MM_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();
         let resp = match decode_mm_request(&req_msg) {
-            Ok(req) => handle_request(&mut reg, req),
+            Ok(req) => handle_request(&mut state, req),
             Err(_) => MmResponse::Error {
                 code: MmErrorCode::Unsupported,
             },
