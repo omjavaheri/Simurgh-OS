@@ -126,4 +126,10 @@ pub enum DriverErrorCode {
     Unsupported = 5,
     /// `PollFrame` found nothing within its bounded, non-blocking check.
     NoData = 6,
+    /// The supervising Device Manager's own in-flight request log for
+    /// this driver is already at capacity (REPO-Simurgh-OS-Remediation.md
+    /// item 09's backpressure requirement — see `device_manager::
+    /// RequestLog`) — retry once an outstanding request completes,
+    /// never silently dropped.
+    DriverBusy = 7,
 }
