@@ -160,6 +160,148 @@ impl Default for Supervised {
     }
 }
 
+// ============================================================================
+// Stateful driver recovery — REPO-Simurgh-OS-Remediation.md item 09.
+//
+// `Supervised` above already proves the restart MECHANISM end to end on
+// QEMU (03 §5.2's own acceptance test); what it does not address is
+// STATE: the current restart policy implicitly assumes a driver is
+// stateless, so an I/O request that was in flight when the driver
+// crashed is simply lost. `RequestLog` is the per-driver accounting a
+// supervisor needs to know which requests were still outstanding at
+// the moment of a crash, so they can be replayed (or reported as
+// idempotent-safe failures) once the replacement process comes up.
+//
+// Scope note: this is the POLICY/accounting half only — pure,
+// host-testable, capacity-bounded — mirroring `Supervised`'s own
+// scope. Actually wiring this into a real Device Manager process (so
+// every client request is observed here before reaching a driver, and
+// replayed after a real restart) needs client requests to route
+// THROUGH Device Manager rather than directly to a driver's own
+// Endpoint, which is a real, separate architectural decision (today's
+// demo traffic goes straight from a client to the driver's own
+// Endpoint, bypassing Device Manager entirely) — deliberately not
+// decided or implemented here, same as this crate's own `subsystem_
+// entry` module doc comment already draws that exact "mechanism proven,
+// full real-driver wiring is the acceptance test" boundary.
+// ============================================================================
+
+/// One in-flight (not yet acknowledged) request a supervised driver is
+/// known to be working on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InFlightRequest {
+    /// The client-supplied identifier this request was submitted with —
+    /// stable across a crash+restart, so both the log and the client
+    /// itself can recognise a replay of the same logical request
+    /// (server-side idempotency: processing it twice must be safe).
+    pub request_id: u32,
+}
+
+/// How many in-flight requests one driver's log tracks at once before
+/// Device Manager must start rejecting new ones with `DriverBusy`
+/// rather than growing unbounded.
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 256;
+
+/// Why `RequestLog::try_insert` refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLogError {
+    /// The log already holds `MAX_IN_FLIGHT_REQUESTS` entries — the
+    /// caller should reply `DriverBusy` (`ipc_protocol::driver::
+    /// DriverErrorCode`) rather than accept more work this driver has
+    /// not yet caught up on.
+    Full,
+}
+
+/// The in-flight request log for ONE supervised driver (Device Manager
+/// holds one of these per driver it supervises, alongside that
+/// driver's own `Supervised` record).
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLog {
+    entries: [Option<InFlightRequest>; MAX_IN_FLIGHT_REQUESTS],
+    len: usize,
+}
+
+impl RequestLog {
+    /// An empty log.
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_IN_FLIGHT_REQUESTS],
+            len: 0,
+        }
+    }
+
+    /// How many requests are currently tracked as in-flight.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the log is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Records a request as in-flight, right before it is handed to the
+    /// driver — per this item's own log-size/backpressure requirement,
+    /// refuses (`Err(RequestLogError::Full)`) rather than growing past
+    /// `MAX_IN_FLIGHT_REQUESTS`. A duplicate `request_id` already
+    /// present is left as-is (idempotent no-op, not a second entry) —
+    /// a client retrying the exact same request it never got a reply
+    /// for should not itself trip the capacity limit.
+    #[inline(always)]
+    pub fn try_insert(&mut self, request_id: u32) -> Result<(), RequestLogError> {
+        if self
+            .entries
+            .iter()
+            .flatten()
+            .any(|e| e.request_id == request_id)
+        {
+            return Ok(());
+        }
+        if self.len >= MAX_IN_FLIGHT_REQUESTS {
+            return Err(RequestLogError::Full);
+        }
+        let slot = self
+            .entries
+            .iter_mut()
+            .find(|e| e.is_none())
+            .expect("len < MAX_IN_FLIGHT_REQUESTS implies a free slot exists");
+        *slot = Some(InFlightRequest { request_id });
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Removes a request from the log once its reply has actually been
+    /// delivered — per this item's own cleanup requirement, the log
+    /// only ever holds requests genuinely in flight, never full
+    /// history. Acknowledging an id the log does not hold (already
+    /// removed, or never inserted) is a safe no-op, not an error —
+    /// acks are not expected to race with replay in a way this method
+    /// needs to reject.
+    #[inline(always)]
+    pub fn ack(&mut self, request_id: u32) {
+        if let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|e| matches!(e, Some(r) if r.request_id == request_id))
+        {
+            *slot = None;
+            self.len -= 1;
+        }
+    }
+
+    /// The requests still in flight, in no particular order — what
+    /// Device Manager replays against a freshly restarted driver.
+    pub fn in_flight(&self) -> impl Iterator<Item = &InFlightRequest> {
+        self.entries.iter().flatten()
+    }
+}
+
+impl Default for RequestLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +336,71 @@ mod tests {
         let st = d.on_crash(FAILURE_WINDOW_NS + 1_000_000_000);
         assert_eq!(st, DriverState::Restarting);
         assert_eq!(d.restarts_in_window, 1);
+    }
+
+    #[test]
+    fn request_log_tracks_and_acks() {
+        let mut log = RequestLog::new();
+        assert!(log.is_empty());
+        log.try_insert(1).unwrap();
+        log.try_insert(2).unwrap();
+        assert_eq!(log.len(), 2);
+        log.ack(1);
+        assert_eq!(log.len(), 1);
+        assert!(log.in_flight().any(|r| r.request_id == 2));
+        assert!(!log.in_flight().any(|r| r.request_id == 1));
+    }
+
+    #[test]
+    fn request_log_duplicate_insert_is_a_noop() {
+        let mut log = RequestLog::new();
+        log.try_insert(42).unwrap();
+        log.try_insert(42).unwrap();
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn request_log_ack_unknown_id_is_a_safe_noop() {
+        let mut log = RequestLog::new();
+        log.try_insert(1).unwrap();
+        log.ack(999); // never inserted
+        assert_eq!(log.len(), 1);
+        log.ack(1);
+        log.ack(1); // already gone - acking twice must not panic/underflow
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn request_log_rejects_past_capacity_with_busy() {
+        let mut log = RequestLog::new();
+        for id in 0..MAX_IN_FLIGHT_REQUESTS as u32 {
+            assert!(log.try_insert(id).is_ok());
+        }
+        assert_eq!(log.len(), MAX_IN_FLIGHT_REQUESTS);
+        assert_eq!(
+            log.try_insert(MAX_IN_FLIGHT_REQUESTS as u32),
+            Err(RequestLogError::Full)
+        );
+        // Freeing exactly one slot (an ack) makes room for exactly one
+        // more - not an error, not silently dropped.
+        log.ack(0);
+        assert!(log.try_insert(MAX_IN_FLIGHT_REQUESTS as u32).is_ok());
+    }
+
+    #[test]
+    fn request_log_in_flight_lists_only_unacked_entries() {
+        let mut log = RequestLog::new();
+        log.try_insert(1).unwrap();
+        log.try_insert(2).unwrap();
+        log.try_insert(3).unwrap();
+        log.ack(2);
+        let mut ids: [u32; 4] = [0; 4];
+        let mut n = 0;
+        for r in log.in_flight() {
+            ids[n] = r.request_id;
+            n += 1;
+        }
+        ids[..n].sort_unstable();
+        assert_eq!(&ids[..n], &[1, 3]);
     }
 }

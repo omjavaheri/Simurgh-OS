@@ -439,6 +439,7 @@ pub fn decode_driver_response(msg: &SmallMessage) -> Result<DriverResponse, Deco
                 4 => DriverErrorCode::DeviceIo,
                 5 => DriverErrorCode::Unsupported,
                 6 => DriverErrorCode::NoData,
+                7 => DriverErrorCode::DriverBusy,
                 _ => return Err(DecodeError::BadField),
             };
             Ok(DriverResponse::Failed { code })
@@ -1176,6 +1177,9 @@ mod tests {
         });
         driver_response_roundtrip(DriverResponse::Failed {
             code: DriverErrorCode::NoData,
+        });
+        driver_response_roundtrip(DriverResponse::Failed {
+            code: DriverErrorCode::DriverBusy,
         });
         driver_response_roundtrip(DriverResponse::FrameSent);
         driver_response_roundtrip(DriverResponse::FrameReceived { len: 60 });
