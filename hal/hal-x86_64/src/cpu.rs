@@ -218,6 +218,19 @@ const TSS_RSP0_STACK_SIZE: usize = 64 * 1024;
 /// points `TSS.rsp0` at its top.
 static mut TSS_RSP0_STACK: [u8; TSS_RSP0_STACK_SIZE] = [0; TSS_RSP0_STACK_SIZE];
 
+/// The double-fault handler's own dedicated IST1 stack (Intel SDM Vol.
+/// 3A §6.15) — deliberately separate from `TSS_RSP0_STACK` above: a
+/// double fault can itself be CAUSED by `rsp0`'s own stack overflowing
+/// (exactly the class of bug `TSS_RSP0_STACK`'s own doc comment
+/// describes finding once already), so the handler that reports it
+/// must not trust that same stack. Only needs to report the fault and
+/// halt — not recurse into arbitrary handler logic the way a normal
+/// trap can — so a modest 8 KiB is enough, unlike `rsp0`'s 64 KiB.
+const TSS_IST1_STACK_SIZE: usize = 8 * 1024;
+/// `.bss`, zeroed by the loader — never read before `bootstrap_current_core`
+/// points `TSS.ist[0]` (IST slot 1) at its top.
+static mut TSS_IST1_STACK: [u8; TSS_IST1_STACK_SIZE] = [0; TSS_IST1_STACK_SIZE];
+
 /// x86_64 TSS layout (Intel SDM Vol. 3A, section 8.7). `#[repr(C, packed)]`
 /// to match the hardware-defined byte offsets exactly — this struct is
 /// never accessed through a Rust reference in a way that would trip
@@ -407,16 +420,25 @@ impl IdtEntry {
         Self {
             offset_low: (handler & 0xFFFF) as u16,
             selector: SegmentSelector::KernelCode as u16,
-            ist: 0, // TODO(layer 1 follow-up): use IST slot 1 for double-fault
-            // (vector 8) — a TSS exists now (see this file's TSS
-            // module docs), but wiring double-fault's own dedicated
-            // stack through it is still a tracked follow-up, not done
-            // speculatively here.
+            ist: 0,
             type_attr: 0b1000_1110, // present, DPL0, 64-bit interrupt gate
             offset_mid: ((handler >> 16) & 0xFFFF) as u16,
             offset_high: ((handler >> 32) & 0xFFFF_FFFF) as u32,
             reserved: 0,
         }
+    }
+
+    /// Requests IST slot `index` (1-7, per `Tss.ist`'s own 1-based
+    /// numbering — `index` here is the IST number itself, not a
+    /// zero-based array position) instead of `TSS.rsp0` for this one
+    /// gate. Used for the double-fault vector: a double fault can be
+    /// caused BY a corrupted/overflowed current stack, so its own
+    /// handler must not trust `rsp0` either — it needs a dedicated
+    /// stack the CPU switches to unconditionally, per Intel SDM Vol. 3A
+    /// §6.15's own recommendation for exactly this vector.
+    fn with_ist(mut self, index: u8) -> Self {
+        self.ist = index;
+        self
     }
 
     /// Like `gate`, but DPL 3 — reachable via a software interrupt
@@ -1165,6 +1187,10 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
                 .cast::<u8>()
                 .add(TSS_RSP0_STACK_SIZE) as u64;
             TSS.rsp0 = rsp0;
+            let ist1 = core::ptr::addr_of_mut!(TSS_IST1_STACK)
+                .cast::<u8>()
+                .add(TSS_IST1_STACK_SIZE) as u64;
+            TSS.ist[0] = ist1;
             let (low, high) = encode_tss_descriptor(core::ptr::addr_of!(TSS) as u64);
             GDT[5] = low;
             GDT[6] = high;
@@ -1206,6 +1232,25 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
                 let handler_addr = isr_stub_address(vector as u8);
                 IDT[vector] = IdtEntry::gate(handler_addr);
             }
+        }
+
+        // The double-fault gate: vector 8, same override pattern as the
+        // syscall/fault/timer gates below — keeps the generic
+        // `isr_stub_8` the loop above already installed (double-fault
+        // has no TrapOutcome-style switch semantics to run; it only
+        // ever reports and halts, same as any other unhandled fault),
+        // but adds `ist: 1` so the CPU switches to `TSS_IST1_STACK`
+        // unconditionally rather than trusting whatever `rsp` was
+        // active when the double fault occurred — see `TSS_IST1_STACK`'s
+        // own doc comment for why that stack cannot be assumed sound.
+        //
+        // SAFETY: `IDT` is written here, on the bootstrap core, before
+        // `load_idt` is called and before interrupts are enabled — no
+        // concurrent access is possible.
+        unsafe {
+            const DOUBLE_FAULT_VECTOR: u8 = 8;
+            let handler_addr = isr_stub_address(DOUBLE_FAULT_VECTOR);
+            IDT[DOUBLE_FAULT_VECTOR as usize] = IdtEntry::gate(handler_addr).with_ist(1);
         }
 
         // The syscall gate: DPL 3 so U-mode's `int 0x80` doesn't take a
