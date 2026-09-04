@@ -27,7 +27,7 @@
 use crate::display::{DisplayErrorCode, DisplayRequest, DisplayResponse, SurfaceHandle};
 use crate::driver::{DriverErrorCode, DriverRequest, DriverResponse};
 use crate::fs::{FileHandle, FsErrorCode, FsRequest, FsResponse, OpenFlags, PathId};
-use crate::mm::{MmErrorCode, MmRequest, MmResponse, ReclaimClass};
+use crate::mm::{ComputeKind, MmErrorCode, MmRequest, MmResponse, ReclaimClass};
 use crate::net::{DirectNicHandle, NetBypassRequest, NetBypassResponse};
 use crate::{label_parts, Namespace, PROTOCOL_VERSION};
 use kernel_ipc::SmallMessage;
@@ -637,30 +637,91 @@ const OP_MM_REGISTER: u8 = 1;
 const OP_MM_UNREGISTER: u8 = 2;
 const OP_MM_QUERY_VICTIM: u8 = 3;
 const OP_MM_QUERY_TOTAL_RESIDENT: u8 = 4;
+const OP_MM_REGISTER_SWAP_REGION: u8 = 5;
+const OP_MM_UNREGISTER_SWAP_REGION: u8 = 6;
+const OP_MM_QUERY_SWAP_VICTIM: u8 = 7;
+const OP_MM_REGISTER_COMPUTE_POOL: u8 = 8;
+const OP_MM_QUERY_COMPUTE_POOL: u8 = 9;
+
+fn encode_compute_kind(kind: ComputeKind) -> u64 {
+    kind as u64
+}
+
+fn decode_compute_kind(word: u64) -> Result<ComputeKind, DecodeError> {
+    match word {
+        0 => Ok(ComputeKind::Cpu),
+        1 => Ok(ComputeKind::Gpu),
+        2 => Ok(ComputeKind::Npu),
+        3 => Ok(ComputeKind::Tpu),
+        4 => Ok(ComputeKind::Fpga),
+        _ => Err(DecodeError::BadField),
+    }
+}
 
 /// Encodes an `MmRequest` into a `SmallMessage`.
 ///
 /// Word layout by variant:
 /// - `Register`: `[thread, resident_bytes, class]`
 /// - `Unregister`: `[thread]`
-/// - `QueryVictim`, `QueryTotalResident`: `[]`
+/// - `QueryVictim`, `QueryTotalResident`, `QuerySwapVictim`: `[]`
+/// - `RegisterSwapRegion`: `[thread, region_id, bytes, last_touched_ns]`
+/// - `UnregisterSwapRegion`: `[thread, region_id]`
+/// - `RegisterComputePool`: `[pool_id, kind, capacity_bytes, used_bytes]`
+/// - `QueryComputePool`: `[bytes, has_preference (0/1), kind]`
 pub fn encode_mm_request(req: &MmRequest) -> SmallMessage {
-    let (op, words): (u8, [u64; 3]) = match *req {
+    let (op, words): (u8, [u64; 4]) = match *req {
         MmRequest::Register {
             thread,
             resident_bytes,
             class,
-        } => (OP_MM_REGISTER, [thread as u64, resident_bytes, class as u64]),
-        MmRequest::Unregister { thread } => (OP_MM_UNREGISTER, [thread as u64, 0, 0]),
-        MmRequest::QueryVictim => (OP_MM_QUERY_VICTIM, [0, 0, 0]),
-        MmRequest::QueryTotalResident => (OP_MM_QUERY_TOTAL_RESIDENT, [0, 0, 0]),
+        } => (
+            OP_MM_REGISTER,
+            [thread as u64, resident_bytes, class as u64, 0],
+        ),
+        MmRequest::Unregister { thread } => (OP_MM_UNREGISTER, [thread as u64, 0, 0, 0]),
+        MmRequest::QueryVictim => (OP_MM_QUERY_VICTIM, [0, 0, 0, 0]),
+        MmRequest::QueryTotalResident => (OP_MM_QUERY_TOTAL_RESIDENT, [0, 0, 0, 0]),
+        MmRequest::RegisterSwapRegion {
+            thread,
+            region_id,
+            bytes,
+            last_touched_ns,
+        } => (
+            OP_MM_REGISTER_SWAP_REGION,
+            [thread as u64, region_id as u64, bytes, last_touched_ns],
+        ),
+        MmRequest::UnregisterSwapRegion { thread, region_id } => (
+            OP_MM_UNREGISTER_SWAP_REGION,
+            [thread as u64, region_id as u64, 0, 0],
+        ),
+        MmRequest::QuerySwapVictim => (OP_MM_QUERY_SWAP_VICTIM, [0, 0, 0, 0]),
+        MmRequest::RegisterComputePool {
+            pool_id,
+            kind,
+            capacity_bytes,
+            used_bytes,
+        } => (
+            OP_MM_REGISTER_COMPUTE_POOL,
+            [pool_id as u64, encode_compute_kind(kind), capacity_bytes, used_bytes],
+        ),
+        MmRequest::QueryComputePool {
+            bytes,
+            preferred_kind,
+        } => {
+            let (has_pref, kind_word) = match preferred_kind {
+                Some(k) => (1, encode_compute_kind(k)),
+                None => (0, 0),
+            };
+            (OP_MM_QUERY_COMPUTE_POOL, [bytes, has_pref, kind_word, 0])
+        }
     };
     let n = match op {
-        OP_MM_REGISTER => 3,
+        OP_MM_REGISTER | OP_MM_REGISTER_SWAP_REGION | OP_MM_REGISTER_COMPUTE_POOL => 4,
+        OP_MM_QUERY_COMPUTE_POOL | OP_MM_UNREGISTER_SWAP_REGION => 3,
         OP_MM_UNREGISTER => 1,
         _ => 0,
     };
-    // `from_words` cannot fail here: n <= 3 <= MSG_MAX_WORDS.
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
     SmallMessage::from_words(Namespace::Mm.label(op), &words[..n])
         .unwrap_or_else(|_| SmallMessage::new(Namespace::Mm.label(op)))
 }
@@ -704,6 +765,44 @@ pub fn decode_mm_request(msg: &SmallMessage) -> Result<MmRequest, DecodeError> {
         }
         OP_MM_QUERY_VICTIM => Ok(MmRequest::QueryVictim),
         OP_MM_QUERY_TOTAL_RESIDENT => Ok(MmRequest::QueryTotalResident),
+        OP_MM_REGISTER_SWAP_REGION => {
+            need(4)?;
+            Ok(MmRequest::RegisterSwapRegion {
+                thread: w[0] as u32,
+                region_id: w[1] as u32,
+                bytes: w[2],
+                last_touched_ns: w[3],
+            })
+        }
+        OP_MM_UNREGISTER_SWAP_REGION => {
+            need(2)?;
+            Ok(MmRequest::UnregisterSwapRegion {
+                thread: w[0] as u32,
+                region_id: w[1] as u32,
+            })
+        }
+        OP_MM_QUERY_SWAP_VICTIM => Ok(MmRequest::QuerySwapVictim),
+        OP_MM_REGISTER_COMPUTE_POOL => {
+            need(4)?;
+            Ok(MmRequest::RegisterComputePool {
+                pool_id: w[0] as u32,
+                kind: decode_compute_kind(w[1])?,
+                capacity_bytes: w[2],
+                used_bytes: w[3],
+            })
+        }
+        OP_MM_QUERY_COMPUTE_POOL => {
+            need(3)?;
+            let preferred_kind = match w[1] {
+                0 => None,
+                1 => Some(decode_compute_kind(w[2])?),
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(MmRequest::QueryComputePool {
+                bytes: w[0],
+                preferred_kind,
+            })
+        }
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -716,27 +815,48 @@ const OP_MMR_UNREGISTERED: u8 = 2;
 const OP_MMR_VICTIM: u8 = 3;
 const OP_MMR_TOTAL_RESIDENT: u8 = 4;
 const OP_MMR_ERROR: u8 = 5;
+const OP_MMR_SWAP_REGION_REGISTERED: u8 = 6;
+const OP_MMR_SWAP_REGION_UNREGISTERED: u8 = 7;
+const OP_MMR_SWAP_VICTIM: u8 = 8;
+const OP_MMR_COMPUTE_POOL_REGISTERED: u8 = 9;
+const OP_MMR_COMPUTE_POOL_CHOSEN: u8 = 10;
 
 /// Encodes an `MmResponse` into a `SmallMessage`.
 ///
 /// Word layout by variant:
-/// - `Registered`, `Unregistered`: `[]`
-/// - `Victim`: `[thread]`
+/// - `Registered`, `Unregistered`, `SwapRegionRegistered`,
+///   `SwapRegionUnregistered`, `ComputePoolRegistered`: `[]`
+/// - `Victim`, `ComputePoolChosen`: `[thread]`/`[pool_id]`
 /// - `TotalResident`: `[bytes]`
+/// - `SwapVictim`: `[thread, region_id]`
 /// - `Error`: `[code]`
 pub fn encode_mm_response(resp: &MmResponse) -> SmallMessage {
-    let (op, words): (u8, [u64; 1]) = match *resp {
-        MmResponse::Registered => (OP_MMR_REGISTERED, [0]),
-        MmResponse::Unregistered => (OP_MMR_UNREGISTERED, [0]),
-        MmResponse::Victim { thread } => (OP_MMR_VICTIM, [thread as u64]),
-        MmResponse::TotalResident { bytes } => (OP_MMR_TOTAL_RESIDENT, [bytes]),
-        MmResponse::Error { code } => (OP_MMR_ERROR, [code as u64]),
+    let (op, words): (u8, [u64; 2]) = match *resp {
+        MmResponse::Registered => (OP_MMR_REGISTERED, [0, 0]),
+        MmResponse::Unregistered => (OP_MMR_UNREGISTERED, [0, 0]),
+        MmResponse::Victim { thread } => (OP_MMR_VICTIM, [thread as u64, 0]),
+        MmResponse::TotalResident { bytes } => (OP_MMR_TOTAL_RESIDENT, [bytes, 0]),
+        MmResponse::SwapRegionRegistered => (OP_MMR_SWAP_REGION_REGISTERED, [0, 0]),
+        MmResponse::SwapRegionUnregistered => (OP_MMR_SWAP_REGION_UNREGISTERED, [0, 0]),
+        MmResponse::SwapVictim { thread, region_id } => {
+            (OP_MMR_SWAP_VICTIM, [thread as u64, region_id as u64])
+        }
+        MmResponse::ComputePoolRegistered => (OP_MMR_COMPUTE_POOL_REGISTERED, [0, 0]),
+        MmResponse::ComputePoolChosen { pool_id } => {
+            (OP_MMR_COMPUTE_POOL_CHOSEN, [pool_id as u64, 0])
+        }
+        MmResponse::Error { code } => (OP_MMR_ERROR, [code as u64, 0]),
     };
     let n = match op {
-        OP_MMR_REGISTERED | OP_MMR_UNREGISTERED => 0,
+        OP_MMR_REGISTERED
+        | OP_MMR_UNREGISTERED
+        | OP_MMR_SWAP_REGION_REGISTERED
+        | OP_MMR_SWAP_REGION_UNREGISTERED
+        | OP_MMR_COMPUTE_POOL_REGISTERED => 0,
+        OP_MMR_SWAP_VICTIM => 2,
         _ => 1,
     };
-    // `from_words` cannot fail here: n <= 1 <= MSG_MAX_WORDS.
+    // `from_words` cannot fail here: n <= 2 <= MSG_MAX_WORDS.
     SmallMessage::from_words(Namespace::Mm.label(op), &words[..n])
         .unwrap_or_else(|_| SmallMessage::new(Namespace::Mm.label(op)))
 }
@@ -769,6 +889,20 @@ pub fn decode_mm_response(msg: &SmallMessage) -> Result<MmResponse, DecodeError>
         OP_MMR_TOTAL_RESIDENT => {
             need(1)?;
             Ok(MmResponse::TotalResident { bytes: w[0] })
+        }
+        OP_MMR_SWAP_REGION_REGISTERED => Ok(MmResponse::SwapRegionRegistered),
+        OP_MMR_SWAP_REGION_UNREGISTERED => Ok(MmResponse::SwapRegionUnregistered),
+        OP_MMR_SWAP_VICTIM => {
+            need(2)?;
+            Ok(MmResponse::SwapVictim {
+                thread: w[0] as u32,
+                region_id: w[1] as u32,
+            })
+        }
+        OP_MMR_COMPUTE_POOL_REGISTERED => Ok(MmResponse::ComputePoolRegistered),
+        OP_MMR_COMPUTE_POOL_CHOSEN => {
+            need(1)?;
+            Ok(MmResponse::ComputePoolChosen { pool_id: w[0] as u32 })
         }
         OP_MMR_ERROR => {
             need(1)?;
@@ -1146,6 +1280,31 @@ mod tests {
         mm_request_roundtrip(MmRequest::Unregister { thread: 3 });
         mm_request_roundtrip(MmRequest::QueryVictim);
         mm_request_roundtrip(MmRequest::QueryTotalResident);
+        mm_request_roundtrip(MmRequest::RegisterSwapRegion {
+            thread: 3,
+            region_id: 1,
+            bytes: 65536,
+            last_touched_ns: 987654321,
+        });
+        mm_request_roundtrip(MmRequest::UnregisterSwapRegion {
+            thread: 3,
+            region_id: 1,
+        });
+        mm_request_roundtrip(MmRequest::QuerySwapVictim);
+        mm_request_roundtrip(MmRequest::RegisterComputePool {
+            pool_id: 2,
+            kind: ComputeKind::Gpu,
+            capacity_bytes: 1 << 30,
+            used_bytes: 1 << 20,
+        });
+        mm_request_roundtrip(MmRequest::QueryComputePool {
+            bytes: 4096,
+            preferred_kind: Some(ComputeKind::Npu),
+        });
+        mm_request_roundtrip(MmRequest::QueryComputePool {
+            bytes: 4096,
+            preferred_kind: None,
+        });
     }
 
     fn mm_response_roundtrip(resp: MmResponse) {
@@ -1160,6 +1319,19 @@ mod tests {
         mm_response_roundtrip(MmResponse::Victim { thread: 7 });
         mm_response_roundtrip(MmResponse::Victim { thread: u32::MAX });
         mm_response_roundtrip(MmResponse::TotalResident { bytes: 123456 });
+        mm_response_roundtrip(MmResponse::SwapRegionRegistered);
+        mm_response_roundtrip(MmResponse::SwapRegionUnregistered);
+        mm_response_roundtrip(MmResponse::SwapVictim {
+            thread: 3,
+            region_id: 1,
+        });
+        mm_response_roundtrip(MmResponse::SwapVictim {
+            thread: u32::MAX,
+            region_id: u32::MAX,
+        });
+        mm_response_roundtrip(MmResponse::ComputePoolRegistered);
+        mm_response_roundtrip(MmResponse::ComputePoolChosen { pool_id: 2 });
+        mm_response_roundtrip(MmResponse::ComputePoolChosen { pool_id: u32::MAX });
         mm_response_roundtrip(MmResponse::Error {
             code: MmErrorCode::Unsupported,
         });
@@ -1181,6 +1353,26 @@ mod tests {
     fn mm_response_truncated_payload_is_rejected() {
         let msg = SmallMessage::new(Namespace::Mm.label(OP_MMR_VICTIM));
         assert_eq!(decode_mm_response(&msg), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn mm_request_bad_compute_kind_is_rejected() {
+        let msg = SmallMessage::from_words(
+            Namespace::Mm.label(OP_MM_REGISTER_COMPUTE_POOL),
+            &[1, 99, 1024, 0],
+        )
+        .unwrap();
+        assert_eq!(decode_mm_request(&msg), Err(DecodeError::BadField));
+    }
+
+    #[test]
+    fn mm_request_bad_has_preference_flag_is_rejected() {
+        let msg = SmallMessage::from_words(
+            Namespace::Mm.label(OP_MM_QUERY_COMPUTE_POOL),
+            &[1024, 2, 0],
+        )
+        .unwrap();
+        assert_eq!(decode_mm_request(&msg), Err(DecodeError::BadField));
     }
 
     fn net_bypass_request_roundtrip(req: NetBypassRequest) {
