@@ -686,15 +686,31 @@ impl KernelState {
         let _src = self.resolve(caller, cap, self.cap_kind_of(caller, cap)?, CapabilityRights::GRANT)?;
 
         let src_cs = self.caller_cap_space(caller)?;
-        // Derive the narrowed child directly into the destination space's
-        // table. This is a real CDT edge, not a copy-then-move: `cap`
-        // itself is left untouched in `src_cs`, and the new slot's parent
-        // link points back at it, so a later `CapRevoke` on `cap` (or any
-        // of its ancestors) reaches this grant even though it now lives in
-        // a different capability space (kernel_cap::cdt::
-        // derive_child_cross_space's whole reason to exist over the MVP's
-        // earlier derive-then-take-then-insert_root sequence).
-        let dst_slot = {
+
+        // **Real bug found via review**: `target_thread` naming a SIBLING
+        // thread in the CALLER'S OWN capability space used to always fail
+        // here with `BadCap` — a real, supported pattern (`do_retype`'s
+        // `ThreadControlBlock` arm binds a freshly retyped TCB to "the
+        // caller's own cap space", so a sibling thread sharing the
+        // caller's table is an expected outcome, not an edge case).
+        // `cap_space_pair_mut` needs two DISJOINT mutable borrows and
+        // refuses `src == dst`, so the cross-space path below was the
+        // ONLY one ever tried — even for a same-table grant that
+        // `CapTable::derive_child` (same mechanism `kernel-cap`'s own
+        // unit tests already exercise directly) handles just fine.
+        let dst_slot = if src_cs == dst_cs {
+            let cs = self.cap_space_mut(src_cs).ok_or(SyscallError::BadCap)?;
+            cs.derive_child(cap, rights, 0)?
+        } else {
+            // Derive the narrowed child directly into the destination
+            // space's table. This is a real CDT edge, not a copy-then-
+            // move: `cap` itself is left untouched in `src_cs`, and the
+            // new slot's parent link points back at it, so a later
+            // `CapRevoke` on `cap` (or any of its ancestors) reaches this
+            // grant even though it now lives in a different capability
+            // space (kernel_cap::cdt::derive_child_cross_space's whole
+            // reason to exist over the MVP's earlier derive-then-take-
+            // then-insert_root sequence).
             let (src, dst) = self
                 .cap_space_pair_mut(src_cs, dst_cs)
                 .ok_or(SyscallError::BadCap)?;
@@ -2265,5 +2281,89 @@ mod tests {
         // must be completely untouched by the failed batch.
         let c1 = k.resolve(caller, caps[1], KernelObjectKind::Endpoint, CapabilityRights::READ);
         assert!(c1.is_ok(), "an unrelated live capability must survive a failed Retype batch");
+    }
+
+    /// **Real bug found via review**: `CapGrant` to a sibling thread in
+    /// the CALLER'S OWN capability space used to always fail with
+    /// `BadCap` — `do_retype`'s own `ThreadControlBlock` arm binds a
+    /// freshly retyped TCB to "the caller's own cap space", so this is a
+    /// real, expected pattern (two threads sharing one process's
+    /// capability table), not a hypothetical edge case.
+    #[test]
+    fn cap_grant_to_a_sibling_thread_in_the_same_cap_space_succeeds() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        // A sibling TCB in the caller's own cap space (Retype's own
+        // documented behavior for ThreadControlBlock).
+        let sibling_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::ThreadControlBlock,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+        let sibling_tid = ThreadId::new(
+            k.resolve(caller, sibling_cap, KernelObjectKind::ThreadControlBlock, CapabilityRights::WRITE)
+                .unwrap()
+                .object
+                .id
+                .as_u32(),
+        );
+
+        // An Endpoint (full rights) to grant a narrowed READ-only copy of.
+        let ep_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Endpoint, count: 1 },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::CapGrant { target_thread: sibling_cap, cap: ep_cap, rights: CapabilityRights::READ },
+            &hal,
+        );
+        let dst = match r.unwrap() {
+            SyscallReturn::Granted { dst } => dst,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // The grant landed in the SIBLING's own cap space — the same
+        // table `caller` used, since they share one cap space — with
+        // exactly the narrowed rights requested, and the original `cap`
+        // is untouched in the caller's table.
+        let sibling_cs = k.tcb(sibling_tid).unwrap().cap_space;
+        assert_eq!(sibling_cs, k.tcb(caller).unwrap().cap_space);
+        let granted = k.cap_space(sibling_cs).unwrap().lookup(dst).unwrap();
+        assert_eq!(granted.rights, CapabilityRights::READ);
+        assert!(k.cap_space(sibling_cs).unwrap().lookup(ep_cap).is_some());
+
+        // Revoking the original still reaches the same-space grant (the
+        // CDT parent link works identically to the cross-space case).
+        let freed = match k.dispatch(caller, 0, SyscallOp::CapRevoke { cap: ep_cap }, &hal).unwrap() {
+            SyscallReturn::Revoked { freed } => freed,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(freed, 2); // ep_cap itself + the same-space grant
+        assert!(k.cap_space(sibling_cs).unwrap().lookup(dst).is_none());
     }
 }
