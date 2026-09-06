@@ -177,3 +177,39 @@ jobs:
           else
             bash scripts/qemu-fault-isolation-test.sh ${{ matrix.arch }}
           fi
+
+  qemu-security-broker-boot:
+    name: QEMU security-broker boot test - real kernel (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: cross-build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, riscv64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Restore target/ from cross-build
+        uses: actions/cache/restore@v4
+        with:
+          path: target
+          key: target-${{ matrix.arch }}-${{ github.run_id }}
+          fail-on-cache-miss: true
+      - name: Install QEMU + UEFI firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.QEMU_APT_PACKAGES }}
+      - name: Run scripts/qemu-security-broker-boot-test.sh
+        run: |
+          if [ "${{ matrix.arch }}" = "riscv64" ]; then
+            # Same known, tracked riscv64 Compositor spawn fault
+            # `qemu-fault-isolation-test.sh`'s own job relaxes for -
+            # it blocks `umode_root`'s sequence before the
+            # security-broker-intermediary demo is ever reached
+            # there either. The job still runs so its log stays
+            # visible; only the pass/fail gate is relaxed.
+            bash scripts/qemu-security-broker-boot-test.sh riscv64 --allow-fail
+          else
+            bash scripts/qemu-security-broker-boot-test.sh ${{ matrix.arch }}
+          fi
