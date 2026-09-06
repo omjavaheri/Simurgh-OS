@@ -229,4 +229,73 @@ fn main() {
         "cargo:rustc-env=MM_SERVICE_ELF_PATH={}",
         mm_service_path.canonicalize().unwrap().display()
     );
+
+    // Same as above, for `security-broker-bin` — the first LAYER-4 process
+    // this project spawns as a real Simurgh-OS subsystem (REPO-simurgh-
+    // security-broker.md §1), not a layer-3 one. Unlike every ELF above,
+    // its source lives in the SEPARATE `simurgh-security-broker` git repo
+    // (per this project's own architecture: layer 4 is out-of-tree,
+    // CLAUDE.md's "Layers 4-5 ... live in separate repositories"), so its
+    // build output lands in THAT repo's own `target/` directory, not this
+    // workspace's — the path below crosses out of `Simurgh-OS` entirely
+    // into its sibling directory. This is a LOCAL-DEV-ONLY assumption
+    // (both repos are siblings under the same parent folder on this
+    // machine, per that repo's own build alias below) that will need to
+    // become a real tagged-artifact fetch once `ipc-protocol` is a
+    // published dependency `simurgh-security-broker` consumes instead of
+    // this ad-hoc path stitch — flagged for Omid, not hidden.
+    let sb_build_alias =
+        format!("(in simurgh-security-broker) cargo +nightly-2025-01-15 build --bin security-broker-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let sb_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-security-broker")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("security-broker-bin");
+
+    if !sb_path.exists() {
+        panic!(
+            "kernel build.rs: security-broker-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {sb_build_alias}",
+            sb_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", sb_path.display());
+    println!(
+        "cargo:rustc-env=SECURITY_BROKER_ELF_PATH={}",
+        sb_path.canonicalize().unwrap().display()
+    );
+
+    // Same as above, for `security-broker-intermediary-bin` (Issue #28) —
+    // the CapGrant/CapRevoke intermediary. Unlike `security-broker-bin`
+    // above, this IS an in-tree subsystem (same `target/<arch>/debug/`
+    // directory as every other one in this block), since it is
+    // kernel-privilege-adjacent trusted glue this project owns directly,
+    // not a separate layer-4 repo.
+    let sbi_build_alias = format!("cargo xbuild-subsystem-security-broker-intermediary-{target_arch}");
+    let sbi_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("security-broker-intermediary-bin");
+
+    if !sbi_path.exists() {
+        panic!(
+            "kernel build.rs: security-broker-intermediary-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {sbi_build_alias}",
+            sbi_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", sbi_path.display());
+    println!(
+        "cargo:rustc-env=SECURITY_BROKER_INTERMEDIARY_ELF_PATH={}",
+        sbi_path.canonicalize().unwrap().display()
+    );
 }

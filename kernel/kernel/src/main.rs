@@ -161,6 +161,26 @@ static COMPOSITOR_ELF: &[u8] = include_bytes!(env!("COMPOSITOR_ELF_PATH"));
 /// Netstack).
 static MM_SERVICE_ELF: &[u8] = include_bytes!(env!("MM_SERVICE_ELF_PATH"));
 
+/// `security-broker-bin`'s own separately-built ELF image — same
+/// packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), but the
+/// FIRST LAYER-4 process this project spawns (`simurgh-security-broker`,
+/// a separate git repo — REPO-simurgh-security-broker.md §1), not a
+/// layer-3 one. See `kernel/build.rs`'s own doc comment on this static's
+/// `SECURITY_BROKER_ELF_PATH` for why its build output crosses out of
+/// this workspace entirely (a local-dev-only path assumption, flagged
+/// there for Omid).
+static SECURITY_BROKER_ELF: &[u8] = include_bytes!(env!("SECURITY_BROKER_ELF_PATH"));
+
+/// `security-broker-intermediary-bin`'s own separately-built ELF image —
+/// same packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), and
+/// (unlike `SECURITY_BROKER_ELF`) an IN-TREE layer-3 subsystem: the
+/// CapGrant/CapRevoke intermediary Issue #28 designed
+/// (`ipc-protocol/src/security.rs`, `root_task::Service::
+/// SecurityBrokerIntermediary`) but never wired to a real process until
+/// now — see `kernel_arch_glue::security_broker_intermediary_demo_start`'s
+/// own doc comment for the full rationale.
+static SECURITY_BROKER_INTERMEDIARY_ELF: &[u8] = include_bytes!(env!("SECURITY_BROKER_INTERMEDIARY_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -753,6 +773,88 @@ mod sys {
     /// itself as usual to trigger the real `Call`; only the result read
     /// differs.
     pub const FS_READ_RESULT_QUIET: usize = 93;
+
+    // -- CAP_GRANT/CAP_REVOKE: the REAL, generic `SyscallOp::CapGrant`/
+    //    `CapRevoke` syscalls, exposed to ANY U-mode process for the
+    //    first time (Issue #28's security-broker-intermediary boundary,
+    //    `ipc-protocol/src/security.rs`) — unlike every opcode above,
+    //    these are not routed through one demo-specific glue function;
+    //    they go straight to `kernel_core::syscall`'s own dispatch, the
+    //    same real mechanism `kernel_arch_glue::grant_cap_into`'s doc
+    //    comment already describes as "the real, capability-gated"
+    //    path — see `kernel_arch_glue::cap_grant`/`cap_revoke`'s own doc
+    //    comments for the full rationale. --
+
+    /// `a0` = `target_thread` capability slot (a `ThreadControlBlock`
+    /// capability the CALLER already holds, in ITS OWN cap space — see
+    /// `kernel_core::syscall::do_cap_grant`'s own doc comment; there is
+    /// no "master grant" shortcut). `a1` = `cap` (low 32 bits — the
+    /// capability slot to copy, also in the caller's own space) packed
+    /// with `rights` (bits 32-37, `CapabilityRights::bits()`) in the SAME
+    /// word — chosen over a 3rd register argument so this reuses the
+    /// existing 2-argument `raw_syscall`/dispatcher ABI unchanged, rather
+    /// than needing new per-architecture trap-entry plumbing. Returns the
+    /// new capability's slot number in the DESTINATION's own cap space,
+    /// or `usize::MAX` on any failure (bad `target_thread`/`cap`, missing
+    /// `GRANT` right, or a rights escalation — `kernel_core::syscall::
+    /// SyscallError` is not distinguished on this wire, same "usize::MAX
+    /// means failure, check the kernel log for why" convention as
+    /// `DRV_BLK_DEMO_START` etc.).
+    pub const CAP_GRANT: usize = 94;
+    /// `a0` = `cap` (the capability, in the caller's own space, to revoke
+    /// — subtree root). A REAL `SyscallOp::CapRevoke`. Returns the number
+    /// of slots freed (across every capability space the kernel's
+    /// `CapRevoke` reached), or `usize::MAX` on failure (bad `cap`, or
+    /// missing `REVOKE` right).
+    pub const CAP_REVOKE: usize = 95;
+
+    // -- security-broker-intermediary: the REAL `SecurityRequest`/
+    //    `SecurityResponse` wire protocol over the REAL Call/Recv/Reply
+    //    mechanism above (Issue #28) — same "plain integers here, real
+    //    `ipc_protocol` encoding happens kernel-side" shape the fs-native
+    //    block above already established. --
+
+    /// No arguments (`security_broker_tid` is threaded in kernel-side —
+    /// `spawn_security_broker_intermediary` already knows it). Spawns
+    /// `security-broker-intermediary` as a genuinely isolated process,
+    /// grants it its own Endpoint (slot 0), a fresh TCB capability for
+    /// the already-spawned `security-broker` process (slot 1), and one
+    /// demo resource capability (slot 2) — see `kernel_arch_glue::
+    /// security_broker_intermediary_demo_start`'s own doc comment for the
+    /// full rationale on each slot. Follow up with `SBI_ENDPOINT_CAP`.
+    pub const SBI_DEMO_START: usize = 96;
+    /// No arguments. Returns the intermediary demo endpoint's capability
+    /// slot (set by `SBI_DEMO_START`) — same role as `IPC_ENDPOINT_CAP`.
+    pub const SBI_ENDPOINT_CAP: usize = 97;
+    /// `a0` = endpoint capability slot (from `SBI_ENDPOINT_CAP`), `a1` =
+    /// `target_service` (`kernel_arch_glue::SBI_TARGET_SECURITY_BROKER`
+    /// for the one target this demo wires up). Builds and sends a REAL
+    /// `SecurityRequest::CapGrant { target_service, cap: 2, rights:
+    /// READ|WRITE }` (`cap`/`rights` are fixed for this demo — see
+    /// `sbi_cap_grant_call`'s own doc comment). Follow up with
+    /// `SBI_CAP_GRANT_RESULT`.
+    pub const SBI_CAP_GRANT: usize = 98;
+    /// No arguments. Returns the new capability's slot number in
+    /// security-broker's OWN capability space (proof that a REAL
+    /// capability now exists there, minted end to end through the
+    /// intermediary — the entire point of Issue #28), or `usize::MAX` on
+    /// failure/`Error`.
+    pub const SBI_CAP_GRANT_RESULT: usize = 99;
+    /// `a0` = endpoint capability slot (from `SBI_ENDPOINT_CAP`). Builds
+    /// and sends a REAL `SecurityRequest::CapRevoke { cap: 2 }` — the SAME
+    /// resource `SBI_CAP_GRANT`'s own demo just granted a derived copy of
+    /// into security-broker's cap space, so a successful revoke here MUST
+    /// free capabilities in TWO capability spaces at once (the
+    /// intermediary's own slot 2, AND security-broker's derived copy),
+    /// proving the real kernel `revoke_cross_space` walk — not just a
+    /// single-table delete — actually ran (`kernel_core::syscall::
+    /// SyscallOp::CapRevoke`'s own doc comment). Follow up with
+    /// `SBI_CAP_REVOKE_RESULT`.
+    pub const SBI_CAP_REVOKE: usize = 100;
+    /// No arguments. Returns the number of capability-table slots freed
+    /// (expected: 2 — see `SBI_CAP_REVOKE`'s own doc comment), or
+    /// `usize::MAX` on failure/`Error`.
+    pub const SBI_CAP_REVOKE_RESULT: usize = 101;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -895,6 +997,11 @@ static mut G_MM_EP: u32 = 0;
 /// `DRV_BLK_READ` handler — same role as `G_FS_EP`.
 #[cfg(target_arch = "riscv64")]
 static mut G_DRV_EP: u32 = 0;
+
+/// `security-broker-intermediary`'s own endpoint capability slot IN THE
+/// CALLER's (root's) own capability space — same role as `G_FS_EP`.
+#[cfg(target_arch = "riscv64")]
+static mut G_SBI_EP: u32 = 0;
 
 /// The virtio-net driver's endpoint capability slot in the caller's
 /// (root's) own capability space — written once by `DRV_NET_DEMO_START`,
@@ -1495,6 +1602,30 @@ extern "C" fn umode_root() -> ! {
         // which `net_demo_riscv64` (7c) guarantees by construction.
         net_bypass_demo_riscv64();
 
+        // 7h. security-broker-intermediary demo (Issue #28): spawns
+        //     security-broker AND the intermediary (via `SBI_DEMO_START`
+        //     — see that opcode's own doc comment for why security-broker
+        //     is spawned HERE and not inside `P2_PREEMPT_START`'s
+        //     handler), then issues one REAL `SecurityRequest::CapGrant`
+        //     targeting `SBI_TARGET_SECURITY_BROKER` (0) and reports the
+        //     new capability slot it lands at in security-broker's OWN
+        //     capability space — proof that a real kernel Capability now
+        //     exists there, minted end to end through the intermediary,
+        //     not just reported as `TransportUnavailable`
+        //     (`kernel_arch_glue::security_broker_intermediary_demo_
+        //     start`'s own doc comment has the full rationale).
+        raw_syscall(sys::SBI_DEMO_START, 0, 0);
+        let sbi_ep = raw_syscall(sys::SBI_ENDPOINT_CAP, 0, 0);
+        raw_syscall(sys::SBI_CAP_GRANT, sbi_ep, 0);
+        let sbi_dst = raw_syscall(sys::SBI_CAP_GRANT_RESULT, 0, 0);
+        raw_syscall(sys::REPORT, sbi_dst, 0);
+        // Now revoke the SAME capability — proves the real kernel
+        // CapRevoke cross-space walk, not just CapGrant (see
+        // `sys::SBI_CAP_REVOKE`'s own doc comment).
+        raw_syscall(sys::SBI_CAP_REVOKE, sbi_ep, 0);
+        let sbi_freed = raw_syscall(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
+        raw_syscall(sys::REPORT, sbi_freed, 0);
+
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
         //    bumping this process's private counter word in the shared
@@ -1787,6 +1918,10 @@ static mut G_MM_EP_X86: u32 = 0;
 /// exactly (see that static's own doc comment).
 #[cfg(target_arch = "x86_64")]
 static mut G_DRV_EP_X86: u32 = 0;
+
+/// See the riscv64 `G_SBI_EP`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+static mut G_SBI_EP_X86: u32 = 0;
 
 /// The virtio-net driver's endpoint capability slot in the caller's
 /// (root's) own capability space — written once by `DRV_NET_DEMO_START`,
@@ -2213,6 +2348,29 @@ extern "C" fn umode_root_x86() -> ! {
         // comment. Runs LAST among the subsystem demos, same ordering
         // reason as riscv64's own identical call site.
         net_bypass_demo_x86();
+
+        // 7h. security-broker-intermediary demo (Issue #28): spawns
+        //     security-broker AND the intermediary (via `SBI_DEMO_START`
+        //     — see that opcode's own doc comment for why security-broker
+        //     is spawned HERE and not inside `P2_PREEMPT_START`'s
+        //     handler), then issues one REAL `SecurityRequest::CapGrant`
+        //     targeting `SBI_TARGET_SECURITY_BROKER` (0) and reports the
+        //     new capability slot it lands at in security-broker's OWN
+        //     capability space — proof that a real kernel Capability now
+        //     exists there, minted end to end through the intermediary,
+        //     not just reported as `TransportUnavailable`
+        //     (`kernel_arch_glue::security_broker_intermediary_demo_
+        //     start`'s own doc comment has the full rationale). Runs
+        //     BEFORE the preemption phase, same reason every other
+        //     `*_DEMO_START` sequential demo above does.
+        raw_syscall_x86(sys::SBI_DEMO_START, 0, 0);
+        let sbi_ep = raw_syscall_x86(sys::SBI_ENDPOINT_CAP, 0, 0);
+        raw_syscall_x86(sys::SBI_CAP_GRANT, sbi_ep, 0);
+        let sbi_dst = raw_syscall_x86(sys::SBI_CAP_GRANT_RESULT, 0, 0);
+        raw_syscall_x86(sys::REPORT, sbi_dst, 0);
+        raw_syscall_x86(sys::SBI_CAP_REVOKE, sbi_ep, 0);
+        let sbi_freed = raw_syscall_x86(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
+        raw_syscall_x86(sys::REPORT, sbi_freed, 0);
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the LAPIC timer, then loop forever bumping
@@ -2915,6 +3073,134 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
         }
+        sys::CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let target_thread = a0 as u32;
+            let cap = a1 as u32;
+            let rights_bits = (a1 >> 32) as u32;
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::cap_grant(hal, caller, target_thread, cap, rights_bits) {
+                    Some(dst) => dst.as_u32() as usize,
+                    None => usize::MAX,
+                },
+            );
+        }
+        sys::CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return TrapOutcome::Resume(match kernel_arch_glue::cap_revoke(hal, caller, a0 as u32) {
+                Some(freed) => freed as usize,
+                None => usize::MAX,
+            });
+        }
+        // security-broker-intermediary (Issue #28) — see riscv64's own
+        // identical `sys::SBI_DEMO_START` arm's doc comment. Spawns
+        // security-broker itself HERE (sequentially, before `P2_PREEMPT_
+        // START`) rather than reading a global written by that handler:
+        // `P2_PREEMPT_START`'s own `int 0x80` normally never returns to
+        // `.user_text` in the success case (it switches straight into the
+        // preemption phase) — see this file's own `sys::P2_PREEMPT_START`
+        // doc comment — so any `.user_text` opcode issued sequentially
+        // AFTER it is dead code. This opcode therefore runs BEFORE
+        // `P2_PREEMPT_START`, mirroring fs-native/compositor/mm-service's
+        // own `*_DEMO_START` opcodes exactly.
+        sys::SBI_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            let Some(security_broker_tid) = spawn_security_broker_x86(hal) else {
+                return TrapOutcome::Resume(usize::MAX);
+            };
+            return match kernel_arch_glue::security_broker_intermediary_demo_start(
+                hal,
+                caller,
+                SECURITY_BROKER_INTERMEDIARY_ELF,
+                elf_loader::machine::EM_X86_64,
+                security_broker_tid,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_SBI_EP_X86, before any SBI_ENDPOINT_CAP/
+                    // SBI_CAP_GRANT call.
+                    unsafe { core::ptr::addr_of_mut!(G_SBI_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by SBI_DEMO_START.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_SBI_EP_X86).read() } as usize);
+        }
+        sys::SBI_CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` / `rights: READ|WRITE` (`0b011`) fixed for this
+            // demo — see riscv64's own identical arm's doc comment.
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 2, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary CapGrant FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary minted a REAL capability into security-broker's own cap space at slot {dst} (Issue #28, end-to-end proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` — the SAME demo resource `SBI_CAP_GRANT` copied a
+            // derived child of into security-broker's own cap space; see
+            // `sys::SBI_CAP_REVOKE`'s own doc comment.
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 2) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary CapRevoke FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary revoked the demo capability — {freed} slot(s) freed across BOTH capability spaces (Issue #28, cross-space revoke proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -2966,6 +3252,9 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // (already proven on riscv64 AND aarch64) takes over the
             // instant the driver is scheduled and faults.
             spawn_device_manager_x86(kernel_arch_glue::khal());
+            // security-broker is now spawned earlier, sequentially, by
+            // `sys::SBI_DEMO_START` (see that arm's own doc comment for
+            // why) — NOT spawned again here.
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3149,6 +3438,39 @@ fn spawn_device_manager_x86(hal: &hal_core::HalInterface) {
     }
 }
 
+/// x86_64 counterpart of `spawn_security_broker` — see that function's
+/// own doc comment for the full rationale.
+/// See riscv64's own `spawn_security_broker`'s doc comment for why this
+/// now returns the spawned thread's id.
+fn spawn_security_broker_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const SB_STACK_VMA: usize = 0xC041_0000;
+    const SB_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        SECURITY_BROKER_ELF,
+        elf_loader::machine::EM_X86_64,
+        SB_STACK_VMA,
+        SB_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned security-broker (tid {}) from its OWN separately-built ELF image (simurgh-security-broker repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
 /// Spawns `umode_faulty_driver_x86` (see its doc comment) via the SAME
 /// generic `kernel_arch_glue::spawn_process` path as device-manager.
 /// Mirrors riscv64's own `spawn_faulty_driver` exactly.
@@ -3271,6 +3593,10 @@ static mut G_MM_EP_AARCH64: u32 = 0;
 /// exactly (see that static's own doc comment).
 #[cfg(target_arch = "aarch64")]
 static mut G_DRV_EP_AARCH64: u32 = 0;
+
+/// See the riscv64 `G_SBI_EP`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+static mut G_SBI_EP_AARCH64: u32 = 0;
 
 /// The virtio-net driver's endpoint capability slot in the caller's
 /// (root's) own capability space — written once by `DRV_NET_DEMO_START`,
@@ -3684,6 +4010,17 @@ extern "C" fn umode_root_aarch64() -> ! {
         // doc comment. Runs LAST among the subsystem demos, same
         // ordering reason as riscv64's own identical call site.
         net_bypass_demo_aarch64();
+
+        // 7h. security-broker-intermediary demo (Issue #28) — see the
+        //     x86_64 call site's own doc comment.
+        raw_syscall_aarch64(sys::SBI_DEMO_START, 0, 0);
+        let sbi_ep = raw_syscall_aarch64(sys::SBI_ENDPOINT_CAP, 0, 0);
+        raw_syscall_aarch64(sys::SBI_CAP_GRANT, sbi_ep, 0);
+        let sbi_dst = raw_syscall_aarch64(sys::SBI_CAP_GRANT_RESULT, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, sbi_dst, 0);
+        raw_syscall_aarch64(sys::SBI_CAP_REVOKE, sbi_ep, 0);
+        let sbi_freed = raw_syscall_aarch64(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, sbi_freed, 0);
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the timer PPI, then loop forever bumping this
@@ -4344,6 +4681,126 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
         }
+        sys::CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let target_thread = x0 as u32;
+            let cap = x1 as u32;
+            let rights_bits = (x1 >> 32) as u32;
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::cap_grant(hal, caller, target_thread, cap, rights_bits) {
+                    Some(dst) => dst.as_u32() as usize,
+                    None => usize::MAX,
+                },
+            );
+        }
+        sys::CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return TrapOutcome::Resume(match kernel_arch_glue::cap_revoke(hal, caller, x0 as u32) {
+                Some(freed) => freed as usize,
+                None => usize::MAX,
+            });
+        }
+        // security-broker-intermediary (Issue #28) — see the x86_64
+        // `sys::SBI_DEMO_START` arm's own doc comment (`P2_PREEMPT_START`
+        // normally never returns to `.user_text`, so security-broker is
+        // spawned HERE, sequentially, before it — not inside that
+        // handler).
+        sys::SBI_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            let Some(security_broker_tid) = spawn_security_broker_aarch64(hal) else {
+                return TrapOutcome::Resume(usize::MAX);
+            };
+            return match kernel_arch_glue::security_broker_intermediary_demo_start(
+                hal,
+                caller,
+                SECURITY_BROKER_INTERMEDIARY_ELF,
+                elf_loader::machine::EM_AARCH64,
+                security_broker_tid,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_SBI_EP_AARCH64, before any SBI_ENDPOINT_CAP/
+                    // SBI_CAP_GRANT call.
+                    unsafe { core::ptr::addr_of_mut!(G_SBI_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by SBI_DEMO_START.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_SBI_EP_AARCH64).read() } as usize);
+        }
+        sys::SBI_CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` / `rights: READ|WRITE` (`0b011`) fixed for this
+            // demo — see riscv64's own identical arm's doc comment.
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, x0 as u32, x1 as u32, 2, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary CapGrant FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary minted a REAL capability into security-broker's own cap space at slot {dst} (Issue #28, end-to-end proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // See riscv64's own identical arm's doc comment.
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, x0 as u32, 2) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary CapRevoke FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary revoked the demo capability — {freed} slot(s) freed across BOTH capability spaces (Issue #28, cross-space revoke proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -4392,6 +4849,9 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             // to-`DM_TID` logic (already proven on riscv64 AND aarch64)
             // takes over the instant the driver is scheduled and faults.
             spawn_device_manager_aarch64(kernel_arch_glue::khal());
+            // security-broker is now spawned earlier, sequentially, by
+            // `sys::SBI_DEMO_START` (see that arm's own doc comment for
+            // why) — NOT spawned again here.
             let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -4532,6 +4992,39 @@ fn spawn_device_manager_aarch64(hal: &hal_core::HalInterface) {
         None => kernel_arch_glue::log(format_args!(
             "root task (aarch64): device-manager spawn skipped (out of resources)\r\n"
         )),
+    }
+}
+
+/// aarch64 counterpart of `spawn_security_broker` — see that function's
+/// own doc comment for the full rationale.
+/// See riscv64's own `spawn_security_broker`'s doc comment for why this
+/// now returns the spawned thread's id.
+fn spawn_security_broker_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const SB_STACK_VMA: usize = 0xC041_0000;
+    const SB_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        SECURITY_BROKER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        SB_STACK_VMA,
+        SB_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned security-broker (tid {}) from its OWN separately-built ELF image (simurgh-security-broker repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
     }
 }
 
@@ -4793,6 +5286,9 @@ fn simurgh_syscall(
         }
         sys::P2_PREEMPT_START => {
             spawn_device_manager(kernel_arch_glue::khal());
+            // security-broker is now spawned earlier, sequentially, by
+            // `sys::SBI_DEMO_START` (see that arm's own doc comment for
+            // why) — NOT spawned again here.
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -5302,6 +5798,135 @@ fn simurgh_syscall(
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
         }
+        sys::CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let target_thread = a0 as u32;
+            let cap = a1 as u32;
+            let rights_bits = (a1 >> 32) as u32;
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::cap_grant(hal, caller, target_thread, cap, rights_bits) {
+                    Some(dst) => dst.as_u32() as usize,
+                    None => usize::MAX,
+                },
+            );
+        }
+        sys::CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return TrapOutcome::Resume(match kernel_arch_glue::cap_revoke(hal, caller, a0 as u32) {
+                Some(freed) => freed as usize,
+                None => usize::MAX,
+            });
+        }
+        // security-broker-intermediary (Issue #28). Spawns security-
+        // broker itself HERE (sequentially, before `P2_PREEMPT_START`)
+        // rather than reading a global written by that handler:
+        // `P2_PREEMPT_START`'s own ecall normally never returns to
+        // `.user_text` in the success case (it switches straight into the
+        // preemption phase) — see this file's own `sys::P2_PREEMPT_START`
+        // doc comment — so any `.user_text` opcode issued sequentially
+        // AFTER it is dead code. This opcode therefore runs BEFORE
+        // `P2_PREEMPT_START`, mirroring fs-native/compositor/mm-service's
+        // own `*_DEMO_START` opcodes exactly.
+        sys::SBI_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            let Some(security_broker_tid) = spawn_security_broker(hal) else {
+                return TrapOutcome::Resume(usize::MAX);
+            };
+            return match kernel_arch_glue::security_broker_intermediary_demo_start(
+                hal,
+                caller,
+                SECURITY_BROKER_INTERMEDIARY_ELF,
+                elf_loader::machine::EM_RISCV,
+                security_broker_tid,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes G_SBI_EP,
+                    // before any SBI_ENDPOINT_CAP/SBI_CAP_GRANT call.
+                    unsafe { core::ptr::addr_of_mut!(G_SBI_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by SBI_DEMO_START.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_SBI_EP).read() } as usize);
+        }
+        sys::SBI_CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` / `rights: READ|WRITE` (`0b011`, `kernel_cap::
+            // CapabilityRights`'s own bit layout) are fixed for this demo
+            // — see `security_broker_intermediary_demo_start`'s own doc
+            // comment on why slot 2 is always the demo resource.
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 2, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract (mirrors
+                        // `p2_ipc_call`'s).
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary CapGrant FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary minted a REAL capability into security-broker's own cap space at slot {dst} (Issue #28, end-to-end proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` — the SAME demo resource `SBI_CAP_GRANT` copied a
+            // derived child of into security-broker's own cap space; see
+            // `sys::SBI_CAP_REVOKE`'s own doc comment.
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 2) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary CapRevoke FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary revoked the demo capability — {freed} slot(s) freed across BOTH capability spaces (Issue #28, cross-space revoke proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -5642,6 +6267,61 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
         None => kernel_arch_glue::log(format_args!(
             "root task: device-manager spawn skipped (out of resources)\r\n"
         )),
+    }
+}
+
+/// Spawns `security-broker-bin` — `simurgh-security-broker`'s own real
+/// process image, from its own separately-built ELF, mirroring
+/// `spawn_device_manager` exactly. The FIRST layer-4 service this
+/// project spawns as a real process (REPO-simurgh-security-broker.md
+/// §1), not a layer-3 subsystem.
+///
+/// Unlike `device-manager`, this process is granted no capability yet
+/// beyond the implicit ones `spawn_process_from_elf` always sets up
+/// (its own address space / thread) — no `Endpoint` capability grant,
+/// since nothing spawned so far sends it anything (the still-open
+/// `security-broker-intermediary` follow-up, flagged in
+/// `simurgh-security-broker`'s own README, is what a real caller and a
+/// granted Endpoint depend on). `subsystem_entry::subsystem_main`'s own
+/// `IPC_RECV` loop blocks immediately on a capability slot that
+/// currently resolves to nothing — an intentional, honest placeholder
+/// state (see that crate's own doc comment), not a bug: this pass only
+/// proves the process itself boots and its ported `Broker` logic runs
+/// correctly on real hardware (see `self_check` in that crate), not a
+/// working IPC round trip yet.
+/// Returns the new thread's id (or `None` if spawning failed) — needed
+/// now (unlike before Issue #28) so `spawn_security_broker_intermediary`
+/// can mint a REAL destination-TCB capability for it (`kernel_arch_glue::
+/// mint_tcb_cap_into`'s own doc comment). `_cap_space` stays discarded
+/// here: nothing in this pass needs it directly (the intermediary mints
+/// its OWN TCB capability straight from `tid`, not by copying anything
+/// out of security-broker's cap space).
+fn spawn_security_broker(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const SB_STACK_VMA: usize = 0xC041_0000;
+    const SB_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        SECURITY_BROKER_ELF,
+        elf_loader::machine::EM_RISCV,
+        SB_STACK_VMA,
+        SB_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned security-broker (tid {}) from its OWN separately-built ELF image (simurgh-security-broker repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
     }
 }
 

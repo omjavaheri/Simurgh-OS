@@ -1284,6 +1284,28 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
     if let Some(fs_tid) = unsafe { core::ptr::addr_of!(G_FS_TID).read() } {
         let _ = state.sched.note_blocked(fs_tid);
     }
+    // security-broker-intermediary (Issue #28) hits the IDENTICAL bug
+    // class as fs-native just above, for the identical underlying reason:
+    // `sbi_ipc_call`'s own `do_reply` (after the intermediary replies to
+    // the `SBI_CAP_GRANT` demo call) hands control back to the CALLER
+    // (root), not to the replying thread itself (`SyscallOp::Reply`'s own
+    // semantics) — leaving the intermediary `Ready`-but-never-resumed,
+    // exactly like fs-native, and eligible for this SAME ordinary
+    // `pick_next` round-robin it was never meant to join. **Real bug
+    // found via QEMU** (this session): without this fix, the x86_64
+    // fault-isolation demo hung completely, silently, right after
+    // "arming preemptive timer" — `pick_next` picked the intermediary's
+    // stale saved context instead of the intended A/B/C rotation, the
+    // exact same failure mode fs-native's own comment above documents.
+    // `note_blocked` (not `remove`): the intermediary's TCB slot must
+    // stay valid — nothing else calls it again in this demo, but
+    // removing it outright is unnecessary and diverges from the
+    // established fs-native precedent for no reason.
+    // SAFETY: single-core; `G_SBI_TID` written once by
+    // `security_broker_intermediary_demo_start`, read-only here.
+    if let Some(sbi_tid) = unsafe { core::ptr::addr_of!(G_SBI_TID).read() } {
+        let _ = state.sched.note_blocked(sbi_tid);
+    }
     // `state.sched.remove(root)` clears `running` (root was it), and this
     // switch to `fresh_tid` happens directly via `user_ctx_switch_ptrs`,
     // bypassing `preempt_tick`/`cooperative_yield` (whose own `Switch`
@@ -6705,6 +6727,467 @@ extern "C" fn bench_server_main() -> ! {
         // Resumed here once the Root Task's NEXT `Call` delivers.
     }
     park();
+}
+
+// ============================================================================
+// Security Broker Intermediary (Issue #28) — the layer-3 process that
+// mints/revokes real Capabilities on the Security Broker's behalf
+// (04-System-Services-Policy-Layer.md §0, 02-Microkernel-Layer.md §6;
+// `ipc-protocol/src/security.rs`'s `SecurityRequest`/`SecurityResponse`
+// wire protocol, designed in commit c68f9c2 / Issues #28/#30 but never
+// wired to a real spawned process or a real syscall path until now).
+//
+// Two genuinely new pieces this section adds, neither of which existed
+// anywhere in this codebase before:
+//
+// 1. `cap_grant`/`cap_revoke`: the REAL `SyscallOp::CapGrant`/`CapRevoke`
+//    exposed over the actual raw syscall ABI (`sys::CAP_GRANT`/
+//    `sys::CAP_REVOKE` in `kernel/src/main.rs`) to ANY U-mode process for
+//    the first time — every existing capability transfer in this codebase
+//    (`grant_cap_into` above, every `spawn_*_demo_start`'s own `Retype` +
+//    grant sequence) is TRUSTED KERNEL GLUE CODE, called directly from
+//    `kernel-arch-glue`/`kernel/src/main.rs`, never reachable from an
+//    ordinary U-mode process. The intermediary is the first (and, by
+//    design — 04-...md §0 — the ONLY) U-mode process meant to actually
+//    issue this syscall itself.
+//
+// 2. `mint_tcb_cap_into`: the missing piece that makes (1) usable at all.
+//    `do_cap_grant` requires the CALLER to already hold a REAL
+//    `ThreadControlBlock` capability for the destination, in ITS OWN
+//    capability space (`kernel-core/src/syscall.rs::do_cap_grant`'s own
+//    doc comment: "there is no 'master grant' shortcut"). But
+//    `spawn_process`/`spawn_process_from_elf` create a TCB by calling
+//    `KernelState::alloc_tcb` DIRECTLY (bypassing `SyscallOp::Retype`
+//    entirely — the ONLY other path that ever inserts a capability for a
+//    newly created TCB, and only into the RETYPING caller's own space,
+//    for a BRAND NEW thread, never an already-existing one) — so no
+//    capability for ANY spawned subsystem's TCB exists anywhere, in any
+//    cap space, until this function mints one.
+//    `spawn_security_broker_intermediary` (`kernel/src/main.rs`) calls
+//    this once per destination service the intermediary should be able
+//    to target, directly into the intermediary's OWN cap space, matching
+//    `root_task::Service::SecurityBrokerIntermediary`'s own doc comment:
+//    "Requires Root Task to grant it a destination-TCB CapId for every
+//    other service it might need to grant capabilities into".
+// ============================================================================
+
+/// The REAL `SyscallOp::CapGrant`, reachable over the raw syscall ABI
+/// (`sys::CAP_GRANT`) for the first time — see this section's own doc
+/// comment. Synchronous: `do_cap_grant` never blocks/reschedules (same
+/// shape as every `SyscallOp::Retype` call already made throughout this
+/// file, e.g. `fs_demo_start`'s own endpoint creation).
+///
+/// `target_thread`/`cap` are `CapId`s in `caller`'s OWN capability space
+/// (`do_cap_grant`'s own precondition); `rights_bits` is a raw
+/// `CapabilityRights::bits()` value, truncated to defined bits (an
+/// undefined bit is simply ignored, not an error — unlike the kernel's
+/// own trusted glue calls elsewhere in this file, this IS reachable from
+/// a real U-mode process, so its input is not necessarily well-formed).
+///
+/// Returns the new capability's slot number in the DESTINATION's own cap
+/// space on success, `None` on any failure (bad `target_thread`/`cap`,
+/// missing rights, a rights escalation, or an unknown `caller`) — the raw
+/// dispatcher arm (`kernel/src/main.rs`) maps `None` to `usize::MAX`,
+/// matching this codebase's established "sentinel means failure, check
+/// the kernel log" convention (e.g. `DRV_BLK_DEMO_START`).
+pub fn cap_grant(hal: &HalInterface, caller: ThreadId, target_thread: u32, cap: u32, rights_bits: u32) -> Option<CapId> {
+    let k = kstate();
+    let rights = CapabilityRights::from_bits_truncate(rights_bits);
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::CapGrant {
+            target_thread: CapId::new(target_thread),
+            cap: CapId::new(cap),
+            rights,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::Granted { dst }) => Some(dst),
+        _ => None,
+    }
+}
+
+/// The REAL `SyscallOp::CapRevoke`, reachable over the raw syscall ABI
+/// (`sys::CAP_REVOKE`) — see this section's own doc comment. `cap` is a
+/// `CapId` in `caller`'s own capability space (the subtree root to
+/// revoke). Returns the number of slots freed (across every capability
+/// space the kernel's `CapRevoke` reached) on success, `None` on failure.
+pub fn cap_revoke(hal: &HalInterface, caller: ThreadId, cap: u32) -> Option<u32> {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::CapRevoke { cap: CapId::new(cap) }, hal) {
+        Ok(SyscallReturn::Revoked { freed }) => Some(freed),
+        _ => None,
+    }
+}
+
+/// Mints a FRESH, full-rights `ThreadControlBlock` capability for the
+/// ALREADY-EXISTING thread `tid`, inserting it as a new ROOT (no CDT
+/// parent — same "boot-time wiring" category `Capability::full`'s own doc
+/// comment describes) directly into `dst_cs`. See this section's own doc
+/// comment for why this — not `grant_cap_into`, not `SyscallOp::Retype`
+/// — is the missing piece: no capability for `tid`'s TCB exists ANYWHERE
+/// yet, so there is nothing to copy/derive FROM (`grant_cap_into`'s own
+/// precondition), and `tid` already exists (`Retype`'s
+/// `ThreadControlBlock` arm only ever creates a BRAND NEW thread, never
+/// mints a second capability for one that already exists).
+///
+/// Trusted glue only — deliberately NOT reachable over the raw syscall
+/// ABI (unlike `cap_grant`/`cap_revoke` above): handing out unforgeable
+/// authority over an ARBITRARY existing thread, with no capability-gated
+/// precondition at all, is exactly the "backdoor" 04-System-Services-
+/// Policy-Layer.md §0 says the intermediary boundary must NOT be (only
+/// Root Task, at boot, decides which TCB caps the intermediary receives
+/// — see `spawn_security_broker_intermediary`'s own doc comment).
+fn mint_tcb_cap_into(state: &mut KernelState, dst_cs: kernel_cap::CapSpaceId, tid: ThreadId) -> Option<CapId> {
+    let cap = kernel_cap::Capability::full(kernel_cap::ObjectRef::new(
+        kernel_cap::KernelObjectKind::ThreadControlBlock,
+        kernel_cap::ObjectId::new(tid.as_u32()),
+    ));
+    let table = state.cap_space_mut(dst_cs)?;
+    table.insert_root(cap).ok()
+}
+
+/// VA the intermediary's own shared `SmallMessage` marshaling page is
+/// mapped at, in ITS OWN address space — a fresh, unused value (every
+/// other subsystem's own shared-page VA already surveyed; collisions
+/// across DIFFERENT processes' own address spaces are harmless regardless
+/// — `fs_demo_start`'s own `FS_SHARED_VA` doc comment — but a fresh
+/// literal keeps this searchable as its own thing).
+const SBI_SHARED_VA: usize = 0xD8B0_0000;
+
+/// VA `security-broker-bin`'s own shared `SecurityRequest`/
+/// `SecurityResponse` marshaling page is mapped at, in ITS OWN address
+/// space — this process's own OUTGOING link to the intermediary (a
+/// SEPARATE page/process from `SBI_SHARED_VA` above, which belongs to
+/// the intermediary itself). Must stay numerically equal to
+/// `simurgh-security-broker::subsystem_entry::SBI_SHARED_VA` (a sibling
+/// repo — see that constant's own doc comment).
+const SB_TO_SBI_SHARED_VA: usize = 0xD8C0_0000;
+
+/// This process's own thread id, set once by
+/// `security_broker_intermediary_demo_start` — same role as `G_FS_TID`.
+///
+/// # Safety
+/// Single-core; written once, read only afterward.
+static mut G_SBI_TID: Option<ThreadId> = None;
+
+/// Physical address of the intermediary's shared message page — same role
+/// as `G_FS_SHARED_PHYS`.
+///
+/// # Safety
+/// Single-core; written once, read only afterward.
+static mut G_SBI_SHARED_PHYS: usize = usize::MAX;
+
+/// See `write_shared_fs_message`'s own doc comment — identical shape,
+/// different backing global.
+///
+/// # Safety
+/// `G_SBI_SHARED_PHYS` must already have been written by
+/// `security_broker_intermediary_demo_start`.
+unsafe fn write_shared_sbi_message(msg: &SmallMessage) {
+    // SAFETY: forwarded from this function's own contract.
+    let base = unsafe { core::ptr::addr_of!(G_SBI_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: `base` names a valid, mapped, 4 KiB physical frame — same
+    // "low RAM is always identity-mapped for kernel-mode access"
+    // assumption `write_shared_fs_message`'s own doc comment relies on.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// See `read_shared_fs_message`'s own doc comment — identical shape.
+///
+/// # Safety
+/// Same contract as `write_shared_sbi_message`.
+unsafe fn read_shared_sbi_message() -> SmallMessage {
+    // SAFETY: forwarded from this function's own contract.
+    let base = unsafe { core::ptr::addr_of!(G_SBI_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// `target_service` value the intermediary's own boot-time mapping
+/// resolves to `simurgh-security-broker`'s real spawned TCB — the
+/// concrete first real target this boundary proves out end to end (the
+/// entire point of Issue #28: letting the Security Broker actually
+/// receive a real kernel `Capability`, not just report
+/// `TransportUnavailable`). Layer-4-defined, per `SecurityRequest::
+/// CapGrant::target_service`'s own doc comment ("What values are valid
+/// and what they mean is defined entirely by layer 4 ... not by this
+/// protocol or this repo") — `0` chosen simply as the first slot filled.
+pub const SBI_TARGET_SECURITY_BROKER: u32 = 0;
+
+/// One-time setup: spawns `security-broker-intermediary` as a genuinely
+/// isolated process from its own separately-built ELF, grants it:
+///   - slot 0: an `Endpoint` capability (its own IPC identity, matching
+///     every other subsystem's `*_ENDPOINT_CAP = 0` convention),
+///   - slot 1: a FRESH `ThreadControlBlock` capability for
+///     `security_broker_tid` (via `mint_tcb_cap_into`) — resolved by the
+///     intermediary's own `target_service == SBI_TARGET_SECURITY_BROKER`
+///     mapping,
+///   - slot 2: one demo "resource" `Endpoint` capability — a stand-in for
+///     whatever real resource a real `MintSpec` would name (REPO-simurgh-
+///     security-broker.md's own `Broker::request_capability` flow, out of
+///     this repo's scope); this pass only needs SOMETHING real to copy,
+///     to prove the mechanism, not a specific resource's semantics,
+/// maps its shared message page, and switches straight to it (same
+/// "avoid the caller/receiver race" requirement `fs_demo_start`'s own
+/// tail comment documents at length — identical fix applied here).
+///
+/// `security_broker_tid`/`security_broker_cs` must already be spawned
+/// (`spawn_security_broker`'s own return value) — this is exactly why
+/// `root_task::Service::SecurityBrokerIntermediary` boots LAST.
+pub fn security_broker_intermediary_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    sbi_elf: &[u8],
+    expected_machine: u16,
+    security_broker_tid: ThreadId,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+
+    // slot 0: this process's own Endpoint.
+    let ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: kernel_mm::KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+
+    const SBI_STACK_VMA: usize = 0xC042_0000;
+    const SBI_STACK_LEN: usize = 4096 * 16;
+    let (sbi_tid, sbi_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, sbi_elf, expected_machine, SBI_STACK_VMA, SBI_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any `sbi_*_call` (all
+    // issued after this opcode returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_SBI_TID).write(Some(sbi_tid)) };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    // slot 0.
+    grant_cap_into(k, src_cs, ep_cap, sbi_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // slot 1: security-broker's own TCB — the destination-TCB CapId this
+    // whole boundary exists to hand the intermediary (see this function's
+    // own doc comment).
+    mint_tcb_cap_into(k, sbi_cs, security_broker_tid)?;
+    // slot 2: one demo resource, minted the SAME way `ep_cap` above was
+    // (a fresh `Retype`, then granted in) — see this function's own doc
+    // comment on why a plain Endpoint stands in for a real `MintSpec`
+    // resource here.
+    let resource_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: kernel_mm::KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    // `REVOKE` is required, not optional: `SecurityRequest::CapRevoke`'s
+    // own demo (`sys::SBI_CAP_REVOKE`) has the intermediary issue a real
+    // `SyscallOp::CapRevoke` on exactly this capability, and `kernel_core::
+    // syscall`'s own dispatch resolves the CALLER's (the intermediary's)
+    // copy against `CapabilityRights::REVOKE` before doing anything else
+    // — **a real bug found via QEMU**: without this bit, the very first
+    // `SBI_CAP_REVOKE` demo call failed with `SecurityErrorCode::
+    // KernelRejected` (insufficient rights on the intermediary's OWN
+    // slot 2, not anything wrong with the wire protocol or the derived
+    // copy in security-broker's space).
+    grant_cap_into(
+        k,
+        src_cs,
+        resource_cap,
+        sbi_cs,
+        CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT | CapabilityRights::REVOKE,
+    )?;
+
+    // Grant `security-broker-bin` itself a derived copy of the
+    // intermediary's OWN endpoint (`ep_cap`, slot 0 in the intermediary's
+    // own space) — its own OUTGOING link, so it can `Call` the
+    // intermediary directly instead of only ever being demonstrated via
+    // Root Task as a stand-in caller (`sbi_cap_grant_call` above). Lands
+    // at slot 0 in security-broker's own cap space (completely empty
+    // until now — `spawn_security_broker`'s own doc comment). See
+    // `simurgh-security-broker::subsystem_entry`'s own module doc comment
+    // (that sibling repo) for the client-side half of this connection.
+    let security_broker_cs = k.tcb(security_broker_tid)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, security_broker_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Shared `SecurityRequest`/`SecurityResponse` marshaling page for
+    // security-broker's OWN outgoing calls — a SEPARATE page from the
+    // intermediary's own `SBI_SHARED_VA` below (different process,
+    // different address space; same VA value would be harmless either
+    // way, per every other subsystem's own "collisions across different
+    // address spaces are fine" precedent, but a distinct constant keeps
+    // this searchable as its own thing).
+    let security_broker_addr_space = k.tcb(security_broker_tid)?.addr_space;
+    let security_broker_root_pt = k.addr_space_mut(security_broker_addr_space)?.root_phys().as_usize();
+    let sb_shared_phys = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(sb_shared_phys as *mut u8, 0, 4096) };
+    let sb_pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(sb_pool as *mut u8, 0, 4096 * 2) };
+    let sb_n = hal.map_range(security_broker_root_pt, SB_TO_SBI_SHARED_VA, sb_shared_phys, 4096, 1 | 2 | 8, sb_pool, 2);
+    if sb_n == u32::MAX {
+        klog!("security_broker_intermediary_demo_start: map_range error (security-broker's own shared page)\r\n");
+        return None;
+    }
+
+    // Shared message page — same shape as `fs_demo_start`'s own
+    // `FS_SHARED_VA` setup (one page, no bulk-data second region needed:
+    // `SecurityRequest`/`SecurityResponse` are plain integer fields that
+    // fit entirely in one `SmallMessage`).
+    let sbi_addr_space = k.tcb(sbi_tid)?.addr_space;
+    let sbi_root_pt = k.addr_space_mut(sbi_addr_space)?.root_phys().as_usize();
+    let shared_phys = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+    let pool = k
+        .untyped_mut(kernel_cap::UntypedId::new(0))
+        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
+        .map(|p| p.as_usize())?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(sbi_root_pt, SBI_SHARED_VA, shared_phys, 4096, 1 | 2 | 8, pool, 2);
+    if n == u32::MAX {
+        klog!("security_broker_intermediary_demo_start: map_range error (shared page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // `sbi_*_call`/`sbi_*_result` can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_SBI_SHARED_PHYS).write(shared_phys) };
+
+    // Switch straight to the intermediary — see this function's own doc
+    // comment / `fs_demo_start`'s tail comment for why this is mandatory,
+    // not optional.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(sbi_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, sbi_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// `SBI_CAP_GRANT` demo opcode: builds a REAL `SecurityRequest::CapGrant`
+/// and issues it as a REAL `Call` to the intermediary — mirrors
+/// `fs_stat_call`'s own shape exactly.
+pub fn sbi_cap_grant_call(
+    hal: &HalInterface,
+    caller: ThreadId,
+    ep_cap: u32,
+    target_service: u32,
+    cap: u32,
+    rights: u32,
+) -> Option<IpcSwitch> {
+    let req = ipc_protocol::SecurityRequest::CapGrant { target_service, cap, rights };
+    let msg = ipc_protocol::codec::encode_security_request(&req);
+    // SAFETY: `security_broker_intermediary_demo_start` has already run
+    // (this opcode is only ever issued after `SBI_DEMO_START` returns).
+    unsafe { write_shared_sbi_message(&msg) };
+    sbi_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `SecurityResponse` for `sbi_cap_grant_call`. Returns the
+/// new capability slot in the destination's own cap space
+/// (`SecurityResponse::Granted::dst`) on success, `usize::MAX` on any
+/// `Error`/decode failure — same sentinel convention as `fs_open_result`.
+pub fn sbi_cap_grant_result() -> usize {
+    // SAFETY: same contract as `sbi_cap_grant_call`.
+    let msg = unsafe { read_shared_sbi_message() };
+    match ipc_protocol::codec::decode_security_response(&msg) {
+        Ok(ipc_protocol::SecurityResponse::Granted { dst }) => dst as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `SBI_CAP_REVOKE` demo opcode: builds a REAL `SecurityRequest::
+/// CapRevoke` and issues it as a REAL `Call` to the intermediary — same
+/// shape as `sbi_cap_grant_call`.
+pub fn sbi_cap_revoke_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, cap: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::SecurityRequest::CapRevoke { cap };
+    let msg = ipc_protocol::codec::encode_security_request(&req);
+    // SAFETY: `security_broker_intermediary_demo_start` has already run.
+    unsafe { write_shared_sbi_message(&msg) };
+    sbi_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `SecurityResponse` for `sbi_cap_revoke_call`. Returns
+/// the number of slots freed (`SecurityResponse::Revoked::freed`) on
+/// success, `usize::MAX` on any `Error`/decode failure.
+pub fn sbi_cap_revoke_result() -> usize {
+    // SAFETY: same contract as `sbi_cap_grant_result`.
+    let msg = unsafe { read_shared_sbi_message() };
+    match ipc_protocol::codec::decode_security_response(&msg) {
+        Ok(ipc_protocol::SecurityResponse::Revoked { freed }) => freed as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `Call`s the intermediary and switches to it, exactly like
+/// `fs_ipc_call`'s own identical shape (same doc comment on why a direct
+/// switch to the known target thread, not generic `pick_next` fairness,
+/// is required here).
+fn sbi_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_SBI_TID` is written once by
+    // `security_broker_intermediary_demo_start`, before any `sbi_*_call`
+    // (this function) can run.
+    let sbi_tid = unsafe { core::ptr::addr_of!(G_SBI_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(sbi_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, sbi_tid)?;
+            // Same reasoning as `fs_ipc_call`'s own identical `poke`
+            // computation: `pending_from`/`pending_msg` are only set on
+            // whichever thread `do_send`'s fast path actually delivered
+            // to directly — that is the intermediary exactly when `n ==
+            // sbi_tid`; otherwise the message is merely queued for its
+            // own next `IPC_RECV`, so there is nothing to poke.
+            let poke = if n == sbi_tid {
+                k.tcb_mut(sbi_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

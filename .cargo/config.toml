@@ -211,6 +211,13 @@ xbuild-subsystem-compositor-riscv64 = "build -p compositor --bin compositor-bin 
 xbuild-subsystem-mm-service-x86_64  = "build -p mm-service --bin mm-service-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-mm-service-aarch64 = "build -p mm-service --bin mm-service-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-mm-service-riscv64 = "build -p mm-service --bin mm-service-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the CapGrant/CapRevoke intermediary's own separately-
+# built ELF (Issue #28) — another real IPC SERVER (like fs-native/
+# compositor/mm-service), and the first process that itself issues a real
+# SyscallOp::CapGrant/CapRevoke.
+xbuild-subsystem-security-broker-intermediary-x86_64  = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-security-broker-intermediary-aarch64 = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-security-broker-intermediary-riscv64 = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)

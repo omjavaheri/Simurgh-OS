@@ -1,0 +1,46 @@
+# ============================================================================
+# security-broker-intermediary  (Issue #28)
+#
+# Simurgh's CapGrant/CapRevoke intermediary — the ONLY process the
+# Security Broker (layer 4, `simurgh-security-broker`) is ever allowed to
+# route a real capability mint/revoke through (04-System-Services-Policy-
+# Layer.md §0, 02-Microkernel-Layer.md §6: "never a backdoor"). Serves the
+# real `ipc_protocol::security::{SecurityRequest, SecurityResponse}` wire
+# protocol (designed in commit c68f9c2 / Issues #28/#30) over the REAL
+# Call/Recv/Reply mechanism, issuing the genuine `SyscallOp::CapGrant`/
+# `CapRevoke` syscalls on the Security Broker's behalf.
+#
+# `#![no_std] + alloc`. `rlib`.
+#
+# The REAL, separately-built process image (see
+# src/bin/security-broker-intermediary-bin.rs's own doc comment) —
+# "subsystems as processes" packaging, mirroring `compositor`'s own
+# `compositor-bin` exactly.
+# ============================================================================
+[package]
+name        = "security-broker-intermediary"
+description = "Simurgh CapGrant/CapRevoke intermediary (Issue #28) — the Security Broker's only path to a real kernel Capability"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "security-broker-intermediary-bin"
+path = "src/bin/security-broker-intermediary-bin.rs"
+# Same reasoning as every other subsystem-bin's own `[[bin]]`: a host
+# `cargo test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
+[dependencies]
+ipc-protocol = { path = "../../ipc-protocol" }
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly (not re-exported by `ipc-protocol`'s own codec module, which
+# takes/returns it by reference to `kernel_ipc` types) — same reasoning
+# `compositor`'s own Cargo.toml doc comment gives.
+kernel-ipc   = { path = "../../kernel/kernel-ipc" }
