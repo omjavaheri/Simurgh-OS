@@ -3396,7 +3396,9 @@ fn user_image() -> kernel_arch_glue::UserImage {
 /// loop for it to "join" yet on this architecture, so the caller must
 /// explicitly hand off to it (or to the faulty driver) afterward.
 #[cfg(target_arch = "x86_64")]
-fn spawn_device_manager_x86(hal: &hal_core::HalInterface) {
+/// See riscv64's own `spawn_device_manager`'s doc comment for why this
+/// now returns the spawned thread's id.
+fn spawn_device_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
     let total = k.total_untyped_bytes();
     match root_task::plan_boot(total) {
@@ -3411,7 +3413,7 @@ fn spawn_device_manager_x86(hal: &hal_core::HalInterface) {
                 "root task (x86_64): plan_boot failed: {:?} - device-manager not spawned\r\n",
                 e
             ));
-            return;
+            return None;
         }
     }
 
@@ -3431,10 +3433,14 @@ fn spawn_device_manager_x86(hal: &hal_core::HalInterface) {
                 "root task (x86_64): spawned device-manager (tid {}) from its OWN separately-built ELF image\r\n",
                 tid.as_u32()
             ));
+            Some(tid)
         }
-        None => kernel_arch_glue::log(format_args!(
-            "root task (x86_64): device-manager spawn skipped (out of resources)\r\n"
-        )),
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): device-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
     }
 }
 
@@ -4952,8 +4958,10 @@ fn simurgh_tick_aarch64() -> hal_arm64::cpu::TrapOutcome {
 /// spawn_process_from_elf`), the SAME mechanism the other two
 /// architectures use. Called once, right after the cooperative §8.4
 /// round-trip completes (`sys::P2_REPORT_A`).
+/// See riscv64's own `spawn_device_manager`'s doc comment for why this
+/// now returns the spawned thread's id.
 #[cfg(target_arch = "aarch64")]
-fn spawn_device_manager_aarch64(hal: &hal_core::HalInterface) {
+fn spawn_device_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
     let total = k.total_untyped_bytes();
     match root_task::plan_boot(total) {
@@ -4968,7 +4976,7 @@ fn spawn_device_manager_aarch64(hal: &hal_core::HalInterface) {
                 "root task (aarch64): plan_boot failed: {:?} - device-manager not spawned\r\n",
                 e
             ));
-            return;
+            return None;
         }
     }
 
@@ -4988,10 +4996,14 @@ fn spawn_device_manager_aarch64(hal: &hal_core::HalInterface) {
                 "root task (aarch64): spawned device-manager (tid {}) from its OWN separately-built ELF image\r\n",
                 tid.as_u32()
             ));
+            Some(tid)
         }
-        None => kernel_arch_glue::log(format_args!(
-            "root task (aarch64): device-manager spawn skipped (out of resources)\r\n"
-        )),
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): device-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
     }
 }
 
@@ -6194,7 +6206,11 @@ fn user_image() -> kernel_arch_glue::UserImage {
 /// doesn't matter, but doing it here keeps every "who else joins the
 /// preemption loop" decision in one place).
 #[cfg(target_arch = "riscv64")]
-fn spawn_device_manager(hal: &hal_core::HalInterface) {
+/// Returns the new thread's id (or `None` if spawning failed/skipped) —
+/// needed (same reason `spawn_security_broker`'s own doc comment gives)
+/// so `spawn_security_broker_intermediary`-style callers can mint a REAL
+/// destination-TCB capability for it.
+fn spawn_device_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
     // The Root Task's own untyped total stands in for "RAM this boot has
@@ -6223,7 +6239,7 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
                 "root task: plan_boot failed: {:?} - device-manager not spawned\r\n",
                 e
             ));
-            return;
+            return None;
         }
     }
 
@@ -6263,10 +6279,14 @@ fn spawn_device_manager(hal: &hal_core::HalInterface) {
                 "root task: spawned device-manager (tid {}) from its OWN separately-built ELF image, joining the preemption loop\r\n",
                 tid.as_u32()
             ));
+            Some(tid)
         }
-        None => kernel_arch_glue::log(format_args!(
-            "root task: device-manager spawn skipped (out of resources)\r\n"
-        )),
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: device-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
     }
 }
 
