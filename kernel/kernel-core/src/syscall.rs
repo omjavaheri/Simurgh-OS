@@ -831,6 +831,29 @@ impl KernelState {
                     if let Some(t) = self.tcb_mut(caller) {
                         t.state = ThreadState::BlockedOnReply;
                     }
+                    // **Real bug found via review** (not via QEMU — 100%
+                    // deterministic on every blocking IPC call, but
+                    // invisible to any test that only asserts on
+                    // `ThreadState`/`Reschedule` targets, never on
+                    // `vruntime`): every OTHER place in this codebase that
+                    // removes the CURRENTLY RUNNING thread from `running`
+                    // (`do_wait`, every function in `preempt.rs`) calls
+                    // `account(now_ns)` first, so the run slice about to
+                    // be discarded gets charged before `note_blocked`
+                    // clears `running`. This call site (and `SenderQueued`
+                    // below, and `do_recv`'s `ReceiverQueued`/`do_reply`)
+                    // used to skip it — `caller`'s vruntime for the
+                    // interval since it was last dispatched was silently
+                    // dropped, never added to `vruntime` or its chain
+                    // group's `group_vruntime`. Since a synchronous IPC
+                    // chain (§4.3's whole reason `ChainGroup` exists) ends
+                    // a run slice via EXACTLY these calls on every hop,
+                    // not via a timer tick, `group_vruntime` stayed at (or
+                    // near) 0 for any chain that never happened to be
+                    // interrupted mid-slice by an unrelated preemption —
+                    // making Throughput mode's core "charge a chain once,
+                    // split fairly" mechanism close to inert in practice.
+                    self.sched.account(now_ns);
                     self.sched.note_blocked(caller)?;
                     let next = if fast_path {
                         // FAST PATH: `rx` is a confirmed, already-blocked
@@ -889,6 +912,11 @@ impl KernelState {
                 if let Some(t) = self.tcb_mut(caller) {
                     t.state = if is_call { ThreadState::BlockedOnReply } else { ThreadState::BlockedOnSend };
                 }
+                // See the identical `account` call in `DeliveredTo`'s own
+                // `is_call` arm above for the full "real bug found via
+                // review" rationale — same fix, same reason, applied to
+                // this second blocking exit point.
+                self.sched.account(now_ns);
                 self.sched.note_blocked(caller)?;
                 let next = self.sched.pick_next(now_ns);
                 Ok(SyscallReturn::Reschedule { next })
@@ -931,6 +959,10 @@ impl KernelState {
                 if let Some(t) = self.tcb_mut(caller) {
                     t.state = ThreadState::BlockedOnRecv;
                 }
+                // See `do_send`'s own identical "real bug found via
+                // review" comment (its `DeliveredTo`/`is_call` arm) for
+                // the full rationale — same fix, same reason.
+                self.sched.account(now_ns);
                 self.sched.note_blocked(caller)?;
                 let next = self.sched.pick_next(now_ns);
                 Ok(SyscallReturn::Reschedule { next })
@@ -963,6 +995,14 @@ impl KernelState {
         if !target_ok {
             return Err(SyscallError::NotBlockedOnReply);
         }
+        // See `do_send`'s own identical "real bug found via review"
+        // comment (its `DeliveredTo`/`is_call` arm) for the full
+        // rationale — same fix, same reason: `Reply` is ALWAYS an
+        // unconditional handoff away from `caller` (this function's own
+        // doc comment), so `caller`'s run slice since it was last
+        // dispatched must be charged here, exactly like every OTHER
+        // place that ends the running thread's slice already does.
+        self.sched.account(now_ns);
         if let Some(t) = self.tcb_mut(to) {
             t.pending_msg = Some(msg);
             t.state = ThreadState::Runnable;
