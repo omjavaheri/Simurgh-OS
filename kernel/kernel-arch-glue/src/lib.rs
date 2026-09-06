@@ -6929,6 +6929,14 @@ unsafe fn read_shared_sbi_message() -> SmallMessage {
 /// protocol or this repo") — `0` chosen simply as the first slot filled.
 pub const SBI_TARGET_SECURITY_BROKER: u32 = 0;
 
+/// `target_service` value the intermediary's own boot-time mapping
+/// resolves to mm-service's real spawned TCB (`G_MM_TID`) — the SECOND
+/// real target, proving `target_service` resolution generalizes beyond
+/// one hardcoded case. See `security_broker_intermediary_demo_start`'s
+/// own doc comment (slot 3/4) for why mm-service, not device-manager, was
+/// chosen for this.
+pub const SBI_TARGET_MM_SERVICE: u32 = 1;
+
 /// One-time setup: spawns `security-broker-intermediary` as a genuinely
 /// isolated process from its own separately-built ELF, grants it:
 ///   - slot 0: an `Endpoint` capability (its own IPC identity, matching
@@ -7022,6 +7030,53 @@ pub fn security_broker_intermediary_demo_start(
         sbi_cs,
         CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT | CapabilityRights::REVOKE,
     )?;
+
+    // slot 3 + slot 4: a SECOND real target, proving `target_service`
+    // resolution generalizes beyond the one hardcoded `SBI_TARGET_
+    // SECURITY_BROKER` case (`security-broker`'s own README/this
+    // function's own doc comment both flagged this as still open). Uses
+    // mm-service (`G_MM_TID`) rather than device-manager: mm-service is
+    // already spawned by the time this function runs (step 7e in
+    // `umode_root`'s own sequence, well before step 7h's `SBI_DEMO_
+    // START`), so no re-ordering of the existing, QEMU-verified boot
+    // sequence is needed — device-manager, by contrast, is not spawned
+    // until `P2_PREEMPT_START`, which runs AFTER this function.
+    // SAFETY: single-core; `G_MM_TID` is written once by `mm_demo_start`,
+    // already-`Some` by this point in the boot sequence (see above).
+    if let Some(mm_tid) = unsafe { core::ptr::addr_of!(G_MM_TID).read() } {
+        // slot 3: mm-service's own TCB.
+        mint_tcb_cap_into(k, sbi_cs, mm_tid)?;
+        // slot 4: a second demo resource, same shape as slot 2's.
+        let resource_cap_2 = match k.dispatch(
+            caller,
+            hal.now_ns(),
+            SyscallOp::Retype {
+                untyped: CapId::new(0),
+                target_type: kernel_mm::KernelObjectType::Endpoint,
+                count: 1,
+            },
+            hal,
+        ) {
+            Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+            _ => return None,
+        };
+        grant_cap_into(
+            k,
+            src_cs,
+            resource_cap_2,
+            sbi_cs,
+            CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT | CapabilityRights::REVOKE,
+        )?;
+    } else {
+        // mm-service was not spawned (e.g. its own `Retype`/map_range
+        // failed) — the multi-target demo simply does not run; slots 3/4
+        // are left unfilled rather than this whole function failing over
+        // a SECOND target's absence (the FIRST target, security-broker,
+        // is unconditionally required — see this function's own doc
+        // comment — but this second one is additive proof, not core to
+        // Issue #28 itself).
+        klog!("security_broker_intermediary_demo_start: G_MM_TID not set - skipping the second (mm-service) target demo\r\n");
+    }
 
     // Grant `security-broker-bin` itself a derived copy of the
     // intermediary's OWN endpoint (`ep_cap`, slot 0 in the intermediary's

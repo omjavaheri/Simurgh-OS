@@ -855,6 +855,34 @@ mod sys {
     /// (expected: 2 — see `SBI_CAP_REVOKE`'s own doc comment), or
     /// `usize::MAX` on failure/`Error`.
     pub const SBI_CAP_REVOKE_RESULT: usize = 101;
+
+    // -- Second target_service demo (mm-service, `kernel_arch_glue::
+    //    SBI_TARGET_MM_SERVICE` = 1) — proves `target_service` resolution
+    //    generalizes beyond the one hardcoded `SBI_CAP_GRANT` case above.
+    //    Same shape as `SBI_CAP_GRANT`/`SBI_CAP_REVOKE`, `cap: 4` instead
+    //    of `cap: 2` (`security_broker_intermediary_demo_start`'s own
+    //    slot 3/4 doc comment). No new `kernel_arch_glue` functions were
+    //    needed for this — `sbi_cap_grant_call`/`sbi_cap_revoke_call`
+    //    already take `target_service`/`cap` as plain arguments. --
+
+    /// `a0` = endpoint capability slot (from `SBI_ENDPOINT_CAP`), `a1` =
+    /// `target_service` (`kernel_arch_glue::SBI_TARGET_MM_SERVICE` for
+    /// this demo). Sends a REAL `SecurityRequest::CapGrant { target_service,
+    /// cap: 4, rights: READ|WRITE }`. Follow up with
+    /// `SBI_CAP_GRANT2_RESULT`. A no-op (returns `usize::MAX` immediately)
+    /// if mm-service was never spawned — see `security_broker_
+    /// intermediary_demo_start`'s own doc comment.
+    pub const SBI_CAP_GRANT2: usize = 102;
+    /// No arguments. Returns the new capability's slot number in
+    /// mm-service's OWN capability space, or `usize::MAX` on failure.
+    pub const SBI_CAP_GRANT2_RESULT: usize = 103;
+    /// `a0` = endpoint capability slot. Sends a REAL `SecurityRequest::
+    /// CapRevoke { cap: 4 }`. Follow up with `SBI_CAP_REVOKE2_RESULT`.
+    pub const SBI_CAP_REVOKE2: usize = 104;
+    /// No arguments. Returns the number of capability-table slots freed
+    /// (expected: 2, same cross-space reasoning as `SBI_CAP_REVOKE_
+    /// RESULT`), or `usize::MAX` on failure.
+    pub const SBI_CAP_REVOKE2_RESULT: usize = 105;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -1625,6 +1653,18 @@ extern "C" fn umode_root() -> ! {
         raw_syscall(sys::SBI_CAP_REVOKE, sbi_ep, 0);
         let sbi_freed = raw_syscall(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
         raw_syscall(sys::REPORT, sbi_freed, 0);
+        // Second target_service (mm-service, target_service=1) — proves
+        // the intermediary's own resolution generalizes beyond the one
+        // hardcoded security-broker case (see `sys::SBI_CAP_GRANT2`'s own
+        // doc comment). `target_service: 1` is a plain integer here, same
+        // "kernel-side encoding, plain integers in `.user_text`"
+        // convention every other opcode in this sequence follows.
+        raw_syscall(sys::SBI_CAP_GRANT2, sbi_ep, 1);
+        let sbi_dst2 = raw_syscall(sys::SBI_CAP_GRANT2_RESULT, 0, 0);
+        raw_syscall(sys::REPORT, sbi_dst2, 0);
+        raw_syscall(sys::SBI_CAP_REVOKE2, sbi_ep, 0);
+        let sbi_freed2 = raw_syscall(sys::SBI_CAP_REVOKE2_RESULT, 0, 0);
+        raw_syscall(sys::REPORT, sbi_freed2, 0);
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the supervisor timer, then loop forever
@@ -2371,6 +2411,12 @@ extern "C" fn umode_root_x86() -> ! {
         raw_syscall_x86(sys::SBI_CAP_REVOKE, sbi_ep, 0);
         let sbi_freed = raw_syscall_x86(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
         raw_syscall_x86(sys::REPORT, sbi_freed, 0);
+        raw_syscall_x86(sys::SBI_CAP_GRANT2, sbi_ep, 1);
+        let sbi_dst2 = raw_syscall_x86(sys::SBI_CAP_GRANT2_RESULT, 0, 0);
+        raw_syscall_x86(sys::REPORT, sbi_dst2, 0);
+        raw_syscall_x86(sys::SBI_CAP_REVOKE2, sbi_ep, 0);
+        let sbi_freed2 = raw_syscall_x86(sys::SBI_CAP_REVOKE2_RESULT, 0, 0);
+        raw_syscall_x86(sys::REPORT, sbi_freed2, 0);
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the LAPIC timer, then loop forever bumping
@@ -3201,6 +3247,66 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             }
             return TrapOutcome::Resume(freed);
         }
+        sys::SBI_CAP_GRANT2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 4` — the SECOND demo resource/target (mm-service, see
+            // `sys::SBI_CAP_GRANT2`'s own doc comment).
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 4, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT2_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary CapGrant (2nd target, mm-service) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary minted a REAL capability into mm-service's own cap space at slot {dst} (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 4) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE2_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary CapRevoke (2nd target) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary revoked the 2nd demo capability — {freed} slot(s) freed (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
             // Discovered ONCE, before the retry loop below — see
@@ -4027,6 +4133,12 @@ extern "C" fn umode_root_aarch64() -> ! {
         raw_syscall_aarch64(sys::SBI_CAP_REVOKE, sbi_ep, 0);
         let sbi_freed = raw_syscall_aarch64(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
         raw_syscall_aarch64(sys::REPORT, sbi_freed, 0);
+        raw_syscall_aarch64(sys::SBI_CAP_GRANT2, sbi_ep, 1);
+        let sbi_dst2 = raw_syscall_aarch64(sys::SBI_CAP_GRANT2_RESULT, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, sbi_dst2, 0);
+        raw_syscall_aarch64(sys::SBI_CAP_REVOKE2, sbi_ep, 0);
+        let sbi_freed2 = raw_syscall_aarch64(sys::SBI_CAP_REVOKE2_RESULT, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, sbi_freed2, 0);
 
         // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
         //    kernel to arm the timer PPI, then loop forever bumping this
@@ -4803,6 +4915,65 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             } else {
                 kernel_arch_glue::log(format_args!(
                     "root task (aarch64): security-broker-intermediary revoked the demo capability — {freed} slot(s) freed across BOTH capability spaces (Issue #28, cross-space revoke proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
+        sys::SBI_CAP_GRANT2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // See riscv64's own identical arm's doc comment.
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, x0 as u32, x1 as u32, 4, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT2_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary CapGrant (2nd target, mm-service) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary minted a REAL capability into mm-service's own cap space at slot {dst} (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, x0 as u32, 4) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE2_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary CapRevoke (2nd target) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary revoked the 2nd demo capability — {freed} slot(s) freed (Issue #28, multi-target proof)\r\n"
                 ));
             }
             return TrapOutcome::Resume(freed);
@@ -5935,6 +6106,69 @@ fn simurgh_syscall(
             } else {
                 kernel_arch_glue::log(format_args!(
                     "root task: security-broker-intermediary revoked the demo capability — {freed} slot(s) freed across BOTH capability spaces (Issue #28, cross-space revoke proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
+        sys::SBI_CAP_GRANT2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 4` / `target_service` (`a1`, `kernel_arch_glue::
+            // SBI_TARGET_MM_SERVICE` for this demo) — a SECOND real
+            // target, proving `target_service` resolution generalizes
+            // (`security_broker_intermediary_demo_start`'s own slot 3/4
+            // doc comment).
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 4, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT2_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary CapGrant (2nd target, mm-service) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary minted a REAL capability into mm-service's own cap space at slot {dst} (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 4) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE2_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary CapRevoke (2nd target) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary revoked the 2nd demo capability — {freed} slot(s) freed (Issue #28, multi-target proof)\r\n"
                 ));
             }
             return TrapOutcome::Resume(freed);

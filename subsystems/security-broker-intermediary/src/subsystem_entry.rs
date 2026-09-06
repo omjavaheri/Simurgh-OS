@@ -86,6 +86,20 @@ const SECURITY_BROKER_TCB_CAP_SLOT: u32 = 1;
 /// SBI_TARGET_SECURITY_BROKER`.
 const TARGET_SECURITY_BROKER: u32 = 0;
 
+/// This process's own capability slot for mm-service's TCB capability —
+/// the SECOND real target (Root Task's own `kernel_arch_glue::
+/// security_broker_intermediary_demo_start` grants this only when
+/// mm-service was already spawned by the time it runs; see that
+/// function's own slot 3/4 doc comment) — proves `target_service`
+/// resolution generalizes beyond the one `SECURITY_BROKER_TCB_CAP_SLOT`
+/// case.
+const MM_SERVICE_TCB_CAP_SLOT: u32 = 3;
+
+/// `target_service` value that resolves to `MM_SERVICE_TCB_CAP_SLOT` —
+/// must stay numerically equal to `kernel_arch_glue::
+/// SBI_TARGET_MM_SERVICE`.
+const TARGET_MM_SERVICE: u32 = 1;
+
 /// VA the shared message page is mapped at in THIS process's own address
 /// space — must stay numerically equal to `kernel_arch_glue::
 /// SBI_SHARED_VA`.
@@ -320,6 +334,15 @@ fn handle_request(intermediary: &Intermediary, req: SecurityRequest) -> Security
 pub extern "C" fn subsystem_main() -> ! {
     let mut intermediary = Intermediary::new();
     intermediary.register_target(TARGET_SECURITY_BROKER, SECURITY_BROKER_TCB_CAP_SLOT);
+    // Registered unconditionally: if `security_broker_intermediary_
+    // demo_start` skipped slot 3/4 (mm-service was not spawned yet — its
+    // own doc comment), `target_service == TARGET_MM_SERVICE` simply
+    // resolves to a slot that was never actually granted a TCB
+    // capability, and the real `CAP_GRANT` syscall fails with
+    // `KernelRejected` (a bad-cap error), not a hang — the SAME honest
+    // failure mode `resolve_target` already produces for any genuinely
+    // unregistered `target_service`.
+    intermediary.register_target(TARGET_MM_SERVICE, MM_SERVICE_TCB_CAP_SLOT);
 
     // Same stack-slot-reuse miscompilation `fs_native::subsystem_entry::
     // subsystem_main`'s own identical loop hits (full investigation in
