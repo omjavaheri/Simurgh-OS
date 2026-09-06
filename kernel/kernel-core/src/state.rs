@@ -218,6 +218,30 @@ impl KernelState {
         Some(SharedRegionId::new(i as u32))
     }
 
+    /// Frees kernel-object-table slot `(kind, id)`, releasing it for
+    /// reuse by the matching `alloc_*` helper above. Used only by
+    /// `syscall::do_retype`'s own rollback path, to unwind a
+    /// partially-completed `count > 1` batch when a later object in the
+    /// same batch fails to allocate (that function's own doc comment has
+    /// the full rationale) — every `alloc_*` helper above picks "the
+    /// first `None` slot", and nothing in this crate ever frees a kernel
+    /// object any other way (kernel objects, unlike capabilities, have
+    /// no general "delete" syscall in this MVP), so this is a narrow,
+    /// single-purpose escape hatch, not a general free path.
+    pub(crate) fn free_kernel_object(&mut self, kind: KernelObjectKind, id: u32) {
+        let i = id as usize;
+        match kind {
+            KernelObjectKind::UntypedMemory => self.untyped[i] = None,
+            KernelObjectKind::PageTable => self.addr_spaces[i] = None,
+            KernelObjectKind::ThreadControlBlock => self.tcbs[i] = None,
+            KernelObjectKind::Endpoint => self.endpoints[i] = None,
+            KernelObjectKind::Notification => self.notifications[i] = None,
+            KernelObjectKind::CapabilitySpace => self.cap_spaces[i] = None,
+            KernelObjectKind::SharedRegion => self.shared_regions[i] = None,
+            KernelObjectKind::MmioRegion => self.mmio_regions[i] = None,
+        }
+    }
+
     /// Directly seeds an `MmioRegion` object describing `descriptor`,
     /// returning its id. Not a `Retype` target (see `MmioRegionDescriptor`'s
     /// own doc comment) — called only from `populate_from_boot_info`'s

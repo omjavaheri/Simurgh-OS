@@ -264,6 +264,16 @@ pub enum SyscallError {
     /// `InterruptController` (an out-of-range line, or one already
     /// registered to a different handler).
     IrqRegistrationFailed,
+    /// `Retype { count, .. }` with `count > 1`: the destination capability
+    /// table's free list did not hand out `count` contiguous slots for
+    /// this batch — real bug found via review, see `do_retype`'s own doc
+    /// comment. `SyscallReturn::NewCaps { cap, count }`'s documented
+    /// contract ("subsequent ones follow at `cap + 1 ..`") only holds for
+    /// a pristine, never-revoked-from table; rather than silently return
+    /// a range the caller cannot actually trust, `do_retype` verifies
+    /// contiguity for real and fails with this error instead. The whole
+    /// batch is rolled back — nothing is left half-created.
+    RetypeNotContiguous,
     /// The requested operation is not implemented in this MVP.
     Unsupported,
 }
@@ -420,6 +430,111 @@ impl KernelState {
         Ok(cs.lookup(cap).ok_or(SyscallError::BadCap)?.object.kind)
     }
 
+    /// Allocates ONE fresh kernel-object-table entry of `target_type` at
+    /// `obj_phys`, for one iteration of `do_retype`'s batch loop. A
+    /// mechanical extraction of that loop's per-kind allocation logic
+    /// (unchanged from before) into its own function, so a failure
+    /// partway through a `count > 1` batch has exactly one call site to
+    /// fail out of — `do_retype` wraps this call with its own
+    /// roll-back-on-error handling.
+    fn alloc_retyped_object(
+        &mut self,
+        caller: ThreadId,
+        target_type: KernelObjectType,
+        obj_phys: u64,
+        per: u64,
+    ) -> Result<u32, SyscallError> {
+        Ok(match target_type {
+            KernelObjectType::Endpoint => {
+                self.alloc_endpoint().ok_or(SyscallError::ObjectTableFull)?.as_u32()
+            }
+            KernelObjectType::Notification => self
+                .alloc_notification()
+                .ok_or(SyscallError::ObjectTableFull)?
+                .as_u32(),
+            KernelObjectType::PageTable => {
+                // The retyped frame becomes the page-table root.
+                self.alloc_addr_space(obj_phys)
+                    .ok_or(SyscallError::ObjectTableFull)?
+                    .as_u32()
+            }
+            KernelObjectType::CapabilitySpace => {
+                self.alloc_cap_space().ok_or(SyscallError::ObjectTableFull)?.as_u32()
+            }
+            KernelObjectType::ThreadControlBlock => {
+                // MVP: a freshly retyped TCB is bound to the caller's own
+                // cap space / address space. A later `feat:` adds a
+                // `Configure`-style op to rebind it (seL4's model).
+                let (cs0, as0) = {
+                    let t = self.tcb(caller).ok_or(SyscallError::NoCaller)?;
+                    (t.cap_space, t.addr_space)
+                };
+                self.alloc_tcb(cs0, as0).ok_or(SyscallError::ObjectTableFull)?.as_u32()
+            }
+            KernelObjectType::Untyped => {
+                // Sub-divide: each child is one page of the reserved
+                // range (MVP granularity — `SyscallOp::Retype` carries no
+                // size argument; a `size_bits` field is a later
+                // extension, seL4-style).
+                self.alloc_untyped(obj_phys, per)
+                    .ok_or(SyscallError::ObjectTableFull)?
+                    .as_u32()
+            }
+            KernelObjectType::SharedRegion => {
+                // MVP: full RW is always the widest a fresh region
+                // permits — `Retype` carries no rights argument (same "no
+                // size/rights argument yet" gap `Untyped`'s own arm above
+                // already notes); a peer can still be GRANTed a narrower
+                // derived capability later via the ordinary `CapGrant`
+                // rights-narrowing path.
+                let region =
+                    SharedRegion::new(PhysAddr::new(obj_phys as usize), per as usize, CapabilityRights::RW);
+                self.alloc_shared_region(region)
+                    .ok_or(SyscallError::ObjectTableFull)?
+                    .as_u32()
+            }
+        })
+    }
+
+    /// `target_type` (the `Retype` argument) mapped to the `KernelObjectKind`
+    /// every object in the batch is created as — fixed for the whole call,
+    /// computed once rather than re-derived per iteration.
+    fn retype_target_kind(target_type: KernelObjectType) -> KernelObjectKind {
+        match target_type {
+            KernelObjectType::Endpoint => KernelObjectKind::Endpoint,
+            KernelObjectType::Notification => KernelObjectKind::Notification,
+            KernelObjectType::PageTable => KernelObjectKind::PageTable,
+            KernelObjectType::CapabilitySpace => KernelObjectKind::CapabilitySpace,
+            KernelObjectType::ThreadControlBlock => KernelObjectKind::ThreadControlBlock,
+            KernelObjectType::Untyped => KernelObjectKind::UntypedMemory,
+            KernelObjectType::SharedRegion => KernelObjectKind::SharedRegion,
+        }
+    }
+
+    /// Rolls back the first `made` objects of an in-progress `Retype`
+    /// batch (their cap-table root slots, then their kernel-object-table
+    /// entries) after a later object in the SAME batch failed. Safe by
+    /// construction: every one of these `made` objects is a fresh root,
+    /// created moments ago in this same still-in-progress syscall
+    /// dispatch — no other syscall can interleave mid-dispatch, so
+    /// nothing could possibly have derived from or otherwise observed any
+    /// of them yet.
+    fn unwind_retype_batch(
+        &mut self,
+        cs_id: kernel_cap::CapSpaceId,
+        kind: KernelObjectKind,
+        first_cap: CapId,
+        first_obj: u32,
+        made: u32,
+    ) {
+        for j in 0..made {
+            if let Some(cs) = self.cap_space_mut(cs_id) {
+                cs.remove_root(CapId::new(first_cap.as_u32() + j));
+            }
+            self.free_kernel_object(kind, first_obj + j);
+        }
+    }
+
     fn do_retype(
         &mut self,
         caller: ThreadId,
@@ -434,7 +549,14 @@ impl KernelState {
             CapabilityRights::WRITE,
         )?;
         let uid = UntypedId::new(ucap.object.id.as_u32());
-        // Reserve the backing physical range.
+        // Reserve the backing physical range. `UntypedMemory::retype`'s
+        // own watermark is forward-only and reserves the WHOLE `count *
+        // per` range here, upfront, in one shot — so a later partial
+        // failure in this function never leaks MORE physical memory than
+        // a full success would have used anyway. That is the one piece of
+        // this operation this function does NOT roll back on failure (by
+        // design, not oversight — see `UntypedMemory`'s own module doc
+        // comment on why the watermark has no free path at all).
         let grant = {
             let u = self.untyped_mut(uid).ok_or(SyscallError::BadCap)?;
             u.retype(target_type, count)?
@@ -442,83 +564,102 @@ impl KernelState {
 
         let cs_id = self.caller_cap_space(caller)?;
         let per = kernel_mm::object_size_bytes(target_type) as u64;
-        let mut first: Option<CapId> = None;
+        let kind = Self::retype_target_kind(target_type);
+
+        // `first_cap`/`first_obj`: the capability slot / kernel-object id
+        // iteration 0 below is granted. Every later iteration in this
+        // same batch must land EXACTLY at `first_cap + i` / `first_obj +
+        // i` — checked for real below, not assumed.
+        //
+        // **Real bug found via review**: `SyscallReturn::NewCaps{cap,
+        // count}`'s own doc comment claims "subsequent ones follow at
+        // `cap + 1 ..`", but `cs.insert_root`'s allocator (`CapTable`'s
+        // free list) is only contiguous for a pristine, never-revoked-
+        // from table. `free_slot` pushes a freed slot onto the HEAD of
+        // that list (kernel-cap/src/cdt.rs), so once ANY prior capability
+        // in the destination table has ever been revoked, the next
+        // `count - 1` insertions in a batch are no longer guaranteed
+        // sequential with the first — silently making the returned
+        // `NewCaps` describe capabilities that are NOT actually at `cap +
+        // 1 ..`, with nothing telling the caller its assumption just
+        // broke. Object-table ids (`self.endpoints`/etc. in `state.rs`)
+        // are separately guaranteed monotonic today (nothing in this
+        // crate ever frees one outside this very rollback path), so only
+        // the CAPABILITY side of the contract can actually break in
+        // practice — but this function checks both, since the object-id
+        // side's monotonicity is an incidental fact about the rest of the
+        // codebase today, not a documented invariant this function may
+        // rely on going forward.
+        //
+        // Rather than let the false claim stand, this function verifies
+        // contiguity for real and fails loudly (`RetypeNotContiguous`,
+        // whole batch rolled back) instead of silently returning a range
+        // the caller cannot trust. In practice this is unreachable today
+        // — every real caller in this codebase (`kernel/kernel/src/
+        // main.rs`, `kernel-arch-glue`) only ever requests `count: 1`,
+        // and the one raw-ABI opcode that reaches this path
+        // (`RETYPE_ENDPOINT`) hardcodes `count: 1` too — but the
+        // dispatch-level `SyscallOp::Retype.count` field exists precisely
+        // so a `count > 1` batch is a real, supported request, not a
+        // hypothetical one, and this function's own return type must
+        // either keep its documented promise or fail, never quietly break
+        // it.
+        let mut first_cap: Option<CapId> = None;
+        let mut first_obj: Option<u32> = None;
         let mut made: u32 = 0;
+
         for i in 0..grant.count {
             // Physical slot for object `i` within the reserved range.
             let obj_phys = grant.phys_base.as_usize() as u64 + i as u64 * per;
 
-            // Allocate the concrete object-table slot for this kind.
-            let (kind, obj_id) = match target_type {
-                KernelObjectType::Endpoint => {
-                    let id = self.alloc_endpoint().ok_or(SyscallError::ObjectTableFull)?;
-                    (KernelObjectKind::Endpoint, id.as_u32())
-                }
-                KernelObjectType::Notification => {
-                    let id = self
-                        .alloc_notification()
-                        .ok_or(SyscallError::ObjectTableFull)?;
-                    (KernelObjectKind::Notification, id.as_u32())
-                }
-                KernelObjectType::PageTable => {
-                    // The retyped frame becomes the page-table root.
-                    let id = self
-                        .alloc_addr_space(obj_phys)
-                        .ok_or(SyscallError::ObjectTableFull)?;
-                    (KernelObjectKind::PageTable, id.as_u32())
-                }
-                KernelObjectType::CapabilitySpace => {
-                    let id = self
-                        .alloc_cap_space()
-                        .ok_or(SyscallError::ObjectTableFull)?;
-                    (KernelObjectKind::CapabilitySpace, id.as_u32())
-                }
-                KernelObjectType::ThreadControlBlock => {
-                    // MVP: a freshly retyped TCB is bound to the caller's
-                    // own cap space / address space. A later `feat:` adds
-                    // a `Configure`-style op to rebind it (seL4's model).
-                    let (cs0, as0) = {
-                        let t = self.tcb(caller).ok_or(SyscallError::NoCaller)?;
-                        (t.cap_space, t.addr_space)
-                    };
-                    let id = self
-                        .alloc_tcb(cs0, as0)
-                        .ok_or(SyscallError::ObjectTableFull)?;
-                    (KernelObjectKind::ThreadControlBlock, id.as_u32())
-                }
-                KernelObjectType::Untyped => {
-                    // Sub-divide: each child is one page of the reserved
-                    // range (MVP granularity — `SyscallOp::Retype` carries
-                    // no size argument; a `size_bits` field is a later
-                    // extension, seL4-style).
-                    let id = self
-                        .alloc_untyped(obj_phys, per)
-                        .ok_or(SyscallError::ObjectTableFull)?;
-                    (KernelObjectKind::UntypedMemory, id.as_u32())
-                }
-                KernelObjectType::SharedRegion => {
-                    // MVP: full RW is always the widest a fresh region
-                    // permits — `Retype` carries no rights argument (same
-                    // "no size/rights argument yet" gap `Untyped`'s own
-                    // arm above already notes); a peer can still be
-                    // GRANTed a narrower derived capability later via the
-                    // ordinary `CapGrant` rights-narrowing path.
-                    let region = SharedRegion::new(PhysAddr::new(obj_phys as usize), per as usize, CapabilityRights::RW);
-                    let id = self
-                        .alloc_shared_region(region)
-                        .ok_or(SyscallError::ObjectTableFull)?;
-                    (KernelObjectKind::SharedRegion, id.as_u32())
+            let obj_id = match self.alloc_retyped_object(caller, target_type, obj_phys, per) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let (Some(fc), Some(fo)) = (first_cap, first_obj) {
+                        self.unwind_retype_batch(cs_id, kind, fc, fo, made);
+                    }
+                    return Err(e);
                 }
             };
 
             let newcap = Capability::full(ObjectRef::new(kind, ObjectId::new(obj_id)));
             let cs = self.cap_space_mut(cs_id).ok_or(SyscallError::NoCaller)?;
-            let slot = cs.insert_root(newcap)?;
-            first.get_or_insert(slot);
+            let slot = match cs.insert_root(newcap) {
+                Ok(s) => s,
+                Err(e) => {
+                    // This iteration's own object was just created but
+                    // never rooted — free it too before unwinding priors.
+                    self.free_kernel_object(kind, obj_id);
+                    if let (Some(fc), Some(fo)) = (first_cap, first_obj) {
+                        self.unwind_retype_batch(cs_id, kind, fc, fo, made);
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            match (first_cap, first_obj) {
+                (None, None) => {
+                    first_cap = Some(slot);
+                    first_obj = Some(obj_id);
+                }
+                (Some(fc), Some(fo)) => {
+                    if slot.as_u32() != fc.as_u32() + i || obj_id != fo + i {
+                        // Contiguity broken: undo THIS iteration's insert
+                        // + object, then unwind every prior one.
+                        if let Some(cs) = self.cap_space_mut(cs_id) {
+                            cs.remove_root(slot);
+                        }
+                        self.free_kernel_object(kind, obj_id);
+                        self.unwind_retype_batch(cs_id, kind, fc, fo, made);
+                        return Err(SyscallError::RetypeNotContiguous);
+                    }
+                }
+                _ => unreachable!("first_cap/first_obj are always set together"),
+            }
             made += 1;
         }
         Ok(SyscallReturn::NewCaps {
-            cap: first.ok_or(SyscallError::Mm(MmError::ZeroCount))?,
+            cap: first_cap.ok_or(SyscallError::Mm(MmError::ZeroCount))?,
             count: made,
         })
     }
@@ -1986,5 +2127,143 @@ mod tests {
         // Replying to yourself is rejected too (never a sensible target).
         let r = k.dispatch(root, 0, SyscallOp::Reply { to: root, msg: SmallMessage::new(0) }, &hal);
         assert_eq!(r, Err(SyscallError::NotBlockedOnReply));
+    }
+
+    /// **Real bug found via review**: a `Retype { count > 1 }` batch that
+    /// fails partway through (the destination object table fills up)
+    /// used to leave every object/capability created before the failing
+    /// iteration in place — orphaned kernel objects with no capability
+    /// referencing any of them (the syscall as a whole reports failure,
+    /// so the caller never learns their ids), plus the caller's own cap
+    /// table permanently larger than it was before the call. `do_retype`
+    /// now rolls the whole batch back on any mid-batch failure.
+    #[test]
+    fn retype_batch_partial_failure_rolls_back_every_object_and_capability() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        let cs_len_before = k.cap_space(k.root_cap_space).unwrap().len();
+
+        // More endpoints than `MAX_ENDPOINTS` (config.rs) in one batch:
+        // the `Endpoint` object table fills up strictly between
+        // iteration 0 and `count`, so `do_retype` must fail with
+        // `ObjectTableFull`.
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Retype {
+                untyped: CapId::new(0),
+                target_type: KernelObjectType::Endpoint,
+                count: crate::config::MAX_ENDPOINTS as u32 + 5,
+            },
+            &hal,
+        );
+        assert_eq!(r, Err(SyscallError::ObjectTableFull));
+
+        // The cap table must be exactly as the failed call found it.
+        assert_eq!(
+            k.cap_space(k.root_cap_space).unwrap().len(),
+            cs_len_before,
+            "a failed batch must leave the caller's cap table exactly as it found it"
+        );
+
+        // And the object table itself must be rolled back too, not just
+        // the capabilities pointing at it — a fresh, ordinary retype
+        // must still succeed afterward (it would fail with
+        // `ObjectTableFull` again if the earlier orphaned objects were
+        // still occupying `MAX_ENDPOINTS` object-table slots).
+        let r2 = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Endpoint, count: 1 },
+            &hal,
+        );
+        assert!(matches!(r2, Ok(SyscallReturn::NewCaps { count: 1, .. })));
+    }
+
+    /// **Real bug found via review**: `SyscallReturn::NewCaps` (`cap`
+    /// plus `count`) claims in its own doc comment that subsequent caps
+    /// follow sequentially after `cap`. But `CapTable`'s free list is
+    /// only contiguous for a pristine, never-revoked-from table —
+    /// `free_slot` pushes a freed slot onto the HEAD of the free list,
+    /// so once any prior capability in the destination table has been
+    /// revoked, the next allocation in a batch can land far from `cap`
+    /// plus one, silently describing a capability that isn't actually
+    /// there (worse: the slot it lands on can belong to a completely
+    /// different, unrelated, still-live capability). `do_retype` now
+    /// detects this for real and fails with `RetypeNotContiguous`
+    /// instead of returning a range the caller cannot trust.
+    #[test]
+    fn retype_batch_detects_non_contiguous_slots_and_rolls_back() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+
+        // Three individual (count: 1) Endpoint capabilities land at
+        // sequential slots in a pristine table.
+        let mut caps = [CapId::new(0); 3];
+        for c in caps.iter_mut() {
+            *c = match k
+                .dispatch(
+                    caller,
+                    0,
+                    SyscallOp::Retype {
+                        untyped: CapId::new(0),
+                        target_type: KernelObjectType::Endpoint,
+                        count: 1,
+                    },
+                    &hal,
+                )
+                .unwrap()
+            {
+                SyscallReturn::NewCaps { cap, .. } => cap,
+                other => panic!("unexpected {other:?}"),
+            };
+        }
+        assert_eq!(caps[1].as_u32(), caps[0].as_u32() + 1);
+        assert_eq!(caps[2].as_u32(), caps[0].as_u32() + 2);
+
+        // Revoke ONLY the first of the three (not its Untyped parent) —
+        // the real-world trigger for the false "contiguous" claim: the
+        // freed slot goes to the free list's HEAD, so the next
+        // allocation reuses it, but the allocation after THAT jumps to
+        // the table's still-untouched tail — NOT `caps[0] + 1`, since
+        // `caps[1]`/`caps[2]` are still occupying that range.
+        let freed = match k.dispatch(caller, 0, SyscallOp::CapRevoke { cap: caps[0] }, &hal).unwrap() {
+            SyscallReturn::Revoked { freed } => freed,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(freed, 1);
+
+        let cs_len_before_batch = k.cap_space(k.root_cap_space).unwrap().len();
+
+        // Before the fix, this silently returned `NewCaps { cap:
+        // caps[0], count: 2 }`, falsely implying a second capability at
+        // `caps[0] + 1` — `caps[1]`'s own slot, still occupied by a
+        // DIFFERENT, unrelated, live capability.
+        let r = k.dispatch(
+            caller,
+            0,
+            SyscallOp::Retype {
+                untyped: CapId::new(0),
+                target_type: KernelObjectType::Notification,
+                count: 2,
+            },
+            &hal,
+        );
+        assert_eq!(r, Err(SyscallError::RetypeNotContiguous));
+
+        // Whole batch rolled back: the cap table is back to exactly
+        // where it was right before this call.
+        assert_eq!(k.cap_space(k.root_cap_space).unwrap().len(), cs_len_before_batch);
+
+        // Crucially: `caps[1]` — the unrelated, still-live capability
+        // whose slot the non-contiguous 2nd allocation reached for —
+        // must be completely untouched by the failed batch.
+        let c1 = k.resolve(caller, caps[1], KernelObjectKind::Endpoint, CapabilityRights::READ);
+        assert!(c1.is_ok(), "an unrelated live capability must survive a failed Retype batch");
     }
 }

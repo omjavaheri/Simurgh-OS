@@ -243,6 +243,34 @@ impl<const N: usize> CapTable<N> {
         Ok(id)
     }
 
+    /// Undoes an `insert_root` that a caller has decided to unwind —
+    /// used only by `kernel-core`'s `do_retype` to roll back a
+    /// partially-completed `count > 1` batch when a later object in the
+    /// same batch fails to allocate (that function's own doc comment has
+    /// the full rationale). Releases `id`'s slot back to the free list.
+    ///
+    /// Precondition: `id` names a slot this same in-progress operation
+    /// itself inserted via `insert_root` moments ago (a fresh root with
+    /// `parent == None`) — nothing else can have derived from it yet,
+    /// since no other syscall can interleave mid-dispatch. This is
+    /// checked defensively, not assumed: a non-root slot (`parent ==
+    /// Some(_)`) is refused rather than silently torn out from under a
+    /// derivation edge that still points at it.
+    ///
+    /// Returns `true` iff `id` named an occupied root slot (now freed);
+    /// `false` — a no-op — for an out-of-range id, an already-free slot,
+    /// or a non-root slot.
+    pub fn remove_root(&mut self, id: CapId) -> bool {
+        let Some(slot) = self.slots.get(id.as_usize()) else {
+            return false;
+        };
+        if slot.cap.is_none() || slot.parent.is_some() {
+            return false;
+        }
+        self.free_slot(id);
+        true
+    }
+
     // ------------------------------------------------------------------
     // Shared derive logic for both the same-table (`derive_child`) and
     // cross-table (`derive_child_cross_space`) entry points: validate
