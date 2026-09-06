@@ -859,7 +859,7 @@ mod sys {
     // -- Second target_service demo (mm-service, `kernel_arch_glue::
     //    SBI_TARGET_MM_SERVICE` = 1) — proves `target_service` resolution
     //    generalizes beyond the one hardcoded `SBI_CAP_GRANT` case above.
-    //    Same shape as `SBI_CAP_GRANT`/`SBI_CAP_REVOKE`, `cap: 4` instead
+    //    Same shape as `SBI_CAP_GRANT`/`SBI_CAP_REVOKE`, `cap: 5` instead
     //    of `cap: 2` (`security_broker_intermediary_demo_start`'s own
     //    slot 3/4 doc comment). No new `kernel_arch_glue` functions were
     //    needed for this — `sbi_cap_grant_call`/`sbi_cap_revoke_call`
@@ -868,7 +868,7 @@ mod sys {
     /// `a0` = endpoint capability slot (from `SBI_ENDPOINT_CAP`), `a1` =
     /// `target_service` (`kernel_arch_glue::SBI_TARGET_MM_SERVICE` for
     /// this demo). Sends a REAL `SecurityRequest::CapGrant { target_service,
-    /// cap: 4, rights: READ|WRITE }`. Follow up with
+    /// cap: 5, rights: READ|WRITE }`. Follow up with
     /// `SBI_CAP_GRANT2_RESULT`. A no-op (returns `usize::MAX` immediately)
     /// if mm-service was never spawned — see `security_broker_
     /// intermediary_demo_start`'s own doc comment.
@@ -877,7 +877,7 @@ mod sys {
     /// mm-service's OWN capability space, or `usize::MAX` on failure.
     pub const SBI_CAP_GRANT2_RESULT: usize = 103;
     /// `a0` = endpoint capability slot. Sends a REAL `SecurityRequest::
-    /// CapRevoke { cap: 4 }`. Follow up with `SBI_CAP_REVOKE2_RESULT`.
+    /// CapRevoke { cap: 5 }`. Follow up with `SBI_CAP_REVOKE2_RESULT`.
     pub const SBI_CAP_REVOKE2: usize = 104;
     /// No arguments. Returns the number of capability-table slots freed
     /// (expected: 2, same cross-space reasoning as `SBI_CAP_REVOKE_
@@ -3250,9 +3250,9 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::SBI_CAP_GRANT2 => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate().root_thread;
-            // `cap: 4` — the SECOND demo resource/target (mm-service, see
+            // `cap: 5` — the SECOND demo resource/target (mm-service, see
             // `sys::SBI_CAP_GRANT2`'s own doc comment).
-            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 4, 0b011) {
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 5, 0b011) {
                 Some(sw) => {
                     if let Some((p0, p1)) = sw.poke {
                         // SAFETY: `sw.into` is a kernel-owned, currently
@@ -3281,7 +3281,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::SBI_CAP_REVOKE2 => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate().root_thread;
-            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 4) {
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 5) {
                 Some(sw) => {
                     if let Some((p0, p1)) = sw.poke {
                         // SAFETY: `sw.into` is a kernel-owned, currently
@@ -4923,7 +4923,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate().root_thread;
             // See riscv64's own identical arm's doc comment.
-            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, x0 as u32, x1 as u32, 4, 0b011) {
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, x0 as u32, x1 as u32, 5, 0b011) {
                 Some(sw) => {
                     if let Some((p0, p1)) = sw.poke {
                         // SAFETY: `sw.into` is a kernel-owned, currently
@@ -4952,7 +4952,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         sys::SBI_CAP_REVOKE2 => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate().root_thread;
-            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, x0 as u32, 4) {
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, x0 as u32, 5) {
                 Some(sw) => {
                     if let Some((p0, p1)) = sw.poke {
                         // SAFETY: `sw.into` is a kernel-owned, currently
@@ -6113,12 +6113,12 @@ fn simurgh_syscall(
         sys::SBI_CAP_GRANT2 => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate().root_thread;
-            // `cap: 4` / `target_service` (`a1`, `kernel_arch_glue::
+            // `cap: 5` / `target_service` (`a1`, `kernel_arch_glue::
             // SBI_TARGET_MM_SERVICE` for this demo) — a SECOND real
             // target, proving `target_service` resolution generalizes
             // (`security_broker_intermediary_demo_start`'s own slot 3/4
             // doc comment).
-            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 4, 0b011) {
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 5, 0b011) {
                 Some(sw) => {
                     if let Some((p0, p1)) = sw.poke {
                         // SAFETY: `sw.into` is a kernel-owned, currently
@@ -6147,7 +6147,7 @@ fn simurgh_syscall(
         sys::SBI_CAP_REVOKE2 => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate().root_thread;
-            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 4) {
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 5) {
                 Some(sw) => {
                     if let Some((p0, p1)) = sw.poke {
                         // SAFETY: `sw.into` is a kernel-owned, currently

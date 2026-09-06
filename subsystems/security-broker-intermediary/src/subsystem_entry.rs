@@ -90,10 +90,10 @@ const TARGET_SECURITY_BROKER: u32 = 0;
 /// the SECOND real target (Root Task's own `kernel_arch_glue::
 /// security_broker_intermediary_demo_start` grants this only when
 /// mm-service was already spawned by the time it runs; see that
-/// function's own slot 3/4 doc comment) — proves `target_service`
+/// function's own slot 4/5 doc comment) — proves `target_service`
 /// resolution generalizes beyond the one `SECURITY_BROKER_TCB_CAP_SLOT`
 /// case.
-const MM_SERVICE_TCB_CAP_SLOT: u32 = 3;
+const MM_SERVICE_TCB_CAP_SLOT: u32 = 4;
 
 /// `target_service` value that resolves to `MM_SERVICE_TCB_CAP_SLOT` —
 /// must stay numerically equal to `kernel_arch_glue::

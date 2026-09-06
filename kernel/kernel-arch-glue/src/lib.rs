@@ -6945,11 +6945,24 @@ pub const SBI_TARGET_MM_SERVICE: u32 = 1;
 ///     `security_broker_tid` (via `mint_tcb_cap_into`) — resolved by the
 ///     intermediary's own `target_service == SBI_TARGET_SECURITY_BROKER`
 ///     mapping,
-///   - slot 2: one demo "resource" `Endpoint` capability — a stand-in for
-///     whatever real resource a real `MintSpec` would name (REPO-simurgh-
-///     security-broker.md's own `Broker::request_capability` flow, out of
-///     this repo's scope); this pass only needs SOMETHING real to copy,
-///     to prove the mechanism, not a specific resource's semantics,
+///   - slot 2: one demo "resource" `Endpoint` capability, used ONLY by
+///     Root Task's own `sbi_cap_grant_call` demo (`cap: 2`) — a stand-in
+///     for whatever real resource a real `MintSpec` would name
+///     (REPO-simurgh-security-broker.md's own `Broker::request_capability`
+///     flow, out of this repo's scope); this pass only needs SOMETHING
+///     real to copy, to prove the mechanism, not a specific resource's
+///     semantics,
+///   - slot 3: a SEPARATE demo resource, reserved for security-broker's
+///     OWN real self-check `request_capability` call (`simurgh-security-
+///     broker::subsystem_entry::self_check`, sibling repo) — deliberately
+///     not slot 2, since Root Task's own demo revokes slot 2 long before
+///     security-broker's thread can possibly run (see this function's
+///     own inline comment on that slot for the full story, including a
+///     real bug this separation fixes),
+///   - slots 4/5 (if mm-service was already spawned): a SECOND real
+///     target (`SBI_TARGET_MM_SERVICE`) proving `target_service`
+///     resolution generalizes — see the inline comment at that point in
+///     this function's own body,
 /// maps its shared message page, and switches straight to it (same
 /// "avoid the caller/receiver race" requirement `fs_demo_start`'s own
 /// tail comment documents at length — identical fix applied here).
@@ -7031,7 +7044,49 @@ pub fn security_broker_intermediary_demo_start(
         CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT | CapabilityRights::REVOKE,
     )?;
 
-    // slot 3 + slot 4: a SECOND real target, proving `target_service`
+    // slot 3: a THIRD demo resource, DELIBERATELY separate from slot 2
+    // above — that one is Root Task's OWN demo resource
+    // (`sbi_cap_grant_call`'s hardcoded `cap: 2`), consumed and then
+    // REVOKED by Root Task's sequential boot-time demo strictly BEFORE
+    // security-broker's own thread is ever scheduled (Root Task's whole
+    // demo runs synchronously in step 7h of `umode_root`, before step 8's
+    // preemption phase — the only point `pick_next` can ever pick
+    // security-broker's thread; `spawn_security_broker` spawns it early
+    // but never switches to it directly). **A real bug caught during
+    // review, not via QEMU** (no log line existed to observe it):
+    // `security-broker::subsystem_entry::self_check`'s own real
+    // `request_capability` call originally reused `cap: 2` — the SAME
+    // slot Root Task's demo already revoked by the time security-broker's
+    // thread could possibly run, so that call would have failed with
+    // `SecurityErrorCode::KernelRejected` (the resource simply no longer
+    // existing), silently undermining the very thing `simurgh-security-
+    // broker`'s own README claims is proven. Placed here (a fixed slot
+    // number, unconditional on whether mm-service was spawned below) so
+    // security-broker's own client code can hardcode `register_
+    // resource_slot("camera", 3)` without depending on the SECOND
+    // target's own conditional slot count.
+    let resource_cap_sb_self = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: kernel_mm::KernelObjectType::Endpoint,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    grant_cap_into(
+        k,
+        src_cs,
+        resource_cap_sb_self,
+        sbi_cs,
+        CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT | CapabilityRights::REVOKE,
+    )?;
+
+    // slot 4 + slot 5: a SECOND real target, proving `target_service`
     // resolution generalizes beyond the one hardcoded `SBI_TARGET_
     // SECURITY_BROKER` case (`security-broker`'s own README/this
     // function's own doc comment both flagged this as still open). Uses
@@ -7044,9 +7099,9 @@ pub fn security_broker_intermediary_demo_start(
     // SAFETY: single-core; `G_MM_TID` is written once by `mm_demo_start`,
     // already-`Some` by this point in the boot sequence (see above).
     if let Some(mm_tid) = unsafe { core::ptr::addr_of!(G_MM_TID).read() } {
-        // slot 3: mm-service's own TCB.
+        // slot 4: mm-service's own TCB.
         mint_tcb_cap_into(k, sbi_cs, mm_tid)?;
-        // slot 4: a second demo resource, same shape as slot 2's.
+        // slot 5: a second demo resource, same shape as slot 2's.
         let resource_cap_2 = match k.dispatch(
             caller,
             hal.now_ns(),
@@ -7069,7 +7124,7 @@ pub fn security_broker_intermediary_demo_start(
         )?;
     } else {
         // mm-service was not spawned (e.g. its own `Retype`/map_range
-        // failed) — the multi-target demo simply does not run; slots 3/4
+        // failed) — the multi-target demo simply does not run; slots 4/5
         // are left unfilled rather than this whole function failing over
         // a SECOND target's absence (the FIRST target, security-broker,
         // is unconditionally required — see this function's own doc
