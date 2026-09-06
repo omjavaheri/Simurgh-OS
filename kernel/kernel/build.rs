@@ -361,4 +361,34 @@ fn main() {
         "cargo:rustc-env=ACCOUNT_MANAGER_ELF_PATH={}",
         am_path.canonicalize().unwrap().display()
     );
+
+    // Same as `account-manager-bin` above, for `backup-manager-bin` — the
+    // FOURTH layer-4 process this project spawns as a real Simurgh-OS
+    // subsystem (`simurgh-backup-manager`, a separate git repo). Same
+    // local-dev-only sibling-directory path stitch.
+    let bm_build_alias =
+        format!("(in simurgh-backup-manager) cargo +nightly-2025-01-15 build -p backup-core --bin backup-manager-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let bm_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-backup-manager")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("backup-manager-bin");
+
+    if !bm_path.exists() {
+        panic!(
+            "kernel build.rs: backup-manager-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {bm_build_alias}",
+            bm_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", bm_path.display());
+    println!(
+        "cargo:rustc-env=BACKUP_MANAGER_ELF_PATH={}",
+        bm_path.canonicalize().unwrap().display()
+    );
 }
