@@ -331,4 +331,34 @@ fn main() {
         "cargo:rustc-env=INIT_ELF_PATH={}",
         init_path.canonicalize().unwrap().display()
     );
+
+    // Same as `init-bin` above, for `account-manager-bin` — the THIRD
+    // layer-4 process this project spawns as a real Simurgh-OS subsystem
+    // (`simurgh-account-manager`, a separate git repo). Same local-dev-
+    // only sibling-directory path stitch.
+    let am_build_alias =
+        format!("(in simurgh-account-manager) cargo +nightly-2025-01-15 build -p session-manager --bin account-manager-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let am_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-account-manager")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("account-manager-bin");
+
+    if !am_path.exists() {
+        panic!(
+            "kernel build.rs: account-manager-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {am_build_alias}",
+            am_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", am_path.display());
+    println!(
+        "cargo:rustc-env=ACCOUNT_MANAGER_ELF_PATH={}",
+        am_path.canonicalize().unwrap().display()
+    );
 }

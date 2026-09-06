@@ -189,6 +189,12 @@ static SECURITY_BROKER_INTERMEDIARY_ELF: &[u8] = include_bytes!(env!("SECURITY_B
 /// reason `SECURITY_BROKER_ELF` is.
 static INIT_ELF: &[u8] = include_bytes!(env!("INIT_ELF_PATH"));
 
+/// `account-manager-bin`'s own separately-built ELF image — same
+/// packaging as `INIT_ELF` (see its own doc comment): the THIRD layer-4
+/// process this project spawns (`simurgh-account-manager`, a separate
+/// git repo), out-of-tree for the same local-dev-only path-stitch reason.
+static ACCOUNT_MANAGER_ELF: &[u8] = include_bytes!(env!("ACCOUNT_MANAGER_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -3370,6 +3376,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // `sys::SBI_DEMO_START` (see that arm's own doc comment for
             // why) — NOT spawned again here.
             let _ = spawn_init_x86(kernel_arch_glue::khal());
+            let _ = spawn_account_manager_x86(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3619,6 +3626,38 @@ fn spawn_init_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> 
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): init spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_account_manager` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_init_x86`.
+fn spawn_account_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        ACCOUNT_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
+        ACCOUNT_MANAGER_STACK_VMA,
+        ACCOUNT_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned account-manager (tid {}) from its OWN separately-built ELF image (simurgh-account-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): account-manager spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -5072,6 +5111,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             // `sys::SBI_DEMO_START` (see that arm's own doc comment for
             // why) — NOT spawned again here.
             let _ = spawn_init_aarch64(kernel_arch_glue::khal());
+            let _ = spawn_account_manager_aarch64(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -5280,6 +5320,38 @@ fn spawn_init_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::Thread
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (aarch64): init spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_account_manager` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_init_aarch64`.
+fn spawn_account_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        ACCOUNT_MANAGER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        ACCOUNT_MANAGER_STACK_VMA,
+        ACCOUNT_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned account-manager (tid {}) from its OWN separately-built ELF image (simurgh-account-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): account-manager spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -5548,6 +5620,7 @@ fn simurgh_syscall(
             // `sys::SBI_DEMO_START` (see that arm's own doc comment for
             // why) — NOT spawned again here.
             let _ = spawn_init(kernel_arch_glue::khal());
+            let _ = spawn_account_manager(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -6691,6 +6764,43 @@ fn spawn_init(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task: init spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `account-manager-bin` — the THIRD layer-4 process this project
+/// spawns as a real Simurgh-OS subsystem (`simurgh-account-manager`, a
+/// separate git repo). Same shape and same reasoning as `spawn_init`:
+/// this process's own real logic (`session_manager::subsystem_entry::
+/// self_check`) is entirely self-contained (no real IPC transport to
+/// `simurgh-security-broker` exists yet on either side), so it simply
+/// proves the process itself boots and its ported account/session logic
+/// runs correctly on real hardware.
+fn spawn_account_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        ACCOUNT_MANAGER_ELF,
+        elf_loader::machine::EM_RISCV,
+        ACCOUNT_MANAGER_STACK_VMA,
+        ACCOUNT_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned account-manager (tid {}) from its OWN separately-built ELF image (simurgh-account-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: account-manager spawn skipped (out of resources)\r\n"
             ));
             None
         }
