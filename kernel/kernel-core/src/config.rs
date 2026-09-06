@@ -47,15 +47,37 @@ pub const MAX_THREADS: usize = 96;
 /// Maximum concurrent synchronous-IPC chain groups (02-Microkernel-Layer.md §4.3).
 pub const MAX_CHAIN_GROUPS: usize = 24;
 
-/// Maximum capability spaces (roughly "processes" — each layer-3 service
-/// plus the Root Task).
-pub const MAX_CAP_SPACES: usize = 16;
+/// Maximum capability spaces (roughly "processes" — each layer-3/4
+/// service, the Root Task, and every transient boot-demo/fault-injection
+/// process spawned along the way).
+///
+/// **Real capacity bug found via review, not a guess**: this was 16,
+/// sized back when only layer-3 subsystems existed. Each real subsystem
+/// spawn (`kernel_arch_glue::spawn_process`/`spawn_process_from_elf`)
+/// consumes exactly one `CapSpaceId` — and so does every one of the
+/// `qemu-fault-isolation-test.sh` demo's own repeated `faulty-driver`
+/// respawns (`MAX_RESTARTS_IN_WINDOW` = 6, each a FRESH process, not a
+/// reused one) plus the handful of two-process zero-copy/Sv39 boot demos
+/// that run even earlier. Once this project started spawning real
+/// layer-4 processes too (`fix/33-fix`: security-broker, init, account-
+/// manager, backup-manager, and more planned), the table filled up
+/// completely partway through boot — confirmed via a real QEMU run: the
+/// 6th `faulty-driver` respawn failed with "spawn skipped (out of
+/// resources)", so `qemu-fault-isolation-test.sh` itself never reached
+/// its own `state=Failed restarts_in_window=6` pass marker. Raised to 48
+/// (matching `MAX_ENDPOINTS`/`MAX_NOTIFICATIONS`'s own scale) for real
+/// headroom as more layer-4 services are spawned this way, not just
+/// enough to clear the one failure observed.
+pub const MAX_CAP_SPACES: usize = 48;
 
 /// Capability slots per capability space (the `N` of each `CapTable`).
 pub const CAP_SLOTS_PER_SPACE: usize = 96;
 
-/// Maximum address spaces (one per `PageTable` root object).
-pub const MAX_ADDR_SPACES: usize = 24;
+/// Maximum address spaces (one per `PageTable` root object). Raised in
+/// lockstep with `MAX_CAP_SPACES` — every real process spawn allocates
+/// exactly one of each, so this must never sit below it (see
+/// `MAX_CAP_SPACES`'s own doc comment for the full rationale).
+pub const MAX_ADDR_SPACES: usize = 48;
 
 /// Distinct virtual mappings per address space (the `M` of each
 /// `AddressSpace`).
