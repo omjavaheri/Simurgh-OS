@@ -181,6 +181,14 @@ static SECURITY_BROKER_ELF: &[u8] = include_bytes!(env!("SECURITY_BROKER_ELF_PAT
 /// own doc comment for the full rationale.
 static SECURITY_BROKER_INTERMEDIARY_ELF: &[u8] = include_bytes!(env!("SECURITY_BROKER_INTERMEDIARY_ELF_PATH"));
 
+/// `init-bin`'s own separately-built ELF image — same packaging as
+/// `SECURITY_BROKER_ELF` (see its own doc comment): the SECOND layer-4
+/// process this project spawns (`simurgh-init`, a separate git repo —
+/// REPO-simurgh-init.md §1: "the very first one the kernel's Root Task
+/// would start"), out-of-tree for the same local-dev-only path-stitch
+/// reason `SECURITY_BROKER_ELF` is.
+static INIT_ELF: &[u8] = include_bytes!(env!("INIT_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -3361,6 +3369,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // security-broker is now spawned earlier, sequentially, by
             // `sys::SBI_DEMO_START` (see that arm's own doc comment for
             // why) — NOT spawned again here.
+            let _ = spawn_init_x86(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3577,6 +3586,39 @@ fn spawn_security_broker_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap:
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_init` (riscv64) — see that function's own
+/// doc comment for the full rationale. Same shape as
+/// `spawn_security_broker_x86`, the first layer-4 process this project
+/// spawned this way.
+fn spawn_init_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const INIT_STACK_VMA: usize = 0xC042_0000;
+    const INIT_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        INIT_ELF,
+        elf_loader::machine::EM_X86_64,
+        INIT_STACK_VMA,
+        INIT_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned init (tid {}) from its OWN separately-built ELF image (simurgh-init repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): init spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -5029,6 +5071,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             // security-broker is now spawned earlier, sequentially, by
             // `sys::SBI_DEMO_START` (see that arm's own doc comment for
             // why) — NOT spawned again here.
+            let _ = spawn_init_aarch64(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -5205,6 +5248,38 @@ fn spawn_security_broker_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (aarch64): security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_init` (riscv64) — see that function's
+/// own doc comment for the full rationale. Same shape as
+/// `spawn_security_broker_aarch64`.
+fn spawn_init_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const INIT_STACK_VMA: usize = 0xC042_0000;
+    const INIT_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        INIT_ELF,
+        elf_loader::machine::EM_AARCH64,
+        INIT_STACK_VMA,
+        INIT_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned init (tid {}) from its OWN separately-built ELF image (simurgh-init repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): init spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -5472,6 +5547,7 @@ fn simurgh_syscall(
             // security-broker is now spawned earlier, sequentially, by
             // `sys::SBI_DEMO_START` (see that arm's own doc comment for
             // why) — NOT spawned again here.
+            let _ = spawn_init(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -6573,6 +6649,48 @@ fn spawn_security_broker(hal: &hal_core::HalInterface) -> Option<kernel_cap::Thr
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task: security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `init-bin` — the SECOND layer-4 process this project spawns as
+/// a real Simurgh-OS subsystem (`simurgh-init`, a separate git repo —
+/// REPO-simurgh-init.md §1: "the very first one the kernel's Root Task
+/// would start, which then starts every other layer-4+ service"). Unlike
+/// `spawn_security_broker`, this process's own real logic
+/// (`init_core::subsystem_entry::self_check`) is entirely self-contained
+/// — it does not yet ask the kernel/intermediary for anything, since no
+/// architecture doc in this project defines a real process-launch
+/// mechanism a non-privileged layer-4 process could call (see that
+/// crate's own `subsystem_entry.rs` module doc) — so, unlike security-
+/// broker, this spawn needs no follow-up `CapGrant`/intermediary dance;
+/// it simply proves the process itself boots and its ported `Init`
+/// DAG-resolution logic runs correctly on real hardware.
+fn spawn_init(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const INIT_STACK_VMA: usize = 0xC042_0000;
+    const INIT_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        INIT_ELF,
+        elf_loader::machine::EM_RISCV,
+        INIT_STACK_VMA,
+        INIT_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned init (tid {}) from its OWN separately-built ELF image (simurgh-init repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: init spawn skipped (out of resources)\r\n"
             ));
             None
         }

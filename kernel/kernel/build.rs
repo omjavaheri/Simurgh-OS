@@ -298,4 +298,37 @@ fn main() {
         "cargo:rustc-env=SECURITY_BROKER_INTERMEDIARY_ELF_PATH={}",
         sbi_path.canonicalize().unwrap().display()
     );
+
+    // Same as `security-broker-bin` above, for `init-bin` — the SECOND
+    // layer-4 process this project spawns as a real Simurgh-OS subsystem
+    // (REPO-simurgh-init.md §1: "the very first one the kernel's Root Task
+    // would start"). Its source lives in the SEPARATE `simurgh-init` git
+    // repo, same local-dev-only sibling-directory path stitch as
+    // `security-broker-bin` — flagged for Omid there, applies identically
+    // here.
+    let init_build_alias =
+        format!("(in simurgh-init) cargo +nightly-2025-01-15 build -p init-core --bin init-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let init_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-init")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("init-bin");
+
+    if !init_path.exists() {
+        panic!(
+            "kernel build.rs: init-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {init_build_alias}",
+            init_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", init_path.display());
+    println!(
+        "cargo:rustc-env=INIT_ELF_PATH={}",
+        init_path.canonicalize().unwrap().display()
+    );
 }
