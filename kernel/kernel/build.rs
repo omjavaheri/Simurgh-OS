@@ -481,4 +481,50 @@ fn main() {
         "cargo:rustc-env=NATIVE_LOADER_ELF_PATH={}",
         nl_path.canonicalize().unwrap().display()
     );
+
+    // Same as `native-loader-bin` above, for `policy-engine-bin` — the
+    // EIGHTH layer-4 process this project spawns as a real Simurgh-OS
+    // subsystem (`simurgh-profile-policy`, a separate git repo). Same
+    // local-dev-only sibling-directory path stitch.
+    //
+    // **Real, flagged exception — `release`, not `debug`, unlike every
+    // other subsystem-bin here**: `policy-engine-bin` links `rhai`, a
+    // real scripting-language engine, not a plain-struct service — its
+    // `dev`-profile (debug, unoptimized) build is ~34 MiB, and this
+    // whole ELF gets embedded WHOLE into the kernel's own image via
+    // `include_bytes!` (`main.rs`'s `POLICY_ENGINE_ELF`). Confirmed via
+    // a real QEMU boot: with the `debug` build embedded, the resulting
+    // ~92 MiB kernel image made OVMF's own boot loader fail with
+    // "BdsDxe: ... Out of Resources" before this project's own code ever
+    // ran — a firmware-level failure, not a `Simurgh-OS` kernel bug. The
+    // `release` build is ~2.9 MiB (roughly 12x smaller — optimization +
+    // stripped debug info), which resolved it. Every other subsystem-bin
+    // stays on `debug` deliberately (matches the whole project's dev-
+    // profile convention and keeps panics/asserts informative); this is
+    // the one crate large enough that the tradeoff flips.
+    let pp_build_alias =
+        format!("(in simurgh-profile-policy) cargo +nightly-2025-01-15 build --release -p simurgh-profile-policy --bin policy-engine-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let pp_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-profile-policy")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("release")
+        .join("policy-engine-bin");
+
+    if !pp_path.exists() {
+        panic!(
+            "kernel build.rs: policy-engine-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {pp_build_alias}",
+            pp_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", pp_path.display());
+    println!(
+        "cargo:rustc-env=POLICY_ENGINE_ELF_PATH={}",
+        pp_path.canonicalize().unwrap().display()
+    );
 }

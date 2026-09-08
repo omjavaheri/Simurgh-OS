@@ -220,6 +220,12 @@ static STORE_ELF: &[u8] = include_bytes!(env!("STORE_ELF_PATH"));
 /// out-of-tree for the same local-dev-only path-stitch reason.
 static NATIVE_LOADER_ELF: &[u8] = include_bytes!(env!("NATIVE_LOADER_ELF_PATH"));
 
+/// `policy-engine-bin`'s own separately-built ELF image — same packaging
+/// as `NATIVE_LOADER_ELF` (see its own doc comment): the EIGHTH layer-4
+/// process this project spawns (`simurgh-profile-policy`, a separate git
+/// repo), out-of-tree for the same local-dev-only path-stitch reason.
+static POLICY_ENGINE_ELF: &[u8] = include_bytes!(env!("POLICY_ENGINE_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -3406,6 +3412,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             let _ = spawn_diagnostics_manager_x86(kernel_arch_glue::khal());
             let _ = spawn_store_x86(kernel_arch_glue::khal());
             let _ = spawn_native_loader_x86(kernel_arch_glue::khal());
+            let _ = spawn_policy_engine_x86(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3815,6 +3822,38 @@ fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::T
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): native-loader spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_policy_engine` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_native_loader_x86`.
+fn spawn_policy_engine_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const POLICY_ENGINE_STACK_VMA: usize = 0xC048_0000;
+    const POLICY_ENGINE_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        POLICY_ENGINE_ELF,
+        elf_loader::machine::EM_X86_64,
+        POLICY_ENGINE_STACK_VMA,
+        POLICY_ENGINE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned policy-engine (tid {}) from its OWN separately-built ELF image (simurgh-profile-policy repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): policy-engine spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -5273,6 +5312,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             let _ = spawn_diagnostics_manager_aarch64(kernel_arch_glue::khal());
             let _ = spawn_store_aarch64(kernel_arch_glue::khal());
             let _ = spawn_native_loader_aarch64(kernel_arch_glue::khal());
+            let _ = spawn_policy_engine_aarch64(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -5647,6 +5687,38 @@ fn spawn_native_loader_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_ca
     }
 }
 
+/// aarch64 counterpart of `spawn_policy_engine` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_native_loader_aarch64`.
+fn spawn_policy_engine_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const POLICY_ENGINE_STACK_VMA: usize = 0xC048_0000;
+    const POLICY_ENGINE_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        POLICY_ENGINE_ELF,
+        elf_loader::machine::EM_AARCH64,
+        POLICY_ENGINE_STACK_VMA,
+        POLICY_ENGINE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned policy-engine (tid {}) from its OWN separately-built ELF image (simurgh-profile-policy repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): policy-engine spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
 /// Spawns `umode_faulty_driver_aarch64` (see its doc comment) via the
 /// SAME generic `kernel_arch_glue::spawn_process` path as
 /// device-manager. Mirrors `spawn_faulty_driver_x86`/riscv64's
@@ -5914,6 +5986,7 @@ fn simurgh_syscall(
             let _ = spawn_diagnostics_manager(kernel_arch_glue::khal());
             let _ = spawn_store(kernel_arch_glue::khal());
             let _ = spawn_native_loader(kernel_arch_glue::khal());
+            let _ = spawn_policy_engine(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -7243,6 +7316,45 @@ fn spawn_native_loader(hal: &hal_core::HalInterface) -> Option<kernel_cap::Threa
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task: native-loader spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `policy-engine-bin` — the EIGHTH layer-4 process this project
+/// spawns as a real Simurgh-OS subsystem (`simurgh-profile-policy`, a
+/// separate git repo). Same shape and same reasoning as
+/// `spawn_native_loader`: this process's own real logic
+/// (`profile_policy::subsystem_entry::self_check`) is entirely self-
+/// contained (no real IPC transport to any other service exists yet on
+/// either side), so it simply proves the process itself boots and its
+/// ported profile/Rhai logic — including a real `rhai::Engine` script
+/// evaluation, the riskiest untested-on-hardware part of this port —
+/// runs correctly on real hardware.
+fn spawn_policy_engine(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const POLICY_ENGINE_STACK_VMA: usize = 0xC048_0000;
+    const POLICY_ENGINE_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        POLICY_ENGINE_ELF,
+        elf_loader::machine::EM_RISCV,
+        POLICY_ENGINE_STACK_VMA,
+        POLICY_ENGINE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned policy-engine (tid {}) from its OWN separately-built ELF image (simurgh-profile-policy repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: policy-engine spawn skipped (out of resources)\r\n"
             ));
             None
         }
