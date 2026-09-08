@@ -201,6 +201,13 @@ static ACCOUNT_MANAGER_ELF: &[u8] = include_bytes!(env!("ACCOUNT_MANAGER_ELF_PAT
 /// repo), out-of-tree for the same local-dev-only path-stitch reason.
 static BACKUP_MANAGER_ELF: &[u8] = include_bytes!(env!("BACKUP_MANAGER_ELF_PATH"));
 
+/// `diagnostics-manager-bin`'s own separately-built ELF image — same
+/// packaging as `BACKUP_MANAGER_ELF` (see its own doc comment): the
+/// FIFTH layer-4 process this project spawns (`simurgh-diagnostics`, a
+/// separate git repo), out-of-tree for the same local-dev-only
+/// path-stitch reason.
+static DIAGNOSTICS_MANAGER_ELF: &[u8] = include_bytes!(env!("DIAGNOSTICS_MANAGER_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -3384,6 +3391,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             let _ = spawn_init_x86(kernel_arch_glue::khal());
             let _ = spawn_account_manager_x86(kernel_arch_glue::khal());
             let _ = spawn_backup_manager_x86(kernel_arch_glue::khal());
+            let _ = spawn_diagnostics_manager_x86(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3697,6 +3705,38 @@ fn spawn_backup_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): backup-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_diagnostics_manager` (riscv64) — see
+/// that function's own doc comment for the full rationale. Same shape as
+/// `spawn_backup_manager_x86`.
+fn spawn_diagnostics_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const DIAGNOSTICS_MANAGER_STACK_VMA: usize = 0xC045_0000;
+    const DIAGNOSTICS_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DIAGNOSTICS_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
+        DIAGNOSTICS_MANAGER_STACK_VMA,
+        DIAGNOSTICS_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned diagnostics-manager (tid {}) from its OWN separately-built ELF image (simurgh-diagnostics repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): diagnostics-manager spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -5152,6 +5192,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             let _ = spawn_init_aarch64(kernel_arch_glue::khal());
             let _ = spawn_account_manager_aarch64(kernel_arch_glue::khal());
             let _ = spawn_backup_manager_aarch64(kernel_arch_glue::khal());
+            let _ = spawn_diagnostics_manager_aarch64(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -5430,6 +5471,38 @@ fn spawn_backup_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_c
     }
 }
 
+/// aarch64 counterpart of `spawn_diagnostics_manager` (riscv64) — see
+/// that function's own doc comment for the full rationale. Same shape as
+/// `spawn_backup_manager_aarch64`.
+fn spawn_diagnostics_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const DIAGNOSTICS_MANAGER_STACK_VMA: usize = 0xC045_0000;
+    const DIAGNOSTICS_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DIAGNOSTICS_MANAGER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        DIAGNOSTICS_MANAGER_STACK_VMA,
+        DIAGNOSTICS_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned diagnostics-manager (tid {}) from its OWN separately-built ELF image (simurgh-diagnostics repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): diagnostics-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
 /// Spawns `umode_faulty_driver_aarch64` (see its doc comment) via the
 /// SAME generic `kernel_arch_glue::spawn_process` path as
 /// device-manager. Mirrors `spawn_faulty_driver_x86`/riscv64's
@@ -5694,6 +5767,7 @@ fn simurgh_syscall(
             let _ = spawn_init(kernel_arch_glue::khal());
             let _ = spawn_account_manager(kernel_arch_glue::khal());
             let _ = spawn_backup_manager(kernel_arch_glue::khal());
+            let _ = spawn_diagnostics_manager(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -6911,6 +6985,44 @@ fn spawn_backup_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::Thre
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task: backup-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `diagnostics-manager-bin` — the FIFTH layer-4 process this
+/// project spawns as a real Simurgh-OS subsystem (`simurgh-diagnostics`,
+/// a separate git repo). Same shape and same reasoning as
+/// `spawn_backup_manager`: this process's own real logic
+/// (`diagnostics_manager::subsystem_entry::self_check`) is entirely
+/// self-contained (no real IPC transport to `Simurgh-OS`'s own Log
+/// Collector or a real network sender exists yet on either side), so it
+/// simply proves the process itself boots and its ported poll/build/
+/// batch-send logic runs correctly on real hardware.
+fn spawn_diagnostics_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const DIAGNOSTICS_MANAGER_STACK_VMA: usize = 0xC045_0000;
+    const DIAGNOSTICS_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DIAGNOSTICS_MANAGER_ELF,
+        elf_loader::machine::EM_RISCV,
+        DIAGNOSTICS_MANAGER_STACK_VMA,
+        DIAGNOSTICS_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned diagnostics-manager (tid {}) from its OWN separately-built ELF image (simurgh-diagnostics repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: diagnostics-manager spawn skipped (out of resources)\r\n"
             ));
             None
         }

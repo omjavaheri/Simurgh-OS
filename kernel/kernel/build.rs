@@ -391,4 +391,34 @@ fn main() {
         "cargo:rustc-env=BACKUP_MANAGER_ELF_PATH={}",
         bm_path.canonicalize().unwrap().display()
     );
+
+    // Same as `backup-manager-bin` above, for `diagnostics-manager-bin` —
+    // the FIFTH layer-4 process this project spawns as a real Simurgh-OS
+    // subsystem (`simurgh-diagnostics`, a separate git repo). Same
+    // local-dev-only sibling-directory path stitch.
+    let dg_build_alias =
+        format!("(in simurgh-diagnostics) cargo +nightly-2025-01-15 build -p diagnostics-manager --bin diagnostics-manager-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let dg_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-diagnostics")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("diagnostics-manager-bin");
+
+    if !dg_path.exists() {
+        panic!(
+            "kernel build.rs: diagnostics-manager-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {dg_build_alias}",
+            dg_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", dg_path.display());
+    println!(
+        "cargo:rustc-env=DIAGNOSTICS_MANAGER_ELF_PATH={}",
+        dg_path.canonicalize().unwrap().display()
+    );
 }
