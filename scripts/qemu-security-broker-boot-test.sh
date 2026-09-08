@@ -73,11 +73,15 @@ run_qemu() {
 	fi
 }
 
+# `-m 512M`, not the original `256M`: see `scripts/qemu-fault-isolation-
+# test.sh`'s own identical comment for the full rationale — the same
+# embedded-kernel-image capacity ceiling applies to every QEMU boot of
+# this kernel, not just the fault-isolation test.
 case "$ARCH" in
 riscv64)
 	cargo xbuild-microkernel-riscv64
 	KERNEL="target/riscv64gc-hal/debug/kernel"
-	run_qemu qemu-system-riscv64 -M virt -smp 1 -m 256M \
+	run_qemu qemu-system-riscv64 -M virt -smp 1 -m 512M \
 		-nographic -no-reboot -kernel "$KERNEL"
 	;;
 
@@ -98,13 +102,13 @@ x86_64 | aarch64)
 		BOOT_NAME="BOOTX64.EFI"
 		CODE="${OVMF_CODE:-$(first_existing "${OVMF_CODE_CANDIDATES_x86_64[@]}" || printf '%s' "${OVMF_CODE_CANDIDATES_x86_64[0]}")}"
 		VARS="${OVMF_VARS:-$(first_existing "${OVMF_VARS_CANDIDATES_x86_64[@]}" || printf '%s' "${OVMF_VARS_CANDIDATES_x86_64[0]}")}"
-		QEMU=(qemu-system-x86_64 -machine q35 -m 256M)
+		QEMU=(qemu-system-x86_64 -machine q35 -m 512M)
 	else
 		UEFI_TARGET="aarch64-unknown-uefi"
 		BOOT_NAME="BOOTAA64.EFI"
 		CODE="${OVMF_CODE:-$(first_existing "${OVMF_CODE_CANDIDATES_aarch64[@]}" || printf '%s' "${OVMF_CODE_CANDIDATES_aarch64[0]}")}"
 		VARS="${OVMF_VARS:-$(first_existing "${OVMF_VARS_CANDIDATES_aarch64[@]}" || printf '%s' "${OVMF_VARS_CANDIDATES_aarch64[0]}")}"
-		QEMU=(qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 256M)
+		QEMU=(qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 512M)
 	fi
 
 	if [[ ! -f "$CODE" ]]; then

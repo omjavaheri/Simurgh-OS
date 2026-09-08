@@ -83,11 +83,23 @@ run_qemu() {
 	fi
 }
 
+# `-m 512M`, not the original `256M`: real capacity bump found via QEMU,
+# not a guess. Every real layer-4 process this project spawns gets its
+# own separately-built subsystem-bin `include_bytes!`-embedded whole into
+# the kernel's own image (`kernel/kernel/src/main.rs`). By the 8th such
+# process (`policy-engine-bin`, `simurgh-profile-policy`), the combined
+# embedded-ELF payload plus the kernel's own (unoptimized `dev`-profile)
+# debug info reached ~51 MiB in one PT_LOAD segment — `uefi-bootloader`'s
+# own `AllocatePages` for that segment started failing inside a `256M` VM
+# ("kernel image corrupted"), a firmware-level resource ceiling, not a
+# `Simurgh-OS` kernel bug. `512M` gives real headroom as more layer-4/5
+# services are spawned this way, not just enough to clear the one
+# failure observed.
 case "$ARCH" in
 riscv64)
 	cargo xbuild-microkernel-riscv64
 	KERNEL="target/riscv64gc-hal/debug/kernel"
-	run_qemu qemu-system-riscv64 -M virt -smp 1 -m 256M \
+	run_qemu qemu-system-riscv64 -M virt -smp 1 -m 512M \
 		-nographic -no-reboot -kernel "$KERNEL"
 	;;
 
@@ -112,7 +124,7 @@ x86_64 | aarch64)
 		BOOT_NAME="BOOTX64.EFI"
 		CODE="${OVMF_CODE:-$(first_existing "${OVMF_CODE_CANDIDATES_x86_64[@]}" || printf '%s' "${OVMF_CODE_CANDIDATES_x86_64[0]}")}"
 		VARS="${OVMF_VARS:-$(first_existing "${OVMF_VARS_CANDIDATES_x86_64[@]}" || printf '%s' "${OVMF_VARS_CANDIDATES_x86_64[0]}")}"
-		QEMU=(qemu-system-x86_64 -machine q35 -m 256M)
+		QEMU=(qemu-system-x86_64 -machine q35 -m 512M)
 	else
 		UEFI_TARGET="aarch64-unknown-uefi"
 		BOOT_NAME="BOOTAA64.EFI"
@@ -120,7 +132,7 @@ x86_64 | aarch64)
 		VARS="${OVMF_VARS:-$(first_existing "${OVMF_VARS_CANDIDATES_aarch64[@]}" || printf '%s' "${OVMF_VARS_CANDIDATES_aarch64[0]}")}"
 		# gic-version=3 explicit - see `.cargo/config.toml`'s own runner
 		# comment for why QEMU's own default isn't reliable across versions.
-		QEMU=(qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 256M)
+		QEMU=(qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 512M)
 	fi
 
 	if [[ ! -f "$CODE" ]]; then
