@@ -214,6 +214,12 @@ static DIAGNOSTICS_MANAGER_ELF: &[u8] = include_bytes!(env!("DIAGNOSTICS_MANAGER
 /// repo), out-of-tree for the same local-dev-only path-stitch reason.
 static STORE_ELF: &[u8] = include_bytes!(env!("STORE_ELF_PATH"));
 
+/// `native-loader-bin`'s own separately-built ELF image — same packaging
+/// as `STORE_ELF` (see its own doc comment): the SEVENTH layer-4 process
+/// this project spawns (`simurgh-native-sdk`, a separate git repo),
+/// out-of-tree for the same local-dev-only path-stitch reason.
+static NATIVE_LOADER_ELF: &[u8] = include_bytes!(env!("NATIVE_LOADER_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -3399,6 +3405,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             let _ = spawn_backup_manager_x86(kernel_arch_glue::khal());
             let _ = spawn_diagnostics_manager_x86(kernel_arch_glue::khal());
             let _ = spawn_store_x86(kernel_arch_glue::khal());
+            let _ = spawn_native_loader_x86(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3776,6 +3783,38 @@ fn spawn_store_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId>
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): store spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_native_loader` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_store_x86`.
+fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        NATIVE_LOADER_ELF,
+        elf_loader::machine::EM_X86_64,
+        NATIVE_LOADER_STACK_VMA,
+        NATIVE_LOADER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned native-loader (tid {}) from its OWN separately-built ELF image (simurgh-native-sdk repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): native-loader spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -5233,6 +5272,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             let _ = spawn_backup_manager_aarch64(kernel_arch_glue::khal());
             let _ = spawn_diagnostics_manager_aarch64(kernel_arch_glue::khal());
             let _ = spawn_store_aarch64(kernel_arch_glue::khal());
+            let _ = spawn_native_loader_aarch64(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -5575,6 +5615,38 @@ fn spawn_store_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::Threa
     }
 }
 
+/// aarch64 counterpart of `spawn_native_loader` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_store_aarch64`.
+fn spawn_native_loader_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        NATIVE_LOADER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        NATIVE_LOADER_STACK_VMA,
+        NATIVE_LOADER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned native-loader (tid {}) from its OWN separately-built ELF image (simurgh-native-sdk repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): native-loader spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
 /// Spawns `umode_faulty_driver_aarch64` (see its doc comment) via the
 /// SAME generic `kernel_arch_glue::spawn_process` path as
 /// device-manager. Mirrors `spawn_faulty_driver_x86`/riscv64's
@@ -5841,6 +5913,7 @@ fn simurgh_syscall(
             let _ = spawn_backup_manager(kernel_arch_glue::khal());
             let _ = spawn_diagnostics_manager(kernel_arch_glue::khal());
             let _ = spawn_store(kernel_arch_glue::khal());
+            let _ = spawn_native_loader(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -7133,6 +7206,43 @@ fn spawn_store(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task: store spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `native-loader-bin` — the SEVENTH layer-4 process this
+/// project spawns as a real Simurgh-OS subsystem (`simurgh-native-sdk`,
+/// a separate git repo). Same shape and same reasoning as `spawn_store`:
+/// this process's own real logic (`native_loader::subsystem_entry::
+/// self_check`) is entirely self-contained (no real IPC transport to
+/// `simurgh-security-broker` exists yet on either side), so it simply
+/// proves the process itself boots and its ported loader/registry logic
+/// runs correctly on real hardware.
+fn spawn_native_loader(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        NATIVE_LOADER_ELF,
+        elf_loader::machine::EM_RISCV,
+        NATIVE_LOADER_STACK_VMA,
+        NATIVE_LOADER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned native-loader (tid {}) from its OWN separately-built ELF image (simurgh-native-sdk repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: native-loader spawn skipped (out of resources)\r\n"
             ));
             None
         }

@@ -451,4 +451,34 @@ fn main() {
         "cargo:rustc-env=STORE_ELF_PATH={}",
         st_path.canonicalize().unwrap().display()
     );
+
+    // Same as `store-bin` above, for `native-loader-bin` — the SEVENTH
+    // layer-4 process this project spawns as a real Simurgh-OS subsystem
+    // (`simurgh-native-sdk`, a separate git repo). Same local-dev-only
+    // sibling-directory path stitch.
+    let nl_build_alias =
+        format!("(in simurgh-native-sdk) cargo +nightly-2025-01-15 build -p native-loader --bin native-loader-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let nl_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-native-sdk")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("native-loader-bin");
+
+    if !nl_path.exists() {
+        panic!(
+            "kernel build.rs: native-loader-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {nl_build_alias}",
+            nl_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", nl_path.display());
+    println!(
+        "cargo:rustc-env=NATIVE_LOADER_ELF_PATH={}",
+        nl_path.canonicalize().unwrap().display()
+    );
 }
