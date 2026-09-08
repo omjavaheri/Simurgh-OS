@@ -421,4 +421,34 @@ fn main() {
         "cargo:rustc-env=DIAGNOSTICS_MANAGER_ELF_PATH={}",
         dg_path.canonicalize().unwrap().display()
     );
+
+    // Same as `diagnostics-manager-bin` above, for `store-bin` — the
+    // SIXTH layer-4 process this project spawns as a real Simurgh-OS
+    // subsystem (`simurgh-store`, a separate git repo). Same
+    // local-dev-only sibling-directory path stitch.
+    let st_build_alias =
+        format!("(in simurgh-store) cargo +nightly-2025-01-15 build -p manifest-installer --bin store-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let st_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-store")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("store-bin");
+
+    if !st_path.exists() {
+        panic!(
+            "kernel build.rs: store-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {st_build_alias}",
+            st_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", st_path.display());
+    println!(
+        "cargo:rustc-env=STORE_ELF_PATH={}",
+        st_path.canonicalize().unwrap().display()
+    );
 }
