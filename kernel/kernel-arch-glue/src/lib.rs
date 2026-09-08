@@ -317,6 +317,47 @@ pub fn build(
     Ok((report, state))
 }
 
+/// Carves `bytes` (aligned to `align`) out of the first `UntypedMemory`
+/// region that has room, trying every region in order instead of only
+/// `UntypedId(0)`.
+///
+/// **Real capacity bug found via QEMU, not a guess** (`fix/33-fix`,
+/// spawning `native-loader` as the 7th real layer-4 process): every carve
+/// site in this file used to hardcode `UntypedId::new(0)` alone. On real
+/// QEMU/OVMF x86_64 hardware, `KernelState::from_boot_info`'s own untyped-
+/// seeding loop (`kernel-core/src/state.rs`) does not hand back one big
+/// contiguous region — OVMF's own UEFI memory map is fragmented into
+/// dozens of small `Usable` ranges around firmware/ACPI reservations, so
+/// `UntypedId(0)` ends up being just the FIRST (and, on this hardware, a
+/// tiny ~3.7 MiB) fragment, while ~170 MiB of real free RAM sits untouched
+/// in `UntypedId(1)..(untyped_count)` (confirmed via a temporary
+/// diagnostic dump: id 1 alone was 57 MiB). Every boot-time allocation —
+/// the in-kernel demo processes, `mm-service`/`fs-native`/`compositor`'s
+/// shared regions, and every real layer-3/4 subsystem's page tables,
+/// mapping pool, and stack — drew down that SAME 3.7 MiB region, so once
+/// enough real layer-4 services were wired in (this was fine through 6;
+/// the 7th, `native-loader`, tipped it over — its own embedded ELF also
+/// growing the kernel image pushed `UntypedId(0)`'s effective remaining
+/// space even lower), spawns started failing with "out of resources"
+/// while the vast majority of RAM was never touched. Trying subsequent
+/// regions once the current one is exhausted is the correct fix (matches
+/// why `MAX_UNTYPED` = 80 in the first place — this kernel was always
+/// designed to expect a fragmented memory map), not another capacity-
+/// constant bump: raising `MAX_CAP_SPACES`/`MAX_ADDR_SPACES` again (as
+/// `a80da44` did for a different, real exhaustion) would not have helped
+/// here, since the actual bottleneck was `UntypedId(0)`'s own size, not
+/// any fixed-capacity table.
+fn carve_from_any_untyped(state: &mut KernelState, align: u64, bytes: u64) -> Option<usize> {
+    for i in 0..state.untyped_count {
+        if let Some(u) = state.untyped_mut(kernel_cap::UntypedId::new(i)) {
+            if let Ok(p) = u.alloc(align, bytes) {
+                return Some(p.as_usize());
+            }
+        }
+    }
+    None
+}
+
 /// Where the final binary's user (layer-3) Root Task image lives: its
 /// `.user_text` and `.user_stack` regions, each as a `(vma, lma, len)`
 /// triple (linked for a virtual address, loaded at a physical address
@@ -456,16 +497,12 @@ pub fn enter(
     // low `bytes_gib` range). Harmless on Sv39/AArch64, which only ever
     // use the first page — carving uniformly here keeps this crate free
     // of `#[cfg(target_arch)]`.
-    let root_pt = state
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 3).ok());
-    let pool = state
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * POOL_FRAMES as u64).ok());
+    let root_pt = carve_from_any_untyped(state, 4096, 4096 * 3);
+    let pool = carve_from_any_untyped(state, 4096, 4096 * POOL_FRAMES as u64);
     // (POOL_FRAMES is usize; `as u64` above for the allocator API.)
 
     let (root_pt, pool) = match (root_pt, pool) {
-        (Some(r), Some(p)) => (r.as_usize(), p.as_usize()),
+        (Some(r), Some(p)) => (r, p),
         _ => {
             klog!("could not allocate page-table frames - halting\r\n");
             park();
@@ -485,11 +522,9 @@ pub fn enter(
     // (`KernelState::install_map_pool`) — kept separate from the
     // boot-time `pool` above so a later `Map` can never trip over the
     // boot mapping's bookkeeping.
-    let map_pool = state
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 8).ok());
+    let map_pool = carve_from_any_untyped(state, 4096, 4096 * 8);
     let map_pool = match map_pool {
-        Some(p) => p.as_usize(),
+        Some(p) => p,
         None => {
             klog!("could not allocate the runtime Map pool - halting\r\n");
             park();
@@ -610,11 +645,7 @@ fn setup_two_process(
     user_sp_a: usize,
 ) -> bool {
     let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
-    let carve = |st: &mut KernelState, bytes: u64| {
-        st.untyped_mut(kernel_cap::UntypedId::new(0))
-            .and_then(|u| u.alloc(4096, bytes).ok())
-            .map(|p| p.as_usize())
-    };
+    let carve = |st: &mut KernelState, bytes: u64| carve_from_any_untyped(st, 4096, bytes);
 
     let (shared, root_pt_b, pool_b, stack_b) = match (
         carve(state, 4096),
@@ -811,11 +842,7 @@ pub fn spawn_process(
     entry_vma: usize,
 ) -> Option<(ThreadId, kernel_cap::CapSpaceId, usize)> {
     let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
-    let carve = |st: &mut KernelState, bytes: u64| {
-        st.untyped_mut(kernel_cap::UntypedId::new(0))
-            .and_then(|u| u.alloc(4096, bytes).ok())
-            .map(|p| p.as_usize())
-    };
+    let carve = |st: &mut KernelState, bytes: u64| carve_from_any_untyped(st, 4096, bytes);
 
     // 3 pages, not 1 — see `enter`'s own `root_pt` carve for why.
     let root_pt = carve(state, 4096 * 3)?;
@@ -894,11 +921,7 @@ pub fn spawn_process_from_elf(
     stack_len: usize,
 ) -> Option<(ThreadId, kernel_cap::CapSpaceId, usize)> {
     let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
-    let carve = |st: &mut KernelState, bytes: u64| {
-        st.untyped_mut(kernel_cap::UntypedId::new(0))
-            .and_then(|u| u.alloc(4096, bytes).ok())
-            .map(|p| p.as_usize())
-    };
+    let carve = |st: &mut KernelState, bytes: u64| carve_from_any_untyped(st, 4096, bytes);
 
     let (entry, segments) =
         match elf_loader::parse_and_collect_load_segments(elf_bytes, expected_machine) {
@@ -1054,9 +1077,18 @@ pub fn spawn_process_from_elf(
         return None;
     }
 
-    let addr_space = state.alloc_addr_space(root_pt as u64)?;
-    let cap_space = state.alloc_cap_space()?;
-    let tid = state.alloc_tcb(cap_space, addr_space)?;
+    let Some(addr_space) = state.alloc_addr_space(root_pt as u64) else {
+        klog!("spawn_process_from_elf: MAX_ADDR_SPACES exhausted\r\n");
+        return None;
+    };
+    let Some(cap_space) = state.alloc_cap_space() else {
+        klog!("spawn_process_from_elf: MAX_CAP_SPACES exhausted\r\n");
+        return None;
+    };
+    let Some(tid) = state.alloc_tcb(cap_space, addr_space) else {
+        klog!("spawn_process_from_elf: MAX_THREADS exhausted\r\n");
+        return None;
+    };
     let stack_top = (stack_vma + stack_len) & !0xF;
     state.init_user_thread(tid, entry as usize, stack_top, root_pt, hal);
     Some((tid, cap_space, stack_phys))
@@ -2105,10 +2137,7 @@ pub fn fs_demo_start(
     // pattern (this is trusted bootstrap glue, not a real user syscall).
     let fs_addr_space = k.tcb(fs_tid)?.addr_space;
     let fs_root_pt = k.addr_space_mut(fs_addr_space)?.root_phys().as_usize();
-    let shared_phys = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096).ok())
-        .map(|p| p.as_usize())?;
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
     // SAFETY: `shared_phys` is fresh untyped RAM, identity-addressable
     // (paging is not active on the CURRENT core for this address —
     // it is only ever touched through the kernel's own identity map or
@@ -2128,10 +2157,7 @@ pub fn fs_demo_start(
     // caller in this file already gets this right via `carve()` (real,
     // explicitly 4 KiB-aligned untyped memory); this one-off inline
     // call is fixed the same way.
-    let pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed (same contract every other
     // pool carve in this file already documents).
@@ -2191,10 +2217,7 @@ pub fn fs_demo_start(
     // caller in this file (e.g. `spawn_process_from_elf`'s own per-
     // segment walks share ONE pool because they're carved together up
     // front — this one is a separate, later carve, so it gets its own).
-    let data_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let data_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed (same contract every other
     // pool carve in this file already documents).
@@ -2682,16 +2705,10 @@ pub fn compositor_demo_start(
     // Shared message page (trusted-bootstrap direct map, no SyscallOp
     // ceremony — same "carve untyped, map_range directly" pattern
     // `fs_demo_start`'s own identical block already uses).
-    let shared_phys = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096).ok())
-        .map(|p| p.as_usize())?;
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
-    let shared_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let shared_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(shared_pool as *mut u8, 0, 4096 * 2) };
@@ -2724,10 +2741,7 @@ pub fn compositor_demo_start(
     let fb_id = k.cap_space(src_cs)?.lookup(fb_cap)?.object.id;
     let fb_phys = k.shared_region(kernel_cap::SharedRegionId::new(fb_id.as_u32()))?.phys_base.as_usize();
     grant_cap_into(k, src_cs, fb_cap, comp_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
-    let fb_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let fb_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 2) };
     let n2 = hal.map_range(comp_root_pt, COMPOSITOR_FB_VA, fb_phys, 4096, 1 | 2 | 8, fb_pool, 2);
@@ -2761,10 +2775,7 @@ pub fn compositor_demo_start(
         k.shared_region(kernel_cap::SharedRegionId::new(confirm_id.as_u32()))?.phys_base.as_usize();
     // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(confirm_phys as *mut u8, 0, 4096) };
-    let confirm_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let confirm_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     unsafe { core::ptr::write_bytes(confirm_pool as *mut u8, 0, 4096 * 2) };
     let n3 = hal.map_range(comp_root_pt, COMPOSITOR_CONFIRM_VA, confirm_phys, 4096, 1 | 2 | 8, confirm_pool, 2);
     if n3 == u32::MAX {
@@ -3057,16 +3068,10 @@ pub fn mm_demo_start(
     let mm_addr_space = k.tcb(mm_tid)?.addr_space;
     let mm_root_pt = k.addr_space_mut(mm_addr_space)?.root_phys().as_usize();
 
-    let shared_phys = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096).ok())
-        .map(|p| p.as_usize())?;
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
-    let shared_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let shared_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(shared_pool as *mut u8, 0, 4096 * 2) };
@@ -3706,10 +3711,7 @@ unsafe fn map_pci_bar(
     // the fixed single-page virtio-mmio pre-map's `pool_len = 2`.
     let pages_needed = map_len / 4096;
     let pool_pages = 2 + pages_needed.div_ceil(512);
-    let pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, (4096 * pool_pages) as u64).ok())
-        .map(|p| p.as_usize())?;
+    let pool = carve_from_any_untyped(k, 4096, (4096 * pool_pages) as u64)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed (same contract every other
     // pool carve in this file already documents).
@@ -3782,10 +3784,7 @@ unsafe fn enable_and_program_msix(
     // instead, at the SAME kind of dedicated, kernel-only VA `KERNEL_
     // PCI_CFG_VA` already uses for the config-space page, not the
     // driver-space `DRV_PCI_BAR_VA_BASE` range `map_pci_bar` targets.
-    let msix_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let msix_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(msix_pool as *mut u8, 0, 4096 * 2) };
@@ -3843,10 +3842,7 @@ unsafe fn enable_and_program_msix(
     // story this fixes. A second kernel-side BAR mapping, exactly the
     // same shape as the MSI-X table's own above (COMMON_CFG is almost
     // always a DIFFERENT BAR).
-    let common_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let common_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(common_pool as *mut u8, 0, 4096 * 2) };
     // SAFETY: forwarded from this function's own contract.
@@ -3928,10 +3924,7 @@ unsafe fn wire_virtio_pci_transport(
     region_phys: usize,
     irq: u32,
 ) -> Option<()> {
-    let cfg_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let cfg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(cfg_pool as *mut u8, 0, 4096 * 2) };
@@ -4094,10 +4087,7 @@ unsafe fn wire_virtio_pci_transport_net(
     region_phys: usize,
     irq: u32,
 ) -> Option<()> {
-    let cfg_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let cfg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(cfg_pool as *mut u8, 0, 4096 * 2) };
@@ -4497,10 +4487,7 @@ pub fn spawn_virtio_blk_driver(
     // own base/size (`hal_arm64::peripheral`'s own module doc comment),
     // which need not even be one of the BARs virtio-pci-modern uses.
     if !is_pci {
-        let mmio_pool = k
-            .untyped_mut(kernel_cap::UntypedId::new(0))
-            .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-            .map(|p| p.as_usize())?;
+        let mmio_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
         // SAFETY: fresh untyped RAM, identity-addressable, single-core;
         // `map_range` needs the pool pre-zeroed (same contract every
         // other pool carve in this file already documents).
@@ -4591,10 +4578,7 @@ pub fn spawn_virtio_blk_driver(
         }
     }
 
-    let queue_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let queue_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(queue_pool as *mut u8, 0, 4096 * 2) };
@@ -5115,10 +5099,7 @@ pub fn spawn_virtio_net_driver(
     // names — same "MMIO map only when NOT PCI" branch `spawn_virtio_blk_
     // driver`'s own doc comment covers.
     if !is_pci {
-        let mmio_pool = k
-            .untyped_mut(kernel_cap::UntypedId::new(0))
-            .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-            .map(|p| p.as_usize())?;
+        let mmio_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
         // SAFETY: fresh untyped RAM, identity-addressable, single-core;
         // `map_range` needs the pool pre-zeroed.
         unsafe { core::ptr::write_bytes(mmio_pool as *mut u8, 0, 4096 * 2) };
@@ -5156,10 +5137,7 @@ pub fn spawn_virtio_net_driver(
     // `driver_virtio_blk::layout::PHYS_BASE_OFFSET`'s own doc comment.
     unsafe { (rx_phys as *mut u64).write_volatile(rx_phys as u64) };
 
-    let rx_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let rx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 2) };
     let n_rx = hal.map_range(drv_root_pt, DRV_NET_RX_VA, rx_phys, 4096, 1 | 2 | 8, rx_pool, 2);
     if n_rx == u32::MAX {
@@ -5189,10 +5167,7 @@ pub fn spawn_virtio_net_driver(
     unsafe { core::ptr::write_bytes(tx_phys as *mut u8, 0, 4096) };
     unsafe { (tx_phys as *mut u64).write_volatile(tx_phys as u64) };
 
-    let tx_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let tx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 2) };
     let n_tx = hal.map_range(drv_root_pt, DRV_NET_TX_VA, tx_phys, 4096, 1 | 2 | 8, tx_pool, 2);
     if n_tx == u32::MAX {
@@ -5445,10 +5420,7 @@ pub fn spawn_netstack_service(
     // `spawn_virtio_net_driver`, already run to completion (this
     // function's own doc comment).
     let rx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read() };
-    let rx_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let rx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 2) };
@@ -5461,10 +5433,7 @@ pub fn spawn_netstack_service(
     // Same for the driver's own TX region.
     // SAFETY: same contract as the RX read above.
     let tx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_TX_PHYS).read() };
-    let tx_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let tx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 2) };
     let n_tx = hal.map_range(ns_root_pt, NETSTACK_DRV_TX_VA, tx_phys, 4096, 1 | 2 | 8, tx_pool, 2);
     if n_tx == u32::MAX {
@@ -5478,16 +5447,10 @@ pub fn spawn_netstack_service(
     // `SharedRegion`, mapped only into Netstack's own address space (root
     // reaches it via `G_NETSTACK_BYPASS_SHARED_PHYS`'s own physical
     // pointer, never through a VA mapping of its own).
-    let bypass_shared_phys = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096).ok())
-        .map(|p| p.as_usize())?;
+    let bypass_shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(bypass_shared_phys as *mut u8, 0, 4096) };
-    let bypass_shared_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let bypass_shared_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(bypass_shared_pool as *mut u8, 0, 4096 * 2) };
@@ -5520,10 +5483,7 @@ pub fn spawn_netstack_service(
         k.shared_region(kernel_cap::SharedRegionId::new(status_id.as_u32()))?.phys_base.as_usize();
     // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(status_phys as *mut u8, 0, 4096) };
-    let status_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let status_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     unsafe { core::ptr::write_bytes(status_pool as *mut u8, 0, 4096 * 2) };
     let n_status = hal.map_range(ns_root_pt, NETSTACK_STATUS_VA, status_phys, 4096, 1 | 2 | 8, status_pool, 2);
     if n_status == u32::MAX {
@@ -5574,10 +5534,7 @@ pub fn spawn_netstack_service(
         let va_page = va & !0xFFF;
         let phys_page = phys & !0xFFF;
         for target_pt in [ns_root_pt, caller_root_pt] {
-            let win_pool = k
-                .untyped_mut(kernel_cap::UntypedId::new(0))
-                .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-                .map(|p| p.as_usize())?;
+            let win_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
             // SAFETY: fresh untyped RAM, identity-addressable, single-core.
             unsafe { core::ptr::write_bytes(win_pool as *mut u8, 0, 4096 * 2) };
             let n = hal.map_range(target_pt, va_page, phys_page, 4096, 1 | 2, win_pool, 2);
@@ -7154,16 +7111,10 @@ pub fn security_broker_intermediary_demo_start(
     // this searchable as its own thing).
     let security_broker_addr_space = k.tcb(security_broker_tid)?.addr_space;
     let security_broker_root_pt = k.addr_space_mut(security_broker_addr_space)?.root_phys().as_usize();
-    let sb_shared_phys = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096).ok())
-        .map(|p| p.as_usize())?;
+    let sb_shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(sb_shared_phys as *mut u8, 0, 4096) };
-    let sb_pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let sb_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(sb_pool as *mut u8, 0, 4096 * 2) };
@@ -7179,16 +7130,10 @@ pub fn security_broker_intermediary_demo_start(
     // fit entirely in one `SmallMessage`).
     let sbi_addr_space = k.tcb(sbi_tid)?.addr_space;
     let sbi_root_pt = k.addr_space_mut(sbi_addr_space)?.root_phys().as_usize();
-    let shared_phys = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096).ok())
-        .map(|p| p.as_usize())?;
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core.
     unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
-    let pool = k
-        .untyped_mut(kernel_cap::UntypedId::new(0))
-        .and_then(|u| u.alloc(4096, 4096 * 2).ok())
-        .map(|p| p.as_usize())?;
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
