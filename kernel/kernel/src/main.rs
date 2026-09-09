@@ -928,6 +928,21 @@ mod sys {
     /// (expected: 2, same cross-space reasoning as `SBI_CAP_REVOKE_
     /// RESULT`), or `usize::MAX` on failure.
     pub const SBI_CAP_REVOKE2_RESULT: usize = 105;
+    /// `a0` = 1 iff `request_capability`'s real round trip to security-
+    /// broker returned `Ok`, 0 otherwise; `a1` = the granted
+    /// `Capability.object_ref`'s raw bits when `a0 == 1` (0 otherwise).
+    /// Mirrors `DM_REPORT`'s own "U-mode process reports state, kernel
+    /// logs it" shape (`native-loader`, this session's real-IPC plan
+    /// Phase 1) — this project's ONE lever for a genuinely isolated
+    /// U-mode process (not Root Task) to prove a real round-tripped VALUE
+    /// on the serial log, not just "didn't crash".
+    pub const NL_REPORT: usize = 106;
+    /// `a0` = the decoded request's `requester` id; `a1` = 1 iff security-
+    /// broker's own real [`Broker::request_capability`] granted it, 0
+    /// otherwise. Server-side counterpart of `NL_REPORT` — see that
+    /// constant's own doc comment for why a U-mode process needs this
+    /// kind of opcode at all to prove a real value, not just survival.
+    pub const SB_REPORT: usize = 107;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -1989,6 +2004,18 @@ static mut G_IPC_EP_X86: u32 = 0;
 /// static's own doc comment).
 #[cfg(target_arch = "x86_64")]
 static mut G_FS_EP_X86: u32 = 0;
+
+/// security-broker's own `ThreadId`, written once by `spawn_security_
+/// broker_x86` — needed later by `spawn_native_loader_x86` (and every
+/// future client this real-IPC plan wires to security-broker) to derive
+/// its `cap_space`/`addr_space` for `kernel_arch_glue::
+/// wire_service_endpoint`, same pattern `G_SBI_TID`/`G_MM_TID` already
+/// use for the same reason. `security-broker` is always spawned well
+/// before `native-loader` in this architecture's own boot sequence
+/// (`SBI_DEMO_START` runs before `P2_PREEMPT_START`), so this is always
+/// `Some` by the time it is read.
+#[cfg(target_arch = "x86_64")]
+static mut G_SECURITY_BROKER_TID_X86: Option<kernel_cap::ThreadId> = None;
 
 /// See the riscv64 `G_COMPOSITOR_EP`'s own doc comment.
 #[cfg(target_arch = "x86_64")]
@@ -3439,6 +3466,25 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             }
             return TrapOutcome::Resume(0);
         }
+        sys::NL_REPORT => {
+            if a0 == 1 {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode, x86_64): real request_capability round trip to security-broker succeeded, object_ref={a1:#x}\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode, x86_64): real request_capability round trip to security-broker returned Err\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::SB_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "security-broker (U-mode, x86_64): served a real request_capability call from requester#{a0}, granted={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
         sys::DM_WAIT_CRASH => {
             return match kernel_arch_glue::p2_dm_wait_crash() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3620,6 +3666,9 @@ fn spawn_security_broker_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap:
         SB_STACK_LEN,
     ) {
         Some((tid, _cap_space, _stack_phys)) => {
+            // SAFETY: single-core; written once here, before
+            // `spawn_native_loader_x86` (which reads it) can run.
+            unsafe { core::ptr::addr_of_mut!(G_SECURITY_BROKER_TID_X86).write(Some(tid)) };
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): spawned security-broker (tid {}) from its OWN separately-built ELF image (simurgh-security-broker repo)\r\n",
                 tid.as_u32()
@@ -3812,11 +3861,12 @@ fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::T
         NATIVE_LOADER_STACK_VMA,
         NATIVE_LOADER_STACK_LEN,
     ) {
-        Some((tid, _cap_space, _stack_phys)) => {
+        Some((tid, cap_space, _stack_phys)) => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): spawned native-loader (tid {}) from its OWN separately-built ELF image (simurgh-native-sdk repo)\r\n",
                 tid.as_u32()
             ));
+            wire_native_loader_to_security_broker_x86(hal, k, tid, cap_space);
             Some(tid)
         }
         None => {
@@ -3825,6 +3875,79 @@ fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::T
             ));
             None
         }
+    }
+}
+
+/// Wires the real `native-loader` -> `security-broker` IPC edge (this
+/// session's real-IPC plan, Phase 1) — a shared `Endpoint` plus one
+/// shared physical page, granted/mapped into both processes' own address
+/// spaces via `kernel_arch_glue::wire_service_endpoint`. Called right
+/// after `native-loader` itself spawns successfully; does nothing (and
+/// logs why) if security-broker was not spawned or either address space
+/// cannot be resolved — native-loader still boots and runs its own
+/// `self_check` either way, just without a working real transport (same
+/// "gap flagged, not hidden" posture every other still-open IPC seam in
+/// this project has).
+fn wire_native_loader_to_security_broker_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    native_loader_tid: kernel_cap::ThreadId,
+    native_loader_cs: kernel_cap::CapSpaceId,
+) {
+    // SAFETY: single-core; only ever read after `spawn_security_broker_x86`
+    // (which runs strictly earlier in boot, see that static's own doc
+    // comment) has written it.
+    let Some(security_broker_tid) = (unsafe { core::ptr::addr_of!(G_SECURITY_BROKER_TID_X86).read() }) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (security-broker was not spawned)\r\n"
+        ));
+        return;
+    };
+    let Some(sb_tcb) = k.tcb(security_broker_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (could not resolve security-broker's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (sb_cs, sb_addr_space) = (sb_tcb.cap_space, sb_tcb.addr_space);
+    let Some(nl_tcb) = k.tcb(native_loader_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (could not resolve native-loader's own TCB)\r\n"
+        ));
+        return;
+    };
+    let nl_addr_space = nl_tcb.addr_space;
+    let Some(sb_root_pt) = k.addr_space_mut(sb_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (could not resolve security-broker's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(nl_root_pt) = k.addr_space_mut(nl_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (could not resolve native-loader's own address space)\r\n"
+        ));
+        return;
+    };
+    const SBS_SHARED_VA: usize = 0xD8D0_0000;
+    const SB_SHARED_VA: usize = 0xD8E0_0000;
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        sb_cs,
+        sb_root_pt,
+        SBS_SHARED_VA,
+        native_loader_cs,
+        nl_root_pt,
+        SB_SHARED_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired native-loader <-> security-broker real IPC edge (request_capability)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (out of resources)\r\n"
+        )),
     }
 }
 
@@ -5339,6 +5462,25 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             }
             return TrapOutcome::Resume(0);
         }
+        sys::NL_REPORT => {
+            if x0 == 1 {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode, aarch64): real request_capability round trip to security-broker succeeded, object_ref={x1:#x}\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode, aarch64): real request_capability round trip to security-broker returned Err\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::SB_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "security-broker (U-mode, aarch64): served a real request_capability call from requester#{x0}, granted={}\r\n",
+                x1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
         sys::DM_WAIT_CRASH => {
             return match kernel_arch_glue::p2_dm_wait_crash() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -6017,6 +6159,25 @@ fn simurgh_syscall(
                 // device-manager's exemption outlived its purpose.
                 kernel_arch_glue::p2_dm_supervision_done();
             }
+            return TrapOutcome::Resume(0);
+        }
+        sys::NL_REPORT => {
+            if a0 == 1 {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode): real request_capability round trip to security-broker succeeded, object_ref={a1:#x}\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode): real request_capability round trip to security-broker returned Err\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::SB_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "security-broker (U-mode): served a real request_capability call from requester#{a0}, granted={}\r\n",
+                a1 == 1
+            ));
             return TrapOutcome::Resume(0);
         }
         sys::DM_WAIT_CRASH => {

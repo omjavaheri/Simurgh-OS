@@ -217,6 +217,29 @@ static mut DM_TID: Option<ThreadId> = None;
 const P2_QUANTUM_NS: u64 = 2_000_000;
 /// Stop preempting after this many ticks and report. Both counters
 /// non-zero proves both processes ran with NO cooperative `P2_YIELD`.
+///
+/// **Investigated, not fixed, via QEMU this session** (real-IPC plan,
+/// Phase 1): none of the 8 layer-4 subsystem processes this project
+/// spawns via `spawn_process_from_elf` (all admitted `Ready`,
+/// `SchedulerMode::Interactive`, `MAX_PRIORITY`, fresh `vruntime = 0` —
+/// which this very file's own doc comment elsewhere says "outranks...
+/// nonzero vruntime" in a fairness comparison) was ever observed getting
+/// a single scheduling turn within this demo's preemption window, even
+/// at 50x this budget (2000) with a 180s wall-clock test timeout — ruling
+/// out "just needs more ticks". No fault/crash was logged for any of
+/// them either (`p2_fault`'s own generic per-thread log line, confirmed
+/// to fire for ANY faulting thread, never appeared), so this is not a
+/// crash-on-schedule bug: `pick_next` (kernel-sched) appears to never
+/// select these threads at all, contradicting the documented vruntime=0
+/// fairness model. Left at the original `40` (proven sufficient for the
+/// closed root+A/B/C+device-manager/faulty-driver demo this constant was
+/// actually sized for) since raising it demonstrably does not reach the
+/// real cause. **Flagged for Omid, not silently worked around**: a real
+/// scheduler-fairness/thread-admission investigation is needed before any
+/// of the 8 ported layer-4 services' own `self_check()` logic can be
+/// considered proven to execute on real hardware — today only their
+/// successful SPAWN (TCB/cap-space/address-space allocation, ELF load,
+/// scheduler admission) is QEMU-verified, not their own code running.
 const P2_TICK_BUDGET: u32 = 40;
 /// Byte offsets into the shared frame each process bumps in its counting
 /// loop — distinct words (the frame is ONE physical page aliased into
@@ -2034,6 +2057,90 @@ fn grant_cap_into(
 ) -> Option<CapId> {
     let (src, dst) = state.cap_space_pair_mut(src_cs, dst_cs)?;
     kernel_cap::cdt::derive_child_cross_space(src, src_cs, cap, dst, rights, 0).ok()
+}
+
+/// Wires a real client-server IPC edge between two ALREADY-SPAWNED,
+/// separately-isolated subsystem-bin processes (neither of which is Root
+/// Task itself) — the general form of what this session's real-IPC plan
+/// needs repeated for every new layer-4/5 service pair. `Retype`s one
+/// fresh `Endpoint`, `grant_cap_into`s it into both `server_cs` and
+/// `client_cs`, then carves and maps ONE shared physical page into BOTH
+/// processes' own address spaces (`server_va` in the server's, `client_va`
+/// in the client's) — genuine shared memory, not a per-side copy.
+///
+/// **Real design point, not an oversight**: this is DELIBERATELY a single
+/// shared physical frame, unlike `security_broker_intermediary_demo_
+/// start`'s own two-separate-pages setup for security-broker's outgoing
+/// link — that edge always has ROOT TASK (which has free physical RAM
+/// access, no VA mapping needed) as at least one party, and its own
+/// `self_check` never actually validates the round-tripped payload
+/// content (`granted` is stored but never asserted on). THIS function is
+/// for two genuine PEER processes, where the message words must actually
+/// survive the trip (`Simurgh-OS`'s generic `IPC_CALL`/`RECV`/`REPLY`
+/// syscall glue — `p2_ipc_call`/`p2_ipc_recv`/`p2_ipc_reply` — only
+/// carries a `label`, never `words`; the shared physical page IS the real
+/// payload transport, the syscalls are pure synchronization).
+///
+/// Returns the server-side `CapId` (for a boot-log line only — each
+/// process's own copy is otherwise a fixed compile-time constant, per
+/// every existing subsystem's own convention).
+///
+/// **Not yet multi-client-safe**: only ONE client is wired per call. A
+/// server meant to serve several clients over the SAME shared page (this
+/// plan's later phases, e.g. security-broker eventually serving account-
+/// manager/store too) would need either a dedicated page per client pair
+/// or an explicit mutual-exclusion scheme — concurrent writers to one
+/// shared page would otherwise be a real race. Flagged here for whoever
+/// wires the second client in, not hidden.
+#[allow(clippy::too_many_arguments)]
+pub fn wire_service_endpoint(
+    hal: &HalInterface,
+    caller: ThreadId,
+    server_cs: kernel_cap::CapSpaceId,
+    server_root_pt: usize,
+    server_va: usize,
+    client_cs: kernel_cap::CapSpaceId,
+    client_root_pt: usize,
+    client_va: usize,
+    rights: CapabilityRights,
+) -> Option<CapId> {
+    let k = kstate();
+    let ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Endpoint, count: 1 },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, server_cs, rights)?;
+    grant_cap_into(k, src_cs, ep_cap, client_cs, rights)?;
+
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+
+    let server_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(server_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(server_root_pt, server_va, shared_phys, 4096, 1 | 2 | 8, server_pool, 2) == u32::MAX {
+        klog!("wire_service_endpoint: map_range error (server's own shared page)\r\n");
+        return None;
+    }
+
+    let client_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: same contract as `server_pool` above.
+    unsafe { core::ptr::write_bytes(client_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(client_root_pt, client_va, shared_phys, 4096, 1 | 2 | 8, client_pool, 2) == u32::MAX {
+        klog!("wire_service_endpoint: map_range error (client's own shared page)\r\n");
+        return None;
+    }
+
+    Some(ep_cap)
 }
 
 /// VA fs-native's own process maps the shared fs page at — an address no
