@@ -943,6 +943,15 @@ mod sys {
     /// constant's own doc comment for why a U-mode process needs this
     /// kind of opcode at all to prove a real value, not just survival.
     pub const SB_REPORT: usize = 107;
+    /// `a0` = endpoint capability slot. `SyscallOp::Recv`, WITHOUT
+    /// `p2_ipc_recv`'s own hardcoded `root_thread` fallback — see
+    /// `kernel_arch_glue::p2_ipc_recv_general`'s own doc comment for the
+    /// real bug this exists to route around (real-IPC plan, Phase 1:
+    /// `security-broker`'s new `request_capability` service loop). A
+    /// SEPARATE opcode from `IPC_RECV`, not a change to it, so `fs-
+    /// native`/`compositor`/`mm-service`/the original demo keep their own
+    /// already-proven, unchanged behavior.
+    pub const SBS_IPC_RECV: usize = 108;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -2784,6 +2793,23 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                     // blocking (nothing to poke into our own trap; the
                     // ordinary `Resume`/`Resume2` path handles that),
                     // not being woken via a direct hand-off.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::SBS_IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // Same reasoning as `IPC_RECV`'s own identical arm.
                     TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume2(0, 0),
@@ -4807,6 +4833,23 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 None => TrapOutcome::Resume2(0, 0),
             };
         }
+        sys::SBS_IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_recv_general(hal, caller, x0 as u32) {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // Same reasoning as `IPC_RECV`'s own identical arm.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate()
@@ -6269,6 +6312,23 @@ fn simurgh_syscall(
                     // `hal_riscv64::cpu::TrapOutcome::SwitchToFast`'s own
                     // doc comment for exactly which registers this skips
                     // and why it is safe to.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::SBS_IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // Same reasoning as `IPC_RECV`'s own identical arm.
                     TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume2(0, 0),

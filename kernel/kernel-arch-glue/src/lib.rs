@@ -218,28 +218,23 @@ const P2_QUANTUM_NS: u64 = 2_000_000;
 /// Stop preempting after this many ticks and report. Both counters
 /// non-zero proves both processes ran with NO cooperative `P2_YIELD`.
 ///
-/// **Investigated, not fixed, via QEMU this session** (real-IPC plan,
-/// Phase 1): none of the 8 layer-4 subsystem processes this project
-/// spawns via `spawn_process_from_elf` (all admitted `Ready`,
-/// `SchedulerMode::Interactive`, `MAX_PRIORITY`, fresh `vruntime = 0` —
-/// which this very file's own doc comment elsewhere says "outranks...
-/// nonzero vruntime" in a fairness comparison) was ever observed getting
-/// a single scheduling turn within this demo's preemption window, even
-/// at 50x this budget (2000) with a 180s wall-clock test timeout — ruling
-/// out "just needs more ticks". No fault/crash was logged for any of
-/// them either (`p2_fault`'s own generic per-thread log line, confirmed
-/// to fire for ANY faulting thread, never appeared), so this is not a
-/// crash-on-schedule bug: `pick_next` (kernel-sched) appears to never
-/// select these threads at all, contradicting the documented vruntime=0
-/// fairness model. Left at the original `40` (proven sufficient for the
-/// closed root+A/B/C+device-manager/faulty-driver demo this constant was
-/// actually sized for) since raising it demonstrably does not reach the
-/// real cause. **Flagged for Omid, not silently worked around**: a real
-/// scheduler-fairness/thread-admission investigation is needed before any
-/// of the 8 ported layer-4 services' own `self_check()` logic can be
-/// considered proven to execute on real hardware — today only their
-/// successful SPAWN (TCB/cap-space/address-space allocation, ELF load,
-/// scheduler admission) is QEMU-verified, not their own code running.
+/// **Investigated via QEMU this session, root cause found and fixed
+/// elsewhere, not here** (real-IPC plan, Phase 1): initially suspected as
+/// a scheduler-fairness bug — none of the 8 layer-4 subsystem processes
+/// this project spawns ever appeared to run within this demo's window,
+/// even at 50x this budget (2000). A temporary diagnostic in `p2_tick`
+/// covering every real switch decision DISPROVED that: `native-loader`'s
+/// own thread (tid 16) DID get a genuine scheduling turn (`SWITCH 15 ->
+/// 16` at tick 7), ran a full quantum, and was ordinarily preempted
+/// afterward, exactly as `pick_next`'s documented fairness model
+/// predicts — the scheduler itself was never the problem. The REAL bug
+/// was in `p2_ipc_recv`'s own hardcoded `root_thread` fallback silently
+/// corrupting the IPC round trip once a thread's own code actually ran
+/// and tried to `Recv` — see `p2_ipc_recv_general`'s own doc comment for
+/// the full story and the fix (a separate opcode, not a change here).
+/// `P2_TICK_BUDGET` itself needed no change — left at the original `40`,
+/// proven sufficient for the closed root+A/B/C+device-manager/faulty-
+/// driver demo it was actually sized for.
 const P2_TICK_BUDGET: u32 = 40;
 /// Byte offsets into the shared frame each process bumps in its counting
 /// loop — distinct words (the frame is ONE physical page aliased into
@@ -1766,6 +1761,50 @@ pub fn p2_ipc_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> O
             // just `user_ctx_switch_ptrs`) is needed here.
             let _ = k.sched.dispatch(k.root_thread, hal.now_ns());
             let (save, into) = k.user_ctx_switch_ptrs(caller, k.root_thread)?;
+            Some(IpcRecvOutcome::Switch(IpcSwitch { save, into, poke: None }))
+        }
+        _ => None,
+    }
+}
+
+/// `SBS_IPC_RECV` opcode: `SyscallOp::Recv`, WITHOUT `p2_ipc_recv`'s own
+/// hardcoded "switch to `root_thread`" hack.
+///
+/// **Real bug found via QEMU** (this session's real-IPC plan, Phase 1):
+/// `p2_ipc_recv`'s own `root_thread` fallback is a narrow fix scoped to
+/// ONE specific 2-party demo (root <-> process B) — see that function's
+/// own doc comment. `fs-native`/`compositor`/`mm-service` also share the
+/// generic `IPC_RECV` opcode and happen to work anyway, because their
+/// own boot sequence always makes Root Task genuinely the correct next
+/// thing to resume right after they first block. `security-broker`'s own
+/// NEW `request_capability` service loop (this plan's Phase 1) has no
+/// such guarantee — by the time it first calls `Recv`, boot has moved
+/// well past Root Task's own sequential setup into the general timer-
+/// preemption phase, where `root_thread` is neither the caller nor
+/// necessarily even still a valid, running participant. Confirmed via a
+/// temporary diagnostic covering every real `p2_tick` switch decision:
+/// `native-loader`'s own thread DOES get scheduled and DOES run (ruling
+/// out the scheduler-fairness dead end investigated first) — the actual
+/// break is HERE, in `Recv`'s own hardcoded destination silently
+/// hijacking control away from the real `pick_next` answer, corrupting
+/// the round trip before either side's own wire-format code ever runs.
+///
+/// This is a SEPARATE opcode, not a change to `p2_ipc_recv` itself,
+/// specifically so `fs-native`/`compositor`/`mm-service`/the original
+/// demo keep their own already-proven, unchanged behavior — only a NEW
+/// consumer with a genuinely general blocking-Recv need opts into this
+/// one.
+pub fn p2_ipc_recv_general(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Recv { endpoint: kernel_cap::CapId::new(endpoint_raw) }, hal) {
+        Ok(SyscallReturn::Message { from, msg }) => {
+            Some(IpcRecvOutcome::Immediate { from: from.as_u32() as usize, label: msg.label as usize })
+        }
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            // See `p2_ipc_call`'s own comment on why `dispatch` (not
+            // just `user_ctx_switch_ptrs`) is needed here.
+            let _ = k.sched.dispatch(n, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
             Some(IpcRecvOutcome::Switch(IpcSwitch { save, into, poke: None }))
         }
         _ => None,
