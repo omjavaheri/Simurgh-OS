@@ -994,6 +994,63 @@ mod sys {
     /// otherwise. Server-side counterpart of the real-IPC plan's `simurgh-
     /// backup-manager` <-> `simurgh-store` edge.
     pub const STR_REPORT: usize = 114;
+    /// `a0` = the crash-report batch size just (simulated-)sent; `a1` =
+    /// the simulated HTTP status code (`200`). `simurgh-diagnostics`'s own
+    /// `ReportSender` has no real network path yet (no TCP/IP stack
+    /// reachable from a bare-metal Simurgh-OS user process) — Omid's own
+    /// 2026-09-10 direction: point it at a local placeholder
+    /// (`http://localhost:1366`) and simulate the round trip (a real
+    /// ~3-second delay via `NOW_NS`, then a simulated 200) until a real
+    /// backend and HTTP/TCP path exist. Same "prove a real value, not
+    /// just survival" reasoning `ST_REPORT`/`PP_REPORT`/`AM_REPORT`/
+    /// `STR_REPORT`'s own doc comments give — this process has no server
+    /// peer to report FROM, so this is its own client-side proof instead.
+    pub const DG_REPORT: usize = 115;
+    /// `a0` = a [`KnownElfId`]-numbered value (0..=15, matching `simurgh-
+    /// init::init-core::wire::KnownElfId`'s own numeric layout exactly —
+    /// `DeviceManager`=0 .. `PolicyEngine`=15). Returns the newly spawned
+    /// process's own raw `ThreadId` (as `a0` on success), or `usize::MAX`
+    /// on denial/failure (unknown `elf_id`, a target outside the v1
+    /// allow-list, or `spawn_process_from_elf` itself failing).
+    ///
+    /// [`KnownElfId`]: (mirrored, not a real type here — see `simurgh-
+    /// init::init-core::wire`)
+    ///
+    /// This is `simurgh-init`'s own real process-launch mechanism (Omid's
+    /// 2026-09-10 approval to implement the session's own earlier-scoped
+    /// design) — the first syscall in this project that lets a genuinely
+    /// unprivileged U-mode process (not Root Task) trigger spawning a new
+    /// process. Deliberately SIMPLER than `simurgh-init::init-core::
+    /// wire::SpawnKnownElfRequest`'s own provisional 5-field shape (which
+    /// assumed a caller-supplied `Untyped`/pre-`Retype`d `CapSpace`/
+    /// `AddrSpace`, mirroring a fuller seL4-style capability-delegation
+    /// model): this v1 takes only `elf_id`, and the kernel carves its own
+    /// untyped memory internally via the SAME `kernel_arch_glue::
+    /// spawn_process_from_elf` helper every boot-time spawn already uses
+    /// (`carve_from_any_untyped`, not a caller-owned `Untyped` capability).
+    /// The security boundary is a plain caller-tid check (only `simurgh-
+    /// init`'s own recorded tid, `kernel_arch_glue::init_tid()`, may call
+    /// this successfully) rather than a capability grant — TODO(spec):
+    /// the fuller Untyped-Retype-based delegation model the client-side
+    /// wire format still documents remains a real, larger follow-up (a
+    /// generalized `Retype` reachable by non-root callers, plus per-
+    /// process `Untyped` ownership tracking), deliberately deferred here
+    /// to land a genuinely working v1 without also taking on that
+    /// additional capability-security-model risk in one pass.
+    ///
+    /// Allow-list (v1 scope): only `SecurityBroker`(7), `Init`(9),
+    /// `AccountManager`(10), `BackupManager`(11), `DiagnosticsManager`(12),
+    /// `Store`(13), `NativeLoader`(14), `PolicyEngine`(15) — the layer-4/
+    /// already-proven-standalone subsystems this session's own real-IPC
+    /// work already spawns once at boot with no hardware/IRQ ownership or
+    /// boot-order singleton dependency. `DeviceManager`(0), `FsNative`(1),
+    /// `DriverVirtioBlk`(2), `DriverVirtioNet`(3), `Netstack`(4),
+    /// `Compositor`(5), `MmService`(6), `SecurityBrokerIntermediary`(8)
+    /// are core kernel-subsystems-layer singletons with real hardware/IRQ
+    /// ownership or intricate boot-order dependencies — spawning a SECOND
+    /// instance of any of those is explicit future work, not yet safe to
+    /// allow blindly.
+    pub const SPAWN_KNOWN_ELF: usize = 116;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3599,7 +3656,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // security-broker is now spawned earlier, sequentially, by
             // `sys::SBI_DEMO_START` (see that arm's own doc comment for
             // why) — NOT spawned again here.
-            let _ = spawn_init_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_init_tid(spawn_init_x86(kernel_arch_glue::khal()));
             let account_manager_tid_x86 = spawn_account_manager_x86(kernel_arch_glue::khal());
             let backup_manager_tid_x86 = spawn_backup_manager_x86(kernel_arch_glue::khal());
             kernel_arch_glue::set_backup_manager_tid(backup_manager_tid_x86);
@@ -3698,6 +3755,38 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 a1 == 1
             ));
             return TrapOutcome::Resume(0);
+        }
+        sys::DG_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "diagnostics-manager (U-mode, x86_64): simulated POST http://localhost:1366 (batch size {a0}), simulated response status={a1}\r\n"
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::SPAWN_KNOWN_ELF => {
+            let k = kernel_arch_glue::kstate();
+            let caller = k.sched.running().unwrap_or(k.root_thread);
+            if Some(caller) != kernel_arch_glue::init_tid() {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): SPAWN_KNOWN_ELF denied - caller tid#{} is not simurgh-init\r\n",
+                    caller.as_u32()
+                ));
+                return TrapOutcome::Resume(usize::MAX);
+            }
+            match spawn_known_elf_x86(kernel_arch_glue::khal(), a0 as u32) {
+                Some(tid) => {
+                    kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): simurgh-init spawned elf_id={a0} as tid {} via SPAWN_KNOWN_ELF\r\n",
+                        tid.as_u32()
+                    ));
+                    return TrapOutcome::Resume(tid.as_u32() as usize);
+                }
+                None => {
+                    kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): SPAWN_KNOWN_ELF failed for elf_id={a0} (unknown id, denied target, or out of resources)\r\n"
+                    ));
+                    return TrapOutcome::Resume(usize::MAX);
+                }
+            }
         }
         sys::DM_WAIT_CRASH => {
             return match kernel_arch_glue::p2_dm_wait_crash() {
@@ -4579,6 +4668,47 @@ fn wire_backup_manager_to_store_x86(
             ));
         }
     }
+}
+
+/// Implements `sys::SPAWN_KNOWN_ELF` — see that opcode's own doc comment
+/// for the full design (v1 scope, allow-list, and what it deliberately
+/// defers). Reuses the SAME already-embedded ELF byte arrays and the SAME
+/// `kernel_arch_glue::spawn_process_from_elf` helper every boot-time spawn
+/// in this file already calls — this is not a new ELF-loading
+/// implementation, only a new, syscall-reachable caller of the existing
+/// one. `elf_id` values match `simurgh-init::init-core::wire::KnownElfId`'s
+/// own numeric layout exactly. A single fixed stack VMA/length is reused
+/// across every target: each spawn gets a brand-new, empty address space,
+/// so nothing else in that space could ever collide with it.
+#[cfg(target_arch = "x86_64")]
+fn spawn_known_elf_x86(hal: &hal_core::HalInterface, elf_id: u32) -> Option<kernel_cap::ThreadId> {
+    const SPAWN_STACK_VMA: usize = 0xC042_0000;
+    const SPAWN_STACK_LEN: usize = 4096 * 16;
+    let (elf_bytes, label): (&[u8], &str) = match elf_id {
+        7 => (SECURITY_BROKER_ELF, "security-broker"),
+        9 => (INIT_ELF, "init"),
+        10 => (ACCOUNT_MANAGER_ELF, "account-manager"),
+        11 => (BACKUP_MANAGER_ELF, "backup-manager"),
+        12 => (DIAGNOSTICS_MANAGER_ELF, "diagnostics-manager"),
+        13 => (STORE_ELF, "store"),
+        14 => (NATIVE_LOADER_ELF, "native-loader"),
+        15 => (POLICY_ENGINE_ELF, "policy-engine"),
+        _ => return None,
+    };
+    let k = kernel_arch_glue::kstate();
+    let (tid, _cap_space, _stack_phys) = kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        elf_bytes,
+        elf_loader::machine::EM_X86_64,
+        SPAWN_STACK_VMA,
+        SPAWN_STACK_LEN,
+    )?;
+    kernel_arch_glue::log(format_args!(
+        "root task (x86_64): SPAWN_KNOWN_ELF spawned a real, on-demand `{label}` process (tid {})\r\n",
+        tid.as_u32()
+    ));
+    Some(tid)
 }
 
 /// x86_64 counterpart of `spawn_policy_engine` (riscv64) — see that

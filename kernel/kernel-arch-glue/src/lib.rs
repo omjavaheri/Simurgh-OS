@@ -738,6 +738,30 @@ pub fn set_diagnostics_manager_tid(tid: Option<ThreadId>) {
     unsafe { core::ptr::addr_of_mut!(G_DIAGNOSTICS_MANAGER_TID).write(tid) };
 }
 
+/// `simurgh-init`'s own tid, recorded once at spawn time — a DIFFERENT
+/// purpose from `G_BACKUP_MANAGER_TID`/`G_DIAGNOSTICS_MANAGER_TID` above
+/// (those track "ready but never resumed" retirement bookkeeping; this
+/// tracks caller IDENTITY). `Simurgh-OS/kernel/kernel/src/main.rs`'s own
+/// `sys::SPAWN_KNOWN_ELF` dispatch reads this to verify a caller really is
+/// `simurgh-init` before honoring a real process-spawn request — this
+/// syscall's own security boundary is a plain caller-tid check, not a
+/// capability grant (v1 scope; see that opcode's own doc comment for why).
+static mut G_INIT_TID: Option<ThreadId> = None;
+
+/// See `G_INIT_TID`'s own doc comment.
+pub fn set_init_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_INIT_TID).write(tid) };
+}
+
+/// See `G_INIT_TID`'s own doc comment.
+pub fn init_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `set_init_tid`, before
+    // any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_INIT_TID).read() }
+}
+
 fn setup_two_process(
     hal: &HalInterface,
     state: &mut KernelState,
