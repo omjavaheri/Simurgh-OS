@@ -982,6 +982,18 @@ mod sys {
     /// all, which mattered during this edge's own real-IPC-plan
     /// root-cause hunt and stays valuable observability going forward.
     pub const PP_REPORT: usize = 112;
+    /// `a0` = the decoded request's `from` tid; `a1` = unused (`0`).
+    /// Server-side counterpart of the real-IPC plan's `simurgh-backup-
+    /// manager` <-> `simurgh-account-manager` edge — same "prove a real
+    /// value, not just survival" reasoning `ST_REPORT`/`PP_REPORT`'s own
+    /// doc comments give.
+    pub const AM_REPORT: usize = 113;
+    /// `a0` = the decoded request's `from` tid; `a1` = 1 iff `simurgh-
+    /// store`'s own real reinstall check accepted every requested package
+    /// (every name matched its own fixed `KNOWN_PACKAGES` catalog), 0
+    /// otherwise. Server-side counterpart of the real-IPC plan's `simurgh-
+    /// backup-manager` <-> `simurgh-store` edge.
+    pub const STR_REPORT: usize = 114;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3588,8 +3600,9 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // `sys::SBI_DEMO_START` (see that arm's own doc comment for
             // why) — NOT spawned again here.
             let _ = spawn_init_x86(kernel_arch_glue::khal());
-            let _ = spawn_account_manager_x86(kernel_arch_glue::khal());
-            kernel_arch_glue::set_backup_manager_tid(spawn_backup_manager_x86(kernel_arch_glue::khal()));
+            let account_manager_tid_x86 = spawn_account_manager_x86(kernel_arch_glue::khal());
+            let backup_manager_tid_x86 = spawn_backup_manager_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_backup_manager_tid(backup_manager_tid_x86);
             kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager_x86(kernel_arch_glue::khal()));
             let store_tid_x86 = spawn_store_x86(kernel_arch_glue::khal());
             let _ = spawn_native_loader_x86(kernel_arch_glue::khal());
@@ -3601,6 +3614,19 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // own doc comment.
             if let (Some(store_tid), Some(pe_tid)) = (store_tid_x86, policy_engine_tid_x86) {
                 wire_store_to_policy_engine_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, pe_tid);
+            }
+            // backup-manager's own two real IPC edges — wired here for the
+            // same reason as store<->profile-policy above. ORDER MATTERS:
+            // the account-manager edge must be wired BEFORE the store edge
+            // (both grant into backup-manager's own cap space, and its own
+            // client-side constants assume account-manager's `Endpoint`
+            // lands at slot 0, store's at slot 1 — see either wiring
+            // function's own doc comment).
+            if let (Some(am_tid), Some(bm_tid)) = (account_manager_tid_x86, backup_manager_tid_x86) {
+                wire_backup_manager_to_account_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, bm_tid);
+            }
+            if let (Some(store_tid), Some(bm_tid)) = (store_tid_x86, backup_manager_tid_x86) {
+                wire_backup_manager_to_store_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, bm_tid);
             }
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
@@ -3656,6 +3682,19 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::PP_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "profile-policy (U-mode, x86_64): served a real compatibility-check call from tid#{a0}, granted={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::AM_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "account-manager (U-mode, x86_64): served a real backup-manager data-query call from tid#{a0}\r\n"
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::STR_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "store (U-mode, x86_64): served a real backup-manager reinstall call from tid#{a0}, accepted={}\r\n",
                 a1 == 1
             ));
             return TrapOutcome::Resume(0);
@@ -4390,6 +4429,153 @@ fn wire_store_to_policy_engine_x86(
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): store<->profile-policy wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the `simurgh-backup-manager` <-> `simurgh-account-manager` real
+/// IPC edge (`backup_core::UserDataSource`). Takes both tids as explicit
+/// parameters — same reasoning `wire_store_to_policy_engine_x86`'s own doc
+/// comment gives for its identical shape: neither side has a `G_*_TID_X86`
+/// global, and this is the only call site that ever wires it. Single
+/// client (backup-manager), so no shared `Notification` is needed, just
+/// one `Endpoint`+page pair from `kernel_arch_glue::wire_service_endpoint`.
+/// `am_va`/`bm_client_va` must stay numerically equal to `simurgh-account-
+/// manager::session-manager::subsystem_entry::BM_SHARED_VA` (`0xD910_
+/// 0000`, the next free slot after that process's own EXISTING security-
+/// broker edge at `0xD900_0000`) and `simurgh-backup-manager::backup-
+/// core::subsystem_entry::AM_SHARED_VA` (`0xD940_0000`, backup-manager's
+/// own first shared page) respectively. Must be called BEFORE
+/// `wire_backup_manager_to_store_x86` — both grant into backup-manager's
+/// own, until-then-empty cap space, and this edge's own client-side
+/// constant (`AM_ENDPOINT_CAP` = 0) assumes it lands first.
+#[cfg(target_arch = "x86_64")]
+fn wire_backup_manager_to_account_manager_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    account_manager_tid: kernel_cap::ThreadId,
+    backup_manager_tid: kernel_cap::ThreadId,
+) {
+    const AM_VA: usize = 0xD910_0000;
+    const BM_CLIENT_VA: usize = 0xD940_0000;
+    let Some(am_tcb) = k.tcb(account_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->account-manager wiring skipped (could not resolve account-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (am_cs, am_addr_space) = (am_tcb.cap_space, am_tcb.addr_space);
+    let Some(bm_tcb) = k.tcb(backup_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->account-manager wiring skipped (could not resolve backup-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (bm_cs, bm_addr_space) = (bm_tcb.cap_space, bm_tcb.addr_space);
+    let Some(am_root_pt) = k.addr_space_mut(am_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->account-manager wiring skipped (could not resolve account-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(bm_root_pt) = k.addr_space_mut(bm_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->account-manager wiring skipped (could not resolve backup-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        am_cs,
+        am_root_pt,
+        AM_VA,
+        bm_cs,
+        bm_root_pt,
+        BM_CLIENT_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired backup-manager <-> account-manager real IPC edge\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): backup-manager<->account-manager wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the `simurgh-backup-manager` <-> `simurgh-store` real IPC edge
+/// (`backup_core::AppInstaller` — reinstall on restore). Same shape as
+/// `wire_backup_manager_to_account_manager_x86` — see that function's own
+/// doc comment. `store_va`/`bm_client_va` must stay numerically equal to
+/// `simurgh-store::manifest-installer::subsystem_entry::BM_SHARED_VA`
+/// (`0xD940_0000`, the next free slot in store's own address space after
+/// its EXISTING profile-policy edge at `0xD930_0000`) and `simurgh-
+/// backup-manager::backup-core::subsystem_entry::STORE_SHARED_VA`
+/// (`0xD950_0000`, backup-manager's own SECOND shared page) respectively.
+/// Must be called AFTER `wire_backup_manager_to_account_manager_x86` —
+/// this edge's own client-side constant (`STORE_ENDPOINT_CAP` = 1) assumes
+/// the account-manager edge already occupies slot 0 in backup-manager's
+/// own cap space.
+#[cfg(target_arch = "x86_64")]
+fn wire_backup_manager_to_store_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    store_tid: kernel_cap::ThreadId,
+    backup_manager_tid: kernel_cap::ThreadId,
+) {
+    const STORE_VA: usize = 0xD940_0000;
+    const BM_CLIENT_VA: usize = 0xD950_0000;
+    let Some(store_tcb) = k.tcb(store_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->store wiring skipped (could not resolve store's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (store_cs, store_addr_space) = (store_tcb.cap_space, store_tcb.addr_space);
+    let Some(bm_tcb) = k.tcb(backup_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->store wiring skipped (could not resolve backup-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (bm_cs, bm_addr_space) = (bm_tcb.cap_space, bm_tcb.addr_space);
+    let Some(store_root_pt) = k.addr_space_mut(store_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->store wiring skipped (could not resolve store's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(bm_root_pt) = k.addr_space_mut(bm_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->store wiring skipped (could not resolve backup-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        store_cs,
+        store_root_pt,
+        STORE_VA,
+        bm_cs,
+        bm_root_pt,
+        BM_CLIENT_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired backup-manager <-> store real IPC edge\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): backup-manager<->store wiring skipped (out of resources)\r\n"
             ));
         }
     }
