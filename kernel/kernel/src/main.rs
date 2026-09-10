@@ -236,6 +236,17 @@ static POLICY_ENGINE_ELF: &[u8] = include_bytes!(env!("POLICY_ENGINE_ELF_PATH"))
 /// `spawn_known_elf_x86`'s own match arms.
 static SHELL_ELF: &[u8] = include_bytes!(env!("SHELL_ELF_PATH"));
 
+/// `fm-core-bin`'s own separately-built ELF image — same packaging as
+/// `SHELL_ELF` (see its own doc comment): the TENTH layer-4 process this
+/// project spawns (`simurgh-file-manager`, a separate git repo), out-of-
+/// tree for the same local-dev-only path-stitch reason. `fm-core` had
+/// never been ported to a real bootable subsystem at all before this
+/// (2026-09-10): its VFS operations were blocked on `fs-native` having no
+/// way to register an arbitrary path string at all (`ipc_protocol::fs::
+/// FsRequest::RegisterPath`, added the same day — see `wire_file_manager_
+/// to_fs_native`'s own doc comment for the full story).
+static FILE_MANAGER_ELF: &[u8] = include_bytes!(env!("FILE_MANAGER_ELF_PATH"));
+
 /// VA `simurgh-shell`'s own dedicated debug-print page is mapped at, in
 /// ITS OWN address space (`spawn_shell_x86`'s own `kernel_arch_glue::
 /// wire_debug_print_page` call) — must stay numerically equal to
@@ -262,6 +273,27 @@ const APP_BUFFER_VA: usize = 0xD880_0000;
 /// the size rationale).
 #[cfg(target_arch = "x86_64")]
 const APP_BUFFER_LEN: usize = 4 * 1024 * 1024;
+
+/// VA `simurgh-file-manager`'s own copy of the shared `fs-native` message
+/// page is mapped at, in ITS OWN address space (`spawn_file_manager_x86`'s
+/// own `kernel_arch_glue::wire_file_manager_to_fs_native` call) — must
+/// stay numerically equal to `simurgh-file-manager::fm-core::
+/// subsystem_entry::FS_SHARED_VA`. Deliberately the SAME numeric value as
+/// `fs-native`'s own `FS_SHARED_VA` (`fs_demo_start`'s own doc comment) —
+/// safe to reuse since each process has its own, independent address
+/// space; this is not the same physical page mapped at two different VAs
+/// in one space, just the same VA chosen independently in two different
+/// spaces.
+#[cfg(target_arch = "x86_64")]
+const FILE_MANAGER_FS_SHARED_VA: usize = 0xD800_0000;
+
+/// VA `simurgh-file-manager`'s own copy of the shared `fs-native` bulk-
+/// data page is mapped at — must stay numerically equal to `simurgh-file-
+/// manager::fm-core::subsystem_entry::FS_DATA_VA`. Same "independently
+/// reused numeric VA, different address space" reasoning as
+/// [`FILE_MANAGER_FS_SHARED_VA`].
+#[cfg(target_arch = "x86_64")]
+const FILE_MANAGER_FS_DATA_VA: usize = 0xD810_0000;
 
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
@@ -1174,6 +1206,13 @@ mod sys {
     /// real value, not just survival" reasoning `NL_REPORT`'s own doc
     /// comment gives, for this separate real round trip.
     pub const NL_SPAWN_REPORT: usize = 121;
+    /// `a0` = 1 iff `simurgh-file-manager`'s own real `self_check` — a
+    /// real `Open`/`Write`/`Close`/`Stat` round trip to `fs-native` via
+    /// `sys::IPC_CALL`, followed by `FileManagerCore::copy`'s own real
+    /// `Open`/`Read`/`Write`/`Close` sequence — succeeded, 0 otherwise.
+    /// Same "prove a real value, not just survival" reasoning `NL_REPORT`'s
+    /// own doc comment gives.
+    pub const FM_REPORT: usize = 122;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3809,6 +3848,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 wire_backup_manager_to_store_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, bm_tid);
             }
             kernel_arch_glue::set_shell_tid(spawn_shell_x86(kernel_arch_glue::khal()));
+            spawn_file_manager_x86(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3989,6 +4029,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::NL_SPAWN_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "native-loader (U-mode, x86_64): real Loader::spawn round trip - ok={}, tid={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::FM_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "file-manager (U-mode, x86_64): real fs-native self_check round trip - ok={}\r\n",
                 a0 == 1
             ));
             return TrapOutcome::Resume(0);
@@ -4580,6 +4627,75 @@ fn wire_security_broker_notification_fanin_x86(hal: &hal_core::HalInterface, k: 
         None => kernel_arch_glue::log(format_args!(
             "root task (x86_64): security-broker notification fan-in skipped (out of resources)\r\n"
         )),
+    }
+}
+
+/// x86_64 counterpart of `spawn_native_loader` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_native_loader_x86`; the TENTH layer-4 process this project
+/// spawns (`simurgh-file-manager`, a separate git repo). `fm-core` had
+/// never been ported to a real bootable subsystem at all before this
+/// (2026-09-10) — its VFS operations were blocked on `fs-native` having
+/// no way to register an arbitrary path string (`ipc_protocol::fs::
+/// FsRequest::RegisterPath`, added the same day). Wires the real `fm-
+/// core` <-> `fs-native` IPC edge right after spawning (`wire_file_
+/// manager_to_fs_native`'s own doc comment): unlike `native-loader`'s own
+/// edge to security-broker, this one needs no `Notification` fan-in —
+/// Root Task's own `fs-native` usage (`fs_demo_start`) happens once,
+/// early in boot, and completes before this process is ever spawned, so
+/// the two are never concurrent callers of fs-native's shared `Endpoint`.
+#[cfg(target_arch = "x86_64")]
+fn spawn_file_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const FILE_MANAGER_STACK_VMA: usize = 0xC049_0000;
+    const FILE_MANAGER_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        FILE_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
+        FILE_MANAGER_STACK_VMA,
+        FILE_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned file-manager (tid {}) from its OWN separately-built ELF image (simurgh-file-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            let root_pt = k
+                .tcb(tid)
+                .map(|t| t.addr_space)
+                .and_then(|addr_space| k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()));
+            match root_pt {
+                Some(root_pt) => {
+                    match kernel_arch_glue::wire_file_manager_to_fs_native(
+                        hal,
+                        cap_space,
+                        root_pt,
+                        FILE_MANAGER_FS_SHARED_VA,
+                        FILE_MANAGER_FS_DATA_VA,
+                    ) {
+                        Some(()) => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): wired file-manager <-> fs-native real IPC edge\r\n"
+                        )),
+                        None => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): file-manager<->fs-native wiring skipped (fs-native not ready or out of resources)\r\n"
+                        )),
+                    }
+                }
+                None => kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): file-manager<->fs-native wiring skipped (could not resolve file-manager's own address space)\r\n"
+                )),
+            }
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): file-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
     }
 }
 

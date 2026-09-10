@@ -112,6 +112,20 @@ pub enum FsRequest {
         /// Open file handle.
         handle: FileHandle,
     },
+    /// Register an arbitrary path string with the VFS Router, returning a
+    /// fresh `PathId` a caller then uses with `Open`/`Stat` — the
+    /// "separate RegisterPath call" this module's own doc comment always
+    /// described but never implemented (2026-09-10: now real). The path
+    /// bytes themselves travel through the caller-provided shared region
+    /// `shared_cap` (never inlined in the `SmallMessage` — same reasoning
+    /// `Read`/`Write`'s own bulk data already follows), `len` bytes long.
+    /// Reply: `PathRegistered` or `Error`.
+    RegisterPath {
+        /// Number of UTF-8 bytes to read from `shared_cap`.
+        len: u32,
+        /// Client capability slot naming the source `SharedRegion`.
+        shared_cap: u32,
+    },
 }
 
 /// A reply from the VFS layer.
@@ -141,6 +155,11 @@ pub enum FsResponse {
     },
     /// `Close` completed.
     Closed,
+    /// `RegisterPath` succeeded.
+    PathRegistered {
+        /// The newly assigned id.
+        path: PathId,
+    },
     /// The request failed. `code` is a `FsErrorCode`.
     Error {
         /// Machine-readable error code.

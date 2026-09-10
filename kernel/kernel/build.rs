@@ -561,4 +561,35 @@ fn main() {
         "cargo:rustc-env=SHELL_ELF_PATH={}",
         shell_path.canonicalize().unwrap().display()
     );
+
+    // Same as `shell-bin` above, for `fm-core-bin` — the TENTH layer-4
+    // process this project spawns as a real Simurgh-OS subsystem
+    // (`simurgh-file-manager`, a separate git repo). Same local-dev-only
+    // sibling-directory path stitch, ordinary `debug` profile (no large
+    // third-party dependency like `policy-engine-bin`'s `rhai`).
+    let fm_build_alias =
+        format!("(in simurgh-file-manager) cargo +nightly-2025-01-15 build -p fm-core --bin fm-core-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let fm_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-file-manager")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("fm-core-bin");
+
+    if !fm_path.exists() {
+        panic!(
+            "kernel build.rs: fm-core-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {fm_build_alias}",
+            fm_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", fm_path.display());
+    println!(
+        "cargo:rustc-env=FILE_MANAGER_ELF_PATH={}",
+        fm_path.canonicalize().unwrap().display()
+    );
 }

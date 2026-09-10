@@ -55,6 +55,7 @@ const OP_READ: u8 = 2;
 const OP_WRITE: u8 = 3;
 const OP_STAT: u8 = 4;
 const OP_CLOSE: u8 = 5;
+const OP_REGISTER_PATH: u8 = 6;
 
 /// Encodes a `FsRequest` into a `SmallMessage`.
 ///
@@ -64,6 +65,7 @@ const OP_CLOSE: u8 = 5;
 /// - `Write`: `[handle, offset, len, shared_cap]`
 /// - `Stat`:  `[path]`
 /// - `Close`: `[handle]`
+/// - `RegisterPath`: `[len, shared_cap]`
 pub fn encode_fs_request(req: &FsRequest) -> SmallMessage {
     let (op, words): (u8, [u64; 4]) = match *req {
         FsRequest::Open { path, flags } => {
@@ -89,9 +91,12 @@ pub fn encode_fs_request(req: &FsRequest) -> SmallMessage {
         ),
         FsRequest::Stat { path } => (OP_STAT, [path.0 as u64, 0, 0, 0]),
         FsRequest::Close { handle } => (OP_CLOSE, [handle.0 as u64, 0, 0, 0]),
+        FsRequest::RegisterPath { len, shared_cap } => {
+            (OP_REGISTER_PATH, [len as u64, shared_cap as u64, 0, 0])
+        }
     };
     let n = match op {
-        OP_OPEN => 2,
+        OP_OPEN | OP_REGISTER_PATH => 2,
         OP_READ | OP_WRITE => 4,
         _ => 1,
     };
@@ -157,6 +162,13 @@ pub fn decode_fs_request(msg: &SmallMessage) -> Result<FsRequest, DecodeError> {
                 handle: FileHandle(w[0] as u32),
             })
         }
+        OP_REGISTER_PATH => {
+            need(2)?;
+            Ok(FsRequest::RegisterPath {
+                len: w[0] as u32,
+                shared_cap: w[1] as u32,
+            })
+        }
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -173,6 +185,7 @@ const OP_FR_WRITTEN: u8 = 3;
 const OP_FR_STAT: u8 = 4;
 const OP_FR_CLOSED: u8 = 5;
 const OP_FR_ERROR: u8 = 6;
+const OP_FR_PATH_REGISTERED: u8 = 7;
 
 /// Encodes a `FsResponse` into a `SmallMessage`.
 ///
@@ -182,6 +195,7 @@ const OP_FR_ERROR: u8 = 6;
 /// - `Written`: `[bytes]`
 /// - `Stat`: `[size, is_dir]`
 /// - `Closed`: `[]`
+/// - `PathRegistered`: `[path]`
 /// - `Error`: `[code]`
 pub fn encode_fs_response(resp: &FsResponse) -> SmallMessage {
     let (op, words): (u8, [u64; 2]) = match *resp {
@@ -190,6 +204,7 @@ pub fn encode_fs_response(resp: &FsResponse) -> SmallMessage {
         FsResponse::Written { bytes } => (OP_FR_WRITTEN, [bytes as u64, 0]),
         FsResponse::Stat { size, is_dir } => (OP_FR_STAT, [size, is_dir as u64]),
         FsResponse::Closed => (OP_FR_CLOSED, [0, 0]),
+        FsResponse::PathRegistered { path } => (OP_FR_PATH_REGISTERED, [path.0 as u64, 0]),
         FsResponse::Error { code } => (OP_FR_ERROR, [code as u64, 0]),
     };
     let n = if op == OP_FR_STAT {
@@ -245,6 +260,12 @@ pub fn decode_fs_response(msg: &SmallMessage) -> Result<FsResponse, DecodeError>
             })
         }
         OP_FR_CLOSED => Ok(FsResponse::Closed),
+        OP_FR_PATH_REGISTERED => {
+            need(1)?;
+            Ok(FsResponse::PathRegistered {
+                path: PathId(w[0] as u32),
+            })
+        }
         OP_FR_ERROR => {
             need(1)?;
             let code = match w[0] {
@@ -1180,6 +1201,10 @@ mod tests {
         roundtrip(FsRequest::Close {
             handle: FileHandle(3),
         });
+        roundtrip(FsRequest::RegisterPath {
+            len: 17,
+            shared_cap: 4,
+        });
     }
 
     #[test]
@@ -1230,6 +1255,7 @@ mod tests {
             is_dir: true,
         });
         fs_response_roundtrip(FsResponse::Closed);
+        fs_response_roundtrip(FsResponse::PathRegistered { path: PathId(9) });
         fs_response_roundtrip(FsResponse::Error {
             code: FsErrorCode::NotFound,
         });

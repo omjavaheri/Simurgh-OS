@@ -50,9 +50,27 @@ use ipc_protocol::fs::FsErrorCode;
 use ipc_protocol::{FileHandle, FsRequest, FsResponse, PathId};
 use kernel_ipc::SmallMessage;
 
-/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_RECV`
-/// (see that constant's own doc comment — the real `SyscallOp::Recv`).
-const IPC_RECV: usize = 43;
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::
+/// SBS_IPC_RECV` — the correctly-GENERAL `Recv` opcode (real-IPC plan
+/// Phase 2's own fix, already proven across every other multi-client-
+/// capable server in this project — `simurgh-security-broker`/
+/// `simurgh-profile-policy`/etc. all use this SAME opcode under an
+/// identically-named local constant). **Changed from `sys::IPC_RECV`
+/// (43) on 2026-09-10**, NOT a cosmetic rename: that opcode's own
+/// dispatch always resumes via `TrapOutcome::SwitchToFast` (the L4-style
+/// register-narrowing fast path — correct ONLY when the receiver's next
+/// caller is a KNOWN, fixed participant, which was true when Root Task
+/// was fs-native's ONLY ever client). Now that `simurgh-file-manager` is
+/// a SECOND, independent real client, fs-native's own post-`Reply` `Recv`
+/// can land on either caller via `pick_next`'s general fairness — exactly
+/// the real, QEMU-confirmed crash class (`SwitchToFast` zeroing a live
+/// register out from under a general `pick_next` target)
+/// `kernel/src/main.rs`'s own `sys::SBS_IPC_RECV` arm doc comment
+/// documents at length. `p2_ipc_recv_general` (backing this opcode) is a
+/// strict generalization of the old `p2_ipc_recv`'s own "switch to root"
+/// behavior, not a different one — Root Task's own existing fs demo
+/// keeps working unchanged.
+const IPC_RECV: usize = 108;
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_REPLY`.
 const IPC_REPLY: usize = 44;
 
@@ -252,16 +270,39 @@ fn write_shared_message(msg: &SmallMessage) {
     }
 }
 
-/// Maps this MVP demo's one registered `PathId` to a real path string.
-/// A stand-in for the VFS Router's own `RegisterPath` mechanism (not
-/// built yet — see `ipc_protocol::fs`'s own module doc comment on why
-/// `PathId` is not an inlined string) — fs-native pre-seeds exactly one
-/// well-known file at boot, so `PathId(0)` is the only valid id.
-fn resolve_path(id: PathId) -> Option<&'static str> {
-    if id.0 == 0 {
-        Some("/greeting")
-    } else {
-        None
+/// A real, dynamic `PathId -> path string` registry — replaces this MVP
+/// demo's own former hardcoded "`PathId(0)` is the only valid id"
+/// (2026-09-10: `FsRequest::RegisterPath` is now real; see this file's
+/// own module doc comment). `0` still always resolves to `/greeting`,
+/// pre-seeded by [`subsystem_main`] at boot (unchanged, so Root Task's
+/// own existing fs demo — the very first real IPC round trip this
+/// project ever proved — keeps working exactly as before); every OTHER
+/// id is only ever reachable by first calling `RegisterPath`.
+struct PathRegistry {
+    by_id: alloc::collections::BTreeMap<u32, alloc::string::String>,
+    next_id: u32,
+}
+
+impl PathRegistry {
+    fn new() -> Self {
+        let mut by_id = alloc::collections::BTreeMap::new();
+        by_id.insert(0, alloc::string::String::from("/greeting"));
+        Self { by_id, next_id: 1 }
+    }
+
+    fn resolve(&self, id: PathId) -> Option<&str> {
+        self.by_id.get(&id.0).map(|s| s.as_str())
+    }
+
+    /// Registers `path`, returning its freshly assigned id. Never fails
+    /// (`u32` id space; this MVP demo has no eviction, matching every
+    /// other unbounded-growth registry this project accepts at this
+    /// scale — e.g. `simurgh-security-broker::AuditLog`).
+    fn register(&mut self, path: alloc::string::String) -> PathId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.by_id.insert(id, path);
+        PathId(id)
     }
 }
 
@@ -287,9 +328,9 @@ fn error_code(e: crate::FsError) -> FsErrorCode {
 /// (looking up an arbitrary CLIENT-side slot number against fs-native's
 /// OWN cap space) is a VFS-Router-level concern, not yet built — a later
 /// `feat:` follow-up, not a correctness gap in what IS wired here.
-fn handle_request(fs: &mut MemFs, req: FsRequest) -> FsResponse {
+fn handle_request(fs: &mut MemFs, registry: &mut PathRegistry, req: FsRequest) -> FsResponse {
     match req {
-        FsRequest::Open { path, flags } => match resolve_path(path) {
+        FsRequest::Open { path, flags } => match registry.resolve(path) {
             Some(p) => {
                 match fs.open(p, flags.contains(ipc_protocol::OpenFlags::WRITE), flags.contains(ipc_protocol::OpenFlags::CREATE)) {
                     Ok(h) => FsResponse::Opened {
@@ -302,7 +343,7 @@ fn handle_request(fs: &mut MemFs, req: FsRequest) -> FsResponse {
                 code: FsErrorCode::BadPath,
             },
         },
-        FsRequest::Stat { path } => match resolve_path(path) {
+        FsRequest::Stat { path } => match registry.resolve(path) {
             Some(p) => match fs.open(p, false, false) {
                 Ok(h) => {
                     let size = fs.size(h).unwrap_or(0);
@@ -348,6 +389,25 @@ fn handle_request(fs: &mut MemFs, req: FsRequest) -> FsResponse {
                 Err(e) => FsResponse::Error { code: error_code(e) },
             }
         }
+        FsRequest::RegisterPath { len, shared_cap: _ } => {
+            if len > FS_DATA_LEN {
+                return FsResponse::Error {
+                    code: FsErrorCode::BadSharedRegion,
+                };
+            }
+            // SAFETY: same contract as `Read`'s own slice above — same
+            // shared bulk region, just read here instead of written by
+            // `fs.read`.
+            let buf = unsafe { core::slice::from_raw_parts(FS_DATA_VA as *const u8, len as usize) };
+            match core::str::from_utf8(buf) {
+                Ok(path) => FsResponse::PathRegistered {
+                    path: registry.register(alloc::string::String::from(path)),
+                },
+                Err(_) => FsResponse::Error {
+                    code: FsErrorCode::BadPath,
+                },
+            }
+        }
     }
 }
 
@@ -361,6 +421,7 @@ fn handle_request(fs: &mut MemFs, req: FsRequest) -> FsResponse {
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut fs = MemFs::new();
+    let mut registry = PathRegistry::new();
     // SAFETY: no memory access beyond `fs`'s own heap allocations —
     // `create`/`open`/`write`/`close` are pure Rust, no `unsafe` needed
     // here at all (unlike `device-manager::subsystem_entry`, this
@@ -401,7 +462,7 @@ pub extern "C" fn subsystem_main() -> ! {
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, FS_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();
         let resp = match decode_fs_request(&req_msg) {
-            Ok(req) => handle_request(&mut fs, req),
+            Ok(req) => handle_request(&mut fs, &mut registry, req),
             Err(_) => FsResponse::Error {
                 code: FsErrorCode::Unsupported,
             },

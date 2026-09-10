@@ -2963,6 +2963,77 @@ pub fn fs_demo_start(
     Some((ep_cap.as_u32(), save, into))
 }
 
+/// Wires a SECOND, independent real client to fs-native — `simurgh-
+/// file-manager`'s own edge, added 2026-09-10, the first time any
+/// process OTHER than Root Task talks to fs-native for real. Deliberately
+/// NOT [`wire_service_endpoint`]'s own shape (Retype a FRESH `Endpoint` +
+/// carve FRESH shared pages): fs-native's Endpoint and both its shared
+/// pages already exist (`fs_demo_start`'s own `FS_ENDPOINT_CAP`=0/
+/// `G_FS_SHARED_PHYS`/`G_FS_DATA_PHYS`) — this instead derives a SECOND
+/// grant of the SAME Endpoint object (sourced from fs-native's own cap
+/// table, slot 0 — `grant_cap_into` only needs SOME cap space already
+/// holding a valid reference to derive from; fs-native's own slot 0 is as
+/// good a source as Root Task's) and maps the SAME two physical pages
+/// (not fresh ones) into `file_manager`'s own address space.
+///
+/// Root Task and `simurgh-file-manager` are NOT concurrent callers in
+/// practice — Root Task's own fs demo runs once, early in boot, and
+/// completes before `simurgh-file-manager` is even spawned (this file's
+/// own boot-sequence ordering) — so unlike `simurgh-security-broker`'s
+/// own 3-way fan-in, no shared `Notification` is needed here: fs-native's
+/// plain, single-`Endpoint` `Recv` loop already correctly serves whoever
+/// calls it next, Root Task or `simurgh-file-manager`, in either order.
+///
+/// **Must be paired with `subsystem_entry.rs`'s own `IPC_RECV` = `sys::
+/// SBS_IPC_RECV` (NOT `sys::IPC_RECV`)** — see that constant's own doc
+/// comment for the real crash class this avoids now that fs-native has a
+/// second, non-fixed caller.
+pub fn wire_file_manager_to_fs_native(
+    hal: &HalInterface,
+    file_manager_cs: kernel_cap::CapSpaceId,
+    file_manager_root_pt: usize,
+    file_manager_msg_va: usize,
+    file_manager_data_va: usize,
+) -> Option<()> {
+    let k = kstate();
+    // SAFETY: `G_FS_TID` is written once by `fs_demo_start`, before this
+    // function can ever be reached (fs-native must already be spawned).
+    let fs_tid = unsafe { core::ptr::addr_of!(G_FS_TID).read() }?;
+    let fs_cs = k.tcb(fs_tid)?.cap_space;
+
+    // Derive a second grant of fs-native's own Endpoint (its own slot 0)
+    // into file-manager's cap space — same object, a new capability.
+    grant_cap_into(k, fs_cs, CapId::new(0), file_manager_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // SAFETY: `G_FS_SHARED_PHYS`/`G_FS_DATA_PHYS` are written once by
+    // `fs_demo_start`, before this function can ever be reached.
+    let shared_phys = unsafe { core::ptr::addr_of!(G_FS_SHARED_PHYS).read() };
+    let data_phys = unsafe { core::ptr::addr_of!(G_FS_DATA_PHYS).read() };
+    if shared_phys == usize::MAX || data_phys == usize::MAX {
+        klog!("wire_file_manager_to_fs_native: fs-native's own shared pages are not set up yet\r\n");
+        return None;
+    }
+
+    let msg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(msg_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(file_manager_root_pt, file_manager_msg_va, shared_phys, 4096, 1 | 2 | 8, msg_pool, 2) == u32::MAX {
+        klog!("wire_file_manager_to_fs_native: map_range error (message page)\r\n");
+        return None;
+    }
+
+    let data_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: same contract as `msg_pool` above.
+    unsafe { core::ptr::write_bytes(data_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(file_manager_root_pt, file_manager_data_va, data_phys, 4096, 1 | 2 | 8, data_pool, 2) == u32::MAX {
+        klog!("wire_file_manager_to_fs_native: map_range error (data page)\r\n");
+        return None;
+    }
+
+    Some(())
+}
+
 /// `Call`, specialized for the fs-native demo's known, fixed 2-party
 /// (root <-> fs-native) shape — unlike `p2_ipc_call` (generic, trusts
 /// whichever thread `do_send`'s fast path or `pick_next`'s general
