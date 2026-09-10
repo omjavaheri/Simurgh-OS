@@ -139,6 +139,19 @@ static mut P2_TICKS: u32 = 0;
 /// (e.g. `spawn_process` ran out of untyped RAM — the demo then falls
 /// back to reporting just A/B, unaffected).
 static mut P3_COUNTER_PHYS: usize = 0;
+/// Process A's own REPLACEMENT thread (`p2_preempt_start`'s own
+/// `fresh_tid` — root's original tid-0 TCB is retired at that same
+/// point, per that function's own doc comment) and process C's own
+/// thread, both stashed here so [`p2_tick`]'s own "budget exceeded"
+/// branch can retire them — see that branch's own doc comment for why:
+/// the SAME "`Ready`-but-never-resumed, stale `pick_next` candidate" bug
+/// class `G_PROCESS_B_TID`/`G_FS_TID`/etc. already needed fixing for,
+/// just discovered later (real-IPC plan Phase 2). `None` until
+/// `p2_preempt_start` runs; process C's own is `None` forever if it was
+/// never spawned (same "out of untyped RAM" fallback `P3_COUNTER_PHYS`'s
+/// own doc comment already describes).
+static mut G_FRESH_A_TID: Option<ThreadId> = None;
+static mut G_PROC_C_TID: Option<ThreadId> = None;
 /// `.user_text`'s vma/lma/len and process C's entry point, stashed by
 /// `setup_two_process` for `p2_preempt_start` to spawn it from — see
 /// that function's doc comment for why the spawn is deferred this late.
@@ -232,10 +245,28 @@ const P2_QUANTUM_NS: u64 = 2_000_000;
 /// corrupting the IPC round trip once a thread's own code actually ran
 /// and tried to `Recv` — see `p2_ipc_recv_general`'s own doc comment for
 /// the full story and the fix (a separate opcode, not a change here).
-/// `P2_TICK_BUDGET` itself needed no change — left at the original `40`,
-/// proven sufficient for the closed root+A/B/C+device-manager/faulty-
-/// driver demo it was actually sized for.
-const P2_TICK_BUDGET: u32 = 40;
+/// `P2_TICK_BUDGET` itself needed no change THEN — left at the original
+/// `40`, proven sufficient for the closed root+A/B/C+device-manager/
+/// faulty-driver demo it was actually sized for.
+///
+/// **Real capacity bug found via QEMU, real-IPC plan Phase 2**: that
+/// closed set has since grown by 6 more freshly-spawned, never-yet-run
+/// threads competing for the SAME fixed 40-tick window before this demo
+/// permanently cancels the timer (`p2_tick`'s own doc comment) — `init`,
+/// `account-manager`, `backup-manager`, `diagnostics-manager`, `store`,
+/// `policy-engine` (`security-broker` was already in the mix). With 3
+/// real IPC clients now needing a genuine scheduling turn EACH (their own
+/// thread to `Signal`+`Call`, AND security-broker's own thread to `Wait`+
+/// `Recv`+`Reply` each one), confirmed via a real QEMU run: none of
+/// native-loader/account-manager/store/security-broker's own threads ever
+/// got picked within the original 40 ticks — the wiring succeeded (`wired
+/// ... real IPC edge` lines all present) but no `NL_REPORT`/`SB_REPORT`
+/// ever fired. Raised to 400 (10x, matching this project's own "real
+/// headroom, not just enough to clear the one failure observed" precedent
+/// — `MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) rather
+/// than a minimal bump, since more layer-4/5 services will keep growing
+/// this same competing set.
+const P2_TICK_BUDGET: u32 = 400;
 /// Byte offsets into the shared frame each process bumps in its counting
 /// loop — distinct words (the frame is ONE physical page aliased into
 /// both spaces), clear of the `0`/`4` area the §8.4 round-trip used.
@@ -652,6 +683,76 @@ const P2_VA_B_CONST: usize = 0xC020_0000;
 /// anything that exercises GENERAL (non-fast-path) `pick_next` before
 /// that point — Netstack's own retry loop is the first such caller.
 static mut G_PROCESS_B_TID: Option<ThreadId> = None;
+
+/// `policy-engine`'s own thread id (`simurgh-profile-policy` repo),
+/// written once by [`set_policy_engine_tid`] right after `kernel/src/
+/// main.rs` spawns it. Read only by `p2_preempt_start`'s own retirement
+/// — same "`Ready`-but-never-resumed" bug class `G_PROCESS_B_TID`'s own
+/// doc comment above documents at length, for the identical underlying
+/// reason: unlike `native-loader`/`account-manager`/`store` (whose own
+/// client code immediately issues a real, genuinely-blocking `Signal`+
+/// `Call` against security-broker, so they end up `Blocked` "for real"
+/// within a few instructions of starting), policy-engine currently has
+/// no real IPC edge wired to or from it at all — it is spawned, marked
+/// `Ready` by `init_user_thread`, and then never touched by any
+/// dedicated direct-dispatch helper (unlike `fs_ipc_call`/`mm_ipc_call`/
+/// `compositor_ipc_call`/`drv_ipc_call`, which all resume their own
+/// target by NAME, bypassing `pick_next` — `note_blocked`, not `remove`,
+/// is right for THOSE). **Real bug found via QEMU** (real-IPC plan
+/// Phase 2): `security-broker`'s own `serve_requests` fan-in
+/// (`p2_ipc_recv_general`) is exactly the kind of general, non-fast-path
+/// `pick_next` caller that can land on policy-engine's own stale,
+/// never-really-run snapshot — confirmed via a real QEMU crash (`#PF`,
+/// write, present page) immediately following a `DIAG p2_ipc_recv_
+/// general: ... switching into n=17` log line, policy-engine's own tid.
+/// Retired the same way as process B (`Exited` + `remove`, not `note_
+/// blocked`): nothing in this codebase today calls policy-engine by
+/// name the way `fs_ipc_call` et al. do, so leaving its TCB slot alive
+/// but hidden buys nothing — if/when a real IPC edge to policy-engine
+/// is wired up (mirroring native-loader/account-manager/store's own
+/// Phase 2 edges), this retirement should move to that edge's own
+/// client code instead, the same way those three don't need any special
+/// handling here at all once they have real blocking work of their own.
+static mut G_POLICY_ENGINE_TID: Option<ThreadId> = None;
+
+/// Records policy-engine's own tid right after `kernel/src/main.rs`
+/// spawns it, for `p2_preempt_start`'s own retirement — see `G_POLICY_
+/// ENGINE_TID`'s own doc comment for the full rationale. A no-op if
+/// called more than once (only the first call should ever happen, one
+/// per boot) or with `None` (spawn failed, nothing to retire).
+pub fn set_policy_engine_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_POLICY_ENGINE_TID).write(tid) };
+}
+
+/// `backup-manager` (`simurgh-backup-manager` repo) and `diagnostics-
+/// manager` (`simurgh-diagnostics` repo) hit the IDENTICAL "`Ready`-but-
+/// never-resumed" landmine as policy-engine, for the identical
+/// underlying reason — see `G_POLICY_ENGINE_TID`'s own doc comment.
+/// Neither has a real IPC edge wired to or from it yet either (still
+/// out of scope for real-IPC plan Phase 2, same as policy-engine), so
+/// the same unconditional retirement applies preemptively here rather
+/// than waiting for a separate QEMU run to prove each one dangerous by
+/// crashing on it individually.
+static mut G_BACKUP_MANAGER_TID: Option<ThreadId> = None;
+static mut G_DIAGNOSTICS_MANAGER_TID: Option<ThreadId> = None;
+
+/// See `G_BACKUP_MANAGER_TID`'s own doc comment (next to `set_policy_
+/// engine_tid`, which this mirrors exactly).
+pub fn set_backup_manager_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_BACKUP_MANAGER_TID).write(tid) };
+}
+
+/// See `G_BACKUP_MANAGER_TID`'s own doc comment (next to `set_policy_
+/// engine_tid`, which this mirrors exactly).
+pub fn set_diagnostics_manager_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_DIAGNOSTICS_MANAGER_TID).write(tid) };
+}
 
 fn setup_two_process(
     hal: &HalInterface,
@@ -1240,6 +1341,9 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
             Some((tid, _cap_space, stack_phys)) => {
                 // SAFETY: single-core; only written here, read by `p2_tick`.
                 unsafe { core::ptr::addr_of_mut!(P3_COUNTER_PHYS).write(stack_phys) };
+                // SAFETY: single-core; only written here, read (and
+                // retired) by `p2_tick`'s own "budget exceeded" branch.
+                unsafe { core::ptr::addr_of_mut!(G_PROC_C_TID).write(Some(tid)) };
                 klog!(
                     "process A: process C spawned (tid {}) via the generic path, joining the preemption loop\r\n",
                     tid.as_u32()
@@ -1279,6 +1383,10 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
     // `root_frame = 0`: keep whatever address space is already active
     // (root's own space A, unchanged — this fresh TCB shares it).
     state.init_user_thread(fresh_tid, a_loop_entry, a_stack_top, 0, hal);
+    // SAFETY: single-core; only written here, read (and retired) by
+    // `p2_tick`'s own "budget exceeded" branch — see `G_FRESH_A_TID`'s
+    // own doc comment.
+    unsafe { core::ptr::addr_of_mut!(G_FRESH_A_TID).write(Some(fresh_tid)) };
     if let Some(t) = state.tcb_mut(root) {
         t.state = ThreadState::Exited;
     }
@@ -1297,6 +1405,70 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
         }
         state.sched.remove(server_tid);
         unsafe { core::ptr::addr_of_mut!(G_IPC_SERVER_TID).write(None) };
+    }
+    // Process B (the §8.4 two-space zero-copy demo's own one-shot
+    // worker) hits the IDENTICAL bug class as the demo server just
+    // above, for the IDENTICAL reason — `G_PROCESS_B_TID`'s own doc
+    // comment already documented this as a known risk ("a live
+    // `pick_next` candidate for anything that exercises GENERAL
+    // (non-fast-path) `pick_next` before [`spawn_netstack_service`'s own
+    // retirement] point"), naming Netstack as the first such caller —
+    // but that retirement is conditional on this boot actually spawning
+    // Netstack, which only happens if a Network-kind peripheral was
+    // discovered. **Real bug found via QEMU** (real-IPC plan Phase 2,
+    // this QEMU config has no network peripheral — confirmed via this
+    // same boot's own "no Network-kind peripheral was discovered at
+    // boot" line, so `spawn_netstack_service` never runs and process B
+    // is NEVER retired): `security-broker`'s own new `serve_requests`
+    // fan-in (`p2_ipc_recv_general`, real-IPC plan Phase 2) is exactly
+    // the kind of "general, non-fast-path `pick_next`" caller that doc
+    // comment warned about, and DOES sometimes land on process B's own
+    // long-stale saved context — confirmed via a real QEMU crash whose
+    // faulting RSP pointed into process B's own text section (not
+    // process B's own — into WHATEVER process happened to be sharing
+    // that stale context's own address space at the time — a `#PF`
+    // reading through a garbage pointer, not a coincidence). Retiring
+    // it HERE, unconditionally (same `Exited` + `remove` treatment as
+    // root/the demo server just above — process B is a genuine one-shot,
+    // not an ongoing server `fs_tid`'s own `note_blocked`-only treatment
+    // would fit), closes the gap for every boot, not just ones that
+    // happen to spawn Netstack.
+    // SAFETY: single-core; `G_PROCESS_B_TID` written once by
+    // `setup_two_process`, read-only here.
+    if let Some(b_tid) = unsafe { core::ptr::addr_of!(G_PROCESS_B_TID).read() } {
+        if let Some(t) = state.tcb_mut(b_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(b_tid);
+    }
+    // policy-engine hits the IDENTICAL bug class as process B just
+    // above, for the identical underlying reason (no real IPC edge
+    // calls it by name today) — see `G_POLICY_ENGINE_TID`'s own doc
+    // comment for the full rationale and the real QEMU crash that found
+    // this.
+    // SAFETY: single-core; `G_POLICY_ENGINE_TID` written once by
+    // `set_policy_engine_tid`, read-only here.
+    if let Some(pe_tid) = unsafe { core::ptr::addr_of!(G_POLICY_ENGINE_TID).read() } {
+        if let Some(t) = state.tcb_mut(pe_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(pe_tid);
+    }
+    // backup-manager / diagnostics-manager: same landmine, same fix —
+    // see `G_BACKUP_MANAGER_TID`'s own doc comment.
+    // SAFETY: single-core; written once each by `set_backup_manager_
+    // tid`/`set_diagnostics_manager_tid`, read-only here.
+    if let Some(bm_tid) = unsafe { core::ptr::addr_of!(G_BACKUP_MANAGER_TID).read() } {
+        if let Some(t) = state.tcb_mut(bm_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(bm_tid);
+    }
+    if let Some(diag_tid) = unsafe { core::ptr::addr_of!(G_DIAGNOSTICS_MANAGER_TID).read() } {
+        if let Some(t) = state.tcb_mut(diag_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(diag_tid);
     }
     // fs-native's own thread hits the SAME bug class as the demo server
     // just above, for a DIFFERENT underlying reason: **real bug found
@@ -1355,6 +1527,46 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
     // `security_broker_intermediary_demo_start`, read-only here.
     if let Some(sbi_tid) = unsafe { core::ptr::addr_of!(G_SBI_TID).read() } {
         let _ = state.sched.note_blocked(sbi_tid);
+    }
+    // compositor/mm-service/driver-virtio/netstack hit the IDENTICAL bug
+    // class as fs-native/the intermediary just above, for the IDENTICAL
+    // reason: root task's own boot-time demo exercises each of them via
+    // ONE (or a few) one-shot `Call`+`Reply` round trip(s)
+    // (`compositor_commit_verify`/`mm_query_total_resident_result`/
+    // `mm_query_victim_result`/the vfs-throughput-adjacent block-driver
+    // demo/etc.) and then moves on — `do_reply` hands control back to
+    // the CALLER (root), not to the replying thread itself, so each of
+    // these real, ongoing servers is left `Ready`-but-never-resumed
+    // after its own LAST reply, exactly like fs-native was, and equally
+    // eligible for `pick_next`'s general fan-out to land on by accident.
+    // **Real bug found via QEMU** (real-IPC plan Phase 2): none of these
+    // four had EVER needed the identical `note_blocked` fix fs-native/
+    // the intermediary already got — `fs-native`'s own doc comment
+    // itself flags that this exact class was "confirmed via QEMU"
+    // aarch64-only, "riscv64/x86_64... never actually observed broken",
+    // i.e. dormant-by-luck on x86_64 until enough NEW competing threads
+    // (native-loader/account-manager/store, real-IPC plan Phase 2) could
+    // shift `pick_next`'s own tie-break far enough to land on one of
+    // these instead — confirmed via a real QEMU crash whose faulting
+    // context did not match any real-IPC-plan client's own state.
+    // `note_blocked` (not `remove`) for the SAME reason fs-native's own
+    // doc comment gives: each one's own `*_ipc_call` helper (`comp_ipc_
+    // call`/`mm_ipc_call`/`drv_ipc_call`/Netstack's own equivalent)
+    // dispatches it directly, bypassing `pick_next` entirely, so its TCB
+    // slot must stay valid for any future such call.
+    // SAFETY: single-core; each of these four is written once by its own
+    // spawn/demo-start function, read-only here.
+    if let Some(comp_tid) = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() } {
+        let _ = state.sched.note_blocked(comp_tid);
+    }
+    if let Some(mm_tid) = unsafe { core::ptr::addr_of!(G_MM_TID).read() } {
+        let _ = state.sched.note_blocked(mm_tid);
+    }
+    if let Some(drv_tid) = unsafe { core::ptr::addr_of!(G_DRV_TID).read() } {
+        let _ = state.sched.note_blocked(drv_tid);
+    }
+    if let Some(ns_tid) = unsafe { core::ptr::addr_of!(G_NETSTACK_TID).read() } {
+        let _ = state.sched.note_blocked(ns_tid);
     }
     // `state.sched.remove(root)` clears `running` (root was it), and this
     // switch to `fresh_tid` happens directly via `user_ctx_switch_ptrs`,
@@ -1463,6 +1675,73 @@ pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
                 "MISMATCH"
             }
         );
+        // **Real bug found via QEMU** (real-IPC plan Phase 2): cancelling
+        // the timer above and returning `None` (this function's own doc
+        // comment: "the running process then keeps its loop") means
+        // WHICHEVER of A/B/C is currently executing keeps running in
+        // real hardware WITHOUT ever having its own TCB-stored context
+        // snapshot updated again — that snapshot stays frozen at wherever
+        // it was as of its own LAST real `preempt_tick` switch-IN, while
+        // its actual register state keeps advancing past that point
+        // forever after. Harmless as long as nothing ever tries to
+        // "resume" it again (this demo's own designed purpose: it just
+        // spins visibly for the smoke grep) — but real-IPC plan Phase
+        // 2's own `p2_wait_general`/`p2_ipc_recv_general` DO call
+        // general, non-fast-path `pick_next`, which can legitimately
+        // select this SAME thread later (it is still, correctly, `Ready`
+        // in the scheduler's own eyes) and switch INTO it using that
+        // frozen, long-stale snapshot — resuming a PAST version of a
+        // thread that is simultaneously still advancing for real,
+        // confirmed via a real QEMU crash whose faulting context
+        // (bisected via a temporary `klog!` on every `p2_ipc_call`/
+        // `p2_wait_general`/`p2_ipc_recv_general` switch decision) was
+        // process C's own tid. `note_blocked` (not `remove`): these
+        // threads never get a real WAKE-UP from anywhere else either way
+        // (this demo's own designed end state), but leaving their TCB
+        // slots intact costs nothing and avoids reasoning about whether
+        // `remove` is safe to call on a thread that is, from hardware's
+        // own perspective, still mid-execution.
+        //
+        // **Second real bug found while verifying this fix, before it was
+        // ever built**: an earlier draft also called `note_blocked` on
+        // `k.sched.running()` itself (to cover "whichever of A/B/C
+        // happens to be currently executing" defensively). That is
+        // actively wrong, not just redundant: the thread that is
+        // CURRENTLY running is not stale (its hardware register state
+        // and its own would-be TCB snapshot are the SAME thing right
+        // now — nothing has diverged yet), and `Scheduler::note_blocked`
+        // unconditionally clears `sched.running()` when called on the
+        // running thread (its own doc comment: "the caller should then
+        // `pick_next`"). Since `p2_tick` returns `None` here with no
+        // dispatch decision at all, nothing ever re-establishes
+        // `sched.running()` afterward — so the VERY NEXT syscall this
+        // same physically-still-executing thread issues (`p2_ipc_call`/
+        // `p2_wait_general`/`p2_ipc_recv_general`, every one of which
+        // discovers its own caller via `k.sched.running()`) would find
+        // `None` and fail. This is the exact bug class `drv_irq_wait_
+        // step`'s own doc comment above already documents and fixes via
+        // an explicit re-`dispatch` — except here there is no good
+        // moment to re-`dispatch`, since `p2_tick` itself doesn't know
+        // it's about to hand control back to that same thread (the trap
+        // return path does that implicitly). Simplest correct fix:
+        // never touch `running()`'s own identity here at all — only
+        // retire whichever of A/C is NOT currently running (the one
+        // that already stopped earlier and is sitting on a stale,
+        // dangerous snapshot); process B needs no entry here, already
+        // retired earlier in `p2_preempt_start`, well before this demo
+        // ever starts.
+        let k = kstate();
+        let running = k.sched.running();
+        if let Some(a_tid) = unsafe { core::ptr::addr_of!(G_FRESH_A_TID).read() } {
+            if Some(a_tid) != running {
+                let _ = k.sched.note_blocked(a_tid);
+            }
+        }
+        if let Some(c_tid) = unsafe { core::ptr::addr_of!(G_PROC_C_TID).read() } {
+            if Some(c_tid) != running {
+                let _ = k.sched.note_blocked(c_tid);
+            }
+        }
         return None;
     }
 
@@ -1689,6 +1968,27 @@ pub fn p2_ipc_call(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32, labe
     let k = kstate();
     let msg = SmallMessage::new(label);
     match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: kernel_cap::CapId::new(endpoint_raw), msg }, hal) {
+        // **Real bug found via QEMU** (real-IPC plan Phase 2 — same class
+        // [`p2_wait_general`]'s own doc comment documents at length):
+        // `do_send` already committed `caller` as blocked
+        // (`BlockedOnReply`/`BlockedOnSend`, `note_blocked`) before ever
+        // returning `Reschedule { next: None }` here — falling through to
+        // the generic `_ => None` arm below used to leave `caller`
+        // stranded `Blocked` in the scheduler's own bookkeeping while
+        // ACTUALLY still executing (the trap-dispatch arm's own `None`
+        // fallback just resumes it with no switch), corrupting every
+        // LATER `pick_next`/`account()` call. Mirrors `KernelState::
+        // block_thread`'s own established fix: undo the block and
+        // re-`dispatch` `caller` itself. Real-IPC plan Phase 2's own 3
+        // client processes are this call's actual real users today
+        // (`native-loader`/`account-manager`/`store`, each issuing a
+        // blocking `Call` after their own `Signal`) — this is not a
+        // theoretical case.
+        Ok(SyscallReturn::Reschedule { next: None }) => {
+            let _ = k.sched.note_ready(caller, hal.now_ns());
+            let _ = k.sched.dispatch(caller, hal.now_ns());
+            None
+        }
         Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
             // `do_send`/`do_recv`/`do_reply` only ever call `note_ready`/
             // `note_blocked` on the entities they touch, never `dispatch`
@@ -1800,6 +2100,29 @@ pub fn p2_ipc_recv_general(hal: &HalInterface, caller: ThreadId, endpoint_raw: u
         Ok(SyscallReturn::Message { from, msg }) => {
             Some(IpcRecvOutcome::Immediate { from: from.as_u32() as usize, label: msg.label as usize })
         }
+        // **Real bug found via QEMU** (real-IPC plan Phase 2 — same class
+        // [`p2_wait_general`]'s own doc comment documents at length):
+        // `do_recv`'s own `ReceiverQueued` arm already committed `caller`
+        // as `BlockedOnRecv` (`note_blocked`) before ever returning
+        // `Reschedule { next: None }` here — falling through to the
+        // generic `_ => None` arm below used to leave `caller` stranded
+        // `Blocked` in the scheduler's own bookkeeping while ACTUALLY
+        // still executing, corrupting every LATER `pick_next`/
+        // `account()` call. Mirrors `KernelState::block_thread`'s own
+        // established fix: undo the block and re-`dispatch` `caller`
+        // itself — safe here specifically because nothing was pending to
+        // receive anyway (same reasoning `p2_wait_general`'s own
+        // `Immediate(0)` fallback gives), so resuming the caller with no
+        // message is a correct "nothing yet" answer, not a wrong one.
+        // `security-broker`'s own multi-endpoint `serve_requests` fan-in
+        // (real-IPC plan Phase 2) is this opcode's actual real user
+        // today — confirmed via a real QEMU crash that traced back to
+        // exactly this gap.
+        Ok(SyscallReturn::Reschedule { next: None }) => {
+            let _ = k.sched.note_ready(caller, hal.now_ns());
+            let _ = k.sched.dispatch(caller, hal.now_ns());
+            None
+        }
         Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
             // See `p2_ipc_call`'s own comment on why `dispatch` (not
             // just `user_ctx_switch_ptrs`) is needed here.
@@ -1808,6 +2131,116 @@ pub fn p2_ipc_recv_general(hal: &HalInterface, caller: ThreadId, endpoint_raw: u
             Some(IpcRecvOutcome::Switch(IpcSwitch { save, into, poke: None }))
         }
         _ => None,
+    }
+}
+
+/// Outcome of [`p2_wait_general`] — mirrors [`IpcRecvOutcome`]'s own
+/// two-way split, just for `SyscallOp::Wait`'s own `Value`/`Blocked`
+/// shape instead of `Recv`'s `Message`/`Reschedule`.
+pub enum WaitOutcome {
+    /// Bits were already pending — resume the caller immediately with
+    /// them, no switch.
+    Immediate(u64),
+    /// The caller genuinely blocked — perform this switch.
+    Switch(IpcSwitch),
+}
+
+/// A general-purpose `SyscallOp::Wait` — unlike `drv_irq_wait_step`
+/// (this file's own single-purpose IRQ-wait helper, which deliberately
+/// does NOT switch away on `Blocked` and instead relies on its own
+/// caller's `wfi`-retry loop, correct only because a driver waiting on
+/// its OWN hardware IRQ genuinely has nothing else to do), this
+/// performs a REAL context switch to whatever `pick_next` finds when the
+/// caller blocks — `kernel_core::syscall::do_wait` itself only marks the
+/// caller `Blocked` (`SyscallReturn::Blocked`, no `next` computed), so
+/// this glue picks and dispatches the next runnable thread itself, the
+/// same shape `p2_ipc_recv_general` uses for `Recv`'s own blocking case.
+/// For a multi-client server (e.g. `security-broker`'s own fan-in across
+/// several dedicated `Endpoint`s, real-IPC plan Phase 2) that must let
+/// OTHER processes run while it waits, this is the correct primitive —
+/// busy-idling in kernel context like the IRQ-wait path would instead
+/// starve every other Ready thread until the timer eventually preempts
+/// it.
+pub fn p2_wait_general(hal: &HalInterface, caller: ThreadId, notif_cap: u32) -> Option<WaitOutcome> {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Wait { notification: kernel_cap::CapId::new(notif_cap) }, hal) {
+        Ok(SyscallReturn::Value(bits)) => Some(WaitOutcome::Immediate(bits)),
+        Ok(SyscallReturn::Blocked) => {
+            // **Real bug found via QEMU** (real-IPC plan Phase 2): `do_wait`
+            // already committed `caller` as `Blocked` (`note_blocked`,
+            // inside `kernel_core::syscall::do_wait`) before ever
+            // returning here — this function's ONE job left is picking
+            // who runs instead. `pick_next` returning `None` (nothing
+            // else `Ready` — confirmed possible, not hypothetical: this
+            // project's own `KernelState::block_thread` already guards
+            // the IDENTICAL case, `preempt.rs`'s own doc comment calling
+            // it out by name) used to propagate straight out via `?`,
+            // leaving `caller` stranded `Blocked` in the scheduler's own
+            // bookkeeping while ACTUALLY still running (the trap-dispatch
+            // arm's own `None` fallback just `Resume`s it with no
+            // switch) — a real, silent scheduler/reality mismatch that
+            // does not crash immediately, but corrupts every LATER
+            // `pick_next`/`account()` call's idea of who is really
+            // running, confirmed via a real QEMU run: `security-broker`'s
+            // own `serve_requests` loop served several real clients
+            // correctly, then crashed on a LATER return to `Wait` once
+            // enough of these silent mismatches had accumulated. Mirrors
+            // `block_thread`'s own fix for the identical class exactly:
+            // undo the block (`note_ready` + re-`dispatch` the caller
+            // itself) and resume it with `0` (nothing is actually
+            // pending — `serve_requests`'s own `if bits & BIT` checks are
+            // all false either way, so this is a harmless, immediate
+            // retry, not a wrong answer).
+            let Some(next) = k.sched.pick_next(hal.now_ns()) else {
+                let _ = k.sched.note_ready(caller, hal.now_ns());
+                let _ = k.sched.dispatch(caller, hal.now_ns());
+                return Some(WaitOutcome::Immediate(0));
+            };
+            let _ = k.sched.dispatch(next, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, next)?;
+            Some(WaitOutcome::Switch(IpcSwitch { save, into, poke: None }))
+        }
+        _ => None,
+    }
+}
+
+/// What the architecture-specific caller (`kernel/src/main.rs`'s own
+/// `NOTIF_SIGNAL` arm) must do to finish a [`p2_signal`] call.
+pub enum SignalOutcome {
+    /// Signaled successfully; nobody needed a value poked (either no
+    /// waiter was blocked yet, or — not this project's own use case —
+    /// more than one was, `SyscallReturn::DeliveredValue`'s own doc
+    /// comment).
+    Ok,
+    /// Signaled successfully AND woke exactly one `Wait`-blocked thread —
+    /// the caller MUST poke `value` into `woke`'s own saved context
+    /// (`kernel_core::syscall::SyscallReturn::DeliveredValue`'s own doc
+    /// comment for why this cannot happen here: no `UserContext` layout
+    /// knowledge in this crate) via `hal_<arch>::cpu::poke_saved_a0_a1`
+    /// and [`KernelState::thread_context_mut_ptr`] (through [`kstate`]),
+    /// BEFORE that thread is next dispatched.
+    OkWithPoke {
+        /// The thread to poke.
+        woke: ThreadId,
+        /// The value to poke into its saved return-value register.
+        value: u64,
+    },
+    /// Bad/missing capability.
+    Failed,
+}
+
+/// A general-purpose `SyscallOp::Signal` — `do_signal` (kernel-core) never
+/// blocks the signaling thread itself (it just OR's `bits` into the
+/// notification and wakes any already-blocked waiters via its own
+/// `wake_blocked`), so this needs no SWITCH logic, unlike
+/// [`p2_wait_general`] — but see [`SignalOutcome::OkWithPoke`] for the
+/// one thing it still needs from its own caller.
+pub fn p2_signal(hal: &HalInterface, caller: ThreadId, notif_cap: u32, bits: u64) -> SignalOutcome {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Signal { notification: kernel_cap::CapId::new(notif_cap), bits }, hal) {
+        Ok(SyscallReturn::DeliveredValue { woke, value }) => SignalOutcome::OkWithPoke { woke, value },
+        Ok(_) => SignalOutcome::Ok,
+        Err(_) => SignalOutcome::Failed,
     }
 }
 
@@ -2180,6 +2613,42 @@ pub fn wire_service_endpoint(
     }
 
     Some(ep_cap)
+}
+
+/// Wires ONE shared `Notification` into every cap space in `targets` —
+/// the fan-in primitive a multi-client server needs when each client got
+/// its OWN dedicated `Endpoint`+page from separate [`wire_service_
+/// endpoint`] calls (real-IPC plan Phase 2): since `Recv` only ever
+/// waits on one `Endpoint` at a time (confirmed — no "any of N" syscall
+/// exists in this kernel), the server instead `Wait`s on this single
+/// `Notification` (see [`p2_wait_general`]) and each client `Signal`s
+/// its own bit (see [`p2_signal`]) right before its own blocking `Call`,
+/// so the server learns WHICH dedicated `Endpoint` to `Recv` on next
+/// without ever guessing or busy-polling every one of them.
+///
+/// Returns the FIRST target's own `CapId` for this Notification (a
+/// derived copy, same object, lands at whatever slot `grant_cap_into`
+/// gives it in each space — the caller already knows/documents each
+/// target's own fixed slot, same convention every other wiring helper in
+/// this file uses; this return value is for a boot-log line only).
+pub fn wire_notification(hal: &HalInterface, caller: ThreadId, targets: &[kernel_cap::CapSpaceId], rights: CapabilityRights) -> Option<CapId> {
+    let k = kstate();
+    let notif_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Notification, count: 1 },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    for &target_cs in targets {
+        grant_cap_into(k, src_cs, notif_cap, target_cs, rights)?;
+    }
+
+    Some(notif_cap)
 }
 
 /// VA fs-native's own process maps the shared fs page at — an address no

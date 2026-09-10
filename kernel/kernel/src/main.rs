@@ -952,6 +952,19 @@ mod sys {
     /// native`/`compositor`/`mm-service`/the original demo keep their own
     /// already-proven, unchanged behavior.
     pub const SBS_IPC_RECV: usize = 108;
+    /// `a0` = notification capability slot. `SyscallOp::Wait`, performing
+    /// a REAL context switch when it blocks (unlike the single-purpose
+    /// `DRV_IRQ_WAIT`, which busy-idles instead — see `kernel_arch_glue::
+    /// p2_wait_general`'s own doc comment for why that shortcut is wrong
+    /// here). Returns the pending bit-set in `a0` once it becomes
+    /// non-zero (real-IPC plan, Phase 2: `security-broker`'s own fan-in
+    /// across several dedicated per-client `Endpoint`s).
+    pub const NOTIF_WAIT: usize = 109;
+    /// `a0` = notification capability slot, `a1` = bits to OR in.
+    /// `SyscallOp::Signal` — never blocks the caller (see `kernel_arch_
+    /// glue::p2_signal`'s own doc comment). The client-side half of
+    /// `NOTIF_WAIT`'s own fan-in.
+    pub const NOTIF_SIGNAL: usize = 110;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -2026,6 +2039,20 @@ static mut G_FS_EP_X86: u32 = 0;
 #[cfg(target_arch = "x86_64")]
 static mut G_SECURITY_BROKER_TID_X86: Option<kernel_cap::ThreadId> = None;
 
+/// `account-manager`'s own `CapSpaceId`, written once its own edge to
+/// security-broker is wired (real-IPC plan, Phase 2) — needed by the
+/// LAST client wired in the `P2_PREEMPT_START` sequence (`native-loader`
+/// today) to wire the shared `Notification` fan-in across all clients in
+/// one final step, without needing to reorder the existing, proven boot
+/// sequence.
+#[cfg(target_arch = "x86_64")]
+static mut G_ACCOUNT_MANAGER_CS_X86: Option<kernel_cap::CapSpaceId> = None;
+
+/// `store`'s own `CapSpaceId` — see `G_ACCOUNT_MANAGER_CS_X86`'s own doc
+/// comment for why this exists.
+#[cfg(target_arch = "x86_64")]
+static mut G_STORE_CS_X86: Option<kernel_cap::CapSpaceId> = None;
+
 /// See the riscv64 `G_COMPOSITOR_EP`'s own doc comment.
 #[cfg(target_arch = "x86_64")]
 static mut G_COMPOSITOR_EP_X86: u32 = 0;
@@ -2762,18 +2789,37 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
             return match kernel_arch_glue::p2_ipc_call(hal, caller, a0 as u32, a1 as u64) {
                 Some(sw) => {
-                    if let Some((p0, p1)) = sw.poke {
-                        // SAFETY: `sw.into` is a kernel-owned, currently
-                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
-                        // `p2_ipc_call`'s own contract.
-                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    match sw.poke {
+                        Some((p0, p1)) => {
+                            // SAFETY: `sw.into` is a kernel-owned,
+                            // currently not-executing
+                            // `HAL_USER_CONTEXT_BYTES` blob —
+                            // `p2_ipc_call`'s own contract.
+                            unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                            // A genuine `do_send` fast-path direct
+                            // delivery (`poke.is_some()` — `p2_ipc_call`'s
+                            // own doc comment) — the L4-style
+                            // register-only fast path
+                            // (02-Microkernel-Layer.md §5.3/§8.3) is safe
+                            // here. See `hal_x86_64::cpu::TrapOutcome::
+                            // SwitchToFast`'s own doc comment for exactly
+                            // which registers this skips and why.
+                            TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                        }
+                        // **Real bug found via QEMU** (real-IPC plan Phase
+                        // 2): `poke.is_none()` here means `do_send` did
+                        // NOT deliver directly — `n` is a general
+                        // `pick_next` fallback pick (`p2_ipc_call`'s own
+                        // doc comment on its `Reschedule{next:Some(n)}`
+                        // arm), which can be ANY `Ready` thread
+                        // system-wide, not a cooperating participant in
+                        // the fast path's own narrow register-set
+                        // convention — same bug/fix as `SBS_IPC_RECV`'s
+                        // own arm (that one's doc comment has the full
+                        // real-crash story: `SwitchToFast` zeroing `rcx`
+                        // out from under the §8.4 demo's own process C).
+                        None => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
                     }
-                    // The L4-style register-only fast path
-                    // (02-Microkernel-Layer.md §5.3/§8.3) — see
-                    // `hal_x86_64::cpu::TrapOutcome::SwitchToFast`'s own
-                    // doc comment for exactly which registers this skips
-                    // and why it is safe to.
-                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume(0),
             };
@@ -2809,10 +2855,75 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                     TrapOutcome::Resume2(from, label)
                 }
                 Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
-                    // Same reasoning as `IPC_RECV`'s own identical arm.
-                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                    // **Real bug found via QEMU** (real-IPC plan Phase 2):
+                    // unlike `IPC_RECV`'s own identical-LOOKING arm (whose
+                    // `p2_ipc_recv` ALWAYS switches to `root_thread`
+                    // specifically, a known participant in the L4 fast
+                    // path's own narrow register-set convention),
+                    // `p2_ipc_recv_general`'s whole POINT is a general
+                    // `pick_next` fallback that can land on ANY `Ready`
+                    // thread system-wide — confirmed via a real QEMU
+                    // crash (`#PF`, cr2=0) where `security-broker`'s own
+                    // `serve_requests` fan-in switched into the §8.4 A/B/C
+                    // fairness demo's process C mid-loop: `SwitchToFast`'s
+                    // own `restore_ipc_fast_context` deliberately ZEROES
+                    // `rcx`/`rdx`/`r8`-`r11` (real SysV caller-saved
+                    // scratch registers for the L4 IPC convention this
+                    // fast path was built for — see `TrapOutcome::
+                    // SwitchToFast`'s own doc comment: "used ONLY by...
+                    // real `IPC_CALL`/`IPC_RECV`/`IPC_REPLY`"), but process
+                    // C's own loop genuinely KEEPS its counter address
+                    // live in `rcx` across the switch — zeroing it turned
+                    // its next `mov eax, [rcx]` into a null-pointer read.
+                    // `SwitchTo` (full, unconditional register restore) is
+                    // exactly what `common_fault_entry`'s/`common_timer_
+                    // entry`'s own `SwitchToFast` arms already fall back
+                    // to for the identical reason ("no basis to assume the
+                    // fast path's narrower register set is safe").
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::NOTIF_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_wait_general(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => {
+                    // Same bug, same fix as `SBS_IPC_RECV`'s own identical
+                    // arm above: `p2_wait_general`'s `next` is a general
+                    // `pick_next` pick too, never the L4 fast path's own
+                    // narrow, cooperating-thread set — `SwitchTo`, not
+                    // `SwitchToFast`.
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_SIGNAL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_signal(hal, caller, a0 as u32, a1 as u64) {
+                kernel_arch_glue::SignalOutcome::OkWithPoke { woke, value } => {
+                    if let Some(ctx) = kernel_arch_glue::kstate().thread_context_mut_ptr(woke) {
+                        // SAFETY: `woke` is blocked (not currently
+                        // `Running` — single-core), so its own saved
+                        // context is not concurrently touched by
+                        // anything else; `SignalOutcome::OkWithPoke`'s
+                        // own doc comment.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(ctx, value as usize, 0) };
+                    }
+                    TrapOutcome::Resume(1)
+                }
+                kernel_arch_glue::SignalOutcome::Ok => TrapOutcome::Resume(1),
+                kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
             };
         }
         sys::IPC_REPLY => {
@@ -3461,11 +3572,11 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // why) — NOT spawned again here.
             let _ = spawn_init_x86(kernel_arch_glue::khal());
             let _ = spawn_account_manager_x86(kernel_arch_glue::khal());
-            let _ = spawn_backup_manager_x86(kernel_arch_glue::khal());
-            let _ = spawn_diagnostics_manager_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_backup_manager_tid(spawn_backup_manager_x86(kernel_arch_glue::khal()));
+            kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager_x86(kernel_arch_glue::khal()));
             let _ = spawn_store_x86(kernel_arch_glue::khal());
             let _ = spawn_native_loader_x86(kernel_arch_glue::khal());
-            let _ = spawn_policy_engine_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_policy_engine_tid(spawn_policy_engine_x86(kernel_arch_glue::khal()));
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3506,7 +3617,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         }
         sys::SB_REPORT => {
             kernel_arch_glue::log(format_args!(
-                "security-broker (U-mode, x86_64): served a real request_capability call from requester#{a0}, granted={}\r\n",
+                "security-broker (U-mode, x86_64): served a real service call from requester#{a0}, granted={}\r\n",
                 a1 == 1
             ));
             return TrapOutcome::Resume(0);
@@ -3678,11 +3789,31 @@ fn spawn_device_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::
 /// own doc comment for the full rationale.
 /// See riscv64's own `spawn_security_broker`'s doc comment for why this
 /// now returns the spawned thread's id.
+#[cfg(target_arch = "x86_64")]
 fn spawn_security_broker_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
     const SB_STACK_VMA: usize = 0xC041_0000;
-    const SB_STACK_LEN: usize = 4096 * 16;
+    /// **Real capacity bug found via QEMU** (real-IPC plan Phase 2): the
+    /// original `4096 * 16` (64 KiB, shared by every other subsystem
+    /// process spawned this way) was sized back when this process ran
+    /// Phase 1's own single, simple `serve_capability_requests` loop.
+    /// Phase 2's `serve_requests` fan-in now calls through 3 separate
+    /// handler paths (`serve_one_capability_request`/`_elevation_
+    /// request`/`_signature_request`), each with its own wire encode/
+    /// decode and (for `_signature_request`) a `StorePackage` built with
+    /// several `String`/`Vec` fields — real stack depth this process
+    /// never exercised before, compiled at `-O0` (larger per-frame stack
+    /// use than a release build). Confirmed via a real QEMU crash: `RIP`
+    /// landed INSIDE this process's own bump-allocator heap region (data,
+    /// never meant to be executed) — the unmistakable signature of a
+    /// stack overflow silently overwriting adjacent memory. Raised to
+    /// `4096 * 64` (256 KiB, 4x) for real headroom, matching this
+    /// project's own established precedent (`Simurgh-OS::kernel_core::
+    /// config::MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) —
+    /// left at the shared 64 KiB for every OTHER process spawned here,
+    /// none of which grew this way.
+    const SB_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -3714,6 +3845,7 @@ fn spawn_security_broker_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap:
 /// doc comment for the full rationale. Same shape as
 /// `spawn_security_broker_x86`, the first layer-4 process this project
 /// spawned this way.
+#[cfg(target_arch = "x86_64")]
 fn spawn_init_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
@@ -3746,11 +3878,16 @@ fn spawn_init_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> 
 /// x86_64 counterpart of `spawn_account_manager` (riscv64) — see that
 /// function's own doc comment for the full rationale. Same shape as
 /// `spawn_init_x86`.
+#[cfg(target_arch = "x86_64")]
 fn spawn_account_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
     const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
-    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -3764,6 +3901,12 @@ fn spawn_account_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap:
                 "root task (x86_64): spawned account-manager (tid {}) from its OWN separately-built ELF image (simurgh-account-manager repo)\r\n",
                 tid.as_u32()
             ));
+            const SBS_VA_AM: usize = 0xD8F0_0000;
+            const AM_VA: usize = 0xD900_0000;
+            let cs = wire_client_to_security_broker_x86(hal, k, tid, "account-manager", AM_VA, SBS_VA_AM);
+            // SAFETY: single-core; written once here, read once by
+            // whichever client is wired LAST in this arm's own sequence.
+            unsafe { core::ptr::addr_of_mut!(G_ACCOUNT_MANAGER_CS_X86).write(cs) };
             Some(tid)
         }
         None => {
@@ -3778,6 +3921,7 @@ fn spawn_account_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap:
 /// x86_64 counterpart of `spawn_backup_manager` (riscv64) — see that
 /// function's own doc comment for the full rationale. Same shape as
 /// `spawn_account_manager_x86`.
+#[cfg(target_arch = "x86_64")]
 fn spawn_backup_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
@@ -3810,6 +3954,7 @@ fn spawn_backup_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::
 /// x86_64 counterpart of `spawn_diagnostics_manager` (riscv64) — see
 /// that function's own doc comment for the full rationale. Same shape as
 /// `spawn_backup_manager_x86`.
+#[cfg(target_arch = "x86_64")]
 fn spawn_diagnostics_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
@@ -3842,11 +3987,16 @@ fn spawn_diagnostics_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_
 /// x86_64 counterpart of `spawn_store` (riscv64) — see that function's
 /// own doc comment for the full rationale. Same shape as
 /// `spawn_diagnostics_manager_x86`.
+#[cfg(target_arch = "x86_64")]
 fn spawn_store_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
     const STORE_STACK_VMA: usize = 0xC046_0000;
-    const STORE_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const STORE_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -3860,6 +4010,12 @@ fn spawn_store_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId>
                 "root task (x86_64): spawned store (tid {}) from its OWN separately-built ELF image (simurgh-store repo)\r\n",
                 tid.as_u32()
             ));
+            const SBS_VA_STORE: usize = 0xD910_0000;
+            const STORE_VA: usize = 0xD920_0000;
+            let cs = wire_client_to_security_broker_x86(hal, k, tid, "store", STORE_VA, SBS_VA_STORE);
+            // SAFETY: single-core; written once here, read once by
+            // whichever client is wired LAST in this arm's own sequence.
+            unsafe { core::ptr::addr_of_mut!(G_STORE_CS_X86).write(cs) };
             Some(tid)
         }
         None => {
@@ -3874,11 +4030,18 @@ fn spawn_store_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId>
 /// x86_64 counterpart of `spawn_native_loader` (riscv64) — see that
 /// function's own doc comment for the full rationale. Same shape as
 /// `spawn_store_x86`.
+#[cfg(target_arch = "x86_64")]
 fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
     const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
-    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`'s own identical fix (that
+    // constant's own doc comment has the full story — a real QEMU-traced
+    // crash bisected into this process's own bump-allocator code,
+    // consistent with a stack overflow corrupting nearby state) — this
+    // process's own real-IPC plan Phase 2 additions (`NOTIF_SIGNAL` +
+    // wire encode/decode) are new stack depth Phase 1 never exercised.
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -3893,6 +4056,7 @@ fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::T
                 tid.as_u32()
             ));
             wire_native_loader_to_security_broker_x86(hal, k, tid, cap_space);
+            wire_security_broker_notification_fanin_x86(hal, k, cap_space);
             Some(tid)
         }
         None => {
@@ -3914,6 +4078,7 @@ fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::T
 /// `self_check` either way, just without a working real transport (same
 /// "gap flagged, not hidden" posture every other still-open IPC seam in
 /// this project has).
+#[cfg(target_arch = "x86_64")]
 fn wire_native_loader_to_security_broker_x86(
     hal: &hal_core::HalInterface,
     k: &mut kernel_core::KernelState,
@@ -3974,6 +4139,144 @@ fn wire_native_loader_to_security_broker_x86(
         None => kernel_arch_glue::log(format_args!(
             "root task (x86_64): native-loader<->security-broker wiring skipped (out of resources)\r\n"
         )),
+    }
+}
+
+/// Wires the shared `Notification` fan-in (real-IPC plan, Phase 2) across
+/// security-broker and its 3 real clients — called once, from `spawn_
+/// native_loader_x86`, since native-loader is the LAST of the 3 clients
+/// spawned in this architecture's own `P2_PREEMPT_START` sequence
+/// (account-manager, then store, then native-loader) — by this point
+/// `G_ACCOUNT_MANAGER_CS_X86`/`G_STORE_CS_X86` are already `Some` (each
+/// written by its own `wire_client_to_security_broker_x86` call, right
+/// after its own spawn succeeds).
+///
+/// Bit assignment (a plain caller-defined `u64` OR-mask — the kernel
+/// never interprets it, `kernel_core::syscall`'s own `Signal` doc
+/// comment): `NATIVE_LOADER_BIT = 1`, `ACCOUNT_MANAGER_BIT = 2`,
+/// `STORE_BIT = 4`. Each client's own `subsystem_entry.rs` hardcodes its
+/// own bit and the resulting notification `CapId` slot (a fixed compile-
+/// time constant, same convention every other capability grant in this
+/// project already uses) — see `simurgh-security-broker`'s own
+/// `serve_capability_requests`'s module doc comment for the exact,
+/// verified slot numbers this grant sequence produces.
+#[cfg(target_arch = "x86_64")]
+fn wire_security_broker_notification_fanin_x86(hal: &hal_core::HalInterface, k: &mut kernel_core::KernelState, native_loader_cs: kernel_cap::CapSpaceId) {
+    let Some(security_broker_tid) = (unsafe { core::ptr::addr_of!(G_SECURITY_BROKER_TID_X86).read() }) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): security-broker notification fan-in skipped (security-broker was not spawned)\r\n"
+        ));
+        return;
+    };
+    let Some(sb_cs) = k.tcb(security_broker_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): security-broker notification fan-in skipped (could not resolve security-broker's own TCB)\r\n"
+        ));
+        return;
+    };
+    // SAFETY: single-core; both written by this arm's own earlier spawn
+    // calls, strictly before native-loader's own spawn runs.
+    let (am_cs, store_cs) = unsafe {
+        (
+            core::ptr::addr_of!(G_ACCOUNT_MANAGER_CS_X86).read(),
+            core::ptr::addr_of!(G_STORE_CS_X86).read(),
+        )
+    };
+    let (Some(am_cs), Some(store_cs)) = (am_cs, store_cs) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): security-broker notification fan-in skipped (account-manager or store was not wired)\r\n"
+        ));
+        return;
+    };
+    let targets = [sb_cs, native_loader_cs, am_cs, store_cs];
+    match kernel_arch_glue::wire_notification(hal, k.root_thread, &targets, kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE) {
+        Some(_) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired security-broker notification fan-in (native-loader, account-manager, store)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): security-broker notification fan-in skipped (out of resources)\r\n"
+        )),
+    }
+}
+
+/// Shared helper for `account-manager`'s and `store`'s own edges to
+/// security-broker (real-IPC plan, Phase 2) — both are a plain repeat of
+/// `wire_native_loader_to_security_broker_x86`'s own shape (Phase 1),
+/// generalized once here rather than copy-pasted a second and third
+/// time, since the ONLY thing that differs per edge is which client and
+/// which pair of VAs. `wire_native_loader_to_security_broker_x86` itself
+/// is left exactly as committed — already proven working via real QEMU,
+/// not worth the regression risk of routing it through this too.
+///
+/// Returns the client's own `CapSpaceId` on success (needed afterward to
+/// wire the shared `Notification`, real-IPC plan Phase 2's own fan-in
+/// step) — `None` (and logs why) on any failure, same posture every
+/// other wiring helper in this file has.
+#[cfg(target_arch = "x86_64")]
+fn wire_client_to_security_broker_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    client_tid: kernel_cap::ThreadId,
+    client_label: &str,
+    client_shared_va: usize,
+    sb_shared_va: usize,
+) -> Option<kernel_cap::CapSpaceId> {
+    let Some(security_broker_tid) = (unsafe { core::ptr::addr_of!(G_SECURITY_BROKER_TID_X86).read() }) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (security-broker was not spawned)\r\n"
+        ));
+        return None;
+    };
+    let Some(sb_tcb) = k.tcb(security_broker_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (could not resolve security-broker's own TCB)\r\n"
+        ));
+        return None;
+    };
+    let (sb_cs, sb_addr_space) = (sb_tcb.cap_space, sb_tcb.addr_space);
+    let Some(client_tcb) = k.tcb(client_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (could not resolve {client_label}'s own TCB)\r\n"
+        ));
+        return None;
+    };
+    let client_cs = client_tcb.cap_space;
+    let client_addr_space = client_tcb.addr_space;
+    let Some(sb_root_pt) = k.addr_space_mut(sb_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (could not resolve security-broker's own address space)\r\n"
+        ));
+        return None;
+    };
+    let Some(client_root_pt) = k.addr_space_mut(client_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (could not resolve {client_label}'s own address space)\r\n"
+        ));
+        return None;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        sb_cs,
+        sb_root_pt,
+        sb_shared_va,
+        client_cs,
+        client_root_pt,
+        client_shared_va,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired {client_label} <-> security-broker real IPC edge\r\n"
+            ));
+            Some(client_cs)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): {client_label}<->security-broker wiring skipped (out of resources)\r\n"
+            ));
+            None
+        }
     }
 }
 
@@ -4797,18 +5100,37 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
             return match kernel_arch_glue::p2_ipc_call(hal, caller, x0 as u32, x1 as u64) {
                 Some(sw) => {
-                    if let Some((p0, p1)) = sw.poke {
-                        // SAFETY: `sw.into` is a kernel-owned, currently
-                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
-                        // `p2_ipc_call`'s own contract.
-                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    match sw.poke {
+                        Some((p0, p1)) => {
+                            // SAFETY: `sw.into` is a kernel-owned,
+                            // currently not-executing
+                            // `HAL_USER_CONTEXT_BYTES` blob —
+                            // `p2_ipc_call`'s own contract.
+                            unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                            // A genuine `do_send` fast-path direct
+                            // delivery (`poke.is_some()` — `p2_ipc_call`'s
+                            // own doc comment) — the L4-style
+                            // register-only fast path
+                            // (02-Microkernel-Layer.md §5.3/§8.3) is safe
+                            // here. See `hal_arm64::cpu::TrapOutcome::
+                            // SwitchToFast`'s own doc comment for exactly
+                            // which registers this skips and why.
+                            TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                        }
+                        // **Real bug found via QEMU** (real-IPC plan Phase
+                        // 2): `poke.is_none()` here means `do_send` did
+                        // NOT deliver directly — `n` is a general
+                        // `pick_next` fallback pick (`p2_ipc_call`'s own
+                        // doc comment on its `Reschedule{next:Some(n)}`
+                        // arm), which can be ANY `Ready` thread
+                        // system-wide, not a cooperating participant in
+                        // the fast path's own narrow register-set
+                        // convention — same bug/fix as `SBS_IPC_RECV`'s
+                        // own arm (that one's doc comment has the full
+                        // real-crash story: `SwitchToFast` zeroing `rcx`
+                        // out from under the §8.4 demo's own process C).
+                        None => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
                     }
-                    // The L4-style register-only fast path
-                    // (02-Microkernel-Layer.md §5.3/§8.3) — see
-                    // `hal_arm64::cpu::TrapOutcome::SwitchToFast`'s own
-                    // doc comment for exactly which registers this skips
-                    // and why it is safe to.
-                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume(0),
             };
@@ -4844,10 +5166,75 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                     TrapOutcome::Resume2(from, label)
                 }
                 Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
-                    // Same reasoning as `IPC_RECV`'s own identical arm.
-                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                    // **Real bug found via QEMU** (real-IPC plan Phase 2):
+                    // unlike `IPC_RECV`'s own identical-LOOKING arm (whose
+                    // `p2_ipc_recv` ALWAYS switches to `root_thread`
+                    // specifically, a known participant in the L4 fast
+                    // path's own narrow register-set convention),
+                    // `p2_ipc_recv_general`'s whole POINT is a general
+                    // `pick_next` fallback that can land on ANY `Ready`
+                    // thread system-wide — confirmed via a real QEMU
+                    // crash (`#PF`, cr2=0) where `security-broker`'s own
+                    // `serve_requests` fan-in switched into the §8.4 A/B/C
+                    // fairness demo's process C mid-loop: `SwitchToFast`'s
+                    // own `restore_ipc_fast_context` deliberately ZEROES
+                    // `rcx`/`rdx`/`r8`-`r11` (real SysV caller-saved
+                    // scratch registers for the L4 IPC convention this
+                    // fast path was built for — see `TrapOutcome::
+                    // SwitchToFast`'s own doc comment: "used ONLY by...
+                    // real `IPC_CALL`/`IPC_RECV`/`IPC_REPLY`"), but process
+                    // C's own loop genuinely KEEPS its counter address
+                    // live in `rcx` across the switch — zeroing it turned
+                    // its next `mov eax, [rcx]` into a null-pointer read.
+                    // `SwitchTo` (full, unconditional register restore) is
+                    // exactly what `common_fault_entry`'s/`common_timer_
+                    // entry`'s own `SwitchToFast` arms already fall back
+                    // to for the identical reason ("no basis to assume the
+                    // fast path's narrower register set is safe").
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::NOTIF_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_wait_general(hal, caller, x0 as u32) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => {
+                    // Same bug, same fix as `SBS_IPC_RECV`'s own identical
+                    // arm above: `p2_wait_general`'s `next` is a general
+                    // `pick_next` pick too, never the L4 fast path's own
+                    // narrow, cooperating-thread set — `SwitchTo`, not
+                    // `SwitchToFast`.
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_SIGNAL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_signal(hal, caller, x0 as u32, x1 as u64) {
+                kernel_arch_glue::SignalOutcome::OkWithPoke { woke, value } => {
+                    if let Some(ctx) = kernel_arch_glue::kstate().thread_context_mut_ptr(woke) {
+                        // SAFETY: `woke` is blocked (not currently
+                        // `Running` — single-core), so its own saved
+                        // context is not concurrently touched by
+                        // anything else; `SignalOutcome::OkWithPoke`'s
+                        // own doc comment.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(ctx, value as usize, 0) };
+                    }
+                    TrapOutcome::Resume(1)
+                }
+                kernel_arch_glue::SignalOutcome::Ok => TrapOutcome::Resume(1),
+                kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
             };
         }
         sys::IPC_REPLY => {
@@ -5474,11 +5861,11 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             // why) — NOT spawned again here.
             let _ = spawn_init_aarch64(kernel_arch_glue::khal());
             let _ = spawn_account_manager_aarch64(kernel_arch_glue::khal());
-            let _ = spawn_backup_manager_aarch64(kernel_arch_glue::khal());
-            let _ = spawn_diagnostics_manager_aarch64(kernel_arch_glue::khal());
+            kernel_arch_glue::set_backup_manager_tid(spawn_backup_manager_aarch64(kernel_arch_glue::khal()));
+            kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager_aarch64(kernel_arch_glue::khal()));
             let _ = spawn_store_aarch64(kernel_arch_glue::khal());
             let _ = spawn_native_loader_aarch64(kernel_arch_glue::khal());
-            let _ = spawn_policy_engine_aarch64(kernel_arch_glue::khal());
+            kernel_arch_glue::set_policy_engine_tid(spawn_policy_engine_aarch64(kernel_arch_glue::khal()));
             let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -5519,7 +5906,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::SB_REPORT => {
             kernel_arch_glue::log(format_args!(
-                "security-broker (U-mode, aarch64): served a real request_capability call from requester#{x0}, granted={}\r\n",
+                "security-broker (U-mode, aarch64): served a real service call from requester#{x0}, granted={}\r\n",
                 x1 == 1
             ));
             return TrapOutcome::Resume(0);
@@ -5655,7 +6042,26 @@ fn spawn_security_broker_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_
     let k = kernel_arch_glue::kstate();
 
     const SB_STACK_VMA: usize = 0xC041_0000;
-    const SB_STACK_LEN: usize = 4096 * 16;
+    /// **Real capacity bug found via QEMU** (real-IPC plan Phase 2): the
+    /// original `4096 * 16` (64 KiB, shared by every other subsystem
+    /// process spawned this way) was sized back when this process ran
+    /// Phase 1's own single, simple `serve_capability_requests` loop.
+    /// Phase 2's `serve_requests` fan-in now calls through 3 separate
+    /// handler paths (`serve_one_capability_request`/`_elevation_
+    /// request`/`_signature_request`), each with its own wire encode/
+    /// decode and (for `_signature_request`) a `StorePackage` built with
+    /// several `String`/`Vec` fields — real stack depth this process
+    /// never exercised before, compiled at `-O0` (larger per-frame stack
+    /// use than a release build). Confirmed via a real QEMU crash: `RIP`
+    /// landed INSIDE this process's own bump-allocator heap region (data,
+    /// never meant to be executed) — the unmistakable signature of a
+    /// stack overflow silently overwriting adjacent memory. Raised to
+    /// `4096 * 64` (256 KiB, 4x) for real headroom, matching this
+    /// project's own established precedent (`Simurgh-OS::kernel_core::
+    /// config::MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) —
+    /// left at the shared 64 KiB for every OTHER process spawned here,
+    /// none of which grew this way.
+    const SB_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -5719,7 +6125,11 @@ fn spawn_account_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_
     let k = kernel_arch_glue::kstate();
 
     const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
-    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -5815,7 +6225,11 @@ fn spawn_store_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::Threa
     let k = kernel_arch_glue::kstate();
 
     const STORE_STACK_VMA: usize = 0xC046_0000;
-    const STORE_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const STORE_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -5847,7 +6261,13 @@ fn spawn_native_loader_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_ca
     let k = kernel_arch_glue::kstate();
 
     const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
-    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`'s own identical fix (that
+    // constant's own doc comment has the full story — a real QEMU-traced
+    // crash bisected into this process's own bump-allocator code,
+    // consistent with a stack overflow corrupting nearby state) — this
+    // process's own real-IPC plan Phase 2 additions (`NOTIF_SIGNAL` +
+    // wire encode/decode) are new stack depth Phase 1 never exercised.
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -6167,11 +6587,11 @@ fn simurgh_syscall(
             // why) — NOT spawned again here.
             let _ = spawn_init(kernel_arch_glue::khal());
             let _ = spawn_account_manager(kernel_arch_glue::khal());
-            let _ = spawn_backup_manager(kernel_arch_glue::khal());
-            let _ = spawn_diagnostics_manager(kernel_arch_glue::khal());
+            kernel_arch_glue::set_backup_manager_tid(spawn_backup_manager(kernel_arch_glue::khal()));
+            kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager(kernel_arch_glue::khal()));
             let _ = spawn_store(kernel_arch_glue::khal());
             let _ = spawn_native_loader(kernel_arch_glue::khal());
-            let _ = spawn_policy_engine(kernel_arch_glue::khal());
+            kernel_arch_glue::set_policy_engine_tid(spawn_policy_engine(kernel_arch_glue::khal()));
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -6218,7 +6638,7 @@ fn simurgh_syscall(
         }
         sys::SB_REPORT => {
             kernel_arch_glue::log(format_args!(
-                "security-broker (U-mode): served a real request_capability call from requester#{a0}, granted={}\r\n",
+                "security-broker (U-mode): served a real service call from requester#{a0}, granted={}\r\n",
                 a1 == 1
             ));
             return TrapOutcome::Resume(0);
@@ -6276,18 +6696,37 @@ fn simurgh_syscall(
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
             return match kernel_arch_glue::p2_ipc_call(hal, caller, a0 as u32, a1 as u64) {
                 Some(sw) => {
-                    if let Some((p0, p1)) = sw.poke {
-                        // SAFETY: `sw.into` is a kernel-owned, currently
-                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
-                        // `p2_ipc_call`'s own contract.
-                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    match sw.poke {
+                        Some((p0, p1)) => {
+                            // SAFETY: `sw.into` is a kernel-owned,
+                            // currently not-executing
+                            // `HAL_USER_CONTEXT_BYTES` blob —
+                            // `p2_ipc_call`'s own contract.
+                            unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                            // A genuine `do_send` fast-path direct
+                            // delivery (`poke.is_some()` — `p2_ipc_call`'s
+                            // own doc comment) — the L4-style
+                            // register-only fast path
+                            // (02-Microkernel-Layer.md §5.3/§8.3) is safe
+                            // here. See `hal_riscv64::cpu::TrapOutcome::
+                            // SwitchToFast`'s own doc comment for exactly
+                            // which registers this skips and why.
+                            TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                        }
+                        // **Real bug found via QEMU** (real-IPC plan Phase
+                        // 2): `poke.is_none()` here means `do_send` did
+                        // NOT deliver directly — `n` is a general
+                        // `pick_next` fallback pick (`p2_ipc_call`'s own
+                        // doc comment on its `Reschedule{next:Some(n)}`
+                        // arm), which can be ANY `Ready` thread
+                        // system-wide, not a cooperating participant in
+                        // the fast path's own narrow register-set
+                        // convention — same bug/fix as `SBS_IPC_RECV`'s
+                        // own arm (that one's doc comment has the full
+                        // real-crash story: `SwitchToFast` zeroing `rcx`
+                        // out from under the §8.4 demo's own process C).
+                        None => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
                     }
-                    // The L4-style register-only fast path
-                    // (02-Microkernel-Layer.md §5.3/§8.3) — see
-                    // `hal_riscv64::cpu::TrapOutcome::SwitchToFast`'s own
-                    // doc comment for exactly which registers this skips
-                    // and why it is safe to.
-                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume(0),
             };
@@ -6328,10 +6767,75 @@ fn simurgh_syscall(
                     TrapOutcome::Resume2(from, label)
                 }
                 Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
-                    // Same reasoning as `IPC_RECV`'s own identical arm.
-                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                    // **Real bug found via QEMU** (real-IPC plan Phase 2):
+                    // unlike `IPC_RECV`'s own identical-LOOKING arm (whose
+                    // `p2_ipc_recv` ALWAYS switches to `root_thread`
+                    // specifically, a known participant in the L4 fast
+                    // path's own narrow register-set convention),
+                    // `p2_ipc_recv_general`'s whole POINT is a general
+                    // `pick_next` fallback that can land on ANY `Ready`
+                    // thread system-wide — confirmed via a real QEMU
+                    // crash (`#PF`, cr2=0) where `security-broker`'s own
+                    // `serve_requests` fan-in switched into the §8.4 A/B/C
+                    // fairness demo's process C mid-loop: `SwitchToFast`'s
+                    // own `restore_ipc_fast_context` deliberately ZEROES
+                    // `rcx`/`rdx`/`r8`-`r11` (real SysV caller-saved
+                    // scratch registers for the L4 IPC convention this
+                    // fast path was built for — see `TrapOutcome::
+                    // SwitchToFast`'s own doc comment: "used ONLY by...
+                    // real `IPC_CALL`/`IPC_RECV`/`IPC_REPLY`"), but process
+                    // C's own loop genuinely KEEPS its counter address
+                    // live in `rcx` across the switch — zeroing it turned
+                    // its next `mov eax, [rcx]` into a null-pointer read.
+                    // `SwitchTo` (full, unconditional register restore) is
+                    // exactly what `common_fault_entry`'s/`common_timer_
+                    // entry`'s own `SwitchToFast` arms already fall back
+                    // to for the identical reason ("no basis to assume the
+                    // fast path's narrower register set is safe").
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::NOTIF_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_wait_general(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => {
+                    // Same bug, same fix as `SBS_IPC_RECV`'s own identical
+                    // arm above: `p2_wait_general`'s `next` is a general
+                    // `pick_next` pick too, never the L4 fast path's own
+                    // narrow, cooperating-thread set — `SwitchTo`, not
+                    // `SwitchToFast`.
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_SIGNAL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_signal(hal, caller, a0 as u32, a1 as u64) {
+                kernel_arch_glue::SignalOutcome::OkWithPoke { woke, value } => {
+                    if let Some(ctx) = kernel_arch_glue::kstate().thread_context_mut_ptr(woke) {
+                        // SAFETY: `woke` is blocked (not currently
+                        // `Running` -- single-core), so its own saved
+                        // context is not concurrently touched by
+                        // anything else; `SignalOutcome::OkWithPoke`s
+                        // own doc comment.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(ctx, value as usize, 0) };
+                    }
+                    TrapOutcome::Resume(1)
+                }
+                kernel_arch_glue::SignalOutcome::Ok => TrapOutcome::Resume(1),
+                kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
             };
         }
         sys::IPC_REPLY => {
@@ -7290,7 +7794,26 @@ fn spawn_security_broker(hal: &hal_core::HalInterface) -> Option<kernel_cap::Thr
     let k = kernel_arch_glue::kstate();
 
     const SB_STACK_VMA: usize = 0xC041_0000;
-    const SB_STACK_LEN: usize = 4096 * 16;
+    /// **Real capacity bug found via QEMU** (real-IPC plan Phase 2): the
+    /// original `4096 * 16` (64 KiB, shared by every other subsystem
+    /// process spawned this way) was sized back when this process ran
+    /// Phase 1's own single, simple `serve_capability_requests` loop.
+    /// Phase 2's `serve_requests` fan-in now calls through 3 separate
+    /// handler paths (`serve_one_capability_request`/`_elevation_
+    /// request`/`_signature_request`), each with its own wire encode/
+    /// decode and (for `_signature_request`) a `StorePackage` built with
+    /// several `String`/`Vec` fields — real stack depth this process
+    /// never exercised before, compiled at `-O0` (larger per-frame stack
+    /// use than a release build). Confirmed via a real QEMU crash: `RIP`
+    /// landed INSIDE this process's own bump-allocator heap region (data,
+    /// never meant to be executed) — the unmistakable signature of a
+    /// stack overflow silently overwriting adjacent memory. Raised to
+    /// `4096 * 64` (256 KiB, 4x) for real headroom, matching this
+    /// project's own established precedent (`Simurgh-OS::kernel_core::
+    /// config::MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) —
+    /// left at the shared 64 KiB for every OTHER process spawned here,
+    /// none of which grew this way.
+    const SB_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -7369,7 +7892,11 @@ fn spawn_account_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::Thr
     let k = kernel_arch_glue::kstate();
 
     const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
-    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -7481,7 +8008,11 @@ fn spawn_store(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
     const STORE_STACK_VMA: usize = 0xC046_0000;
-    const STORE_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const STORE_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,
@@ -7518,7 +8049,13 @@ fn spawn_native_loader(hal: &hal_core::HalInterface) -> Option<kernel_cap::Threa
     let k = kernel_arch_glue::kstate();
 
     const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
-    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 16;
+    // Bumped alongside `SB_STACK_LEN`'s own identical fix (that
+    // constant's own doc comment has the full story — a real QEMU-traced
+    // crash bisected into this process's own bump-allocator code,
+    // consistent with a stack overflow corrupting nearby state) — this
+    // process's own real-IPC plan Phase 2 additions (`NOTIF_SIGNAL` +
+    // wire encode/decode) are new stack depth Phase 1 never exercised.
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 64;
     match kernel_arch_glue::spawn_process_from_elf(
         hal,
         k,

@@ -71,7 +71,26 @@ pub const MAX_CHAIN_GROUPS: usize = 24;
 pub const MAX_CAP_SPACES: usize = 48;
 
 /// Capability slots per capability space (the `N` of each `CapTable`).
-pub const CAP_SLOTS_PER_SPACE: usize = 96;
+///
+/// **Real capacity bug found via QEMU, not a guess** (real-IPC plan
+/// Phase 2): ROOT TASK's own capability space is the transient `Retype`
+/// target for every new kernel object this file's own boot-wiring code
+/// creates (`kernel_arch_glue::wire_service_endpoint`'s new `Endpoint`,
+/// `wire_notification`'s new `Notification`, every subsystem spawn's own
+/// TCB/`AddressSpace` — same reasoning `MAX_CAP_SPACES`'s own doc comment
+/// gives for that table, just the PER-SPACE slot count instead of the
+/// space COUNT). By the time `account-manager`'s own dedicated `Endpoint`
+/// was wired (the 7th layer-4 service's own edge), root's own table was
+/// already at 95/96 — one more real-world spawn (`diagnostics-manager`)
+/// pushed it to a hard 96/96, so `store`'s own `Endpoint` `Retype` failed
+/// outright ("out of resources") before `wire_client_to_security_broker_
+/// x86` ever reached `grant_cap_into` — confirmed via a temporary
+/// diagnostic log of root's own `CapTable::len()`, not assumed from the
+/// generic error message alone. Raised to 192 (double, matching `MAX_CAP_
+/// SPACES`'s own "real headroom, not just enough to clear the one failure
+/// observed" precedent) for room to keep adding layer-4/5 services this
+/// way without hitting the SAME ceiling again almost immediately.
+pub const CAP_SLOTS_PER_SPACE: usize = 192;
 
 /// Maximum address spaces (one per `PageTable` root object). Raised in
 /// lockstep with `MAX_CAP_SPACES` — every real process spawn allocates

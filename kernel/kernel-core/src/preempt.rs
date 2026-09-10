@@ -179,6 +179,26 @@ impl KernelState {
         Some(self.tcb(tid)?.user_context.as_bytes())
     }
 
+    /// Mutable raw byte pointer into `tid`'s own saved `user_context` —
+    /// unlike [`Self::user_ctx_switch_ptrs`] (which resolves BOTH sides of
+    /// an active switch at once), this resolves a SINGLE, arbitrary
+    /// thread's context in isolation, for a caller that needs to poke a
+    /// value into a thread that is merely SUSPENDED (not necessarily one
+    /// side of the switch currently in progress) — `kernel_arch_glue::
+    /// p2_signal`'s own delivery of `SyscallReturn::DeliveredValue`'s
+    /// `value` into the woken thread's saved return-value register is the
+    /// motivating case (that field's own doc comment). `None` if the TCB
+    /// is absent.
+    ///
+    /// # Safety (of the returned pointer, once used)
+    /// Caller must ensure `tid` is not concurrently being read/written by
+    /// anything else — true for any thread not currently `Running` (this
+    /// project is single-core; a suspended thread's own saved context is
+    /// otherwise untouched).
+    pub fn thread_context_mut_ptr(&mut self, tid: ThreadId) -> Option<*mut u8> {
+        Some(self.tcb_mut(tid)?.user_context.as_bytes_mut().as_mut_ptr())
+    }
+
     /// Turns a freshly-`Retype`d / `alloc`ed TCB into a runnable U-mode
     /// thread: seeds its `user_context` (entry, stack, address-space root)
     /// via the HAL, marks it `Runnable`, and admits it to the scheduler

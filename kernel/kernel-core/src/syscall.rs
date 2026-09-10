@@ -217,6 +217,46 @@ pub enum SyscallReturn {
         /// The thread made runnable by this rendezvous.
         woke: ThreadId,
     },
+    /// `Signal` woke exactly one thread that was blocked in `Wait` and is
+    /// handing it `value` (the notification's own freshly-drained
+    /// `signal_word`) to deliver into its resumption context.
+    ///
+    /// **Real bug found via QEMU** (real-IPC plan Phase 2): unlike
+    /// `Recv`'s own blocking case (woken via a DIRECT hand-off from
+    /// `do_send`'s own Call fast path, in the SAME synchronous operation
+    /// that delivers the message — see `IpcSwitch::poke`'s own doc
+    /// comment), `Wait`'s blocking case (`do_wait`) returns `Blocked`
+    /// SYNCHRONOUSLY, before any value is known, and the later `Signal`
+    /// that actually wakes it (`do_signal`, THIS call) happens as a
+    /// COMPLETELY SEPARATE syscall that never itself switches to the
+    /// woken thread. Without this variant, the woken thread's saved
+    /// return-value register kept whatever stale value it held from
+    /// BEFORE it originally blocked — confirmed via a real QEMU
+    /// checkpoint trace: security-broker's own `serve_requests` loop
+    /// correctly read fresh bits the FIRST two times (both from an
+    /// `Immediate`/non-blocking `Wait`), then crashed the THIRD time
+    /// (the first time it had actually blocked-then-been-woken), because
+    /// nothing had ever poked the real value in. The caller
+    /// (`kernel_arch_glue::p2_signal`) is expected to poke `value` into
+    /// `woke`'s saved context via the SAME `hal_<arch>::cpu::
+    /// poke_saved_a0_a1` primitive `IpcSwitch::poke` already uses — see
+    /// that field's own doc comment for why kernel-core cannot do this
+    /// poke itself (no `UserContext` layout knowledge here).
+    ///
+    /// Only ever produced when exactly one thread was woken (this
+    /// project's own design: `security-broker` is the sole `Wait`er on
+    /// its own shared `Notification`, real-IPC plan Phase 2 — `Notification::
+    /// signal`'s own `W`-wide waiter list exists for future multi-waiter
+    /// use, not exercised yet). Zero or multiple woken threads fall back
+    /// to plain `Done` — a known, documented limitation, not a silent
+    /// gap: a multi-waiter caller would need a richer variant than this.
+    DeliveredValue {
+        /// The thread woken and handed `value`.
+        woke: ThreadId,
+        /// The notification's own drained `signal_word` at the moment of
+        /// delivery.
+        value: u64,
+    },
     /// A `Recv` delivered a message from `from`.
     Message {
         /// The sender.
@@ -836,14 +876,29 @@ impl KernelState {
             CapabilityRights::WRITE,
         )?;
         let nid = NotificationId::new(cap.object.id.as_u32());
-        let woken = self
-            .notification_mut(nid)
-            .ok_or(SyscallError::BadCap)?
-            .signal(bits);
+        let notif = self.notification_mut(nid).ok_or(SyscallError::BadCap)?;
+        let woken = notif.signal(bits);
+        // Only drain when there is actually someone to deliver to — a
+        // REAL bug introduced while fixing `DeliveredValue`'s own
+        // motivating one: draining unconditionally here (even with an
+        // EMPTY `woken`, the common case when `Signal` races ahead of the
+        // first `Wait`) would silently discard `bits` before any future
+        // `Wait`'s own `poll()` fast path ever got a chance to see them —
+        // the signal would be lost, not just delayed, and the eventual
+        // `Wait` would block forever on a notification that already
+        // fired. `woken` is only non-empty when a thread was ALREADY
+        // blocked in `Wait` (`Notification::wait`'s own precondition:
+        // `kernel-core` only calls it when `poll` would return `0`), so
+        // gating the drain on that is exactly "drain only when someone is
+        // there to receive the value right now".
+        let value = if !woken.as_slice().is_empty() { notif.poll() } else { 0 };
         for &tid in woken.as_slice() {
             self.wake_blocked(tid, now_ns);
         }
-        Ok(SyscallReturn::Done)
+        match woken.as_slice() {
+            [tid] => Ok(SyscallReturn::DeliveredValue { woke: *tid, value }),
+            _ => Ok(SyscallReturn::Done),
+        }
     }
 
     /// `SyscallOp::Wait` — consumes and returns pending bits immediately
@@ -1541,25 +1596,71 @@ mod tests {
         let r = k.dispatch(caller, 0, SyscallOp::Wait { notification: notif_cap }, &hal);
         assert_eq!(r, Ok(SyscallReturn::Blocked));
 
-        // Signal wakes it: `wake_blocked` marks `caller` Ready again.
+        // Signal wakes it: `wake_blocked` marks `caller` Ready again, and
+        // (real-IPC plan Phase 2's own `DeliveredValue` — see that
+        // variant's own doc comment for the real bug this fixes) hands
+        // back the drained bits for the caller's own glue to poke into
+        // the woken thread's saved context, since `Wait`'s original
+        // `Blocked` return happened before any value was known and
+        // `Signal` itself never switches to the woken thread.
         let r = k.dispatch(
             caller,
             0,
             SyscallOp::Signal { notification: notif_cap, bits: 0b101 },
             &hal,
         );
-        assert_eq!(r, Ok(SyscallReturn::Done));
+        assert_eq!(r, Ok(SyscallReturn::DeliveredValue { woke: caller, value: 0b101 }));
         assert_eq!(
             k.sched.entity(caller).unwrap().state,
             kernel_sched::RunState::Ready
         );
 
-        // Now Poll/Wait see the (sticky) bits without blocking, and
-        // consume them.
-        let r = k.dispatch(caller, 0, SyscallOp::Poll { notification: notif_cap }, &hal);
-        assert_eq!(r, Ok(SyscallReturn::Value(0b101)));
+        // The delivered value is ALREADY drained (not left sticky for a
+        // later Poll to see again) — it was handed to `Signal`'s own
+        // caller specifically so it does not need to be re-fetched.
         let r = k.dispatch(caller, 0, SyscallOp::Poll { notification: notif_cap }, &hal);
         assert_eq!(r, Ok(SyscallReturn::Value(0)));
+    }
+
+    #[test]
+    fn signal_before_anyone_waits_leaves_the_bits_pending_for_a_later_wait() {
+        // Real bug found while fixing `signal_wakes_a_waiting_thread`'s
+        // own `DeliveredValue` case above: an earlier draft drained
+        // `signal_word` unconditionally inside `do_signal`, even with an
+        // EMPTY `woken` list (the common case — `Signal` racing ahead of
+        // the first `Wait`) — silently discarding the bits before any
+        // future `Wait`'s own immediate-return fast path could ever see
+        // them, so the eventual `Wait` blocked forever on a signal that
+        // had already fired. The drain must happen ONLY when there is a
+        // woken thread to deliver the value to right now.
+        let mut k = kernel_with_mmio_blk();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let notif_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Notification,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        // Nobody is waiting yet.
+        let r = k.dispatch(caller, 0, SyscallOp::Signal { notification: notif_cap, bits: 0b10 }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Done));
+
+        // A later Wait must still see the bits — not lost.
+        let r = k.dispatch(caller, 0, SyscallOp::Wait { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Value(0b10)));
     }
 
     #[test]
