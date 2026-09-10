@@ -965,6 +965,23 @@ mod sys {
     /// glue::p2_signal`'s own doc comment). The client-side half of
     /// `NOTIF_WAIT`'s own fan-in.
     pub const NOTIF_SIGNAL: usize = 110;
+    /// `a0` = how many of `simurgh-store`'s own self-check packages
+    /// passed BOTH the security-broker signature check and profile-
+    /// policy's own compatibility check; `a1` = how many were attempted.
+    /// Same "prove a real value, not just survival" reasoning `NL_REPORT`/
+    /// `SB_REPORT`'s own doc comments give — real-IPC plan's newest edge
+    /// (`store` <-> `profile-policy`) has no other on-hardware evidence
+    /// its own real IPC round trips actually SUCCEEDED, not just "did not
+    /// crash".
+    pub const ST_REPORT: usize = 111;
+    /// `a0` = the decoded request's `from` tid; `a1` = 1 iff `simurgh-
+    /// profile-policy`'s own real `Manager::is_compatible_with_active`
+    /// granted it, 0 otherwise. Server-side counterpart of `ST_REPORT`,
+    /// same reasoning — this edge's own server side had no on-hardware
+    /// evidence of its own that it was ever really entered/serving at
+    /// all, which mattered during this edge's own real-IPC-plan
+    /// root-cause hunt and stays valuable observability going forward.
+    pub const PP_REPORT: usize = 112;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3574,9 +3591,17 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             let _ = spawn_account_manager_x86(kernel_arch_glue::khal());
             kernel_arch_glue::set_backup_manager_tid(spawn_backup_manager_x86(kernel_arch_glue::khal()));
             kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager_x86(kernel_arch_glue::khal()));
-            let _ = spawn_store_x86(kernel_arch_glue::khal());
+            let store_tid_x86 = spawn_store_x86(kernel_arch_glue::khal());
             let _ = spawn_native_loader_x86(kernel_arch_glue::khal());
-            kernel_arch_glue::set_policy_engine_tid(spawn_policy_engine_x86(kernel_arch_glue::khal()));
+            let policy_engine_tid_x86 = spawn_policy_engine_x86(kernel_arch_glue::khal());
+            // real-IPC plan's newest edge: store <-> profile-policy,
+            // wired here (not inside either spawn function) since it
+            // needs BOTH tids, and policy-engine spawns AFTER store in
+            // this boot sequence — see `wire_store_to_policy_engine_x86`'s
+            // own doc comment.
+            if let (Some(store_tid), Some(pe_tid)) = (store_tid_x86, policy_engine_tid_x86) {
+                wire_store_to_policy_engine_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, pe_tid);
+            }
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3618,6 +3643,19 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::SB_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "security-broker (U-mode, x86_64): served a real service call from requester#{a0}, granted={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::ST_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "store (U-mode, x86_64): real install self-check - {a0}/{a1} packages passed both the security-broker signature check and profile-policy's own compatibility check\r\n"
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::PP_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "profile-policy (U-mode, x86_64): served a real compatibility-check call from tid#{a0}, granted={}\r\n",
                 a1 == 1
             ));
             return TrapOutcome::Resume(0);
@@ -4280,9 +4318,87 @@ fn wire_client_to_security_broker_x86(
     }
 }
 
+/// Wires the `simurgh-store` <-> `simurgh-profile-policy` real IPC edge
+/// (real-IPC plan's newest edge — `store`'s own install-time
+/// compatibility check). Unlike [`wire_client_to_security_broker_x86`],
+/// this takes BOTH tids as explicit parameters rather than resolving the
+/// server side through a `G_*_TID_X86`-style global: policy-engine has no
+/// such global (nothing else in this boot sequence needs its tid), and
+/// this is the ONLY call site that ever wires it, so a parameter is
+/// simpler than adding a new global purely for this one read. Single
+/// client, so — unlike security-broker's own 3-way fan-in — this needs no
+/// shared `Notification`, just one `Endpoint`+page pair from
+/// `kernel_arch_glue::wire_service_endpoint`. `policy_engine_va`/
+/// `store_va` must stay numerically equal to `simurgh-profile-policy::
+/// subsystem_entry::PP_SHARED_VA` (`0xD920_0000`, that repo's own first
+/// and only shared page) and `simurgh-store::manifest-installer::
+/// subsystem_entry::PP_SHARED_VA` (`0xD930_0000`, distinct from that same
+/// process's own `STORE_VA` = `0xD920_0000` used for its EXISTING
+/// security-broker edge — same address space, so these two must not
+/// collide) respectively.
+#[cfg(target_arch = "x86_64")]
+fn wire_store_to_policy_engine_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    store_tid: kernel_cap::ThreadId,
+    policy_engine_tid: kernel_cap::ThreadId,
+) {
+    const POLICY_ENGINE_VA: usize = 0xD920_0000;
+    const STORE_PP_VA: usize = 0xD930_0000;
+    let Some(pe_tcb) = k.tcb(policy_engine_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): store<->profile-policy wiring skipped (could not resolve policy-engine's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (pe_cs, pe_addr_space) = (pe_tcb.cap_space, pe_tcb.addr_space);
+    let Some(store_tcb) = k.tcb(store_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): store<->profile-policy wiring skipped (could not resolve store's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (store_cs, store_addr_space) = (store_tcb.cap_space, store_tcb.addr_space);
+    let Some(pe_root_pt) = k.addr_space_mut(pe_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): store<->profile-policy wiring skipped (could not resolve policy-engine's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(store_root_pt) = k.addr_space_mut(store_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): store<->profile-policy wiring skipped (could not resolve store's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        pe_cs,
+        pe_root_pt,
+        POLICY_ENGINE_VA,
+        store_cs,
+        store_root_pt,
+        STORE_PP_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired store <-> profile-policy real IPC edge\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): store<->profile-policy wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
 /// x86_64 counterpart of `spawn_policy_engine` (riscv64) — see that
 /// function's own doc comment for the full rationale. Same shape as
 /// `spawn_native_loader_x86`.
+#[cfg(target_arch = "x86_64")]
 fn spawn_policy_engine_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
 
@@ -5865,7 +5981,7 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager_aarch64(kernel_arch_glue::khal()));
             let _ = spawn_store_aarch64(kernel_arch_glue::khal());
             let _ = spawn_native_loader_aarch64(kernel_arch_glue::khal());
-            kernel_arch_glue::set_policy_engine_tid(spawn_policy_engine_aarch64(kernel_arch_glue::khal()));
+            let _ = spawn_policy_engine_aarch64(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -6591,7 +6707,7 @@ fn simurgh_syscall(
             kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager(kernel_arch_glue::khal()));
             let _ = spawn_store(kernel_arch_glue::khal());
             let _ = spawn_native_loader(kernel_arch_glue::khal());
-            kernel_arch_glue::set_policy_engine_tid(spawn_policy_engine(kernel_arch_glue::khal()));
+            let _ = spawn_policy_engine(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },

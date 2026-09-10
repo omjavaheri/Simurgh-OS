@@ -684,70 +684,54 @@ const P2_VA_B_CONST: usize = 0xC020_0000;
 /// that point — Netstack's own retry loop is the first such caller.
 static mut G_PROCESS_B_TID: Option<ThreadId> = None;
 
-/// `policy-engine`'s own thread id (`simurgh-profile-policy` repo),
-/// written once by [`set_policy_engine_tid`] right after `kernel/src/
-/// main.rs` spawns it. Read only by `p2_preempt_start`'s own retirement
-/// — same "`Ready`-but-never-resumed" bug class `G_PROCESS_B_TID`'s own
-/// doc comment above documents at length, for the identical underlying
-/// reason: unlike `native-loader`/`account-manager`/`store` (whose own
-/// client code immediately issues a real, genuinely-blocking `Signal`+
-/// `Call` against security-broker, so they end up `Blocked` "for real"
-/// within a few instructions of starting), policy-engine currently has
-/// no real IPC edge wired to or from it at all — it is spawned, marked
-/// `Ready` by `init_user_thread`, and then never touched by any
+/// `backup-manager` (`simurgh-backup-manager` repo) and `diagnostics-
+/// manager` (`simurgh-diagnostics` repo) hit the "`Ready`-but-never-
+/// resumed" bug class `G_PROCESS_B_TID`'s own doc comment above documents
+/// at length: unlike `native-loader`/`account-manager`/`store`/`policy-
+/// engine` (whose own client OR server code immediately issues, or
+/// blocks serving, real IPC — see the note below), these two currently
+/// have no real IPC edge wired to or from them at all — each is spawned,
+/// marked `Ready` by `init_user_thread`, and then never touched by any
 /// dedicated direct-dispatch helper (unlike `fs_ipc_call`/`mm_ipc_call`/
 /// `compositor_ipc_call`/`drv_ipc_call`, which all resume their own
 /// target by NAME, bypassing `pick_next` — `note_blocked`, not `remove`,
-/// is right for THOSE). **Real bug found via QEMU** (real-IPC plan
-/// Phase 2): `security-broker`'s own `serve_requests` fan-in
-/// (`p2_ipc_recv_general`) is exactly the kind of general, non-fast-path
-/// `pick_next` caller that can land on policy-engine's own stale,
-/// never-really-run snapshot — confirmed via a real QEMU crash (`#PF`,
-/// write, present page) immediately following a `DIAG p2_ipc_recv_
-/// general: ... switching into n=17` log line, policy-engine's own tid.
-/// Retired the same way as process B (`Exited` + `remove`, not `note_
-/// blocked`): nothing in this codebase today calls policy-engine by
-/// name the way `fs_ipc_call` et al. do, so leaving its TCB slot alive
-/// but hidden buys nothing — if/when a real IPC edge to policy-engine
-/// is wired up (mirroring native-loader/account-manager/store's own
-/// Phase 2 edges), this retirement should move to that edge's own
-/// client code instead, the same way those three don't need any special
-/// handling here at all once they have real blocking work of their own.
-static mut G_POLICY_ENGINE_TID: Option<ThreadId> = None;
-
-/// Records policy-engine's own tid right after `kernel/src/main.rs`
-/// spawns it, for `p2_preempt_start`'s own retirement — see `G_POLICY_
-/// ENGINE_TID`'s own doc comment for the full rationale. A no-op if
-/// called more than once (only the first call should ever happen, one
-/// per boot) or with `None` (spawn failed, nothing to retire).
-pub fn set_policy_engine_tid(tid: Option<ThreadId>) {
-    // SAFETY: single-core; called at most once per boot, before any
-    // syscall that could race it.
-    unsafe { core::ptr::addr_of_mut!(G_POLICY_ENGINE_TID).write(tid) };
-}
-
-/// `backup-manager` (`simurgh-backup-manager` repo) and `diagnostics-
-/// manager` (`simurgh-diagnostics` repo) hit the IDENTICAL "`Ready`-but-
-/// never-resumed" landmine as policy-engine, for the identical
-/// underlying reason — see `G_POLICY_ENGINE_TID`'s own doc comment.
-/// Neither has a real IPC edge wired to or from it yet either (still
-/// out of scope for real-IPC plan Phase 2, same as policy-engine), so
-/// the same unconditional retirement applies preemptively here rather
-/// than waiting for a separate QEMU run to prove each one dangerous by
-/// crashing on it individually.
+/// is right for THOSE). Retired the same way as process B (`Exited` +
+/// `remove`, not `note_blocked`): nothing in this codebase today calls
+/// either by name the way `fs_ipc_call` et al. do, so leaving their TCB
+/// slots alive but hidden buys nothing — if/when a real IPC edge to
+/// either is wired up (mirroring `native-loader`/`account-manager`/
+/// `store`'s own Phase 2 edges), this retirement should move to that
+/// edge's own client/server code instead, the same way those repos don't
+/// need any special handling here at all once they have real blocking
+/// work of their own.
+///
+/// `policy-engine` USED to be tracked here too (`G_POLICY_ENGINE_TID`,
+/// removed) — **real bug found via QEMU** (real-IPC plan Phase 2):
+/// `security-broker`'s own `serve_requests` fan-in (`p2_ipc_recv_
+/// general`) landed on policy-engine's own stale, never-really-run
+/// snapshot, confirmed via a real crash. Fixed at the time by retiring
+/// it exactly like `backup-manager`/`diagnostics-manager` below. Now
+/// that a real edge exists (`simurgh-store`'s own install-time
+/// compatibility check, real-IPC plan's newest edge — wired in `kernel/
+/// src/main.rs`'s own `wire_store_to_policy_engine_x86`), policy-engine
+/// runs a real, ongoing `serve_one_compat_check` loop of its own after
+/// `self_check`, the SAME lifecycle shape `security-broker` itself
+/// already has — and `security-broker` has never needed ANY retirement
+/// tracking here, since a real blocking `Recv` loop is not a landmine.
+/// Removing this retirement, not just leaving it as a harmless no-op,
+/// matters: `Exited`+`remove` on a thread that is ACTUALLY about to run
+/// its own real serve loop would kill it before it ever gets there.
 static mut G_BACKUP_MANAGER_TID: Option<ThreadId> = None;
 static mut G_DIAGNOSTICS_MANAGER_TID: Option<ThreadId> = None;
 
-/// See `G_BACKUP_MANAGER_TID`'s own doc comment (next to `set_policy_
-/// engine_tid`, which this mirrors exactly).
+/// See `G_BACKUP_MANAGER_TID`'s own doc comment.
 pub fn set_backup_manager_tid(tid: Option<ThreadId>) {
     // SAFETY: single-core; called at most once per boot, before any
     // syscall that could race it.
     unsafe { core::ptr::addr_of_mut!(G_BACKUP_MANAGER_TID).write(tid) };
 }
 
-/// See `G_BACKUP_MANAGER_TID`'s own doc comment (next to `set_policy_
-/// engine_tid`, which this mirrors exactly).
+/// See `G_BACKUP_MANAGER_TID`'s own doc comment.
 pub fn set_diagnostics_manager_tid(tid: Option<ThreadId>) {
     // SAFETY: single-core; called at most once per boot, before any
     // syscall that could race it.
@@ -1441,19 +1425,11 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
         }
         state.sched.remove(b_tid);
     }
-    // policy-engine hits the IDENTICAL bug class as process B just
-    // above, for the identical underlying reason (no real IPC edge
-    // calls it by name today) — see `G_POLICY_ENGINE_TID`'s own doc
-    // comment for the full rationale and the real QEMU crash that found
-    // this.
-    // SAFETY: single-core; `G_POLICY_ENGINE_TID` written once by
-    // `set_policy_engine_tid`, read-only here.
-    if let Some(pe_tid) = unsafe { core::ptr::addr_of!(G_POLICY_ENGINE_TID).read() } {
-        if let Some(t) = state.tcb_mut(pe_tid) {
-            t.state = ThreadState::Exited;
-        }
-        state.sched.remove(pe_tid);
-    }
+    // policy-engine is deliberately NOT retired here anymore — see
+    // `G_BACKUP_MANAGER_TID`'s own doc comment for why (it now runs a
+    // real, ongoing serve loop of its own, the same lifecycle shape
+    // `security-broker` already has, which never needed this either).
+    //
     // backup-manager / diagnostics-manager: same landmine, same fix —
     // see `G_BACKUP_MANAGER_TID`'s own doc comment.
     // SAFETY: single-core; written once each by `set_backup_manager_
