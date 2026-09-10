@@ -762,6 +762,48 @@ pub fn init_tid() -> Option<ThreadId> {
     unsafe { core::ptr::addr_of!(G_INIT_TID).read() }
 }
 
+/// `simurgh-shell`'s own tid, recorded once at spawn time — same purpose
+/// and reasoning as `G_INIT_TID` above, for the SAME `sys::
+/// SPAWN_KNOWN_ELF` caller check (extended, alongside this global, to
+/// accept either process — `simurgh-shell`'s own `spawn <name>` command
+/// is this syscall's second real caller).
+static mut G_SHELL_TID: Option<ThreadId> = None;
+
+/// See `G_SHELL_TID`'s own doc comment.
+pub fn set_shell_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_SHELL_TID).write(tid) };
+}
+
+/// See `G_SHELL_TID`'s own doc comment.
+pub fn shell_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `set_shell_tid`, before
+    // any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_SHELL_TID).read() }
+}
+
+/// `simurgh-native-sdk`'s own tid — same purpose and reasoning as
+/// `G_INIT_TID`/`G_SHELL_TID` above, for `sys::SPAWN_FROM_BUFFER`'s own
+/// caller check (`Simurgh-OS/kernel/kernel/src/main.rs`) — that syscall's
+/// security boundary, same as `SPAWN_KNOWN_ELF`'s, is a plain caller-tid
+/// check rather than a capability grant.
+static mut G_NATIVE_LOADER_TID: Option<ThreadId> = None;
+
+/// See `G_NATIVE_LOADER_TID`'s own doc comment.
+pub fn set_native_loader_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_NATIVE_LOADER_TID).write(tid) };
+}
+
+/// See `G_NATIVE_LOADER_TID`'s own doc comment.
+pub fn native_loader_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `set_native_loader_tid`,
+    // before any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_NATIVE_LOADER_TID).read() }
+}
+
 fn setup_two_process(
     hal: &HalInterface,
     state: &mut KernelState,
@@ -2649,6 +2691,45 @@ pub fn wire_notification(hal: &HalInterface, caller: ThreadId, targets: &[kernel
     }
 
     Some(notif_cap)
+}
+
+/// Maps `byte_len` (rounded up to a whole number of 4096-byte pages) of
+/// fresh physical memory into `client_cs`'s own address space at
+/// `client_va` — no `Endpoint`/`Notification` capability at all, unlike
+/// [`wire_service_endpoint`]/[`wire_notification`] above: this region is
+/// never shared with another PROCESS, only with the kernel's own
+/// dispatch code (`sys::SERIAL_PRINT`/`sys::SPAWN_FROM_BUFFER`,
+/// `Simurgh-OS/kernel/kernel/src/main.rs`), so there is no peer to wire
+/// it FOR. `simurgh-shell`'s own debug-print channel (one page) and
+/// `simurgh-native-sdk`'s own app-upload buffer (multiple pages) both use
+/// this — see either repo's own `subsystem_entry.rs` for the full design.
+///
+/// `POOL_PAGES` = 32 regardless of `byte_len`: the pool backs NEW page-
+/// table STRUCTURE pages `map_range` allocates while walking/extending
+/// the target `client_root_pt` (PDPT/PD/PT entries), not the mapped data
+/// itself — 32 already proven sufficient for `kernel_arch_glue::
+/// spawn_process_from_elf`'s own considerably more scattered real-world
+/// case (a whole process's multiple ELF segments plus its stack, `POOL_
+/// PAGES`'s own doc comment there for the real bug that sized it), so the
+/// SAME budget comfortably covers one contiguous region here too.
+pub fn wire_shared_pages(hal: &HalInterface, client_root_pt: usize, client_va: usize, byte_len: usize) -> Option<()> {
+    const POOL_PAGES: usize = 32;
+    let byte_len = (byte_len + 0xFFF) & !0xFFF;
+    let k = kstate();
+    let shared_phys = carve_from_any_untyped(k, 4096, byte_len as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, byte_len) };
+
+    let client_pool = carve_from_any_untyped(k, 4096, 4096 * POOL_PAGES as u64)?;
+    // SAFETY: same contract as `shared_phys` above; `map_range` needs
+    // the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(client_pool as *mut u8, 0, 4096 * POOL_PAGES) };
+    if hal.map_range(client_root_pt, client_va, shared_phys, byte_len, 1 | 2 | 8, client_pool, POOL_PAGES) == u32::MAX {
+        klog!("wire_shared_pages: map_range error\r\n");
+        return None;
+    }
+
+    Some(())
 }
 
 /// VA fs-native's own process maps the shared fs page at — an address no

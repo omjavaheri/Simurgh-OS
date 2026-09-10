@@ -226,6 +226,43 @@ static NATIVE_LOADER_ELF: &[u8] = include_bytes!(env!("NATIVE_LOADER_ELF_PATH"))
 /// repo), out-of-tree for the same local-dev-only path-stitch reason.
 static POLICY_ENGINE_ELF: &[u8] = include_bytes!(env!("POLICY_ENGINE_ELF_PATH"));
 
+/// `shell-bin`'s own separately-built ELF image — same packaging as
+/// `POLICY_ENGINE_ELF` (see its own doc comment): the NINTH layer-4
+/// process this project spawns (`simurgh-shell`, a separate git repo, no
+/// `MD/REPO-Simurgh-OS/` charter — Omid's own 2026-09-10 direction), out-
+/// of-tree for the same local-dev-only path-stitch reason. Unlike every
+/// other subsystem here, this one is reachable via `sys::SPAWN_KNOWN_ELF`
+/// (`elf_id` 16) as well as being spawned once at boot — see
+/// `spawn_known_elf_x86`'s own match arms.
+static SHELL_ELF: &[u8] = include_bytes!(env!("SHELL_ELF_PATH"));
+
+/// VA `simurgh-shell`'s own dedicated debug-print page is mapped at, in
+/// ITS OWN address space (`spawn_shell_x86`'s own `kernel_arch_glue::
+/// wire_debug_print_page` call) — must stay numerically equal to
+/// `simurgh-shell::shell-core::subsystem_entry::SHELL_OUT_VA`, and to
+/// `sys::SERIAL_PRINT`'s own dispatch (below), which reads this SAME
+/// constant directly (that opcode's own doc comment explains why no
+/// addr_space/root_pt lookup is needed there).
+#[cfg(target_arch = "x86_64")]
+const SHELL_OUT_VA: usize = 0xD900_0000;
+
+/// VA `simurgh-native-sdk`'s own real app-upload buffer is mapped at, in
+/// ITS OWN address space (`spawn_native_loader_x86`'s own `kernel_arch_
+/// glue::wire_shared_pages` call) — must stay numerically equal to
+/// `simurgh-native-sdk::native-loader::subsystem_entry::APP_BUFFER_VA`,
+/// and to `sys::SPAWN_FROM_BUFFER`'s own dispatch (below), which reads
+/// this SAME constant directly (same "no addr_space/root_pt lookup
+/// needed" reasoning `sys::SERIAL_PRINT`'s own doc comment gives).
+#[cfg(target_arch = "x86_64")]
+const APP_BUFFER_VA: usize = 0xD880_0000;
+
+/// Byte length of the app-upload buffer [`APP_BUFFER_VA`] maps — must
+/// stay numerically equal to `simurgh-native-sdk::native-loader::
+/// subsystem_entry::APP_BUFFER_LEN` (that constant's own doc comment for
+/// the size rationale).
+#[cfg(target_arch = "x86_64")]
+const APP_BUFFER_LEN: usize = 4 * 1024 * 1024;
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -250,6 +287,27 @@ mod backend {
             out_byte(COM1_PORT + 3, 0x03);
             out_byte(COM1_PORT + 2, 0xC7);
             out_byte(COM1_PORT + 4, 0x0B);
+        }
+    }
+
+    /// Non-blocking real UART receive — `simurgh-shell`'s own `sys::
+    /// SERIAL_TRY_READ`. Standard 16550 polled-receive sequence: LSR bit
+    /// 0 (Data Ready) set means a real byte is already sitting in RBR
+    /// (offset 0, the SAME I/O port `write_byte` uses for THR — the
+    /// 16550 multiplexes transmit/receive onto one port, direction
+    /// implied by read-vs-write). Never blocks — `None` if nothing is
+    /// waiting, so the caller (`sys::SERIAL_TRY_READ`'s own dispatch)
+    /// stays a plain, non-blocking syscall the real preemptive scheduler
+    /// can freely interleave around, the same reasoning `simurgh-shell`'s
+    /// own `run_forever` polling loop relies on.
+    pub fn try_read_byte() -> Option<u8> {
+        // SAFETY: same COM1 I/O ports `write_byte`/`init` already use;
+        // reading LSR/RBR has no precondition beyond the port existing.
+        unsafe {
+            if in_byte(COM1_PORT + 5) & 0x01 == 0 {
+                return None;
+            }
+            Some(in_byte(COM1_PORT))
         }
     }
 
@@ -1051,6 +1109,71 @@ mod sys {
     /// instance of any of those is explicit future work, not yet safe to
     /// allow blindly.
     pub const SPAWN_KNOWN_ELF: usize = 116;
+    /// No arguments. Returns the next waiting real UART byte in `a0`, or
+    /// `usize::MAX` if nothing is waiting — never blocks (`backend::
+    /// try_read_byte`'s own doc comment). `simurgh-shell`'s own real
+    /// input path (Omid's own 2026-09-10 direction, alongside `SPAWN_
+    /// KNOWN_ELF`'s own extension to accept this repo as a second real
+    /// caller): the first syscall in this project that lets a U-mode
+    /// process read real, host-typed keystrokes rather than only ever
+    /// producing output.
+    pub const SERIAL_TRY_READ: usize = 117;
+    /// `a0` = byte count (capped at 4096, one page). Writes those bytes,
+    /// read from the CALLING process's own dedicated shared page (mapped
+    /// at boot by `kernel_arch_glue::wire_debug_print_page`, one page per
+    /// caller — currently only `simurgh-shell`, at `spawn_shell_x86`'s
+    /// own fixed VA), to the real serial console via `kernel_arch_glue::
+    /// log`, lossily as UTF-8. Deliberately NOT `sys::DEBUG_LOG`'s own
+    /// shape (`a0` as a raw, directly-dereferenced pointer): that opcode
+    /// predates real per-process page tables and is only safe for the
+    /// single-address-space MVP demo phase that still uses it — a
+    /// genuinely isolated Sv39/4-level-paged process's own `a0` would not
+    /// name the right physical bytes there. Reading from a caller's own
+    /// FIXED, already-mapped shared page instead is the SAME safe
+    /// pattern every real-IPC edge in this project already uses to move
+    /// bytes across an address-space boundary.
+    pub const SERIAL_PRINT: usize = 118;
+    /// `a0` = the `UserId` a real scheduled backup was just attempted
+    /// for; `a1` = 1 iff `simurgh-backup-manager`'s own real `Manager::
+    /// run_due_backups` trigger succeeded, 0 otherwise. Same "prove a
+    /// real value, not just survival" reasoning `ST_REPORT`/`PP_REPORT`/
+    /// `AM_REPORT`/`STR_REPORT`/`DG_REPORT`'s own doc comments give —
+    /// this process has no server peer to report FROM (its own automatic
+    /// trigger runs on a real periodic timer, not in response to a real
+    /// IPC caller), so this is its own client-side proof instead.
+    pub const BM_REPORT: usize = 119;
+    /// `a0` = byte count (capped at [`APP_BUFFER_LEN`], one page-aligned
+    /// buffer). Reads that many bytes from the CALLING process's own
+    /// dedicated app-upload buffer (mapped at boot by `kernel_arch_glue::
+    /// wire_shared_pages`, currently only `simurgh-native-sdk`'s own
+    /// `native-loader`, at `spawn_native_loader_x86`'s own fixed VA,
+    /// [`APP_BUFFER_VA`]) and spawns a REAL process from them via the
+    /// SAME `kernel_arch_glue::spawn_process_from_elf` helper every
+    /// boot-time spawn and `sys::SPAWN_KNOWN_ELF` already use — the ONE
+    /// real difference is the ELF bytes come from a caller-supplied
+    /// buffer, not a kernel-embedded array, so this is NOT restricted to
+    /// a fixed allow-list of known targets the way `SPAWN_KNOWN_ELF` is.
+    /// Returns the newly spawned process's own raw `ThreadId` on success,
+    /// `usize::MAX` on denial/failure (caller is not `simurgh-native-sdk`,
+    /// a malformed ELF, or the kernel itself out of resources).
+    ///
+    /// Omid's own 2026-09-10 approval to build this: `simurgh-native-
+    /// sdk::native-loader::Loader::spawn`'s own real completion of
+    /// "creating the process" (05-Legacy-Compat-Applications-Layer.md
+    /// §2) — that repo's own `ProcessSpawner` trait doc comment has the
+    /// full design, including what this does NOT yet connect to (the
+    /// capabilities `Loader::load`'s own separate, already-real IPC round
+    /// trip to `simurgh-security-broker` grants are not transferred into
+    /// the newly spawned process's own capability space — same open gap
+    /// `simurgh-store::AppInstallRecord::granted_capabilities`'s own
+    /// always-empty field is flagged for).
+    pub const SPAWN_FROM_BUFFER: usize = 120;
+    /// `a0` = 1 iff `simurgh-native-sdk`'s own real `Loader::spawn` call
+    /// (via `sys::SPAWN_FROM_BUFFER`) succeeded, 0 otherwise; `a1` = the
+    /// newly spawned process's own raw tid when it did. Same "prove a
+    /// real value, not just survival" reasoning `NL_REPORT`'s own doc
+    /// comment gives, for this separate real round trip.
+    pub const NL_SPAWN_REPORT: usize = 121;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3662,7 +3785,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             kernel_arch_glue::set_backup_manager_tid(backup_manager_tid_x86);
             kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager_x86(kernel_arch_glue::khal()));
             let store_tid_x86 = spawn_store_x86(kernel_arch_glue::khal());
-            let _ = spawn_native_loader_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_native_loader_tid(spawn_native_loader_x86(kernel_arch_glue::khal()));
             let policy_engine_tid_x86 = spawn_policy_engine_x86(kernel_arch_glue::khal());
             // real-IPC plan's newest edge: store <-> profile-policy,
             // wired here (not inside either spawn function) since it
@@ -3685,6 +3808,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             if let (Some(store_tid), Some(bm_tid)) = (store_tid_x86, backup_manager_tid_x86) {
                 wire_backup_manager_to_store_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, bm_tid);
             }
+            kernel_arch_glue::set_shell_tid(spawn_shell_x86(kernel_arch_glue::khal()));
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -3765,9 +3889,9 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::SPAWN_KNOWN_ELF => {
             let k = kernel_arch_glue::kstate();
             let caller = k.sched.running().unwrap_or(k.root_thread);
-            if Some(caller) != kernel_arch_glue::init_tid() {
+            if Some(caller) != kernel_arch_glue::init_tid() && Some(caller) != kernel_arch_glue::shell_tid() {
                 kernel_arch_glue::log(format_args!(
-                    "root task (x86_64): SPAWN_KNOWN_ELF denied - caller tid#{} is not simurgh-init\r\n",
+                    "root task (x86_64): SPAWN_KNOWN_ELF denied - caller tid#{} is neither simurgh-init nor simurgh-shell\r\n",
                     caller.as_u32()
                 ));
                 return TrapOutcome::Resume(usize::MAX);
@@ -3775,7 +3899,8 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             match spawn_known_elf_x86(kernel_arch_glue::khal(), a0 as u32) {
                 Some(tid) => {
                     kernel_arch_glue::log(format_args!(
-                        "root task (x86_64): simurgh-init spawned elf_id={a0} as tid {} via SPAWN_KNOWN_ELF\r\n",
+                        "root task (x86_64): tid#{} spawned elf_id={a0} as tid {} via SPAWN_KNOWN_ELF\r\n",
+                        caller.as_u32(),
                         tid.as_u32()
                     ));
                     return TrapOutcome::Resume(tid.as_u32() as usize);
@@ -3787,6 +3912,86 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                     return TrapOutcome::Resume(usize::MAX);
                 }
             }
+        }
+        sys::SERIAL_TRY_READ => {
+            return match backend::try_read_byte() {
+                Some(b) => TrapOutcome::Resume(b as usize),
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SERIAL_PRINT => {
+            let len = a0.min(4096);
+            // SAFETY: `int 0x80` never changes `cr3` (only privilege
+            // level) — this dispatch code runs under whatever page
+            // table the CALLING process already had active, the same
+            // reason every other real-IPC edge's own dispatch code in
+            // this file safely touches a caller-mapped shared VA
+            // directly with no addr_space/root_pt lookup of its own.
+            // `SHELL_OUT_VA` is `simurgh-shell`'s own dedicated shared
+            // page, mapped at process entry onward
+            // (`kernel_arch_glue::wire_debug_print_page`, called from
+            // `spawn_shell_x86`).
+            let bytes = unsafe { core::slice::from_raw_parts(SHELL_OUT_VA as *const u8, len) };
+            let text = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+            kernel_arch_glue::log(format_args!("{text}"));
+            return TrapOutcome::Resume(0);
+        }
+        sys::BM_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "backup-manager (U-mode, x86_64): real scheduled-backup trigger fired for uid#{a0}, ok={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::SPAWN_FROM_BUFFER => {
+            let k = kernel_arch_glue::kstate();
+            let caller = k.sched.running().unwrap_or(k.root_thread);
+            if Some(caller) != kernel_arch_glue::native_loader_tid() {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): SPAWN_FROM_BUFFER denied - caller tid#{} is not simurgh-native-sdk\r\n",
+                    caller.as_u32()
+                ));
+                return TrapOutcome::Resume(usize::MAX);
+            }
+            let len = a0.min(APP_BUFFER_LEN);
+            const APP_STACK_VMA: usize = 0xC060_0000;
+            const APP_STACK_LEN: usize = 4096 * 16;
+            // SAFETY: `int 0x80` never changes `cr3` — this dispatch code
+            // runs under native-loader's own already-active page table,
+            // where `APP_BUFFER_VA` is mapped `U=1 R+W` from process
+            // entry onward (`spawn_native_loader_x86`'s own `kernel_
+            // arch_glue::wire_shared_pages` call) — same reasoning
+            // `sys::SERIAL_PRINT`'s own doc comment gives.
+            let elf_bytes = unsafe { core::slice::from_raw_parts(APP_BUFFER_VA as *const u8, len) };
+            match kernel_arch_glue::spawn_process_from_elf(
+                kernel_arch_glue::khal(),
+                k,
+                elf_bytes,
+                elf_loader::machine::EM_X86_64,
+                APP_STACK_VMA,
+                APP_STACK_LEN,
+            ) {
+                Some((tid, _cap_space, _stack_phys)) => {
+                    kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): simurgh-native-sdk spawned a real process from a caller-supplied buffer (tid {}) via SPAWN_FROM_BUFFER\r\n",
+                        tid.as_u32()
+                    ));
+                    return TrapOutcome::Resume(tid.as_u32() as usize);
+                }
+                None => {
+                    kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): SPAWN_FROM_BUFFER failed (malformed ELF or out of resources)\r\n"
+                    ));
+                    return TrapOutcome::Resume(usize::MAX);
+                }
+            }
+        }
+        sys::NL_SPAWN_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "native-loader (U-mode, x86_64): real Loader::spawn round trip - ok={}, tid={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
         }
         sys::DM_WAIT_CRASH => {
             return match kernel_arch_glue::p2_dm_wait_crash() {
@@ -4223,6 +4428,19 @@ fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::T
             ));
             wire_native_loader_to_security_broker_x86(hal, k, tid, cap_space);
             wire_security_broker_notification_fanin_x86(hal, k, cap_space);
+            // `sys::SPAWN_FROM_BUFFER`'s own real app-upload buffer
+            // (`APP_BUFFER_VA`'s own doc comment) — real-IPC plan style
+            // wiring, but no capability at all (`kernel_arch_glue::
+            // wire_shared_pages`'s own doc comment for why).
+            if let Some(addr_space) = k.tcb(tid).map(|t| t.addr_space) {
+                if let Some(root_pt) = k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()) {
+                    if kernel_arch_glue::wire_shared_pages(hal, root_pt, APP_BUFFER_VA, APP_BUFFER_LEN).is_none() {
+                        kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): native-loader app-buffer wiring failed (out of resources) - SPAWN_FROM_BUFFER calls will fault\r\n"
+                        ));
+                    }
+                }
+            }
             Some(tid)
         }
         None => {
@@ -4680,6 +4898,23 @@ fn wire_backup_manager_to_store_x86(
 /// own numeric layout exactly. A single fixed stack VMA/length is reused
 /// across every target: each spawn gets a brand-new, empty address space,
 /// so nothing else in that space could ever collide with it.
+///
+/// `elf_id` 16 (`simurgh-shell`) is deliberately NOT in this match, even
+/// though `SHELL_ELF` is embedded and `simurgh-shell` may itself now call
+/// this syscall (`sys::SPAWN_KNOWN_ELF`'s own doc comment): an on-demand
+/// second `shell-bin` instance spawned this way would have a completely
+/// empty capability space, same as every other on-demand spawn — but
+/// UNLIKE every other target here, `shell-bin`'s own `run_forever` calls
+/// `sys::SERIAL_PRINT` unconditionally right after `self_check` returns,
+/// which reads `SHELL_OUT_VA` as a FIXED, directly-dereferenced address
+/// with no capability check at all (that opcode's own doc comment) —
+/// only `spawn_shell_x86`'s own ONE boot-time call to `kernel_arch_glue::
+/// wire_debug_print_page` ever maps that page. A second, on-demand
+/// instance would hit an unmapped page on its very first print and fault.
+/// Denying `elf_id` 16 here (falling through to `_ => return None`, the
+/// same clean failure every other denied id already gets) avoids that
+/// real crash risk; `simurgh-shell`'s own `KNOWN_TARGETS` does not offer
+/// `"shell"` as a `spawn` target for the identical reason.
 #[cfg(target_arch = "x86_64")]
 fn spawn_known_elf_x86(hal: &hal_core::HalInterface, elf_id: u32) -> Option<kernel_cap::ThreadId> {
     const SPAWN_STACK_VMA: usize = 0xC042_0000;
@@ -4706,6 +4941,53 @@ fn spawn_known_elf_x86(hal: &hal_core::HalInterface, elf_id: u32) -> Option<kern
     )?;
     kernel_arch_glue::log(format_args!(
         "root task (x86_64): SPAWN_KNOWN_ELF spawned a real, on-demand `{label}` process (tid {})\r\n",
+        tid.as_u32()
+    ));
+    Some(tid)
+}
+
+/// Spawns `shell-bin` (`simurgh-shell`, a separate git repo, no `MD/
+/// REPO-Simurgh-OS/` charter — Omid's own 2026-09-10 direction) and, on
+/// success, wires its own dedicated debug-print page
+/// (`kernel_arch_glue::wire_debug_print_page`, [`SHELL_OUT_VA`]'s own
+/// doc comment) — unlike every other spawn function in this file, this
+/// one HAS to wire something right after spawning, since `shell-bin`'s
+/// own `run_forever` calls `sys::SERIAL_PRINT` unconditionally the
+/// moment `self_check` returns (no live peer/round-trip to wait for the
+/// way every real-IPC edge's own two-sided wiring does).
+#[cfg(target_arch = "x86_64")]
+fn spawn_shell_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    const SHELL_STACK_VMA: usize = 0xC058_0000;
+    const SHELL_STACK_LEN: usize = 4096 * 16;
+    let k = kernel_arch_glue::kstate();
+    let (tid, _cap_space, _stack_phys) = kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        SHELL_ELF,
+        elf_loader::machine::EM_X86_64,
+        SHELL_STACK_VMA,
+        SHELL_STACK_LEN,
+    )?;
+    let Some(addr_space) = k.tcb(tid).map(|t| t.addr_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): shell debug-print page wiring skipped (could not resolve shell's own TCB)\r\n"
+        ));
+        return None;
+    };
+    let Some(root_pt) = k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): shell debug-print page wiring skipped (could not resolve shell's own address space)\r\n"
+        ));
+        return None;
+    };
+    if kernel_arch_glue::wire_shared_pages(hal, root_pt, SHELL_OUT_VA, 4096).is_none() {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): shell debug-print page wiring failed (out of resources) - shell's own SERIAL_PRINT calls will fault\r\n"
+        ));
+        return None;
+    }
+    kernel_arch_glue::log(format_args!(
+        "root task (x86_64): spawned shell (tid {}) from its OWN separately-built ELF image (simurgh-shell repo)\r\n",
         tid.as_u32()
     ));
     Some(tid)

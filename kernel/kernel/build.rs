@@ -527,4 +527,38 @@ fn main() {
         "cargo:rustc-env=POLICY_ENGINE_ELF_PATH={}",
         pp_path.canonicalize().unwrap().display()
     );
+
+    // Same as `policy-engine-bin` above, for `shell-bin` — the NINTH
+    // layer-4 process this project spawns as a real Simurgh-OS subsystem
+    // (`simurgh-shell`, a separate git repo, no `MD/REPO-Simurgh-OS/`
+    // charter — Omid's own 2026-09-10 direction). Same local-dev-only
+    // sibling-directory path stitch, and the ordinary `debug` profile
+    // (not `release`): unlike `policy-engine-bin`, this crate has no
+    // large third-party dependency like `rhai` pushing its debug build
+    // past OVMF's own size ceiling.
+    let shell_build_alias =
+        format!("(in simurgh-shell) cargo +nightly-2025-01-15 build -p shell-core --bin shell-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let shell_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("simurgh-shell")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("shell-bin");
+
+    if !shell_path.exists() {
+        panic!(
+            "kernel build.rs: shell-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {shell_build_alias}",
+            shell_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", shell_path.display());
+    println!(
+        "cargo:rustc-env=SHELL_ELF_PATH={}",
+        shell_path.canonicalize().unwrap().display()
+    );
 }
