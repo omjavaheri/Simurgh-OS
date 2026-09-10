@@ -240,6 +240,7 @@ unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
 /// Reads the `SmallMessage` (label + up to 6 data words, zero-padded)
 /// the caller wrote into the shared fs page — same fixed 56-byte layout
 /// `kernel_arch_glue::write_shared_fs_message` uses on the other side.
+#[inline(never)]
 fn read_shared_message() -> SmallMessage {
     let base = FS_SHARED_VA as *const u64;
     // SAFETY: `FS_SHARED_VA` is mapped `U=1 R+W` in this process's own
@@ -258,6 +259,7 @@ fn read_shared_message() -> SmallMessage {
 /// Writes `msg` into the shared fs page for the caller to read back
 /// after `IPC_REPLY` wakes it — same fixed layout as `read_shared_
 /// message`.
+#[inline(never)]
 fn write_shared_message(msg: &SmallMessage) {
     let base = FS_SHARED_VA as *mut u64;
     // SAFETY: same contract as `read_shared_message`.
@@ -328,6 +330,7 @@ fn error_code(e: crate::FsError) -> FsErrorCode {
 /// (looking up an arbitrary CLIENT-side slot number against fs-native's
 /// OWN cap space) is a VFS-Router-level concern, not yet built — a later
 /// `feat:` follow-up, not a correctness gap in what IS wired here.
+#[inline(never)]
 fn handle_request(fs: &mut MemFs, registry: &mut PathRegistry, req: FsRequest) -> FsResponse {
     match req {
         FsRequest::Open { path, flags } => match registry.resolve(path) {

@@ -2498,6 +2498,94 @@ static mut G_FS_DATA_PHYS: usize = usize::MAX;
 /// Single-core; written once by `fs_demo_start`, read only afterward.
 static mut G_FS_TID: Option<ThreadId> = None;
 
+/// `G_FS_TID`, exposed to `kernel/kernel/src/main.rs` — needed by the
+/// `sys::SBS_IPC_RECV` dispatch arm to recognize fs-native as the CALLER
+/// of that syscall (`fs_native_recv`'s own doc comment for why this
+/// matters).
+pub fn fs_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `fs_demo_start`, before
+    // any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_FS_TID).read() }
+}
+
+/// Set `true` by `fs_demo_start`, right after it hands control to
+/// fs-native for the very first time; cleared by `wire_file_manager_to_
+/// fs_native`, right when file-manager becomes fs-native's SECOND real
+/// client.
+///
+/// **Real bug found via QEMU** (found while verifying `simurgh-file-
+/// manager`'s new real IPC edge to fs-native, 2026-09-10-11), in two
+/// layers:
+///
+/// 1. fs-native's FIRST EVER `Recv` call — reached the moment `fs_demo_
+///    start` switches control to it, BEFORE Root Task has sent it
+///    anything at all — always finds nothing queued and must block.
+/// 2. Confirmed via a temporary diagnostic covering every `p2_ipc_recv_
+///    general` outcome: fs-native's SECOND (and every later) `Recv` call,
+///    made right after its own `IPC_REPLY` to Root Task's PRECEDING call,
+///    ALSO finds nothing queued and blocks — `IPC_REPLY` marks Root Task
+///    `Ready` again but does NOT itself switch execution away from
+///    fs-native (fs-native's own `raw_syscall(IPC_REPLY, ...)` call
+///    simply returns and its loop continues straight into its NEXT
+///    `Recv`, before Root Task has been scheduled to issue its own next
+///    FS_* call) — so this is NOT a one-shot "only the very first call"
+///    problem, it recurs on EVERY fs-native `Recv` for the WHOLE
+///    sequential, Root-Task-only phase of the fs demo (FS_OPEN, FS_STAT,
+///    FS_WRITE, FS_READ, and the 100+100-iteration throughput benchmark —
+///    202 round trips total).
+///
+/// Both layers are the SAME underlying issue: `p2_ipc_recv_general`'s own
+/// `Reschedule { next: Some(n) }` arm trusts `pick_next`'s general
+/// fairness answer for `n` — correct in general, but AT THIS EXACT POINT
+/// IN BOOT (before `P2_PREEMPT_START` has ever run), `pick_next` can
+/// prefer a stale, long-`Ready`-but-permanently-idle thread left over
+/// from an EARLIER one-shot boot demo (confirmed via a real QEMU boot:
+/// the §8.4 two-process zero-copy demo's own "process B" is exactly this
+/// kind of thread — `p2_ipc_recv`'s own doc comment already documents
+/// this SAME class of thread breaking a different, narrower case) over
+/// Root Task. With no preemptive timer armed yet to ever reschedule
+/// anything, whichever stale thread gets switched to simply keeps running
+/// forever, Root Task never resumes to issue its own next FS_* call, and
+/// the entire sequential fs demo hangs (confirmed via real QEMU CPU-time
+/// accounting: the process kept consuming real CPU cycles — some OTHER
+/// thread genuinely running — while the boot's own serial output stayed
+/// completely silent for 45+ minutes).
+///
+/// Fixed by keeping this flag `true` for fs-native's ENTIRE Root-Task-
+/// only bootstrap phase, not just its first call — `p2_ipc_recv`'s own
+/// narrow, hardcoded-root dispatch is exactly correct for every one of
+/// these 202 round trips (Root Task genuinely is the only party fs-native
+/// ever talks to here, the SAME assumption this exact function already
+/// safely made for the whole fs demo before `SBS_IPC_RECV` existed at
+/// all) — and only cleared once `simurgh-file-manager` is spawned and
+/// wired as a genuine second client, well after `P2_PREEMPT_START` has
+/// armed the preemptive timer, at which point `p2_ipc_recv_general`'s
+/// `pick_next` trust is safe again (self-correcting via round-robin even
+/// on a suboptimal pick — `wire_file_manager_to_fs_native`'s own doc
+/// comment).
+///
+/// # Safety
+/// Single-core; set once by `fs_demo_start`, cleared once by
+/// `wire_file_manager_to_fs_native`, read every time by `fs_native_recv`.
+static mut G_FS_ROOT_ONLY_PHASE: bool = false;
+
+/// The correctly-scoped `Recv` dispatch for fs-native's OWN `SBS_IPC_RECV`
+/// calls specifically — see [`G_FS_ROOT_ONLY_PHASE`]'s own doc comment
+/// for the full story. `kernel/kernel/src/main.rs`'s own `sys::
+/// SBS_IPC_RECV` arm calls this (not `p2_ipc_recv_general` directly)
+/// whenever the calling thread is fs-native itself ([`fs_tid`]); every
+/// other `SBS_IPC_RECV` caller (`security-broker`, `policy-engine`, ...)
+/// keeps calling `p2_ipc_recv_general` directly, unaffected.
+pub fn fs_native_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
+    // SAFETY: single-core; only ever written by `fs_demo_start`/`wire_
+    // file_manager_to_fs_native`, never concurrently with this read.
+    let root_only_phase = unsafe { core::ptr::addr_of!(G_FS_ROOT_ONLY_PHASE).read() };
+    if root_only_phase {
+        return p2_ipc_recv(hal, caller, endpoint_raw);
+    }
+    p2_ipc_recv_general(hal, caller, endpoint_raw)
+}
+
 /// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
 /// shared fs page. Always writes all 6 word slots (unused ones as 0)
 /// rather than tracking a separate length — `decode_fs_request`/
@@ -2950,15 +3038,28 @@ pub fn fs_demo_start(
     // "switch to root" doc comment already explains from the other
     // side. Fixed by switching to fs-native HERE, unconditionally: it
     // runs its own boot sequence (seed `/greeting`) and reaches its own
-    // first `IPC_RECV`, which (per `p2_ipc_recv`'s own existing,
-    // unmodified logic) finds nothing queued yet and switches straight
-    // back to `k.root_thread` — by the time `caller` resumes from THIS
-    // switch and issues `FS_OPEN`, fs-native is genuinely blocked in
-    // `Recv`, so the real fast path (already proven across all three
-    // architectures) takes over correctly from there on.
+    // first `IPC_RECV`, which finds nothing queued yet and must block.
+    // `G_FS_ROOT_ONLY_PHASE` (set just below) is what makes that — and
+    // EVERY subsequent `Recv` call for the rest of Root Task's own
+    // sequential fs demo — switch straight back to `k.root_thread`
+    // deterministically — see that flag's own doc comment for the real
+    // QEMU-confirmed hang this replaced (fs-native's `Recv` opcode is
+    // `SBS_IPC_RECV`/`p2_ipc_recv_general` as of 2026-09-10, not the
+    // narrow `p2_ipc_recv` an earlier version of this comment described —
+    // general `pick_next` fairness is not safe for ANY of these calls,
+    // before `P2_PREEMPT_START` has ever armed the preemptive timer). By
+    // the time `caller` resumes from THIS switch and issues `FS_OPEN`,
+    // fs-native is genuinely blocked in `Recv`, so the real fast path
+    // (already proven across all three architectures) takes over
+    // correctly from there on.
     let _ = k.sched.note_ready(caller, hal.now_ns());
     let _ = k.sched.dispatch(fs_tid, hal.now_ns());
     let (save, into) = k.user_ctx_switch_ptrs(caller, fs_tid)?;
+    // SAFETY: single-core; the only writer, always before fs-native's own
+    // first `SBS_IPC_RECV` trap (fs-native is not switched to for the
+    // first time until the `Some(...)` this function returns is actually
+    // acted on by the caller).
+    unsafe { core::ptr::addr_of_mut!(G_FS_ROOT_ONLY_PHASE).write(true) };
 
     Some((ep_cap.as_u32(), save, into))
 }

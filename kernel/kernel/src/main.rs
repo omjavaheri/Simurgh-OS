@@ -3098,7 +3098,21 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 .sched
                 .running()
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
-            return match kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32) {
+            // fs-native is a REAL, general multi-client `SBS_IPC_RECV`
+            // caller (`simurgh-file-manager`'s own edge, this session),
+            // but its very FIRST `Recv` call needs the narrow, hardcoded-
+            // root dispatch instead — see `kernel_arch_glue::
+            // G_FS_AWAITING_FIRST_RECV`'s own doc comment for the real
+            // QEMU-confirmed hang `fs_native_recv` fixes. Every other
+            // `SBS_IPC_RECV` caller (`security-broker`, `policy-engine`,
+            // ...) is unaffected — this check is `false` for them (`fs_tid`
+            // never equals their own tid).
+            let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
+                kernel_arch_glue::fs_native_recv(hal, caller, a0 as u32)
+            } else {
+                kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32)
+            };
+            return match ipc_recv_outcome {
                 Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
                     TrapOutcome::Resume2(from, label)
                 }
@@ -4035,7 +4049,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         }
         sys::FM_REPORT => {
             kernel_arch_glue::log(format_args!(
-                "file-manager (U-mode, x86_64): real fs-native self_check round trip - ok={}\r\n",
+                "file-manager (U-mode, x86_64): real fs-native self_check round trip - ok={} step={a1}\r\n",
                 a0 == 1
             ));
             return TrapOutcome::Resume(0);
@@ -5991,7 +6005,16 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 .sched
                 .running()
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
-            return match kernel_arch_glue::p2_ipc_recv_general(hal, caller, x0 as u32) {
+            // See the x86_64/riscv64 `SBS_IPC_RECV` arm's own comment
+            // (`kernel_arch_glue::G_FS_AWAITING_FIRST_RECV`'s doc comment
+            // for the full story) — identical reasoning, this arch's own
+            // register name (`x0`) for the endpoint argument.
+            let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
+                kernel_arch_glue::fs_native_recv(hal, caller, x0 as u32)
+            } else {
+                kernel_arch_glue::p2_ipc_recv_general(hal, caller, x0 as u32)
+            };
+            return match ipc_recv_outcome {
                 Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
                     TrapOutcome::Resume2(from, label)
                 }
@@ -7592,7 +7615,21 @@ fn simurgh_syscall(
                 .sched
                 .running()
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
-            return match kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32) {
+            // fs-native is a REAL, general multi-client `SBS_IPC_RECV`
+            // caller (`simurgh-file-manager`'s own edge, this session),
+            // but its very FIRST `Recv` call needs the narrow, hardcoded-
+            // root dispatch instead — see `kernel_arch_glue::
+            // G_FS_AWAITING_FIRST_RECV`'s own doc comment for the real
+            // QEMU-confirmed hang `fs_native_recv` fixes. Every other
+            // `SBS_IPC_RECV` caller (`security-broker`, `policy-engine`,
+            // ...) is unaffected — this check is `false` for them (`fs_tid`
+            // never equals their own tid).
+            let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
+                kernel_arch_glue::fs_native_recv(hal, caller, a0 as u32)
+            } else {
+                kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32)
+            };
+            return match ipc_recv_outcome {
                 Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
                     TrapOutcome::Resume2(from, label)
                 }
