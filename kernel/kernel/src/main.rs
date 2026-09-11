@@ -3911,7 +3911,22 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             }
             kernel_arch_glue::set_shell_tid(spawn_shell_x86(kernel_arch_glue::khal()));
             spawn_file_manager_x86(kernel_arch_glue::khal());
-            spawn_ui_core_x86(kernel_arch_glue::khal());
+            let ui_core_tid_x86 = spawn_ui_core_x86(kernel_arch_glue::khal());
+            // ui-core <-> account-manager real login edge (2026-09-11):
+            // wired here (not inside `spawn_ui_core_x86`) since it needs
+            // BOTH tids, and follows the SAME "wire after both spawn"
+            // pattern `wire_backup_manager_to_account_manager_x86` above
+            // already uses. The hub notification fan-in must run AFTER
+            // this (it grants a THIRD capability into account-manager's
+            // own cap space, following the endpoint grant this call
+            // makes) — see `wire_account_manager_hub_notification_
+            // fanin_x86`'s own doc comment.
+            if let (Some(am_tid), Some(ui_tid)) = (account_manager_tid_x86, ui_core_tid_x86) {
+                wire_ui_core_to_account_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, ui_tid);
+            }
+            if let (Some(am_tid), Some(bm_tid), Some(ui_tid)) = (account_manager_tid_x86, backup_manager_tid_x86, ui_core_tid_x86) {
+                wire_account_manager_hub_notification_fanin_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, bm_tid, ui_tid);
+            }
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -5077,6 +5092,130 @@ fn wire_backup_manager_to_account_manager_x86(
                 "root task (x86_64): backup-manager<->account-manager wiring skipped (out of resources)\r\n"
             ));
         }
+    }
+}
+
+/// Wires the `Simurgh-UI-Template01::ui-core` <-> `simurgh-account-manager`
+/// real IPC edge for a real login request (`session_manager::
+/// SessionManager::login`) — same shape as `wire_backup_manager_to_
+/// account_manager_x86` (one dedicated `Endpoint`+page via `kernel_arch_
+/// glue::wire_service_endpoint`), except account-manager now serves TWO
+/// real clients (backup-manager AND ui-core) over two SEPARATE dedicated
+/// `Endpoint`s, which needs the shared-`Notification` fan-in — see
+/// `wire_account_manager_hub_notification_fanin_x86`'s own doc comment,
+/// always called right after this one. `am_va`/`ui_core_client_va` must
+/// stay numerically equal to `simurgh-account-manager::session-manager::
+/// subsystem_entry::UI_CORE_SHARED_VA` (`0xD920_0000`, the next free slot
+/// after that process's own existing backup-manager edge at
+/// `0xD910_0000`) and `Simurgh-UI-Template01::ui-core::subsystem_entry::
+/// AM_SHARED_VA` (`0xD870_0000`, comfortably past ui-core's own frame-
+/// buffer region's own end) respectively.
+#[cfg(target_arch = "x86_64")]
+fn wire_ui_core_to_account_manager_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    account_manager_tid: kernel_cap::ThreadId,
+    ui_core_tid: kernel_cap::ThreadId,
+) {
+    const AM_VA: usize = 0xD920_0000;
+    const UI_CORE_CLIENT_VA: usize = 0xD870_0000;
+    let Some(am_tcb) = k.tcb(account_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->account-manager wiring skipped (could not resolve account-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (am_cs, am_addr_space) = (am_tcb.cap_space, am_tcb.addr_space);
+    let Some(ui_tcb) = k.tcb(ui_core_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->account-manager wiring skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (ui_cs, ui_addr_space) = (ui_tcb.cap_space, ui_tcb.addr_space);
+    let Some(am_root_pt) = k.addr_space_mut(am_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->account-manager wiring skipped (could not resolve account-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_root_pt) = k.addr_space_mut(ui_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->account-manager wiring skipped (could not resolve ui-core's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        am_cs,
+        am_root_pt,
+        AM_VA,
+        ui_cs,
+        ui_root_pt,
+        UI_CORE_CLIENT_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired ui-core <-> account-manager real IPC edge (login)\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core<->account-manager wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the shared `Notification` fan-in for account-manager's own hub
+/// role: it now serves TWO real clients (`simurgh-backup-manager`'s
+/// existing data-query edge, `Simurgh-UI-Template01::ui-core`'s new login
+/// edge) over two SEPARATE dedicated `Endpoint`s — same "`Recv` only
+/// waits on one `Endpoint` at a time" reasoning `wire_security_broker_
+/// notification_fanin_x86`'s own doc comment gives for security-broker's
+/// own, separate fan-in (a DIFFERENT `Notification` object — this one has
+/// account-manager as the HUB, not a client). Bit assignment (a plain
+/// caller-defined `u64` OR-mask, never interpreted by the kernel):
+/// `HUB_BM_BIT = 1`, `HUB_UI_CORE_BIT = 2`. Called once, right after
+/// `wire_ui_core_to_account_manager_x86` (the LAST of account-manager's
+/// own two real clients to be wired) — grants a Notification into all
+/// three of account-manager's/backup-manager's/ui-core's own cap spaces.
+#[cfg(target_arch = "x86_64")]
+fn wire_account_manager_hub_notification_fanin_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    account_manager_tid: kernel_cap::ThreadId,
+    backup_manager_tid: kernel_cap::ThreadId,
+    ui_core_tid: kernel_cap::ThreadId,
+) {
+    let Some(am_cs) = k.tcb(account_manager_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): account-manager hub notification fan-in skipped (could not resolve account-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let Some(bm_cs) = k.tcb(backup_manager_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): account-manager hub notification fan-in skipped (could not resolve backup-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_cs) = k.tcb(ui_core_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): account-manager hub notification fan-in skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let targets = [am_cs, bm_cs, ui_cs];
+    match kernel_arch_glue::wire_notification(hal, k.root_thread, &targets, kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE) {
+        Some(_) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired account-manager hub notification fan-in (backup-manager, ui-core)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): account-manager hub notification fan-in skipped (out of resources)\r\n"
+        )),
     }
 }
 
