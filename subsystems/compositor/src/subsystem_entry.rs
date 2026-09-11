@@ -467,17 +467,38 @@ fn handle_request(comp: &mut Compositor, pending_key_event: &mut Option<KeyEvent
                 code: DisplayErrorCode::BadSurface,
             },
         },
-        // Not yet built — `03-Kernel-Subsystems-Layer.md` §2.4's own
-        // `input_event_stream` needs a real `Notification`-based async
-        // delivery path (matching driver-virtio-net's own interrupt-
-        // driven TX completion in shape), and `output_topology` needs a
-        // real output source once one exists; neither is required by
-        // §5.4.2's own MVP acceptance bar (create surface, commit a
-        // buffer, show it zero-copy). Reported as `Unsupported` rather
-        // than silently faked data, matching this project's own "an
-        // honest gap beats a guessed answer" convention.
-        DisplayRequest::SubscribeInput | DisplayRequest::QueryOutputs => DisplayResponse::Error {
+        // `03-Kernel-Subsystems-Layer.md` §2.4's own `input_event_stream`
+        // called for a real `Notification`-based async delivery path
+        // (matching driver-virtio-net's own interrupt-driven TX
+        // completion in shape). That got superseded in practice, not
+        // left undone: `PollInputEvent` below (and its mouse-event
+        // counterpart) already deliver real, decoded input to a real
+        // client, matching driver-virtio-net's own established "poll,
+        // not push" precedent for unsolicited external data in this same
+        // codebase — no client-side `Notification` wait loop is needed
+        // to receive input, so there is nothing for a real subscription
+        // step to gate. Kept as a real, permanent `Unsupported` (an
+        // honest "superseded by PollInputEvent", not a "not yet built")
+        // rather than silently repurposed to mean something the wire
+        // protocol's own doc comment doesn't say.
+        DisplayRequest::SubscribeInput => DisplayResponse::Error {
             code: DisplayErrorCode::Unsupported,
+        },
+        // Real, single-output MVP: this process's own display pipeline
+        // always commits at a fixed 800x600 (the real resolution
+        // `Simurgh-UI-Template01::ui-core`'s own `Desktop` and every
+        // frame this process actually handles use throughout this
+        // codebase — see `FRAME_MAX`'s own doc comment) — reported here
+        // instead of `Unsupported` since a real, single, well-known
+        // output genuinely exists. 60000 milli-Hz (60 Hz) is the
+        // standard default any software compositor reports absent a
+        // real monitor to negotiate EDID/refresh timing with (no such
+        // hardware exists in this headless/file-output MVP, §5.4.2).
+        DisplayRequest::QueryOutputs => DisplayResponse::OutputTopology {
+            output_count: 1,
+            primary_width: 800,
+            primary_height: 600,
+            primary_refresh_mhz: 60_000,
         },
         // Real, per this file's own `read_i8042_message`/`KeyEvent` —
         // drains (not peeks) `pending_key_event`, matching `driver-
@@ -646,5 +667,39 @@ pub extern "C" fn subsystem_main() -> ! {
         // continues here only on the (unreachable in practice) error
         // case, matching every other subsystem's own identical loop.
         unsafe { raw_syscall(IPC_REPLY, from, zero!()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_outputs_reports_the_real_single_800x600_output() {
+        let mut comp = Compositor::new();
+        let mut pending_key = None;
+        let resp = handle_request(&mut comp, &mut pending_key, DisplayRequest::QueryOutputs);
+        assert_eq!(
+            resp,
+            DisplayResponse::OutputTopology {
+                output_count: 1,
+                primary_width: 800,
+                primary_height: 600,
+                primary_refresh_mhz: 60_000,
+            }
+        );
+    }
+
+    #[test]
+    fn subscribe_input_stays_unsupported_superseded_by_poll_input_event() {
+        let mut comp = Compositor::new();
+        let mut pending_key = None;
+        let resp = handle_request(&mut comp, &mut pending_key, DisplayRequest::SubscribeInput);
+        assert_eq!(
+            resp,
+            DisplayResponse::Error {
+                code: DisplayErrorCode::Unsupported,
+            }
+        );
     }
 }
