@@ -15,7 +15,7 @@
     "panic-strategy": "abort",
     "disable-redzone": true,
 
-    "features": "+strict-align,+neon,+fp-armv8",
+    "features": "+strict-align,+neon,+fp-armv8,+el3",
 
     "relocation-model": "static",
     "code-model": "large",

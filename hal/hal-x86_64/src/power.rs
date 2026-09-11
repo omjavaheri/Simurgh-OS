@@ -24,7 +24,9 @@ use core::cell::RefCell;
 
 use hal_core::compute::ComputeDeviceDiscovery;
 use hal_core::error::HalError;
-use hal_core::power::{DomainsAboveThresholdIter, DvfsRequest, DvfsState, MilliCelsius, PowerDomain, PowerThermal};
+use hal_core::power::{
+    DomainsAboveThresholdIter, DvfsRequest, DvfsState, MilliCelsius, PowerDomain, PowerThermal, SystemControl,
+};
 use hal_manifest::raw::{PowerDomainRaw, MAX_POWER_DOMAINS};
 
 use crate::compute::ComputeDiscovery;
@@ -79,6 +81,47 @@ unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+// ============================================================================
+// Port I/O — used only by `SystemControl` below (reboot's keyboard-
+// controller pulse, shutdown's ACPI PM1a_CNT write). Every other
+// register access in this file goes through MSRs (`rdmsr`/`wrmsr`
+// above); these two are the file's only legacy port-I/O users.
+// ============================================================================
+
+/// # Safety
+/// `port` must name a port whose read has no side effect the caller
+/// does not want (every call site below reads the i8042 keyboard
+/// controller's status port, architecturally defined to be safe to
+/// poll).
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!("in al, dx", in("dx") port, out("al") value);
+    }
+    value
+}
+
+/// # Safety
+/// `port`/`value` must be a combination the caller has verified is
+/// safe to write (every call site below is documented with the exact
+/// port and value it writes and why).
+unsafe fn outb(port: u16, value: u8) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value);
+    }
+}
+
+/// # Safety
+/// Same contract as `outb`, for a 16-bit port write.
+unsafe fn outw(port: u16, value: u16) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!("out dx, ax", in("dx") port, in("ax") value);
+    }
+}
+
 const IA32_THERM_STATUS: u32 = 0x19C;
 const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
 const MSR_RAPL_POWER_UNIT: u32 = 0x606;
@@ -105,6 +148,12 @@ pub struct PowerThermalImpl {
     /// absolute reading on its own.
     tcc_activation_temp_c: i32,
     rapl_supported: bool,
+    /// The FADT's `PM1a_CNT_BLK` I/O port, if ACPI reported one —
+    /// `SystemControl::shutdown`'s only real dependency. `None` when no
+    /// FADT was found (or it reported no PM1a control block), in which
+    /// case `shutdown` falls back to halting forever, per that method's
+    /// own doc comment.
+    pm1a_cnt_port: Option<u16>,
 }
 
 impl PowerThermalImpl {
@@ -112,7 +161,13 @@ impl PowerThermalImpl {
     /// package domain, plus one placeholder domain per device
     /// `compute` discovered (per this file's module docs on GPU/NPU
     /// domain scope for this MVP phase).
-    pub fn new(compute: &ComputeDiscovery) -> Self {
+    ///
+    /// `rsdp_phys` is threaded through only for `SystemControl::
+    /// shutdown`'s own FADT lookup (`memory::acpi_fadt_pm1a_cnt_port`)
+    /// — `0` if ACPI is unavailable (mirrors every other ACPI-scan call
+    /// site in this crate, e.g. `hal_x86_64_rust_entry`'s own
+    /// `acpi_mcfg_ecam_base` call).
+    pub fn new(compute: &ComputeDiscovery, rsdp_phys: u64) -> Self {
         let temp_target = rdmsr(MSR_TEMPERATURE_TARGET);
         let tcc_activation_temp_c = ((temp_target >> 16) & 0xFF) as i32;
 
@@ -152,11 +207,18 @@ impl PowerThermalImpl {
             domain_count += 1;
         }
 
+        // SAFETY: `rsdp_phys` is either `0` (handled by an early return
+        // inside the function) or a value obtained the same way every
+        // other ACPI-scan call site in this crate trusts it (see this
+        // function's own doc comment).
+        let pm1a_cnt_port = unsafe { crate::memory::acpi_fadt_pm1a_cnt_port(rsdp_phys) };
+
         Self {
             domains: RefCell::new(domains),
             domain_count: RefCell::new(domain_count),
             tcc_activation_temp_c,
             rapl_supported,
+            pm1a_cnt_port,
         }
     }
 
@@ -263,6 +325,90 @@ impl PowerThermal for PowerThermalImpl {
         Self: Sized,
     {
         DomainsAboveThresholdIter::new(self, threshold)
+    }
+}
+
+// ============================================================================
+// SystemControl — real reboot/shutdown (hal_core::power::SystemControl)
+//
+// Per the user-selected approach for this MVP phase (documented in this
+// project's own session record, not a design doc — no dedicated
+// 01-HAL-Layer.md section covers this yet, same "no charter, ask before
+// building" situation `SystemControl`'s own hal-core doc comment
+// describes): the SIMPLE, PORTABLE mechanism for each operation, not
+// the fully ACPI/AML-spec-correct one — both are still real, standard
+// mechanisms that work on real x86_64 hardware, not QEMU-only tricks.
+// ============================================================================
+
+impl SystemControl for PowerThermalImpl {
+    /// Full hardware reset via the i8042 keyboard controller's pulse
+    /// line (write `0xFE` to port `0x64`) — the same mechanism Linux's
+    /// own `reboot=kbd` path and most bare-metal/hobby x86_64 kernels
+    /// use, because unlike ACPI reset it needs no table lookup at all:
+    /// the i8042 controller (or an emulation of it) is present on every
+    /// real x86_64 PC-compatible machine and every x86_64 QEMU machine
+    /// type this project targets.
+    fn reboot(&self) -> ! {
+        // SAFETY: port `0x64` is the i8042 controller's command/status
+        // port, standard on every PC-compatible x86_64 platform;
+        // polling bit 1 (input buffer full) before writing is the
+        // documented handshake, and `0xFE` ("pulse output line 0",
+        // which carries the CPU's own RESET# line) is the documented
+        // reset command.
+        unsafe {
+            // Wait for the controller's input buffer to drain so this
+            // command is not lost behind a stale, still-pending byte.
+            let mut spins = 0u32;
+            while inb(0x64) & 0x02 != 0 && spins < 1_000_000 {
+                spins += 1;
+            }
+            outb(0x64, 0xFE);
+        }
+        // The reset pulse takes effect asynchronously — if this line is
+        // ever reached, it did not (e.g. QEMU machine type without an
+        // i8042 emulation, or an unusually slow controller); there is
+        // nothing more useful to do than halt, per this trait's own
+        // doc comment.
+        loop {
+            // SAFETY: `hlt` with interrupts already off by construction
+            // this late in a reboot path is the standard idle-forever
+            // idiom this crate's own boot.S `.halt_forever` uses.
+            unsafe { core::arch::asm!("cli", "hlt") };
+        }
+    }
+
+    /// Powers the machine off via a direct ACPI `PM1a_CNT` write —
+    /// SLP_EN (bit 13) set together with SLP_TYPa = 0 in bits 10-12.
+    /// SLP_TYPa = 0 is NOT read from the platform's own AML `_S5`
+    /// object (this MVP parses no AML at all — see this file's own
+    /// module doc comment on GPU/NPU domain scope for the same kind of
+    /// "real ACPI presence, deliberately partial parsing" tradeoff);
+    /// `0` is simply the value QEMU's own PIIX4/ICH9 ACPI emulation
+    /// (and a wide range of real firmware) assigns S5, which is why
+    /// this exact write is a long-standing convention among small/
+    /// hobby OS kernels that skip a full AML interpreter. When no FADT
+    /// (or no `PM1a_CNT_BLK`) was found at boot, there is no ACPI path
+    /// to try at all — this falls back to halting forever, same as
+    /// `reboot`'s own hardware-did-not-respond fallback.
+    fn shutdown(&self) -> ! {
+        if let Some(port) = self.pm1a_cnt_port {
+            const SLP_EN: u16 = 1 << 13;
+            const SLP_TYPA_S5_COMMON: u16 = 0 << 10;
+            // SAFETY: `port` came from a real FADT `PM1a_CNT_BLK` field
+            // read at boot (`PowerThermalImpl::new`); writing SLP_EN
+            // with a SLP_TYP field is the ACPI-defined mechanism for
+            // entering a sleep state through this exact register, per
+            // ACPI spec section 4.8.3.2 (PM1 Control Registers).
+            unsafe { outw(port, SLP_EN | SLP_TYPA_S5_COMMON) };
+        }
+        // Either no ACPI path exists, or (on real hardware whose real
+        // SLP_TYPa differs from this MVP's common-case guess) the write
+        // above did not actually power the machine off — halt forever,
+        // per this trait's own doc comment.
+        loop {
+            // SAFETY: same idle-forever idiom as `reboot`'s own fallback.
+            unsafe { core::arch::asm!("cli", "hlt") };
+        }
     }
 }
 

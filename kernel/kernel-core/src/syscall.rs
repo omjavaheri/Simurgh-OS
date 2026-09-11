@@ -1339,13 +1339,27 @@ mod tests {
         fn end_of_interrupt(&self, _irq: hal_core::interrupt::IrqId) {}
     }
 
-    // `build_interface`'s `cpu`/`timer`/`interrupt` refs must outlive the
-    // `HalInterface` it returns, so this returns owned values for each
-    // test to bind as locals before building its own `hal` — kernel-core
-    // is `#![no_std]` with no `alloc`, so no `Box::leak` shortcut (same
-    // pattern `run.rs`'s tests already use).
-    fn mock_hal_pair() -> (MockCpu, MockTimer, MockInterrupt) {
-        (MockCpu, MockTimer, MockInterrupt)
+    /// No `SyscallOp` in this module's tests ever reaches
+    /// `hal_core::power::SystemControl::reboot`/`shutdown` (both `-> !`,
+    /// and no dispatch path here calls them) — this mock exists purely
+    /// to satisfy `build_interface`'s generic bound.
+    struct MockPower;
+    impl hal_core::power::SystemControl for MockPower {
+        fn reboot(&self) -> ! {
+            loop {}
+        }
+        fn shutdown(&self) -> ! {
+            loop {}
+        }
+    }
+
+    // `build_interface`'s `cpu`/`timer`/`interrupt`/`power` refs must
+    // outlive the `HalInterface` it returns, so this returns owned
+    // values for each test to bind as locals before building its own
+    // `hal` — kernel-core is `#![no_std]` with no `alloc`, so no
+    // `Box::leak` shortcut (same pattern `run.rs`'s tests already use).
+    fn mock_hal_pair() -> (MockCpu, MockTimer, MockInterrupt, MockPower) {
+        (MockCpu, MockTimer, MockInterrupt, MockPower)
     }
 
     fn kernel() -> KernelState {
@@ -1374,8 +1388,8 @@ mod tests {
     fn retype_untyped_into_endpoint_gives_new_cap() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         // The Root Task's first capability (slot 0) is an UntypedMemory cap.
         let r = k
             .dispatch(
@@ -1409,8 +1423,8 @@ mod tests {
     fn retype_untyped_into_shared_region_gives_new_cap() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         let r = k
             .dispatch(
                 caller,
@@ -1548,8 +1562,8 @@ mod tests {
         let caller = k.root_thread;
         let mmio_cap = k.root_mmio_blk_cap;
         let pt_cap = k.root_page_table_cap;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         let r = k.dispatch(
             caller,
             0,
@@ -1573,8 +1587,8 @@ mod tests {
     fn signal_wakes_a_waiting_thread() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         let notif_cap = match k
             .dispatch(
                 caller,
@@ -1635,8 +1649,8 @@ mod tests {
         // woken thread to deliver the value to right now.
         let mut k = kernel_with_mmio_blk();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         let notif_cap = match k
             .dispatch(
                 caller,
@@ -1668,8 +1682,8 @@ mod tests {
         let mut k = kernel_with_mmio_blk();
         let caller = k.root_thread;
         let mmio_cap = k.root_mmio_blk_cap;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         let notif_cap = match k
             .dispatch(
                 caller,
@@ -1727,8 +1741,8 @@ mod tests {
     fn revoke_requires_revoke_right_and_frees_slots() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         // Make an endpoint, then revoke the untyped it came from — the
         // untyped root cap has full rights (incl. REVOKE).
         k.dispatch(
@@ -1759,8 +1773,8 @@ mod tests {
         // lower-level API (02-Microkernel-Layer.md line 65).
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         // An Endpoint capability in the caller's own (root) space — the
         // thing that will be granted elsewhere, then revoked from here.
@@ -1842,8 +1856,8 @@ mod tests {
     fn bad_cap_is_rejected() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         let e = k.dispatch(caller, 0, SyscallOp::CapRevoke { cap: CapId::new(99) }, &hal);
         assert_eq!(e, Err(SyscallError::BadCap));
     }
@@ -1852,8 +1866,8 @@ mod tests {
     fn yield_reports_reschedule() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         // Root task must be dispatched first for account() to have work.
         k.sched.dispatch(caller, 0).unwrap();
         let r = k.dispatch(caller, 1_000_000, SyscallOp::Yield, &hal).unwrap();
@@ -1864,8 +1878,8 @@ mod tests {
     fn map_installs_hardware_ptes_when_a_pool_is_present() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         // Retype a PageTable and a frame from the Root Task's first untyped.
         let pt_cap = match k
@@ -1961,8 +1975,8 @@ mod tests {
 
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         let ep_cap = match k
             .dispatch(
@@ -2031,8 +2045,8 @@ mod tests {
 
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         let ep_cap = match k
             .dispatch(
@@ -2078,8 +2092,8 @@ mod tests {
 
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         let ep_cap = match k
             .dispatch(
@@ -2156,8 +2170,8 @@ mod tests {
 
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         let ep_cap = match k
             .dispatch(
@@ -2228,8 +2242,8 @@ mod tests {
     fn reply_to_non_blocked_thread_is_rejected() {
         let mut k = kernel();
         let root = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         // `bystander` was never Called nor is it BlockedOnReply.
         let bystander = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
@@ -2258,8 +2272,8 @@ mod tests {
     fn retype_batch_partial_failure_rolls_back_every_object_and_capability() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         let cs_len_before = k.cap_space(k.root_cap_space).unwrap().len();
 
@@ -2316,8 +2330,8 @@ mod tests {
     fn retype_batch_detects_non_contiguous_slots_and_rolls_back() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         // Three individual (count: 1) Endpoint capabilities land at
         // sequential slots in a pristine table.
@@ -2394,8 +2408,8 @@ mod tests {
     fn cap_grant_to_a_sibling_thread_in_the_same_cap_space_succeeds() {
         let mut k = kernel();
         let caller = k.root_thread;
-        let (cpu, timer, irqc) = mock_hal_pair();
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         // A sibling TCB in the caller's own cap space (Retype's own
         // documented behavior for ThreadControlBlock).

@@ -35,7 +35,9 @@ use core::cell::RefCell;
 
 use hal_core::compute::ComputeDeviceDiscovery;
 use hal_core::error::HalError;
-use hal_core::power::{DomainsAboveThresholdIter, DvfsRequest, DvfsState, MilliCelsius, PowerDomain, PowerThermal};
+use hal_core::power::{
+    DomainsAboveThresholdIter, DvfsRequest, DvfsState, MilliCelsius, PowerDomain, PowerThermal, SystemControl,
+};
 use hal_manifest::raw::{PowerDomainRaw, MAX_POWER_DOMAINS};
 
 use crate::compute::ComputeDiscovery;
@@ -148,6 +150,101 @@ impl PowerThermal for PowerThermalImpl {
         // this MVP phase, correctly and without ever reaching the
         // unreachable!() branches above.
         DomainsAboveThresholdIter::new(self, threshold)
+    }
+}
+
+// ============================================================================
+// SystemControl — real reboot/shutdown, via PSCI (Power State
+// Coordination Interface, Arm DEN 0022) — the one ARM64 power
+// mechanism that IS architecturally standardized (unlike DVFS/thermal,
+// per this file's own module doc comment), and required firmware on
+// every real ARMv8-A platform this project targets as well as every
+// ARM64 QEMU machine type it tests against.
+// ============================================================================
+
+/// PSCI function IDs (32-bit calling convention — DEN 0022 section
+/// 5.1): `SYSTEM_OFF`/`SYSTEM_RESET` take no arguments and, per spec,
+/// do not return on success.
+const PSCI_SYSTEM_OFF: u32 = 0x8400_0008;
+const PSCI_SYSTEM_RESET: u32 = 0x8400_0009;
+
+/// Issues a PSCI call via `smc #0` — the conduit this crate's own boot
+/// path implies is correct: `boot.S`'s EL2->EL1 drop (this crate's
+/// `lib.rs`) means the kernel never retains EL2, so on QEMU's `virt`
+/// machine (this project's own ARM64 test target) PSCI is provided by
+/// EL3 firmware reached directly via SMC — the "no EL2 present at all"
+/// configuration QEMU uses unless `virtualization=on` is explicitly
+/// passed (which this project's own QEMU test scripts do not), and the
+/// same conduit real firmware overwhelmingly uses when no hypervisor
+/// occupies EL2 either. Per the SMC32 calling convention, PSCI results
+/// return in `x0`; `SYSTEM_OFF`/`SYSTEM_RESET` are defined not to
+/// return at all on success — but this call is NOT marked
+/// `options(noreturn)`: a non-compliant or unexpectedly configured
+/// firmware returning anyway must fall through to `reboot`/`shutdown`'s
+/// own halt-forever fallback below, not hit undefined behavior.
+///
+/// # Safety
+/// `smc` traps to EL3 firmware; this is only sound to call on a
+/// platform whose firmware actually implements the standard PSCI
+/// function IDs above, per DEN 0022 — true for every real ARMv8-A
+/// platform (PSCI is mandatory for any Arm-compliant boot firmware)
+/// and QEMU's own `virt` machine.
+#[cfg(target_os = "none")]
+unsafe fn psci_smc_call(function_id: u32) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            inout("x0") function_id => _,
+            in("x1") 0u64,
+            in("x2") 0u64,
+            in("x3") 0u64,
+        );
+    }
+}
+
+/// Host (`cargo test`) stub — `smc` is not a valid instruction for the
+/// host target. Unit tests never call `reboot`/`shutdown` (both `-> !`),
+/// so this only exists so the crate compiles.
+///
+/// # Safety
+/// None — trivially safe, kept `unsafe` only so both this stub and the
+/// real bare-metal version above share one call-site signature.
+#[cfg(not(target_os = "none"))]
+unsafe fn psci_smc_call(_function_id: u32) {}
+
+/// Halts this core forever — the fallback both `reboot` and `shutdown`
+/// use if their own PSCI call did not actually reset/power off the
+/// machine (see `SystemControl`'s own doc comment). Gated the same way
+/// as `psci_smc_call` for the same host-build reason (`wfe` is not a
+/// valid instruction off the bare-metal target).
+#[cfg(target_os = "none")]
+fn idle_forever() -> ! {
+    loop {
+        // SAFETY: `wfe` is the standard ARM64 idle-forever idiom.
+        unsafe { core::arch::asm!("wfe") };
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+fn idle_forever() -> ! {
+    loop {}
+}
+
+impl SystemControl for PowerThermalImpl {
+    fn reboot(&self) -> ! {
+        // SAFETY: see `psci_smc_call`'s own doc comment.
+        unsafe { psci_smc_call(PSCI_SYSTEM_RESET) };
+        // Reached only if firmware did not honor the call — nothing
+        // more useful to do, per `hal_core::power::SystemControl`'s own
+        // doc comment.
+        idle_forever()
+    }
+
+    fn shutdown(&self) -> ! {
+        // SAFETY: see `psci_smc_call`'s own doc comment.
+        unsafe { psci_smc_call(PSCI_SYSTEM_OFF) };
+        idle_forever()
     }
 }
 

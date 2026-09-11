@@ -306,6 +306,19 @@ unsafe fn trampoline_msi_message<I: InterruptController>(
     }
 }
 
+unsafe fn trampoline_reboot<P: crate::power::SystemControl>(state: *const ()) -> ! {
+    // SAFETY: `state` was produced by `build_interface` from a `&P` and
+    // remains valid per that function's safety contract.
+    let power = unsafe { &*(state as *const P) };
+    power.reboot()
+}
+
+unsafe fn trampoline_shutdown<P: crate::power::SystemControl>(state: *const ()) -> ! {
+    // SAFETY: same as `trampoline_reboot`.
+    let power = unsafe { &*(state as *const P) };
+    power.shutdown()
+}
+
 /// Architecture-erased handle to a subset of hal-core's capabilities.
 /// `#[repr(C)]` for a stable layout across the `extern "Rust"`
 /// declaration/definition boundary, matching this project's other
@@ -315,6 +328,7 @@ pub struct HalInterface {
     cpu_state: *const (),
     timer_state: *const (),
     interrupt_state: *const (),
+    power_state: *const (),
     cpu_core_count: unsafe fn(*const ()) -> usize,
     cpu_current_core_id: unsafe fn(*const ()) -> usize,
     cpu_feature_flags_bits: unsafe fn(*const ()) -> u64,
@@ -333,6 +347,8 @@ pub struct HalInterface {
     timer_cancel: unsafe fn(*const ()),
     interrupt_register_irq: unsafe fn(*const (), u32, IrqHandler) -> bool,
     interrupt_msi_message: unsafe fn(*const (), u32, *mut bool) -> (u64, u32),
+    power_reboot: unsafe fn(*const ()) -> !,
+    power_shutdown: unsafe fn(*const ()) -> !,
 }
 
 impl HalInterface {
@@ -580,6 +596,21 @@ impl HalInterface {
             None
         }
     }
+
+    /// Performs a full hardware reset. Does not return. See
+    /// `hal_core::power::SystemControl::reboot`.
+    pub fn reboot(&self) -> ! {
+        // SAFETY: `power_state`/`power_reboot` were produced together by
+        // `build_interface`.
+        unsafe { (self.power_reboot)(self.power_state) }
+    }
+
+    /// Powers the machine off. Does not return. See
+    /// `hal_core::power::SystemControl::shutdown`.
+    pub fn shutdown(&self) -> ! {
+        // SAFETY: same contract as `reboot`.
+        unsafe { (self.power_shutdown)(self.power_state) }
+    }
 }
 
 /// Builds a `HalInterface` from a concrete CPU/timer implementation.
@@ -599,16 +630,18 @@ impl HalInterface {
 /// function whose only continuation is passing this same `HalInterface`
 /// into an equally diverging `kernel_main` — that stack frame is never
 /// popped, so this holds for the remainder of execution.
-pub fn build_interface<C, T, I>(cpu: &C, timer: &T, interrupt: &I) -> HalInterface
+pub fn build_interface<C, T, I, P>(cpu: &C, timer: &T, interrupt: &I, power: &P) -> HalInterface
 where
     C: CpuAbstraction<HAL_CONTEXT_BYTES>,
     T: TimerAbstraction,
     I: InterruptController,
+    P: crate::power::SystemControl,
 {
     HalInterface {
         cpu_state: cpu as *const C as *const (),
         timer_state: timer as *const T as *const (),
         interrupt_state: interrupt as *const I as *const (),
+        power_state: power as *const P as *const (),
         cpu_core_count: trampoline_core_count::<C>,
         cpu_current_core_id: trampoline_current_core_id::<C>,
         cpu_feature_flags_bits: trampoline_feature_flags_bits::<C>,
@@ -627,6 +660,8 @@ where
         timer_cancel: trampoline_cancel_timer::<T>,
         interrupt_register_irq: trampoline_register_irq::<I>,
         interrupt_msi_message: trampoline_msi_message::<I>,
+        power_reboot: trampoline_reboot::<P>,
+        power_shutdown: trampoline_shutdown::<P>,
     }
 }
 
@@ -722,14 +757,33 @@ mod tests {
 
     fn dummy_irq_handler(_irq: IrqId) {}
 
+    /// `SystemControl`'s own two methods are `-> !` by design (see that
+    /// trait's doc comment) — no test here calls `reboot`/`shutdown`
+    /// through the interface, so this mock exists purely to satisfy
+    /// `build_interface`'s generic bound.
+    struct MockPower;
+    impl crate::power::SystemControl for MockPower {
+        fn reboot(&self) -> ! {
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        fn shutdown(&self) -> ! {
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
     #[test]
     fn interface_forwards_cpu_calls() {
-        let (cpu, timer, irqc) = (
+        let (cpu, timer, irqc, power) = (
             MockCpu { switches: Cell::new(0) },
             MockTimer,
             MockInterrupt { registered: Cell::new(None) },
+            MockPower,
         );
-        let iface = build_interface(&cpu, &timer, &irqc);
+        let iface = build_interface(&cpu, &timer, &irqc, &power);
         assert_eq!(iface.core_count(), 4);
         assert_eq!(iface.current_core_id(), 2);
         assert_eq!(iface.cpu_feature_flags_bits(), CpuFeatureFlags::SIMD_128.bits());
@@ -737,12 +791,13 @@ mod tests {
 
     #[test]
     fn interface_forwards_timer_calls() {
-        let (cpu, timer, irqc) = (
+        let (cpu, timer, irqc, power) = (
             MockCpu { switches: Cell::new(0) },
             MockTimer,
             MockInterrupt { registered: Cell::new(None) },
+            MockPower,
         );
-        let iface = build_interface(&cpu, &timer, &irqc);
+        let iface = build_interface(&cpu, &timer, &irqc, &power);
         assert_eq!(iface.now_ns(), 123_456);
         assert_eq!(iface.frequency_hz(), 1_000_000_000);
     }
@@ -752,7 +807,8 @@ mod tests {
         let cpu = MockCpu { switches: Cell::new(0) };
         let timer = MockTimer;
         let irqc = MockInterrupt { registered: Cell::new(None) };
-        let iface = build_interface(&cpu, &timer, &irqc);
+        let power = MockPower;
+        let iface = build_interface(&cpu, &timer, &irqc, &power);
         let mut from = [0u8; HAL_CONTEXT_BYTES];
         let mut to = [0u8; HAL_CONTEXT_BYTES];
         to[0] = 0xAB;
@@ -768,7 +824,8 @@ mod tests {
         let cpu = MockCpu { switches: Cell::new(0) };
         let timer = MockTimer;
         let irqc = MockInterrupt { registered: Cell::new(None) };
-        let iface = build_interface(&cpu, &timer, &irqc);
+        let power = MockPower;
+        let iface = build_interface(&cpu, &timer, &irqc, &power);
         assert!(iface.register_irq(7, dummy_irq_handler));
         assert_eq!(irqc.registered.get(), Some(7));
         assert!(!iface.register_irq(0, dummy_irq_handler));

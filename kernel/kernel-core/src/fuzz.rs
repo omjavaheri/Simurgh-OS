@@ -127,6 +127,19 @@ impl hal_core::interrupt::InterruptController for MockInterrupt {
     fn end_of_interrupt(&self, _irq: hal_core::interrupt::IrqId) {}
 }
 
+/// No test in this module reaches `hal_core::power::SystemControl::
+/// reboot`/`shutdown` (both `-> !`) — this mock exists purely to
+/// satisfy `build_interface`'s generic bound.
+struct MockPower;
+impl hal_core::power::SystemControl for MockPower {
+    fn reboot(&self) -> ! {
+        loop {}
+    }
+    fn shutdown(&self) -> ! {
+        loop {}
+    }
+}
+
 /// splitmix64 — a small, dependency-free, non-cryptographic PRNG. Fast
 /// and spreads bits well enough over many iterations to hit boundary
 /// values (0, near `u32::MAX`) as well as the interior of each range.
@@ -320,8 +333,8 @@ fn syscall_dispatch_survives_random_malformed_input() {
         let root = state.root_thread;
         let root_cs = state.root_cap_space;
         let mut rng = Rng(seed);
-        let (cpu, timer, irqc) = (MockCpu, MockTimer, MockInterrupt);
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let (cpu, timer, irqc, power) = (MockCpu, MockTimer, MockInterrupt, MockPower);
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
         // A fake pool (never dereferenced — `MockCpu`'s default
         // `map_range` ignores its args and always reports failure) so
         // `do_map`'s hardware-walk-then-rollback path actually runs

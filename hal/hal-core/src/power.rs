@@ -206,6 +206,35 @@ impl<'a, T: PowerThermal + ?Sized> Iterator for DomainsAboveThresholdIter<'a, T>
     }
 }
 
+// ============================================================================
+// SystemControl trait — real machine reboot/shutdown
+// ============================================================================
+
+/// Per-architecture "turn the machine off or restart it" abstraction.
+/// Not part of section 3.7's original scope (DVFS/thermal only) — added
+/// once the microkernel actually needed a real power-off/reboot syscall
+/// and a direct check of every hal-core trait (including this file, and
+/// `boot.rs`) confirmed no such primitive existed anywhere in the HAL,
+/// the microkernel, or any kernel subsystem. Kept in this file rather
+/// than a new one since it is still squarely a "power" responsibility,
+/// and every architecture crate already has a `power.rs` module to
+/// implement it in (mirroring `PowerThermal`'s own placement).
+///
+/// Both methods are `-> !`: on success the machine is gone (rebooting
+/// or powered off) and there is nothing to return to; on failure (the
+/// underlying hardware mechanism did not take effect) the
+/// implementation falls back to halting the core forever, since no
+/// architecture crate has, or needs, a richer recovery story for "the
+/// reset/power-off line did not respond" — matching this file's own
+/// `HalError`-free design for methods with no meaningful continuation.
+pub trait SystemControl {
+    /// Performs a full hardware reset. Does not return.
+    fn reboot(&self) -> !;
+
+    /// Powers the machine off. Does not return.
+    fn shutdown(&self) -> !;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

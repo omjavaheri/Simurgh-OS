@@ -1248,6 +1248,16 @@ mod sys {
     /// "prove a real value, not just survival" reasoning `NL_REPORT`'s
     /// own doc comment gives.
     pub const UI_REPORT: usize = 123;
+    /// `a0` = `0` to reboot, `1` to shut down; `a1` unused. Calls
+    /// straight into `kernel_arch_glue::khal()`'s `reboot()`/
+    /// `shutdown()` (`hal_core::power::SystemControl`, built once per
+    /// architecture in that architecture's own `power.rs`) — both are
+    /// `-> !`, so a successful call never returns to the caller at all.
+    /// No capability gating yet (mirrors every other syscall opcode in
+    /// this MVP phase, e.g. `MAP_PAGE`'s own doc comment) — real
+    /// capability-gated power control is a tracked follow-up, not a
+    /// silent scope cut specific to this opcode.
+    pub const POWER_CONTROL: usize = 124;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -4100,6 +4110,18 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             ));
             return TrapOutcome::Resume(0);
         }
+        sys::POWER_CONTROL => {
+            let hal = kernel_arch_glue::khal();
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): real POWER_CONTROL syscall - {}\r\n",
+                if a0 == 0 { "reboot" } else { "shutdown" }
+            ));
+            if a0 == 0 {
+                hal.reboot();
+            } else {
+                hal.shutdown();
+            }
+        }
         sys::DM_WAIT_CRASH => {
             return match kernel_arch_glue::p2_dm_wait_crash() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -6879,6 +6901,18 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             ));
             return TrapOutcome::Resume(0);
         }
+        sys::POWER_CONTROL => {
+            let hal = kernel_arch_glue::khal();
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): real POWER_CONTROL syscall - {}\r\n",
+                if x0 == 0 { "reboot" } else { "shutdown" }
+            ));
+            if x0 == 0 {
+                hal.reboot();
+            } else {
+                hal.shutdown();
+            }
+        }
         sys::DM_WAIT_CRASH => {
             return match kernel_arch_glue::p2_dm_wait_crash() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -7610,6 +7644,18 @@ fn simurgh_syscall(
                 a1 == 1
             ));
             return TrapOutcome::Resume(0);
+        }
+        sys::POWER_CONTROL => {
+            let hal = kernel_arch_glue::khal();
+            kernel_arch_glue::log(format_args!(
+                "root task (riscv64): real POWER_CONTROL syscall - {}\r\n",
+                if a0 == 0 { "reboot" } else { "shutdown" }
+            ));
+            if a0 == 0 {
+                hal.reboot();
+            } else {
+                hal.shutdown();
+            }
         }
         sys::DM_WAIT_CRASH => {
             return match kernel_arch_glue::p2_dm_wait_crash() {

@@ -33,7 +33,9 @@ use core::cell::RefCell;
 
 use hal_core::compute::ComputeDeviceDiscovery;
 use hal_core::error::HalError;
-use hal_core::power::{DomainsAboveThresholdIter, DvfsRequest, DvfsState, MilliCelsius, PowerDomain, PowerThermal};
+use hal_core::power::{
+    DomainsAboveThresholdIter, DvfsRequest, DvfsState, MilliCelsius, PowerDomain, PowerThermal, SystemControl,
+};
 use hal_manifest::raw::{PowerDomainRaw, MAX_POWER_DOMAINS};
 
 use crate::compute::ComputeDiscovery;
@@ -143,6 +145,96 @@ impl PowerThermal for PowerThermalImpl {
         // MVP phase, correctly and without ever reaching the
         // unreachable!() branches above.
         DomainsAboveThresholdIter::new(self, threshold)
+    }
+}
+
+// ============================================================================
+// SystemControl — real reboot/shutdown, via the SBI System Reset
+// Extension (SRST, SBI spec chapter 10) — a stable, mandatory-for-
+// compliant-firmware SBI extension (unlike the still-evolving power-
+// management extension family this file's own module doc comment
+// discusses for DVFS/thermal), present on every real RISC-V platform's
+// OpenSBI (or equivalent) firmware and on QEMU's own `virt` machine.
+// ============================================================================
+
+/// SRST extension ID (`"SRST"` sbi spec chapter 10) and its one
+/// function (`sbi_system_reset`, function ID 0).
+const SBI_EXT_SRST: usize = 0x5352_5354;
+const SBI_SRST_SYSTEM_RESET: usize = 0;
+
+/// Reset types (SBI spec chapter 10, table 10.1).
+const SBI_SRST_TYPE_SHUTDOWN: usize = 0;
+const SBI_SRST_TYPE_COLD_REBOOT: usize = 1;
+/// Reset reason: no specific reason given (chapter 10, table 10.2).
+const SBI_SRST_REASON_NONE: usize = 0;
+
+/// Issues `sbi_system_reset(reset_type, SBI_SRST_REASON_NONE)`. Per the
+/// SBI calling convention: a7 = extension ID, a6 = function ID, a0 =
+/// reset_type, a1 = reset_reason; a0 = error code on return. Per SRST's
+/// own spec, this call does not return at all on success — only a
+/// genuinely unsupported/non-compliant firmware would return here,
+/// which `reboot`/`shutdown` below fall back to halting forever for,
+/// same as every other architecture's own `SystemControl` fallback.
+#[cfg(not(target_os = "none"))]
+fn sbi_system_reset(_reset_type: usize) {
+    // Host (`cargo test`) stub — no SBI firmware off the bare-metal
+    // target; unit tests never construct `PowerThermalImpl`, so this
+    // only exists so the crate compiles, mirroring `cpu.rs`'s own
+    // `sbi_call` host stub.
+}
+
+#[cfg(target_os = "none")]
+fn sbi_system_reset(reset_type: usize) {
+    // SAFETY: `ecall` from S-mode to SBI is the standard RISC-V
+    // supervisor-to-firmware call mechanism; SRST is a stable SBI
+    // extension per this section's own doc comment, so this call
+    // cannot target a genuinely unimplemented firmware surface on any
+    // platform this project supports.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") SBI_EXT_SRST,
+            in("a6") SBI_SRST_SYSTEM_RESET,
+            in("a0") reset_type,
+            in("a1") SBI_SRST_REASON_NONE,
+            out("a2") _,
+            lateout("a0") _,
+            lateout("a1") _,
+        );
+    }
+}
+
+/// Halts this core forever — the fallback both `reboot` and `shutdown`
+/// use if their own SBI call did not actually reset/power off the
+/// machine (see `SystemControl`'s own doc comment). A separate function
+/// (rather than inlining the loop at both call sites) purely so the
+/// `target_os = "none"` gate below (needed because `wfi` is not a valid
+/// instruction for a host `cargo test` build) lives in one place.
+#[cfg(target_os = "none")]
+fn idle_forever() -> ! {
+    loop {
+        // SAFETY: `wfi` is the standard RISC-V idle-forever idiom.
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+fn idle_forever() -> ! {
+    // Host (`cargo test`) stub — unit tests never call `reboot`/
+    // `shutdown` (both `-> !`), so this only exists so the crate
+    // compiles, mirroring `sbi_system_reset`'s own host stub above.
+    loop {}
+}
+
+impl SystemControl for PowerThermalImpl {
+    fn reboot(&self) -> ! {
+        sbi_system_reset(SBI_SRST_TYPE_COLD_REBOOT);
+        idle_forever()
+    }
+
+    fn shutdown(&self) -> ! {
+        sbi_system_reset(SBI_SRST_TYPE_SHUTDOWN);
+        idle_forever()
     }
 }
 

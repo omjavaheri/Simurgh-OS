@@ -317,7 +317,7 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // install profile — profile policy is applied later, in layer 4.
     // ------------------------------------------------------------------
     let compute = compute::ComputeDiscovery::new();
-    let power = power::PowerThermalImpl::new(&compute);
+    let power = power::PowerThermalImpl::new(&compute, memory.rsdp_phys());
     // SAFETY: `memory.rsdp_phys()` is either `0` or a value obtained
     // per `Memory::from_uefi_memory_map`'s own boot-protocol guarantees
     // (the same trust boundary `acpi_dmar_present` already relies on,
@@ -441,7 +441,7 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // separate `kernel-stub` crate's linked-in symbol until the real
     // microkernel (layer 2) is implemented.
     // ------------------------------------------------------------------
-    let hal_interface = hal_core::build_interface(&hal.cpu, &hal.timer, &hal.interrupt);
+    let hal_interface = hal_core::build_interface(&hal.cpu, &hal.timer, &hal.interrupt, &hal.power);
 
     extern "Rust" {
         fn kernel_main(hal: hal_core::HalInterface, boot_info: hal_core::BootInfo) -> !;

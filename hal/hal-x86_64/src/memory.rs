@@ -368,6 +368,79 @@ pub(crate) unsafe fn acpi_mcfg_ecam_base(rsdp_phys: u64) -> Option<u64> {
     None
 }
 
+const FADT_SIGNATURE: [u8; 4] = *b"FACP"; // ACPI's own table name for the FADT.
+
+/// Scans the ACPI table pointers reachable from `rsdp_phys` for the FADT
+/// (Fixed ACPI Description Table) and returns its legacy 32-bit
+/// `PM1a_CNT_BLK` I/O port address (FADT byte offset 64, per ACPI spec
+/// table 5-35) — the one register `power::SystemControl::shutdown`
+/// needs. Returns `None` if no FADT is present, or its `PM1a_CNT_BLK`
+/// field itself reads back `0` (no PM1a control block — the ACPI
+/// pieces this MVP's shutdown path needs are simply absent).
+///
+/// Deliberately does NOT read the FADT's `X_PM1a_CNT_BLK` (ACPI 2.0+
+/// Generic Address Structure at offset 172), which would be the
+/// spec-correct field to prefer when present: this MVP only ever needs
+/// an I/O-port address (every real x86_64 target this project's own
+/// QEMU testing and real-hardware scope cares about still exposes
+/// `PM1a_CNT_BLK` as a plain port, per `power.rs`'s own module doc
+/// comment on this phase's "simple and practical, not 100%
+/// ACPI-compliant" scope) — reading the 64-bit extended field too would
+/// add a second code path this MVP does not need yet.
+///
+/// # Safety
+/// Same contract as `acpi_dmar_present`/`acpi_mcfg_ecam_base`.
+pub(crate) unsafe fn acpi_fadt_pm1a_cnt_port(rsdp_phys: u64) -> Option<u16> {
+    if rsdp_phys == 0 {
+        return None;
+    }
+
+    // SAFETY: forwarded from this function's own contract; same RSDP
+    // layout offset `acpi_dmar_present`/`acpi_mcfg_ecam_base` already
+    // read.
+    let xsdt_addr = unsafe { core::ptr::read_unaligned((rsdp_phys as *const u8).add(24) as *const u64) };
+    if xsdt_addr == 0 {
+        return None;
+    }
+
+    // SAFETY: forwarded; `xsdt_addr` is a trusted XSDT pointer per the
+    // same RSDP contract the sibling ACPI scans above rely on.
+    let xsdt_header = unsafe { core::ptr::read_unaligned(xsdt_addr as *const AcpiSdtHeader) };
+    let entry_count = (xsdt_header.length as usize - size_of::<AcpiSdtHeader>()) / size_of::<u64>();
+    let entries_ptr = (xsdt_addr as usize + size_of::<AcpiSdtHeader>()) as *const u64;
+
+    for i in 0..entry_count {
+        // SAFETY: `i < entry_count`, computed from the XSDT's own
+        // `length` field per the ACPI spec's table layout.
+        let table_addr = unsafe { core::ptr::read_unaligned(entries_ptr.add(i)) };
+        // SAFETY: `table_addr` came from a well-formed XSDT entry.
+        let header = unsafe { core::ptr::read_unaligned(table_addr as *const AcpiSdtHeader) };
+        if header.signature != FADT_SIGNATURE {
+            continue;
+        }
+        // FADT's own body: `AcpiSdtHeader` (36 bytes), then a long run
+        // of fixed fields up to `PM1a_CNT_BLK` at absolute byte offset
+        // 64 (ACPI spec table 5-35) — read directly at that offset
+        // rather than modeling every preceding field, since none of
+        // them are needed here.
+        const PM1A_CNT_BLK_OFFSET: usize = 64;
+        if (header.length as usize) < PM1A_CNT_BLK_OFFSET + size_of::<u32>() {
+            return None; // table present but too short to carry this field.
+        }
+        // SAFETY: `table_addr + PM1A_CNT_BLK_OFFSET` is within the
+        // FADT's own `length`-bounded body, just checked above.
+        let pm1a_cnt_blk = unsafe {
+            core::ptr::read_unaligned((table_addr as usize + PM1A_CNT_BLK_OFFSET) as *const u32)
+        };
+        if pm1a_cnt_blk == 0 || pm1a_cnt_blk > u16::MAX as u32 {
+            return None; // absent, or not a plain 16-bit I/O port.
+        }
+        return Some(pm1a_cnt_blk as u16);
+    }
+
+    None
+}
+
 // ============================================================================
 // Page table setup (minimal identity/kernel mapping, section 3.2)
 // ============================================================================

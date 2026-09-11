@@ -279,6 +279,19 @@ mod tests {
         fn end_of_interrupt(&self, _irq: hal_core::interrupt::IrqId) {}
     }
 
+    /// No test in this module reaches `hal_core::power::SystemControl::
+    /// reboot`/`shutdown` (both `-> !`) — this mock exists purely to
+    /// satisfy `build_interface`'s generic bound.
+    struct MockPower;
+    impl hal_core::power::SystemControl for MockPower {
+        fn reboot(&self) -> ! {
+            loop {}
+        }
+        fn shutdown(&self) -> ! {
+            loop {}
+        }
+    }
+
     fn boot() -> BootInfo {
         let mut m = HardwareManifestRaw::zeroed();
         m.cpu_core_count = 1;
@@ -306,7 +319,8 @@ mod tests {
         let cpu = MockCpu { switches: Cell::new(0) };
         let timer = MockTimer { now: Cell::new(1000) };
         let irqc = MockInterrupt;
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let power = MockPower;
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         // Root Task exists and is Runnable, but entry == 0 (no image).
         assert_eq!(
@@ -331,7 +345,8 @@ mod tests {
         let cpu = MockCpu { switches: Cell::new(0) };
         let timer = MockTimer { now: Cell::new(2000) };
         let irqc = MockInterrupt;
-        let hal = hal_core::build_interface(&cpu, &timer, &irqc);
+        let power = MockPower;
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
 
         let out = k.schedule_step(&hal);
         assert_eq!(
