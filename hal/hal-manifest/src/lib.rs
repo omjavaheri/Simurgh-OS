@@ -220,6 +220,7 @@ mod dynamic {
         Console,
         Input,
         Pointer,
+        Nvme,
     }
 
     impl From<PeripheralKindRaw> for PeripheralKind {
@@ -232,6 +233,7 @@ mod dynamic {
                 PeripheralKindRaw::Console => Self::Console,
                 PeripheralKindRaw::Input => Self::Input,
                 PeripheralKindRaw::Pointer => Self::Pointer,
+                PeripheralKindRaw::Nvme => Self::Nvme,
             }
         }
     }

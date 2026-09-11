@@ -103,8 +103,9 @@ const PIC1_CASCADE_LINE_MASK: u8 = 0x04; // tells master: slave lives on IRQ2
 /// to avoid every vector this project already reserves:
 /// `interrupt::TIMER_VECTOR = 32`, and `peripheral.rs`'s own
 /// `X86_64_VIRTIO_BLK_MSI_VECTOR = 44` / `X86_64_VIRTIO_NET_MSI_VECTOR =
-/// 45` (plus that file's own `+ 1 = 46` fallback for any other
-/// peripheral kind) — 80 is clear of all of them with wide margin.
+/// 45` / `X86_64_NVME_MSI_VECTOR = 46` (plus that file's own `+ 1 = 47`
+/// fallback for any other peripheral kind) — 80 is clear of all of them
+/// with wide margin.
 pub const PIC1_OFFSET: u8 = 80;
 /// Vector offset the slave PIC's lines (IRQ8-15) are remapped to. Must be
 /// distinct from [`PIC1_OFFSET`] by at least 8 (one vector per line);
@@ -436,8 +437,8 @@ mod tests {
 
     #[test]
     fn pic_offsets_do_not_collide_with_reserved_vectors() {
-        // TIMER_VECTOR = 32, virtio MSI vectors 44/45/46 (peripheral.rs).
-        const RESERVED: [u32; 4] = [32, 44, 45, 46];
+        // TIMER_VECTOR = 32, virtio/NVMe MSI vectors 44/45/46 (peripheral.rs).
+        const RESERVED: [u32; 5] = [32, 44, 45, 46, 47];
         for v in [PIC1_OFFSET as u32, PIC1_OFFSET as u32 + 7, PIC2_OFFSET as u32, PIC2_OFFSET as u32 + 7] {
             assert!(!RESERVED.contains(&v), "vector {v} collides with a reserved vector");
         }

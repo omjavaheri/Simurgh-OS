@@ -297,6 +297,18 @@ pub enum PeripheralKindRaw {
     /// bus-discovered" reasoning, which applies identically here except
     /// `irq` is `hal_x86_64::pic::MOUSE_IRQ_VECTOR`.
     Pointer = 6,
+    /// A real NVMe controller (PCI class 0x01 "Mass Storage", subclass
+    /// 0x08 "Non-Volatile Memory", prog-if 0x02 "NVM Express I/O
+    /// Controller") — discovered by PCI CLASS CODE, unlike every virtio
+    /// kind above (discovered by virtio's own PCI-SIG VENDOR id,
+    /// `hal_x86_64::peripheral`'s own module doc comment). A separate
+    /// kind from `Block`, not a reuse of it: `Block` names virtio-blk's
+    /// own wire protocol specifically (`driver-virtio-blk`'s own doc
+    /// comment), a completely different register/queue layout from
+    /// NVMe's — collapsing both onto one kind would leave `kernel_arch_
+    /// glue`'s own driver-dispatch code unable to tell which real driver
+    /// binary a given device needs.
+    Nvme = 7,
 }
 
 /// One discovered MMIO-transport peripheral (virtio-mmio on QEMU's

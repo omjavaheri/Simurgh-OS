@@ -92,20 +92,29 @@ const X86_64_VIRTIO_BLK_MSI_VECTOR: u32 = 44;
 /// same "HAL discovers a real IRQ id, kernel-arch-glue just uses it"
 /// shape either way, just no longer collapsing every device onto one.
 const X86_64_VIRTIO_NET_MSI_VECTOR: u32 = 45;
+/// Same role as `X86_64_VIRTIO_BLK_MSI_VECTOR`/`X86_64_VIRTIO_NET_MSI_
+/// VECTOR`, for a real NVMe controller — a distinct vector, not the
+/// shared `_ =>` fallback below, since this kind DOES get a real
+/// `IrqBind` (`driver-nvme`'s own doc comment), unlike `Gpu`/`Unknown`
+/// today — reusing the shared fallback here would silently reintroduce
+/// the exact class of bug `X86_64_VIRTIO_NET_MSI_VECTOR`'s own doc
+/// comment already describes and fixed once for blk/net.
+const X86_64_NVME_MSI_VECTOR: u32 = 46;
 
 /// Picks the reserved MSI-X vector for a just-classified PCI device —
 /// see `X86_64_VIRTIO_NET_MSI_VECTOR`'s own doc comment for why this
 /// must NOT collapse onto a single shared constant. `PeripheralKind::
 /// Unknown`/`Gpu`/anything else this project does not yet bind a real
-/// IRQ to still gets a distinct-from-blk/net vector (harmless — nothing
-/// calls `IrqBind` for those kinds today, so no collision is possible
-/// either way; kept distinct anyway so this function never needs a
-/// TODO the day one of them does).
+/// IRQ to still gets a distinct-from-blk/net/nvme vector (harmless —
+/// nothing calls `IrqBind` for those kinds today, so no collision is
+/// possible either way; kept distinct anyway so this function never
+/// needs a TODO the day one of them does).
 fn msi_vector_for_kind(kind: PeripheralKind) -> u32 {
     match kind {
         PeripheralKind::Block => X86_64_VIRTIO_BLK_MSI_VECTOR,
         PeripheralKind::Network => X86_64_VIRTIO_NET_MSI_VECTOR,
-        _ => X86_64_VIRTIO_NET_MSI_VECTOR + 1,
+        PeripheralKind::Nvme => X86_64_NVME_MSI_VECTOR,
+        _ => X86_64_NVME_MSI_VECTOR + 1,
     }
 }
 
@@ -132,6 +141,22 @@ unsafe fn ecam_read_u32(ecam_base: u64, bus: u8, device: u8, function: u8, offse
 struct PciDeviceHeader {
     vendor_id: u16,
     class_code: u8,
+    /// PCI Configuration Space dword 0x08, bits 16-23 — needed (alongside
+    /// `class_code`/`prog_if`) to recognise an NVMe controller by CLASS
+    /// CODE rather than vendor id (`classify_by_class_code`'s own doc
+    /// comment): class 0x01 "Mass Storage" alone is not specific enough
+    /// — a SATA AHCI controller (subclass 0x06) or a plain legacy IDE
+    /// controller (subclass 0x01) both share it with NVMe (subclass
+    /// 0x08).
+    subclass: u8,
+    /// PCI Configuration Space dword 0x08, bits 8-15 — the "programming
+    /// interface" byte. NVMe controllers are required to report `0x02`
+    /// ("NVM Express I/O Controller Interface") here, per the NVMe base
+    /// spec's own PCI identification chapter; without checking it, a
+    /// future subclass-0x08-but-different-prog-if device would be
+    /// misclassified as NVMe and this driver would attempt the wrong
+    /// register protocol against it.
+    prog_if: u8,
     header_type: u8,
 }
 
@@ -145,15 +170,20 @@ unsafe fn read_pci_header(ecam_base: u64, bus: u8, device: u8, function: u8) -> 
         return None;
     }
 
-    // SAFETY: forwarded from this function's own contract.
+    // SAFETY: forwarded from this function's own contract. Dword 0x08
+    // layout (PCI spec, Type 0/1 header, common to both): byte 0 =
+    // Revision ID, byte 1 = Prog IF, byte 2 = Subclass, byte 3 = Class
+    // Code.
     let dword2 = unsafe { ecam_read_u32(ecam_base, bus, device, function, 0x08) };
     let class_code = ((dword2 >> 24) & 0xFF) as u8;
+    let subclass = ((dword2 >> 16) & 0xFF) as u8;
+    let prog_if = ((dword2 >> 8) & 0xFF) as u8;
 
     // SAFETY: forwarded from this function's own contract.
     let dword3 = unsafe { ecam_read_u32(ecam_base, bus, device, function, 0x0C) };
     let header_type = ((dword3 >> 16) & 0xFF) as u8;
 
-    Some(PciDeviceHeader { vendor_id, class_code, header_type })
+    Some(PciDeviceHeader { vendor_id, class_code, subclass, prog_if, header_type })
 }
 
 /// Maps a PCI class code (for a device already confirmed to carry
@@ -165,6 +195,24 @@ fn classify_virtio_pci_device(header: &PciDeviceHeader) -> PeripheralKind {
         PCI_CLASS_DISPLAY => PeripheralKind::Gpu,
         _ => PeripheralKind::Unknown,
     }
+}
+
+/// NVMe base spec, PCI identification chapter: class 0x01 "Mass
+/// Storage", subclass 0x08 "Non-Volatile Memory".
+const PCI_SUBCLASS_NVM: u8 = 0x08;
+/// "NVM Express I/O Controller Interface" — the only prog-if value this
+/// driver understands (`PciDeviceHeader::prog_if`'s own doc comment).
+const PCI_PROG_IF_NVME_IO: u8 = 0x02;
+
+/// Whether `header` is a real NVMe controller — checked by CLASS CODE,
+/// not vendor id (`PciDeviceHeader::subclass`'s own doc comment: unlike
+/// virtio, no single vendor id identifies every real NVMe implementation
+/// — QEMU's own emulated `-device nvme` reports Intel's PCI-SIG vendor
+/// id, 0x8086, but a real NVMe SSD could report any vendor at all).
+fn is_nvme_controller(header: &PciDeviceHeader) -> bool {
+    header.class_code == PCI_CLASS_MASS_STORAGE
+        && header.subclass == PCI_SUBCLASS_NVM
+        && header.prog_if == PCI_PROG_IF_NVME_IO
 }
 
 /// BAR0 sizing — identical logic to `hal_arm64::peripheral::probe_bar0`,
@@ -196,6 +244,79 @@ unsafe fn probe_bar0(ecam_base: u64, bus: u8, device: u8, function: u8) -> Optio
         return None;
     }
     let size = (!(size_mask & 0xFFFF_FFF0) as u64) + 1;
+    Some((base, size))
+}
+
+/// BAR0 sizing that also handles a 64-BIT memory BAR — `probe_bar0`
+/// above assumes a 32-bit BAR throughout (true for every virtio-pci
+/// device this project has driven so far), but real NVMe controllers
+/// (QEMU's `-device nvme` included) commonly report BAR0 as 64-bit
+/// (PCI spec §6.2.5.1, "type" bits 2:1 of the BAR = `10`), where the
+/// base address spans BAR0 (low 32 bits, minus the low 4 flag bits) AND
+/// BAR1 (high 32 bits) as ONE combined 64-bit value/size, rather than
+/// BAR1 naming an independent, second BAR the way it would for a
+/// 32-bit-BAR0 device. A NEW function, not a `probe_bar0` rewrite: this
+/// keeps the already-QEMU-verified virtio path completely untouched.
+///
+/// # Safety
+/// Same contract as `ecam_read_u32`.
+unsafe fn probe_bar0_maybe64(ecam_base: u64, bus: u8, device: u8, function: u8) -> Option<(u64, u64)> {
+    // SAFETY: forwarded from this function's own contract.
+    let bar0 = unsafe { ecam_read_u32(ecam_base, bus, device, function, 0x10) };
+    if bar0 & 0x1 != 0 {
+        return None; // I/O-space BAR — not a real NVMe MMIO register window.
+    }
+    let is_64bit = (bar0 >> 1) & 0x3 == 0x2;
+
+    let bar0_addr = ecam_base + ecam_offset(bus, device, function) + 0x10;
+    let bar0_ptr = bar0_addr as *mut u32;
+
+    if !is_64bit {
+        // Same 32-bit sizing procedure as `probe_bar0`.
+        let base = (bar0 & 0xFFFF_FFF0) as u64;
+        // SAFETY: forwarded from this function's own contract; original
+        // value always restored below.
+        unsafe { bar0_ptr.write_volatile(0xFFFF_FFFF) };
+        // SAFETY: forwarded from this function's own contract.
+        let size_mask = unsafe { bar0_ptr.read_volatile() };
+        // SAFETY: forwarded from this function's own contract; restoring.
+        unsafe { bar0_ptr.write_volatile(bar0) };
+        if size_mask == 0 {
+            return None;
+        }
+        let size = (!(size_mask & 0xFFFF_FFF0) as u64) + 1;
+        return Some((base, size));
+    }
+
+    // 64-bit BAR: BAR1 (offset 0x14) holds the high 32 bits of both the
+    // base address and, during sizing, the size mask (PCI spec
+    // §6.2.5.1's own 64-bit sizing procedure: write all-ones to BOTH
+    // dwords, then read BOTH back, combined as one 64-bit value).
+    // SAFETY: forwarded from this function's own contract.
+    let bar1 = unsafe { ecam_read_u32(ecam_base, bus, device, function, 0x14) };
+    let base = ((bar0 & 0xFFFF_FFF0) as u64) | ((bar1 as u64) << 32);
+
+    let bar1_addr = ecam_base + ecam_offset(bus, device, function) + 0x14;
+    let bar1_ptr = bar1_addr as *mut u32;
+    // SAFETY: forwarded from this function's own contract; both dwords
+    // restored below to their original values before returning.
+    unsafe {
+        bar0_ptr.write_volatile(0xFFFF_FFFF);
+        bar1_ptr.write_volatile(0xFFFF_FFFF);
+    }
+    // SAFETY: forwarded from this function's own contract.
+    let (size_lo, size_hi) = unsafe { (bar0_ptr.read_volatile(), bar1_ptr.read_volatile()) };
+    // SAFETY: forwarded from this function's own contract; restoring.
+    unsafe {
+        bar0_ptr.write_volatile(bar0);
+        bar1_ptr.write_volatile(bar1);
+    }
+
+    let size_mask = ((size_lo & 0xFFFF_FFF0) as u64) | ((size_hi as u64) << 32);
+    if size_mask == 0 {
+        return None;
+    }
+    let size = (!size_mask).wrapping_add(1);
     Some((base, size))
 }
 
@@ -251,7 +372,14 @@ impl PeripheralDiscovery {
                         continue;
                     };
 
-                    if header.vendor_id != VIRTIO_PCI_VENDOR_ID {
+                    // Two, independent recognition paths — virtio's own
+                    // vendor id (unchanged from before), and NVMe's own
+                    // CLASS CODE (`is_nvme_controller`'s own doc comment
+                    // on why NVMe needs a different check than every
+                    // other kind this scan already recognises).
+                    let is_virtio = header.vendor_id == VIRTIO_PCI_VENDOR_ID;
+                    let is_nvme = is_nvme_controller(&header);
+                    if !is_virtio && !is_nvme {
                         continue;
                     }
 
@@ -259,12 +387,23 @@ impl PeripheralDiscovery {
                         break 'bus_scan;
                     }
 
-                    // SAFETY: same ordering contract as above.
-                    let bar0 = unsafe { probe_bar0(ecam_base, bus, device, function) };
-                    let (mmio_base, mmio_size) = bar0.unwrap_or((0, 0));
                     let config_space_base = ecam_base + ecam_offset(bus, device, function);
 
-                    let kind = classify_virtio_pci_device(&header);
+                    let (kind, mmio_base, mmio_size) = if is_nvme {
+                        // SAFETY: same ordering contract as above. NVMe's
+                        // BAR0 is commonly 64-bit (`probe_bar0_maybe64`'s
+                        // own doc comment) — a plain 32-bit `probe_bar0`
+                        // would misread its base/size.
+                        let bar0 = unsafe { probe_bar0_maybe64(ecam_base, bus, device, function) };
+                        let (mmio_base, mmio_size) = bar0.unwrap_or((0, 0));
+                        (PeripheralKind::Nvme, mmio_base, mmio_size)
+                    } else {
+                        // SAFETY: same ordering contract as above.
+                        let bar0 = unsafe { probe_bar0(ecam_base, bus, device, function) };
+                        let (mmio_base, mmio_size) = bar0.unwrap_or((0, 0));
+                        (classify_virtio_pci_device(&header), mmio_base, mmio_size)
+                    };
+
                     devices[device_count] = PeripheralDevice::new_pci(
                         kind,
                         mmio_base,
@@ -344,12 +483,46 @@ mod tests {
         let mk = |class_code: u8| PciDeviceHeader {
             vendor_id: VIRTIO_PCI_VENDOR_ID,
             class_code,
+            subclass: 0,
+            prog_if: 0,
             header_type: 0,
         };
         assert_eq!(classify_virtio_pci_device(&mk(PCI_CLASS_MASS_STORAGE)), PeripheralKind::Block);
         assert_eq!(classify_virtio_pci_device(&mk(PCI_CLASS_NETWORK)), PeripheralKind::Network);
         assert_eq!(classify_virtio_pci_device(&mk(PCI_CLASS_DISPLAY)), PeripheralKind::Gpu);
         assert_eq!(classify_virtio_pci_device(&mk(0xFF)), PeripheralKind::Unknown);
+    }
+
+    #[test]
+    fn is_nvme_controller_requires_class_subclass_and_prog_if_together() {
+        let mk = |class_code: u8, subclass: u8, prog_if: u8| PciDeviceHeader {
+            vendor_id: 0x8086, // QEMU's own emulated -device nvme vendor id
+            class_code,
+            subclass,
+            prog_if,
+            header_type: 0,
+        };
+        assert!(is_nvme_controller(&mk(PCI_CLASS_MASS_STORAGE, PCI_SUBCLASS_NVM, PCI_PROG_IF_NVME_IO)));
+        // Right class, wrong subclass (e.g. 0x06 = SATA AHCI).
+        assert!(!is_nvme_controller(&mk(PCI_CLASS_MASS_STORAGE, 0x06, PCI_PROG_IF_NVME_IO)));
+        // Right class/subclass, wrong prog-if.
+        assert!(!is_nvme_controller(&mk(PCI_CLASS_MASS_STORAGE, PCI_SUBCLASS_NVM, 0x00)));
+        // Wrong class entirely.
+        assert!(!is_nvme_controller(&mk(PCI_CLASS_NETWORK, PCI_SUBCLASS_NVM, PCI_PROG_IF_NVME_IO)));
+    }
+
+    #[test]
+    fn nvme_gets_its_own_msi_vector_distinct_from_blk_and_net() {
+        // Same real-bug class `msi_vector_for_kind_never_collapses_blk_
+        // and_net_onto_the_same_vector` already guards against, extended
+        // to the third real `IrqBind` consumer this scan now recognises.
+        let blk = msi_vector_for_kind(PeripheralKind::Block);
+        let net = msi_vector_for_kind(PeripheralKind::Network);
+        let nvme = msi_vector_for_kind(PeripheralKind::Nvme);
+        assert_ne!(blk, net);
+        assert_ne!(blk, nvme);
+        assert_ne!(net, nvme);
+        assert!(nvme >= crate::interrupt::FIRST_USABLE_IRQ_VECTOR as u32);
     }
 
     #[test]
