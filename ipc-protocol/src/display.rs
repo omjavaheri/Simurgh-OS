@@ -56,6 +56,22 @@ pub enum DisplayRequest {
     /// Query the output topology (monitor count / resolution / refresh).
     /// Reply: `OutputTopology`.
     QueryOutputs,
+    /// Real-input-handling plan (Stage C): a non-blocking check for one
+    /// pending real keyboard event — driven by the SAME real i8042
+    /// pipeline `SubscribeInput`'s own doc comment above describes as
+    /// not-yet-built, but landing this way instead: `driver-i8042`
+    /// (`subsystems/drivers/driver-i8042`) pushes real, decoded key
+    /// events to Compositor's own internal queue over a dedicated
+    /// internal edge (not this wire protocol — that edge is this
+    /// driver's own small, locally-scoped shape), and THIS request is
+    /// how a real display client (`ui-core`) drains that queue, one
+    /// event per call, matching `driver-virtio-net`'s own "unsolicited
+    /// external data exposed as a non-blocking poll, not a push"
+    /// precedent in this same codebase. Reply: `InputEvent` if one was
+    /// pending, `NoInputPending` otherwise (a normal reply, not an
+    /// error — matching `SyscallOp::Poll`'s own "0 bits is not a
+    /// failure" semantics).
+    PollInputEvent,
 }
 
 /// A reply from the compositor service.
@@ -89,6 +105,20 @@ pub enum DisplayResponse {
         /// Machine-readable error code.
         code: DisplayErrorCode,
     },
+    /// `PollInputEvent` found one real, pending key event. `keycode` is
+    /// a raw Scan Code Set 1 make code (bit 7 cleared) — see
+    /// `driver_i8042::scancode`'s own doc comment (`Simurgh-OS`'s own
+    /// `subsystems/drivers/driver-i8042` crate) for the full decode
+    /// scope (make/break only, no extended keys, no mouse).
+    InputEvent {
+        /// Raw Scan Code Set 1 keycode (bit 7 already cleared).
+        keycode: u8,
+        /// `true` for a key-down (make), `false` for key-up (break).
+        pressed: bool,
+    },
+    /// `PollInputEvent` found nothing pending — a normal reply, not an
+    /// error (see `DisplayRequest::PollInputEvent`'s own doc comment).
+    NoInputPending,
 }
 
 /// Compositor error codes.

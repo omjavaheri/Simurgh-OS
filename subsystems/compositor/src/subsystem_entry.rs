@@ -343,11 +343,7 @@ const I8042_VA: usize = 0xD8B0_0000;
 /// on a driver's own wire shape, not its crate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeyEvent {
-    #[allow(dead_code)] // read by a later stage's own real consumer —
-    // stored now (see `subsystem_main`'s own doc comment) so this
-    // stage's edge is genuinely verifiable, not a dead write.
     keycode: u8,
-    #[allow(dead_code)]
     pressed: bool,
 }
 
@@ -379,7 +375,7 @@ fn read_i8042_message() -> Option<KeyEvent> {
 /// comment already makes for `shared_cap`. Real per-connection
 /// capability resolution is a later `feat:` follow-up, not a correctness
 /// gap in what IS wired here.
-fn handle_request(comp: &mut Compositor, req: DisplayRequest) -> DisplayResponse {
+fn handle_request(comp: &mut Compositor, pending_key_event: &mut Option<KeyEvent>, req: DisplayRequest) -> DisplayResponse {
     match req {
         DisplayRequest::CreateSurface => DisplayResponse::SurfaceCreated {
             surface: SurfaceHandle(comp.create_surface()),
@@ -424,6 +420,14 @@ fn handle_request(comp: &mut Compositor, req: DisplayRequest) -> DisplayResponse
         DisplayRequest::SubscribeInput | DisplayRequest::QueryOutputs => DisplayResponse::Error {
             code: DisplayErrorCode::Unsupported,
         },
+        // Real, per this file's own `read_i8042_message`/`KeyEvent` —
+        // drains (not peeks) `pending_key_event`, matching `driver-
+        // virtio-net`'s own `PollFrame` precedent this variant's own
+        // `ipc_protocol::display` doc comment cites.
+        DisplayRequest::PollInputEvent => match pending_key_event.take() {
+            Some(event) => DisplayResponse::InputEvent { keycode: event.keycode, pressed: event.pressed },
+            None => DisplayResponse::NoInputPending,
+        },
     }
 }
 
@@ -433,17 +437,16 @@ fn handle_request(comp: &mut Compositor, req: DisplayRequest) -> DisplayResponse
 /// (always switches away on success — see `Reply`'s own doc comment in
 /// `kernel_core::syscall`).
 ///
-/// Real-input-handling plan, Stage B/C: ADDITIVELY (see this function's
-/// own doc comment further down for why) polls `I8042_SIGNAL_NOTIF_CAP`
-/// once at the top of every iteration; if `driver-i8042` has signaled,
-/// drains its one queued `KeyEvent` (a real, bounded, non-blocking-in-
-/// practice `Recv`+`Reply` — see `I8042_ENDPOINT_CAP`'s own doc comment
-/// for why this specific endpoint never needs the display Endpoint's own
-/// special-cased `Recv` opcode) and stores it in `last_key_event`. There
-/// is no real consumer of `last_key_event` yet — wiring a `PollInputEvent`-
-/// style request `ui-core` can call is this plan's own next stage; this
-/// stage's own bar is proving the driver-i8042-to-Compositor edge is
-/// real and does not regress the existing display-Endpoint traffic.
+/// Real-input-handling plan, Stage B/C: ADDITIVELY polls `I8042_SIGNAL_
+/// NOTIF_CAP` once at the top of every iteration; if `driver-i8042` has
+/// signaled, drains its one queued `KeyEvent` (a real, bounded, non-
+/// blocking-in-practice `Recv`+`Reply` — see `I8042_ENDPOINT_CAP`'s own
+/// doc comment for why this specific endpoint never needs the display
+/// Endpoint's own special-cased `Recv` opcode) and stores it in
+/// `last_key_event`, until a real client drains it back out via
+/// `DisplayRequest::PollInputEvent` (`handle_request`'s own arm) — the
+/// real, ui-core-facing half of this same edge, matching `ipc_protocol::
+/// display::DisplayRequest::PollInputEvent`'s own doc comment.
 ///
 /// Verification status (2026-09-11): structural, not yet a direct real-
 /// QEMU observation of a decoded `KeyEvent` reaching this function.
@@ -475,9 +478,9 @@ fn handle_request(comp: &mut Compositor, req: DisplayRequest) -> DisplayResponse
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut comp = Compositor::new();
-    // Not read anywhere yet — see this function's own doc comment on why
-    // (a real consumer, `PollInputEvent`, is this plan's own next stage).
-    #[allow(unused_assignments)]
+    // Drained by a real client's own `PollInputEvent` (`handle_request`'s
+    // own arm) — at most one pending event at a time, matching `driver-
+    // i8042`'s own one-event-per-`Call` shape.
     let mut last_key_event: Option<KeyEvent> = None;
 
     // Same stack-slot-reuse miscompilation `fs_native::subsystem_entry::
@@ -528,7 +531,7 @@ pub extern "C" fn subsystem_main() -> ! {
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, COMPOSITOR_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();
         let resp = match decode_display_request(&req_msg) {
-            Ok(req) => handle_request(&mut comp, req),
+            Ok(req) => handle_request(&mut comp, &mut last_key_event, req),
             Err(_) => DisplayResponse::Error {
                 code: DisplayErrorCode::Unsupported,
             },

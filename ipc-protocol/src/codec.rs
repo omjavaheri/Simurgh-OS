@@ -481,11 +481,12 @@ const OP_DP_COMMIT_BUFFER: u8 = 2;
 const OP_DP_DESTROY_SURFACE: u8 = 3;
 const OP_DP_SUBSCRIBE_INPUT: u8 = 4;
 const OP_DP_QUERY_OUTPUTS: u8 = 5;
+const OP_DP_POLL_INPUT_EVENT: u8 = 6;
 
 /// Encodes a `DisplayRequest` into a `SmallMessage`.
 ///
 /// Word layout by variant:
-/// - `CreateSurface`, `SubscribeInput`, `QueryOutputs`: `[]`
+/// - `CreateSurface`, `SubscribeInput`, `QueryOutputs`, `PollInputEvent`: `[]`
 /// - `CommitBuffer`: `[surface, buffer_cap, width, height]`
 /// - `DestroySurface`: `[surface]`
 pub fn encode_display_request(req: &DisplayRequest) -> SmallMessage {
@@ -503,6 +504,7 @@ pub fn encode_display_request(req: &DisplayRequest) -> SmallMessage {
         DisplayRequest::DestroySurface { surface } => (OP_DP_DESTROY_SURFACE, [surface.0 as u64, 0, 0, 0]),
         DisplayRequest::SubscribeInput => (OP_DP_SUBSCRIBE_INPUT, [0, 0, 0, 0]),
         DisplayRequest::QueryOutputs => (OP_DP_QUERY_OUTPUTS, [0, 0, 0, 0]),
+        DisplayRequest::PollInputEvent => (OP_DP_POLL_INPUT_EVENT, [0, 0, 0, 0]),
     };
     let n = match op {
         OP_DP_COMMIT_BUFFER => 4,
@@ -551,6 +553,7 @@ pub fn decode_display_request(msg: &SmallMessage) -> Result<DisplayRequest, Deco
         }
         OP_DP_SUBSCRIBE_INPUT => Ok(DisplayRequest::SubscribeInput),
         OP_DP_QUERY_OUTPUTS => Ok(DisplayRequest::QueryOutputs),
+        OP_DP_POLL_INPUT_EVENT => Ok(DisplayRequest::PollInputEvent),
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -564,6 +567,8 @@ const OP_DPR_DESTROYED: u8 = 3;
 const OP_DPR_INPUT_SUBSCRIBED: u8 = 4;
 const OP_DPR_OUTPUT_TOPOLOGY: u8 = 5;
 const OP_DPR_ERROR: u8 = 6;
+const OP_DPR_INPUT_EVENT: u8 = 7;
+const OP_DPR_NO_INPUT_PENDING: u8 = 8;
 
 /// Encodes a `DisplayResponse` into a `SmallMessage`.
 ///
@@ -572,6 +577,8 @@ const OP_DPR_ERROR: u8 = 6;
 /// - `Committed`, `Destroyed`, `InputSubscribed`: `[]`
 /// - `OutputTopology`: `[output_count, primary_width, primary_height, primary_refresh_mhz]`
 /// - `Error`: `[code]`
+/// - `InputEvent`: `[keycode, pressed]`
+/// - `NoInputPending`: `[]`
 pub fn encode_display_response(resp: &DisplayResponse) -> SmallMessage {
     let (op, words): (u8, [u64; 4]) = match *resp {
         DisplayResponse::SurfaceCreated { surface } => (OP_DPR_SURFACE_CREATED, [surface.0 as u64, 0, 0, 0]),
@@ -593,9 +600,14 @@ pub fn encode_display_response(resp: &DisplayResponse) -> SmallMessage {
             ],
         ),
         DisplayResponse::Error { code } => (OP_DPR_ERROR, [code as u64, 0, 0, 0]),
+        DisplayResponse::InputEvent { keycode, pressed } => {
+            (OP_DPR_INPUT_EVENT, [keycode as u64, pressed as u64, 0, 0])
+        }
+        DisplayResponse::NoInputPending => (OP_DPR_NO_INPUT_PENDING, [0, 0, 0, 0]),
     };
     let n = match op {
         OP_DPR_OUTPUT_TOPOLOGY => 4,
+        OP_DPR_INPUT_EVENT => 2,
         OP_DPR_SURFACE_CREATED | OP_DPR_ERROR => 1,
         _ => 0,
     };
@@ -651,6 +663,14 @@ pub fn decode_display_response(msg: &SmallMessage) -> Result<DisplayResponse, De
             };
             Ok(DisplayResponse::Error { code })
         }
+        OP_DPR_INPUT_EVENT => {
+            need(2)?;
+            Ok(DisplayResponse::InputEvent {
+                keycode: w[0] as u8,
+                pressed: w[1] != 0,
+            })
+        }
+        OP_DPR_NO_INPUT_PENDING => Ok(DisplayResponse::NoInputPending),
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -1359,6 +1379,7 @@ mod tests {
         });
         display_request_roundtrip(DisplayRequest::SubscribeInput);
         display_request_roundtrip(DisplayRequest::QueryOutputs);
+        display_request_roundtrip(DisplayRequest::PollInputEvent);
     }
 
     fn display_response_roundtrip(resp: DisplayResponse) {
@@ -1383,6 +1404,15 @@ mod tests {
         display_response_roundtrip(DisplayResponse::Error {
             code: DisplayErrorCode::BadBuffer,
         });
+        display_response_roundtrip(DisplayResponse::InputEvent {
+            keycode: 0x1e,
+            pressed: true,
+        });
+        display_response_roundtrip(DisplayResponse::InputEvent {
+            keycode: 0x1e,
+            pressed: false,
+        });
+        display_response_roundtrip(DisplayResponse::NoInputPending);
     }
 
     #[test]
