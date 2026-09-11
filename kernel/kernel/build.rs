@@ -592,4 +592,35 @@ fn main() {
         "cargo:rustc-env=FILE_MANAGER_ELF_PATH={}",
         fm_path.canonicalize().unwrap().display()
     );
+
+    // Same as `fm-core-bin` above, for `ui-core-bin` — the ELEVENTH
+    // layer-4/5/6 process this project spawns as a real Simurgh-OS
+    // subsystem (`Simurgh-UI-Template01`, a separate git repo — the base
+    // graphical desktop environment). Same local-dev-only sibling-
+    // directory path stitch, ordinary `debug` profile.
+    let ui_build_alias =
+        format!("(in Simurgh-UI-Template01) cargo +nightly-2025-01-15 build -p ui-core --bin ui-core-bin --features subsystem-bin --target ../Simurgh-OS/targets/{dm_target_dir_name}.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem");
+    let ui_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("Simurgh-UI-Template01")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("ui-core-bin");
+
+    if !ui_path.exists() {
+        panic!(
+            "kernel build.rs: ui-core-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {ui_build_alias}",
+            ui_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", ui_path.display());
+    println!(
+        "cargo:rustc-env=UI_CORE_ELF_PATH={}",
+        ui_path.canonicalize().unwrap().display()
+    );
 }

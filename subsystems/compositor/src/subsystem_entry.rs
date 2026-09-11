@@ -55,8 +55,21 @@ use ipc_protocol::display::DisplayErrorCode;
 use ipc_protocol::{DisplayRequest, DisplayResponse, SurfaceHandle};
 use kernel_ipc::SmallMessage;
 
-/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_RECV`.
-const IPC_RECV: usize = 43;
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::
+/// SBS_IPC_RECV` — the correctly-GENERAL `Recv` opcode, needed now that
+/// `Simurgh-UI-Template01`'s own `ui-core` is a SECOND, independent real
+/// client. **Changed from `sys::IPC_RECV` (43) on 2026-09-11**, NOT a
+/// cosmetic rename — see `kernel_arch_glue::G_COMPOSITOR_ROOT_ONLY_PHASE`'s
+/// own doc comment for the real, QEMU-confirmed boot hang this exact
+/// change already caused (and fixed) once, for fs-native's own identical
+/// situation: switching this constant alone, without ALSO keeping the
+/// narrow, hardcoded-root dispatch for Compositor's own Root-Task-only
+/// bootstrap phase, reintroduces that same class of permanent hang.
+/// `kernel_arch_glue::compositor_native_recv` (the dispatch `kernel/
+/// kernel/src/main.rs`'s own `sys::SBS_IPC_RECV` arm actually calls for
+/// Compositor) handles that distinction; this constant only needs to
+/// name the right raw opcode.
+const IPC_RECV: usize = 108;
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_REPLY`.
 const IPC_REPLY: usize = 44;
 

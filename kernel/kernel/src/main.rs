@@ -295,6 +295,34 @@ const FILE_MANAGER_FS_SHARED_VA: usize = 0xD800_0000;
 #[cfg(target_arch = "x86_64")]
 const FILE_MANAGER_FS_DATA_VA: usize = 0xD810_0000;
 
+/// `ui-core-bin`'s own separately-built ELF image — same packaging as
+/// `FILE_MANAGER_ELF` (see its own doc comment): the ELEVENTH layer-4/5/6
+/// process this project spawns (`Simurgh-UI-Template01`, a separate git
+/// repo, no `MD/REPO-Simurgh-OS/` charter — Omid's own 2026-09-11
+/// direction: the base graphical desktop environment), out-of-tree for
+/// the same local-dev-only path-stitch reason.
+static UI_CORE_ELF: &[u8] = include_bytes!(env!("UI_CORE_ELF_PATH"));
+
+/// VA `Simurgh-UI-Template01`'s own copy of the shared Compositor message
+/// page is mapped at, in ITS OWN address space (`spawn_ui_core_x86`'s own
+/// `kernel_arch_glue::wire_ui_core_to_compositor` call) — must stay
+/// numerically equal to `ui_core::subsystem_entry::COMPOSITOR_SHARED_VA`.
+/// Deliberately the SAME numeric value as Compositor's own
+/// `COMPOSITOR_SHARED_VA` (`compositor_demo_start`'s own doc comment) —
+/// safe to reuse since each process has its own, independent address
+/// space, same reasoning [`FILE_MANAGER_FS_SHARED_VA`]'s own doc comment
+/// gives for the identical fs-native precedent.
+#[cfg(target_arch = "x86_64")]
+const UI_CORE_COMPOSITOR_SHARED_VA: usize = 0xD840_0000;
+
+/// VA `Simurgh-UI-Template01`'s own copy of the shared Compositor frame-
+/// buffer page is mapped at — must stay numerically equal to `ui_core::
+/// subsystem_entry::COMPOSITOR_FB_VA`. Same "independently reused
+/// numeric VA, different address space" reasoning as
+/// [`UI_CORE_COMPOSITOR_SHARED_VA`].
+#[cfg(target_arch = "x86_64")]
+const UI_CORE_COMPOSITOR_FB_VA: usize = 0xD850_0000;
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -1213,6 +1241,13 @@ mod sys {
     /// Same "prove a real value, not just survival" reasoning `NL_REPORT`'s
     /// own doc comment gives.
     pub const FM_REPORT: usize = 122;
+    /// `a0` = 1 iff `Simurgh-UI-Template01`'s own real `self_check` — a
+    /// real `CreateSurface`/`CommitBuffer`/`QueryOutputs`/`DestroySurface`
+    /// round trip to Compositor via `sys::IPC_CALL` — succeeded, 0
+    /// otherwise; `a1` names which step failed when it did not. Same
+    /// "prove a real value, not just survival" reasoning `NL_REPORT`'s
+    /// own doc comment gives.
+    pub const UI_REPORT: usize = 123;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3098,17 +3133,20 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 .sched
                 .running()
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
-            // fs-native is a REAL, general multi-client `SBS_IPC_RECV`
-            // caller (`simurgh-file-manager`'s own edge, this session),
-            // but its very FIRST `Recv` call needs the narrow, hardcoded-
-            // root dispatch instead — see `kernel_arch_glue::
-            // G_FS_AWAITING_FIRST_RECV`'s own doc comment for the real
-            // QEMU-confirmed hang `fs_native_recv` fixes. Every other
-            // `SBS_IPC_RECV` caller (`security-broker`, `policy-engine`,
-            // ...) is unaffected — this check is `false` for them (`fs_tid`
-            // never equals their own tid).
+            // fs-native and Compositor are REAL, general multi-client
+            // `SBS_IPC_RECV` callers (`simurgh-file-manager`/`Simurgh-UI-
+            // Template01`'s own edges, this session), but EACH needs the
+            // narrow, hardcoded-root dispatch for its own Root-Task-only
+            // bootstrap phase — see `kernel_arch_glue::G_FS_ROOT_ONLY_
+            // PHASE`/`G_COMPOSITOR_ROOT_ONLY_PHASE`'s own doc comments for
+            // the real QEMU-confirmed hangs `fs_native_recv`/
+            // `compositor_native_recv` fix. Every other `SBS_IPC_RECV`
+            // caller (`security-broker`, `policy-engine`, ...) is
+            // unaffected — both checks are `false` for them.
             let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
                 kernel_arch_glue::fs_native_recv(hal, caller, a0 as u32)
+            } else if kernel_arch_glue::compositor_tid() == Some(caller) {
+                kernel_arch_glue::compositor_native_recv(hal, caller, a0 as u32)
             } else {
                 kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32)
             };
@@ -3863,6 +3901,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             }
             kernel_arch_glue::set_shell_tid(spawn_shell_x86(kernel_arch_glue::khal()));
             spawn_file_manager_x86(kernel_arch_glue::khal());
+            spawn_ui_core_x86(kernel_arch_glue::khal());
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
@@ -4050,6 +4089,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::FM_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "file-manager (U-mode, x86_64): real fs-native self_check round trip - ok={} step={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::UI_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "ui-core (U-mode, x86_64): real Compositor self_check round trip - ok={} step={a1}\r\n",
                 a0 == 1
             ));
             return TrapOutcome::Resume(0);
@@ -4707,6 +4753,72 @@ fn spawn_file_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::Th
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): file-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_native_loader` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_file_manager_x86`; the ELEVENTH layer-4/5/6 process this
+/// project spawns (`Simurgh-UI-Template01`, a separate git repo — the
+/// base graphical desktop environment, Omid's own 2026-09-11 direction).
+/// Wires the real `ui-core` <-> Compositor IPC edge right after spawning
+/// (`wire_ui_core_to_compositor`'s own doc comment): same "never
+/// concurrent callers" reasoning `spawn_file_manager_x86`'s own doc
+/// comment gives for the identical fs-native precedent — Root Task's own
+/// Compositor usage (`compositor_demo_start`) happens once, early in
+/// boot, and completes before this process is ever spawned.
+#[cfg(target_arch = "x86_64")]
+fn spawn_ui_core_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const UI_CORE_STACK_VMA: usize = 0xC04A_0000;
+    const UI_CORE_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        UI_CORE_ELF,
+        elf_loader::machine::EM_X86_64,
+        UI_CORE_STACK_VMA,
+        UI_CORE_STACK_LEN,
+    ) {
+        Some((tid, cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned ui-core (tid {}) from its OWN separately-built ELF image (Simurgh-UI-Template01 repo)\r\n",
+                tid.as_u32()
+            ));
+            let root_pt = k
+                .tcb(tid)
+                .map(|t| t.addr_space)
+                .and_then(|addr_space| k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()));
+            match root_pt {
+                Some(root_pt) => {
+                    match kernel_arch_glue::wire_ui_core_to_compositor(
+                        hal,
+                        cap_space,
+                        root_pt,
+                        UI_CORE_COMPOSITOR_SHARED_VA,
+                        UI_CORE_COMPOSITOR_FB_VA,
+                    ) {
+                        Some(()) => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): wired ui-core <-> Compositor real IPC edge\r\n"
+                        )),
+                        None => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): ui-core<->Compositor wiring skipped (Compositor not ready or out of resources)\r\n"
+                        )),
+                    }
+                }
+                None => kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): ui-core<->Compositor wiring skipped (could not resolve ui-core's own address space)\r\n"
+                )),
+            }
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -6006,11 +6118,14 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 .running()
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
             // See the x86_64/riscv64 `SBS_IPC_RECV` arm's own comment
-            // (`kernel_arch_glue::G_FS_AWAITING_FIRST_RECV`'s doc comment
-            // for the full story) — identical reasoning, this arch's own
-            // register name (`x0`) for the endpoint argument.
+            // (`kernel_arch_glue::G_FS_ROOT_ONLY_PHASE`/`G_COMPOSITOR_
+            // ROOT_ONLY_PHASE`'s own doc comments for the full story) —
+            // identical reasoning, this arch's own register name (`x0`)
+            // for the endpoint argument.
             let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
                 kernel_arch_glue::fs_native_recv(hal, caller, x0 as u32)
+            } else if kernel_arch_glue::compositor_tid() == Some(caller) {
+                kernel_arch_glue::compositor_native_recv(hal, caller, x0 as u32)
             } else {
                 kernel_arch_glue::p2_ipc_recv_general(hal, caller, x0 as u32)
             };
@@ -7615,17 +7730,20 @@ fn simurgh_syscall(
                 .sched
                 .running()
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
-            // fs-native is a REAL, general multi-client `SBS_IPC_RECV`
-            // caller (`simurgh-file-manager`'s own edge, this session),
-            // but its very FIRST `Recv` call needs the narrow, hardcoded-
-            // root dispatch instead — see `kernel_arch_glue::
-            // G_FS_AWAITING_FIRST_RECV`'s own doc comment for the real
-            // QEMU-confirmed hang `fs_native_recv` fixes. Every other
-            // `SBS_IPC_RECV` caller (`security-broker`, `policy-engine`,
-            // ...) is unaffected — this check is `false` for them (`fs_tid`
-            // never equals their own tid).
+            // fs-native and Compositor are REAL, general multi-client
+            // `SBS_IPC_RECV` callers (`simurgh-file-manager`/`Simurgh-UI-
+            // Template01`'s own edges, this session), but EACH needs the
+            // narrow, hardcoded-root dispatch for its own Root-Task-only
+            // bootstrap phase — see `kernel_arch_glue::G_FS_ROOT_ONLY_
+            // PHASE`/`G_COMPOSITOR_ROOT_ONLY_PHASE`'s own doc comments for
+            // the real QEMU-confirmed hangs `fs_native_recv`/
+            // `compositor_native_recv` fix. Every other `SBS_IPC_RECV`
+            // caller (`security-broker`, `policy-engine`, ...) is
+            // unaffected — both checks are `false` for them.
             let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
                 kernel_arch_glue::fs_native_recv(hal, caller, a0 as u32)
+            } else if kernel_arch_glue::compositor_tid() == Some(caller) {
+                kernel_arch_glue::compositor_native_recv(hal, caller, a0 as u32)
             } else {
                 kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32)
             };

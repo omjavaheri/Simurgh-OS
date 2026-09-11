@@ -3443,6 +3443,51 @@ pub fn fs_read_throughput_summary(total_bytes: usize, total_ns: usize) {
 /// same role as `G_FS_TID`.
 static mut G_COMPOSITOR_TID: Option<ThreadId> = None;
 
+/// `G_COMPOSITOR_TID`, exposed to `kernel/kernel/src/main.rs` — same role
+/// as `fs_tid`, needed by the `sys::SBS_IPC_RECV` dispatch arm now that
+/// Compositor is gaining a second real client (`Simurgh-UI-Template01`'s
+/// own `ui-core`).
+pub fn compositor_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `compositor_demo_start`,
+    // before any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }
+}
+
+/// Same role as `G_FS_ROOT_ONLY_PHASE`, for Compositor — see that flag's
+/// own doc comment for the full story (a real, QEMU-confirmed boot hang
+/// this exact pattern already fixed for fs-native's identical situation:
+/// a server whose Recv opcode was the narrow, hardcoded-root `p2_ipc_recv`
+/// while it had exactly one real client, now gaining a second one, needs
+/// the general `SBS_IPC_RECV`/`p2_ipc_recv_general` dispatch for the
+/// second client but MUST stay on the narrow dispatch for its own
+/// Root-Task-only bootstrap phase — trusting `pick_next` during that
+/// early window, before `P2_PREEMPT_START` arms the preemptive timer,
+/// can hand control to a stale, long-`Ready`-but-permanently-idle thread
+/// forever). Set `true` by `compositor_demo_start`; cleared by
+/// `wire_ui_core_to_compositor` once `ui-core` is spawned and wired as a
+/// genuine second client, well after the preemptive timer is armed.
+///
+/// # Safety
+/// Single-core; set once by `compositor_demo_start`, cleared once by
+/// `wire_ui_core_to_compositor`, read every time by `compositor_native_recv`.
+static mut G_COMPOSITOR_ROOT_ONLY_PHASE: bool = false;
+
+/// The correctly-scoped `Recv` dispatch for Compositor's OWN
+/// `SBS_IPC_RECV` calls specifically — see [`G_COMPOSITOR_ROOT_ONLY_
+/// PHASE`]'s own doc comment for the full story. `kernel/kernel/src/
+/// main.rs`'s own `sys::SBS_IPC_RECV` arm calls this (not `p2_ipc_recv_
+/// general` directly) whenever the calling thread is Compositor itself
+/// ([`compositor_tid`]).
+pub fn compositor_native_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
+    // SAFETY: single-core; only ever written by `compositor_demo_start`/
+    // `wire_ui_core_to_compositor`, never concurrently with this read.
+    let root_only_phase = unsafe { core::ptr::addr_of!(G_COMPOSITOR_ROOT_ONLY_PHASE).read() };
+    if root_only_phase {
+        return p2_ipc_recv(hal, caller, endpoint_raw);
+    }
+    p2_ipc_recv_general(hal, caller, endpoint_raw)
+}
+
 /// Physical address of the page shared between the caller (accessed via
 /// the kernel's own always-present identity map) and Compositor's own
 /// process (mapped into ITS address space at `COMPOSITOR_SHARED_VA` by
@@ -3660,8 +3705,75 @@ pub fn compositor_demo_start(
     let _ = k.sched.note_ready(caller, hal.now_ns());
     let _ = k.sched.dispatch(comp_tid, hal.now_ns());
     let (save, into) = k.user_ctx_switch_ptrs(caller, comp_tid)?;
+    // SAFETY: single-core; the only writer, always before Compositor's
+    // own first `SBS_IPC_RECV` trap — see `G_COMPOSITOR_ROOT_ONLY_PHASE`'s
+    // own doc comment.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_ROOT_ONLY_PHASE).write(true) };
 
     Some((ep_cap.as_u32(), save, into))
+}
+
+/// Wires a SECOND, independent real client to Compositor — `Simurgh-UI-
+/// Template01`'s own `ui-core`, the base desktop environment (Phase 1
+/// continuation). Mirrors `wire_file_manager_to_fs_native`'s own shape
+/// exactly (see that function's own doc comment for the full story of
+/// why a plain shared `Endpoint` with no `Notification` fan-in suffices
+/// here too): Root Task's own compositor demo happens once, early in
+/// boot, and completes before `ui-core` is ever spawned, so the two are
+/// never concurrent callers. Clears `G_COMPOSITOR_ROOT_ONLY_PHASE` — see
+/// that flag's own doc comment for why this is the right moment (well
+/// after `P2_PREEMPT_START` has armed the preemptive timer).
+pub fn wire_ui_core_to_compositor(
+    hal: &HalInterface,
+    ui_core_cs: kernel_cap::CapSpaceId,
+    ui_core_root_pt: usize,
+    ui_core_shared_va: usize,
+    ui_core_fb_va: usize,
+) -> Option<()> {
+    let k = kstate();
+    // SAFETY: `G_COMPOSITOR_TID` is written once by `compositor_demo_
+    // start`, before this function can ever be reached (Compositor must
+    // already be spawned).
+    let comp_tid = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }?;
+    let comp_cs = k.tcb(comp_tid)?.cap_space;
+
+    // Derive a second grant of Compositor's own Endpoint (its own slot 0)
+    // into ui-core's cap space — same object, a new capability.
+    grant_cap_into(k, comp_cs, CapId::new(0), ui_core_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // SAFETY: `G_COMPOSITOR_SHARED_PHYS`/`G_COMPOSITOR_FB_PHYS` are
+    // written once by `compositor_demo_start`, before this function can
+    // ever be reached.
+    let shared_phys = unsafe { core::ptr::addr_of!(G_COMPOSITOR_SHARED_PHYS).read() };
+    let fb_phys = unsafe { core::ptr::addr_of!(G_COMPOSITOR_FB_PHYS).read() };
+    if shared_phys == usize::MAX || fb_phys == usize::MAX {
+        klog!("wire_ui_core_to_compositor: Compositor's own shared pages are not set up yet\r\n");
+        return None;
+    }
+
+    let msg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(msg_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(ui_core_root_pt, ui_core_shared_va, shared_phys, 4096, 1 | 2 | 8, msg_pool, 2) == u32::MAX {
+        klog!("wire_ui_core_to_compositor: map_range error (message page)\r\n");
+        return None;
+    }
+
+    let fb_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: same contract as `msg_pool` above.
+    unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(ui_core_root_pt, ui_core_fb_va, fb_phys, 4096, 1 | 2 | 8, fb_pool, 2) == u32::MAX {
+        klog!("wire_ui_core_to_compositor: map_range error (frame buffer page)\r\n");
+        return None;
+    }
+
+    // SAFETY: single-core; the only writer at this point in boot (well
+    // after `compositor_demo_start`'s own write, which this call is
+    // always sequenced after).
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_ROOT_ONLY_PHASE).write(false) };
+
+    Some(())
 }
 
 /// `Call`, specialized for the compositor demo's known, fixed 2-party
