@@ -606,6 +606,45 @@ impl KernelState {
         let per = kernel_mm::object_size_bytes(target_type) as u64;
         let kind = Self::retype_target_kind(target_type);
 
+        // `SharedRegion` is the one `target_type` where `count` means
+        // something different from every other arm below: NOT "how many
+        // separate objects", but "how many contiguous pages does this
+        // ONE region span" — added for `Simurgh-UI-Template01`'s own
+        // desktop-resolution frame buffer, which a single 4096-byte
+        // region (this function's pre-existing `count`-as-object-count
+        // behavior, still exactly what every OTHER `target_type` needs)
+        // cannot come close to holding. A real desktop frame (e.g.
+        // 800x600 BGRA8 = 1,920,000 bytes) would need roughly 470
+        // SEPARATE `SharedRegion` objects under the old semantics — each
+        // consuming its own capability-table slot, blowing straight
+        // through `CAP_SLOTS_PER_SPACE` (96, `kernel-cap/src/cdt.rs`)
+        // long before reaching a useful resolution. `UntypedMemory::
+        // retype` (just above) already reserves `count * per` bytes as
+        // ONE contiguous physical range regardless of `target_type` — so
+        // the physical side needs no change at all; only object
+        // CREATION does: this arm creates exactly ONE `SharedRegion`
+        // spanning the WHOLE reserved range (`grant.phys_len` bytes,
+        // i.e. `count` pages), consuming exactly one capability slot, in
+        // place of the generic per-object loop below (which still
+        // handles every other `target_type`, including a `SharedRegion`
+        // caller passing `count: 1` — the common case, unaffected by
+        // this arm beyond taking this path instead of one loop
+        // iteration with an identical result).
+        if target_type == KernelObjectType::SharedRegion {
+            let obj_phys = grant.phys_base.as_usize() as u64;
+            let region_bytes = grant.phys_len;
+            let obj_id = self.alloc_retyped_object(caller, target_type, obj_phys, region_bytes)?;
+            let newcap = Capability::full(ObjectRef::new(kind, ObjectId::new(obj_id)));
+            let cs = self.cap_space_mut(cs_id).ok_or(SyscallError::NoCaller)?;
+            return match cs.insert_root(newcap) {
+                Ok(slot) => Ok(SyscallReturn::NewCaps { cap: slot, count: 1 }),
+                Err(e) => {
+                    self.free_kernel_object(kind, obj_id);
+                    Err(e.into())
+                }
+            };
+        }
+
         // `first_cap`/`first_obj`: the capability slot / kernel-object id
         // iteration 0 below is granted. Every later iteration in this
         // same batch must land EXACTLY at `first_cap + i` / `first_obj +
@@ -1447,6 +1486,54 @@ mod tests {
                     .shared_region(kernel_cap::SharedRegionId::new(c.object.id.as_u32()))
                     .unwrap();
                 assert_eq!(region.size, PAGE_SIZE);
+                assert!(region.max_rights.contains(CapabilityRights::RW));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// `count > 1` for `SharedRegion` means "how many contiguous pages
+    /// does this ONE region span", NOT "how many separate objects" (see
+    /// `do_retype`'s own doc comment on this arm) — added for
+    /// `Simurgh-UI-Template01`'s own desktop-resolution frame buffer,
+    /// which a fixed single page cannot hold. This test is the
+    /// count-as-object-count behavior's own direct counterpart above,
+    /// proving the opposite semantic for the one `target_type` where it
+    /// applies: exactly ONE capability/object comes back (not `count`
+    /// of them), and that one object's own `size` is `count * PAGE_SIZE`.
+    #[test]
+    fn retype_untyped_into_multi_page_shared_region_gives_one_cap_spanning_every_page() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
+        const PAGES: u32 = 470; // ~ an 800x600 BGRA8 frame's own page count.
+        let r = k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::SharedRegion,
+                    count: PAGES,
+                },
+                &hal,
+            )
+            .unwrap();
+        match r {
+            SyscallReturn::NewCaps { cap, count } => {
+                // Exactly one capability/object — NOT `PAGES` of them
+                // (the old, object-count semantic every OTHER
+                // `target_type` still has, and this same `target_type`
+                // still has for `count: 1`, per the test just above).
+                assert_eq!(count, 1);
+                let c = k
+                    .resolve(caller, cap, KernelObjectKind::SharedRegion, CapabilityRights::READ)
+                    .unwrap();
+                let region = k
+                    .shared_region(kernel_cap::SharedRegionId::new(c.object.id.as_u32()))
+                    .unwrap();
+                assert_eq!(region.size, PAGE_SIZE * PAGES as usize);
                 assert!(region.max_rights.contains(CapabilityRights::RW));
             }
             other => panic!("unexpected {other:?}"),

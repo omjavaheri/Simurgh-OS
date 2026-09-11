@@ -3512,7 +3512,42 @@ const COMPOSITOR_FB_VA: usize = 0xD850_0000;
 
 /// VA Compositor's own process maps its private confirm region at — must
 /// stay numerically equal to `compositor::subsystem_entry::CONFIRM_VA`.
-const COMPOSITOR_CONFIRM_VA: usize = 0xD860_0000;
+///
+/// Was `0xD860_0000` (1 MiB past `COMPOSITOR_FB_VA`) until the frame
+/// buffer itself grew past 1 MiB (`COMPOSITOR_FB_PAGES`'s own doc
+/// comment) — `0xD850_0000 + COMPOSITOR_FB_PAGES * 4096` reaches
+/// `0xD86D_6000`, which is PAST the old `0xD860_0000`, so the two
+/// regions would have silently overlapped in Compositor's own address
+/// space (the frame buffer's own tail pages aliasing the confirm
+/// region's head pages) had this not moved. `0xD8A0_0000` leaves a
+/// clean ~3.6 MiB gap after the frame buffer's own end, with headroom
+/// for the frame buffer to grow further without needing this to move
+/// again.
+const COMPOSITOR_CONFIRM_VA: usize = 0xD8A0_0000;
+
+/// Page count for the frame buffer AND confirm `SharedRegion`s — enough
+/// for a real 800x600 BGRA8 desktop frame (800 * 600 * 4 = 1,920,000
+/// bytes; 470 pages = 1,925,120 bytes, the smallest page count that
+/// covers it). Both regions use the SAME count: `subsystem_entry::
+/// copy_frame_to_confirm` copies up to `FRAME_MAX` bytes from `FB_VA`
+/// into `CONFIRM_VA`, so a confirm region smaller than the frame buffer
+/// would make a large, legitimately-sized commit overrun it.
+///
+/// Was `1` (a single page, 4096 bytes) until `Simurgh-UI-Template01`'s
+/// own `ui-core` needed a real, full-resolution frame to flow through
+/// this same pipe (that repo's own README, "Also needed before Phase 1
+/// is truly done"). Made possible by `kernel-core::syscall::do_retype`'s
+/// own new `SharedRegion`-specific `count`-means-"pages in this ONE
+/// region" semantic (see that function's own doc comment) — the naive
+/// alternative, ~470 SEPARATE one-page `SharedRegion` objects, would
+/// have blown straight through `CAP_SLOTS_PER_SPACE` (96,
+/// `kernel-cap/src/cdt.rs`) on its own.
+const COMPOSITOR_FB_PAGES: u32 = 470;
+
+/// Byte length of the frame buffer / confirm `SharedRegion`s —
+/// `COMPOSITOR_FB_PAGES * 4096`. Must stay numerically equal to
+/// `compositor::subsystem_entry::FRAME_MAX`.
+const COMPOSITOR_FB_LEN: usize = COMPOSITOR_FB_PAGES as usize * 4096;
 
 /// Fixed MVP test frame — a 2x2 packed-BGRA8 surface (16 bytes), a
 /// recognizable sentinel pattern (not all-zero, so a MISMATCH from an
@@ -3634,17 +3669,21 @@ pub fn compositor_demo_start(
     // compositor call can be reached.
     unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_SHARED_PHYS).write(shared_phys) };
 
-    // Frame buffer page — a REAL `SyscallOp::Retype` into `KernelObjectType::
+    // Frame buffer — a REAL `SyscallOp::Retype` into `KernelObjectType::
     // SharedRegion` (the genuine capability object, not a bare untyped
     // carve like the message page above), matching `fs_demo_start`'s own
-    // identical second-region precedent.
+    // identical second-region precedent. `count: COMPOSITOR_FB_PAGES`
+    // (not `1`): this ONE capability now spans `COMPOSITOR_FB_PAGES`
+    // contiguous pages, per `do_retype`'s own `SharedRegion`-specific
+    // "count means pages in this region" semantic — see that constant's
+    // own doc comment.
     let fb_cap = match k.dispatch(
         caller,
         hal.now_ns(),
         SyscallOp::Retype {
             untyped: CapId::new(0),
             target_type: KernelObjectType::SharedRegion,
-            count: 1,
+            count: COMPOSITOR_FB_PAGES,
         },
         hal,
     ) {
@@ -3654,12 +3693,16 @@ pub fn compositor_demo_start(
     let fb_id = k.cap_space(src_cs)?.lookup(fb_cap)?.object.id;
     let fb_phys = k.shared_region(kernel_cap::SharedRegionId::new(fb_id.as_u32()))?.phys_base.as_usize();
     grant_cap_into(k, src_cs, fb_cap, comp_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
-    let fb_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // Pool sized for the worst case this VA range actually needs: 470
+    // pages starting at `COMPOSITOR_FB_VA` crosses one 2 MiB (one PD
+    // entry) boundary, needing at most 1 new PD-level table + 2 new
+    // PT-level tables = 3 pool frames — `4` leaves one frame of margin.
+    let fb_pool = carve_from_any_untyped(k, 4096, 4096 * 4)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core.
-    unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 2) };
-    let n2 = hal.map_range(comp_root_pt, COMPOSITOR_FB_VA, fb_phys, 4096, 1 | 2 | 8, fb_pool, 2);
+    unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 4) };
+    let n2 = hal.map_range(comp_root_pt, COMPOSITOR_FB_VA, fb_phys, COMPOSITOR_FB_LEN, 1 | 2 | 8, fb_pool, 4);
     if n2 == u32::MAX {
-        klog!("compositor_demo_start: map_range error (frame buffer page)\r\n");
+        klog!("compositor_demo_start: map_range error (frame buffer)\r\n");
         return None;
     }
     // SAFETY: single-core; written exactly once here.
@@ -3669,14 +3712,16 @@ pub fn compositor_demo_start(
     // into the caller's cap space needed: the kernel peeks it directly
     // via its own identity map, same "trusted bootstrap, no Map
     // ceremony" pattern `netstack::spawn_netstack_service`'s own STATUS_
-    // VA region already established).
+    // VA region already established). Same `COMPOSITOR_FB_PAGES` page
+    // count as the frame buffer itself — see `COMPOSITOR_FB_PAGES`'s own
+    // doc comment for why the two must match.
     let confirm_cap = match k.dispatch(
         caller,
         hal.now_ns(),
         SyscallOp::Retype {
             untyped: CapId::new(0),
             target_type: KernelObjectType::SharedRegion,
-            count: 1,
+            count: COMPOSITOR_FB_PAGES,
         },
         hal,
     ) {
@@ -3687,10 +3732,16 @@ pub fn compositor_demo_start(
     let confirm_phys =
         k.shared_region(kernel_cap::SharedRegionId::new(confirm_id.as_u32()))?.phys_base.as_usize();
     // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
-    unsafe { core::ptr::write_bytes(confirm_phys as *mut u8, 0, 4096) };
+    unsafe { core::ptr::write_bytes(confirm_phys as *mut u8, 0, COMPOSITOR_FB_LEN) };
+    // `COMPOSITOR_CONFIRM_VA`'s own 470-page range stays within a single
+    // 2 MiB region (see that constant's own doc comment on the VA
+    // layout) — at most 1 new PT-level table, since the PD-level table
+    // covering it already exists after the frame buffer's own mapping
+    // above (same PD table, different PD entry). `2` still leaves margin.
     let confirm_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     unsafe { core::ptr::write_bytes(confirm_pool as *mut u8, 0, 4096 * 2) };
-    let n3 = hal.map_range(comp_root_pt, COMPOSITOR_CONFIRM_VA, confirm_phys, 4096, 1 | 2 | 8, confirm_pool, 2);
+    let n3 =
+        hal.map_range(comp_root_pt, COMPOSITOR_CONFIRM_VA, confirm_phys, COMPOSITOR_FB_LEN, 1 | 2 | 8, confirm_pool, 2);
     if n3 == u32::MAX {
         klog!("compositor_demo_start: map_range error (confirm region)\r\n");
         return None;
@@ -3760,11 +3811,14 @@ pub fn wire_ui_core_to_compositor(
         return None;
     }
 
-    let fb_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // Same pool-sizing reasoning as `compositor_demo_start`'s own
+    // identical frame-buffer mapping (4 frames: up to 1 PD-level + 2
+    // PT-level tables for this 470-page range, plus margin).
+    let fb_pool = carve_from_any_untyped(k, 4096, 4096 * 4)?;
     // SAFETY: same contract as `msg_pool` above.
-    unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 2) };
-    if hal.map_range(ui_core_root_pt, ui_core_fb_va, fb_phys, 4096, 1 | 2 | 8, fb_pool, 2) == u32::MAX {
-        klog!("wire_ui_core_to_compositor: map_range error (frame buffer page)\r\n");
+    unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 4) };
+    if hal.map_range(ui_core_root_pt, ui_core_fb_va, fb_phys, COMPOSITOR_FB_LEN, 1 | 2 | 8, fb_pool, 4) == u32::MAX {
+        klog!("wire_ui_core_to_compositor: map_range error (frame buffer)\r\n");
         return None;
     }
 

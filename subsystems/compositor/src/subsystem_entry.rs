@@ -95,14 +95,30 @@ const FB_VA: usize = 0xD850_0000;
 /// VA this process's own private "confirm" region is mapped at — must
 /// stay numerically equal to `kernel_arch_glue::COMPOSITOR_CONFIRM_VA`.
 /// See this file's own module doc comment for why it exists.
-const CONFIRM_VA: usize = 0xD860_0000;
+///
+/// Was `0xD860_0000` until `FB_VA`'s own region grew past 1 MiB
+/// (`kernel_arch_glue::COMPOSITOR_CONFIRM_VA`'s own doc comment has the
+/// full story) — `kernel_arch_glue::compositor_demo_start` moved where
+/// it MAPS this region accordingly, but this constant did NOT move with
+/// it in an earlier pass, so `copy_frame_to_confirm` kept writing to the
+/// OLD address (now silently aliasing the tail of `FB_VA`'s own,
+/// now-larger range for small frames, or overrunning entirely unmapped
+/// memory for a real desktop-sized one — the exact bug a real QEMU boot
+/// caught: `compositor_commit_verify` reporting MISMATCH, then a full
+/// hang once `ui-core`'s own real, desktop-resolution `CommitBuffer`
+/// reached this same stale write).
+const CONFIRM_VA: usize = 0xD8A0_0000;
 
 /// Cap on a committed frame's own byte length (`width * height * 4`,
-/// packed BGRA8) — one page, same size and rationale as `fs_native::
-/// subsystem_entry::FS_DATA_LEN`: `FB_VA`/`CONFIRM_VA` are each exactly
-/// one mapped page, so a request naming a `len` larger than this is
-/// rejected rather than reading/writing past them.
-const FRAME_MAX: u32 = 4096;
+/// packed BGRA8) — must stay numerically equal to `kernel_arch_glue::
+/// COMPOSITOR_FB_LEN`: `FB_VA`/`CONFIRM_VA` are each mapped exactly this
+/// many bytes (`kernel_arch_glue::COMPOSITOR_FB_PAGES` pages), so a
+/// request naming a `len` larger than this is rejected rather than
+/// reading/writing past them. `470 * 4096` — enough for a real 800x600
+/// BGRA8 desktop frame (800 * 600 * 4 = 1,920,000 bytes); was a single
+/// page (4096 bytes) until `Simurgh-UI-Template01`'s own `ui-core`
+/// needed a real, full-resolution frame to flow through this pipe.
+const FRAME_MAX: u32 = 470 * 4096;
 
 /// # Safety
 /// `ecall` from U-mode traps to the kernel's S-mode handler, which
