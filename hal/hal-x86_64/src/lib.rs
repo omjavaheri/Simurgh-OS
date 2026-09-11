@@ -413,6 +413,14 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     unsafe {
         pic::init();
         pic::unmask_irq1();
+        // Mouse input plan, Stage 1a: unmask IRQ12 (and the master's own
+        // IRQ2 cascade line it rides on — `unmask_irq12`'s own doc
+        // comment) and run the real i8042 controller sequence that turns
+        // the auxiliary (mouse) port on at all — `pic`'s own module doc
+        // comment covers why this extra step exists for the mouse but
+        // never did for the keyboard.
+        pic::unmask_irq12();
+        pic::enable_ps2_mouse();
     }
 
     // ------------------------------------------------------------------

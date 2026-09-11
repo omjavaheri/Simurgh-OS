@@ -332,6 +332,11 @@ const UI_CORE_COMPOSITOR_FB_VA: usize = 0xD850_0000;
 #[cfg(target_arch = "x86_64")]
 static DRIVER_I8042_ELF: &[u8] = include_bytes!(env!("DRIVER_I8042_ELF_PATH"));
 
+/// `driver-mouse-bin`'s own separately-built ELF image (mouse-input
+/// plan, Stage 1b) — x86_64-only, same reasoning as `DRIVER_I8042_ELF`.
+#[cfg(target_arch = "x86_64")]
+static DRIVER_MOUSE_ELF: &[u8] = include_bytes!(env!("DRIVER_MOUSE_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -3974,6 +3979,19 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 kernel_arch_glue::khal(),
                 kernel_arch_glue::kstate().root_thread,
                 DRIVER_I8042_ELF,
+                elf_loader::machine::EM_X86_64,
+            );
+            // Real mouse input, Stage 1a+1b (mouse-input plan): spawns
+            // `driver-mouse` as a real isolated process, binds it to the
+            // real IRQ12 (slave-PIC, dual-EOI cascade) Notification, and
+            // wires it as a new real IPC client of Compositor — see
+            // `kernel_arch_glue::spawn_mouse_driver`'s own doc comment.
+            // Must run after Compositor is spawned, same precondition
+            // `spawn_i8042_driver` already documents.
+            let _ = kernel_arch_glue::spawn_mouse_driver(
+                kernel_arch_glue::khal(),
+                kernel_arch_glue::kstate().root_thread,
+                DRIVER_MOUSE_ELF,
                 elf_loader::machine::EM_X86_64,
             );
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());

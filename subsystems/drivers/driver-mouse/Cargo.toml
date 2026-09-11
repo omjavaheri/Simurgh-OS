@@ -1,0 +1,31 @@
+# ============================================================================
+# driver-mouse
+#
+# The real PS/2 mouse driver process — decodes real 3-byte PS/2 mouse
+# packets the kernel's own IRQ12 trampoline queues (`hal_x86_64::pic` +
+# `kernel_arch_glue::mouse_irq_trampoline`) into structured motion/button
+# events and pushes them to the Compositor service. x86_64-only: no such
+# device exists on aarch64/riscv64.
+#
+# `#![no_std]`. `rlib` for now — same shape as `driver-i8042`.
+# ============================================================================
+[package]
+name        = "driver-mouse"
+description = "Real PS/2 mouse driver for Simurgh (mouse-input plan, Stage 1b)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "driver-mouse-bin"
+path = "src/bin/driver-mouse-bin.rs"
+test = false
+
+[dependencies]
+kernel-ipc = { path = "../../../kernel/kernel-ipc" }

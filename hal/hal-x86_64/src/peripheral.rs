@@ -298,6 +298,23 @@ impl PeripheralDiscovery {
             device_count += 1;
         }
 
+        // The PS/2 mouse — same "not a PCI/virtio device, synthesized
+        // here" reasoning as the keyboard entry just above, on the SAME
+        // i8042 controller, real on every PC-compatible machine and
+        // every x86_64 QEMU machine type this project targets (mouse
+        // input plan, Stage 1). A distinct `PeripheralKind::Pointer`
+        // entry, not a second `Input` — `PeripheralKindRaw::Pointer`'s
+        // own doc comment covers why.
+        if device_count < MAX_SCAN {
+            devices[device_count] = PeripheralDevice::new(
+                PeripheralKind::Pointer,
+                0,
+                0,
+                crate::pic::MOUSE_IRQ_VECTOR,
+            );
+            device_count += 1;
+        }
+
         for (i, d) in devices.iter_mut().enumerate().take(device_count) {
             d.device_index = i as u32;
         }

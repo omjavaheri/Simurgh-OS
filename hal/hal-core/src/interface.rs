@@ -96,6 +96,11 @@
 //!     x86 port-I/O instructions a real scancode read/PIC EOI requires —
 //!     this method is how it reaches that ONE arch-specific operation
 //!     without doing so.
+//!   - v9 (kernel-arch-glue, mouse input plan Stage 1): `read_ps2_mouse_
+//!     byte_and_ack` added, wrapping `hal_core::interrupt::
+//!     InterruptController::read_ps2_mouse_byte_and_ack` — same shape
+//!     and same reason as v8's `read_i8042_scancode_and_ack`, for the
+//!     PS/2 mouse's own IRQ12 line instead of the keyboard's IRQ1.
 //! ============================================================================
 
 use crate::cpu::CpuAbstraction;
@@ -341,6 +346,30 @@ unsafe fn trampoline_read_i8042_scancode_and_ack<I: InterruptController>(
     }
 }
 
+/// `found` is written `true`/`false`, same reasoning as
+/// [`trampoline_read_i8042_scancode_and_ack`]'s own doc comment.
+unsafe fn trampoline_read_ps2_mouse_byte_and_ack<I: InterruptController>(
+    state: *const (),
+    irq: u32,
+    found: *mut bool,
+) -> u8 {
+    // SAFETY: `state` was produced by `build_interface` from a `&I` and
+    // remains valid per that function's safety contract; `found` is a
+    // valid `*mut bool` owned by `HalInterface::read_ps2_mouse_byte_and_
+    // ack`'s own call site below.
+    let ctrl = unsafe { &*(state as *const I) };
+    match ctrl.read_ps2_mouse_byte_and_ack(IrqId::new(irq)) {
+        Some(byte) => {
+            unsafe { found.write(true) };
+            byte
+        }
+        None => {
+            unsafe { found.write(false) };
+            0
+        }
+    }
+}
+
 unsafe fn trampoline_reboot<P: crate::power::SystemControl>(state: *const ()) -> ! {
     // SAFETY: `state` was produced by `build_interface` from a `&P` and
     // remains valid per that function's safety contract.
@@ -383,6 +412,7 @@ pub struct HalInterface {
     interrupt_register_irq: unsafe fn(*const (), u32, IrqHandler) -> bool,
     interrupt_msi_message: unsafe fn(*const (), u32, *mut bool) -> (u64, u32),
     interrupt_read_i8042_scancode_and_ack: unsafe fn(*const (), u32, *mut bool) -> u8,
+    interrupt_read_ps2_mouse_byte_and_ack: unsafe fn(*const (), u32, *mut bool) -> u8,
     power_reboot: unsafe fn(*const ()) -> !,
     power_shutdown: unsafe fn(*const ()) -> !,
 }
@@ -655,6 +685,25 @@ impl HalInterface {
         }
     }
 
+    /// Reads and acknowledges the PS/2 mouse's own IRQ12 packet byte, or
+    /// `None` if this platform has no such capability (mouse input plan,
+    /// Stage 1). Must only be called from the `IrqHandler` currently
+    /// servicing this exact line.
+    pub fn read_ps2_mouse_byte_and_ack(&self, irq: u32) -> Option<u8> {
+        let mut found = false;
+        // SAFETY: `interrupt_state`/`interrupt_read_ps2_mouse_byte_and_
+        // ack` were produced together by `build_interface`; `&mut found`
+        // is a valid `*mut bool` for the duration of this call.
+        let byte = unsafe {
+            (self.interrupt_read_ps2_mouse_byte_and_ack)(self.interrupt_state, irq, &mut found)
+        };
+        if found {
+            Some(byte)
+        } else {
+            None
+        }
+    }
+
     /// Performs a full hardware reset. Does not return. See
     /// `hal_core::power::SystemControl::reboot`.
     pub fn reboot(&self) -> ! {
@@ -719,6 +768,7 @@ where
         interrupt_register_irq: trampoline_register_irq::<I>,
         interrupt_msi_message: trampoline_msi_message::<I>,
         interrupt_read_i8042_scancode_and_ack: trampoline_read_i8042_scancode_and_ack::<I>,
+        interrupt_read_ps2_mouse_byte_and_ack: trampoline_read_ps2_mouse_byte_and_ack::<I>,
         power_reboot: trampoline_reboot::<P>,
         power_shutdown: trampoline_shutdown::<P>,
     }

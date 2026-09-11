@@ -107,6 +107,16 @@ const I8042_ENDPOINT_CAP: usize = 1;
 /// with `driver-i8042` (signal-before-call) — the THIRD grant
 /// (`kernel_arch_glue::wire_notification`).
 const I8042_SIGNAL_NOTIF_CAP: usize = 2;
+/// This process's own capability slot for `driver-mouse`'s own service
+/// `Endpoint` — `kernel_arch_glue::spawn_mouse_driver`'s own grant into
+/// this process's cap space (the FOURTH grant overall: slot 0 display,
+/// slot 1 i8042 endpoint, slot 2 i8042 signal notif, THIS at slot 3),
+/// via `wire_service_endpoint`. Mouse-input plan, Stage 1b.
+const MOUSE_ENDPOINT_CAP: usize = 3;
+/// This process's own capability slot for the `Notification` SHARED
+/// with `driver-mouse` (signal-before-call) — the FIFTH grant
+/// (`kernel_arch_glue::wire_notification`).
+const MOUSE_SIGNAL_NOTIF_CAP: usize = 4;
 
 /// VA the shared message page is mapped at in THIS process's own address
 /// space — must stay numerically equal to `kernel_arch_glue::
@@ -366,6 +376,55 @@ fn read_i8042_message() -> Option<KeyEvent> {
     Some(KeyEvent { keycode: w0 as u8, pressed: w1 != 0 })
 }
 
+/// VA `driver-mouse`'s own shared message page is mapped at in THIS
+/// process's own address space — must stay numerically equal to
+/// `kernel_arch_glue::COMPOSITOR_MOUSE_VA`.
+const MOUSE_VA: usize = 0xD8C0_0000;
+
+/// One decoded real mouse event — matches `driver_mouse::mouse_packet::
+/// MouseEvent`'s own wire shape exactly (see `KeyEvent`'s own doc
+/// comment for why this is a local duplicate, not a shared dependency).
+/// `dx`/`dy` keep PS/2's own raw sign convention (positive `dy` = real
+/// upward motion) — unflipped here, same as the driver's own decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseEvent {
+    dx: i16,
+    dy: i16,
+    left: bool,
+    right: bool,
+    middle: bool,
+}
+
+/// Must match `driver_mouse::wire::MOUSE_EVENT_LABEL` exactly.
+const MOUSE_EVENT_LABEL: u64 = 1;
+
+/// Reads and decodes the `MouseEvent` `driver-mouse` wrote into
+/// `MOUSE_VA` — mirrors `driver_mouse::wire::decode_mouse_event` exactly.
+fn read_mouse_message() -> Option<MouseEvent> {
+    let base = MOUSE_VA as *const u64;
+    // SAFETY: `MOUSE_VA` is mapped `U=1 R+W` in this process's own
+    // address space by `kernel_arch_glue::spawn_mouse_driver`, before
+    // this process's own `NOTIF_POLL` could ever observe a set bit.
+    let (label, w0, w1, w2) = unsafe {
+        (
+            base.read_volatile(),
+            base.add(1).read_volatile(),
+            base.add(2).read_volatile(),
+            base.add(3).read_volatile(),
+        )
+    };
+    if label != MOUSE_EVENT_LABEL {
+        return None;
+    }
+    Some(MouseEvent {
+        dx: w0 as u16 as i16,
+        dy: w1 as u16 as i16,
+        left: w2 & 1 != 0,
+        right: w2 & 2 != 0,
+        middle: w2 & 4 != 0,
+    })
+}
+
 /// Handles one REAL `DisplayRequest`, driving a REAL `Compositor` surface
 /// table. `CommitBuffer`'s own `buffer_cap` (the WIRE protocol's own
 /// "client capability slot" field) is intentionally never resolved here
@@ -475,6 +534,27 @@ fn handle_request(comp: &mut Compositor, pending_key_event: &mut Option<KeyEvent
 /// than a direct end-to-end QEMU log line, pending either more attempts
 /// or a real reactive UI loop giving `ui-core`/`driver-i8042` more
 /// reliable scheduling opportunities.
+///
+/// Mouse-input plan, Stage 1b (2026-09-11): the identical additive
+/// pattern, for `driver-mouse`'s own edge (`MOUSE_SIGNAL_NOTIF_CAP`/
+/// `MOUSE_ENDPOINT_CAP`, draining into `last_mouse_event`). Same
+/// verification status as the i8042 edge above, for the same reason:
+/// `spawn_mouse_driver`'s own real interrupt path was independently
+/// confirmed at the hardware level (a direct PIC IRR register dump
+/// during Stage 1a proved a real mouse event genuinely reaches and
+/// latches at the PIC — see `kernel_arch_glue::mouse_irq_trampoline`'s
+/// own doc comment for the full record, including the real root cause
+/// found there: this kernel only services a maskable interrupt inside
+/// `hal_x86_64::cpu::hlt_wait_for_irq`, so a newly-spawned driver
+/// process needs to actually GET SCHEDULED to ever drain one, and this
+/// session's real QEMU attempts did not observe `driver-mouse` (or
+/// `driver-i8042`, or `ui-core`) getting scheduled either) — this
+/// function's own modified loop is confirmed not to regress the
+/// existing display-Endpoint traffic (`compositor_commit_verify`'s own
+/// `MATCH` every boot, unchanged), but a live, decoded `MouseEvent`
+/// reaching `last_mouse_event` was not directly observed in this
+/// session's own QEMU attempts — structural verification only, same
+/// honest status as the i8042 edge.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut comp = Compositor::new();
@@ -482,6 +562,11 @@ pub extern "C" fn subsystem_main() -> ! {
     // own arm) — at most one pending event at a time, matching `driver-
     // i8042`'s own one-event-per-`Call` shape.
     let mut last_key_event: Option<KeyEvent> = None;
+    // Same drain-on-real-poll shape as `last_key_event`, for `driver-
+    // mouse` (mouse-input plan, Stage 1b). Not read anywhere yet either
+    // — same "real consumer is a later stage" reasoning.
+    #[allow(unused_assignments)]
+    let mut last_mouse_event: Option<MouseEvent> = None;
 
     // Same stack-slot-reuse miscompilation `fs_native::subsystem_entry::
     // subsystem_main`'s own identical loop hits (full investigation in
@@ -525,6 +610,25 @@ pub extern "C" fn subsystem_main() -> ! {
             // i8042`'s own blocking `Call` so it can process its next
             // queued byte.
             unsafe { raw_syscall(IPC_REPLY, i8042_from, zero!()) };
+        }
+
+        // Additive mouse check — same shape as the i8042 check just
+        // above, for `driver-mouse`'s own edge (mouse-input plan, Stage
+        // 1b). Also never touches the display Endpoint's own blocking
+        // `Recv` below.
+        // SAFETY: `raw_syscall`'s own contract.
+        let mouse_bits = unsafe { raw_syscall(NOTIF_POLL, MOUSE_SIGNAL_NOTIF_CAP, zero!()) };
+        if mouse_bits != 0 {
+            // SAFETY: `raw_syscall2`'s own contract — same "already
+            // queued or arriving imminently" reasoning as the i8042
+            // check above.
+            let (mouse_from, _label) = unsafe { raw_syscall2(IPC_RECV_GENERIC, MOUSE_ENDPOINT_CAP, zero!()) };
+            if let Some(event) = read_mouse_message() {
+                last_mouse_event = Some(event);
+            }
+            // SAFETY: `raw_syscall`'s own contract — wakes `driver-
+            // mouse`'s own blocking `Call`.
+            unsafe { raw_syscall(IPC_REPLY, mouse_from, zero!()) };
         }
 
         // SAFETY: `raw_syscall2`'s own contract.

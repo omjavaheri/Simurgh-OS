@@ -141,6 +141,14 @@ pub struct KernelState {
     /// device exists. `CapId::new(u32::MAX)` if none was found or the
     /// cap space was full, same sentinel as `root_mmio_net_cap`.
     pub root_mmio_i8042_cap: CapId,
+    /// The capability, in the Root Task's own cap space, naming the
+    /// FIRST `Pointer`-kind `MmioRegion` the boot-time HAL peripheral
+    /// scan discovered (`populate_from_boot_info`'s Step 3f) — x86_64's
+    /// PS/2 mouse, on the same i8042 controller `root_mmio_i8042_cap`
+    /// names, synthesized the identical way (mouse input plan, Stage 1).
+    /// Same sentinel/empty-on-aarch64-riscv64 contract as `root_mmio_
+    /// i8042_cap`.
+    pub root_mmio_mouse_cap: CapId,
     /// How many `UntypedMemory` objects the boot path created.
     pub untyped_count: u32,
 
@@ -450,6 +458,7 @@ impl KernelState {
         root_mmio_blk_cap: CapId::new(u32::MAX),
         root_mmio_net_cap: CapId::new(u32::MAX),
         root_mmio_i8042_cap: CapId::new(u32::MAX),
+        root_mmio_mouse_cap: CapId::new(u32::MAX),
         untyped_count: 0,
         map_pool_base: 0,
         map_pool_len: 0,
@@ -730,6 +739,34 @@ impl KernelState {
             })
             .unwrap_or(CapId::new(u32::MAX));
 
+        // Step 3f: same as Step 3e, for the first `Pointer`-kind device
+        // — `root_mmio_mouse_cap`'s own doc comment covers the rationale
+        // (mouse input plan, Stage 1).
+        let root_mmio_mouse_cap = boot
+            .hardware_manifest
+            .peripheral_devices()
+            .iter()
+            .find(|d| d.kind == PeripheralKindRaw::Pointer)
+            .and_then(|d| {
+                self.alloc_mmio_region_direct(MmioRegionDescriptor {
+                    phys_base: d.mmio_base,
+                    size: d.mmio_size,
+                    irq: d.irq,
+                    config_space_base: d.config_space_base,
+                })
+            })
+            .and_then(|mmio_id| {
+                let cap = Capability::full(ObjectRef::new(
+                    KernelObjectKind::MmioRegion,
+                    ObjectId::new(mmio_id.as_u32()),
+                ));
+                self.cap_space_mut(root_cs)
+                    .expect("root cap space exists")
+                    .insert_root(cap)
+                    .ok()
+            })
+            .unwrap_or(CapId::new(u32::MAX));
+
         // Step 4: schedule the Root Task.
         self.sched
             .admit(root_tid, SchedulerMode::Interactive, kernel_sched::MAX_PRIORITY, None)
@@ -749,6 +786,7 @@ impl KernelState {
         self.root_mmio_blk_cap = root_mmio_blk_cap;
         self.root_mmio_net_cap = root_mmio_net_cap;
         self.root_mmio_i8042_cap = root_mmio_i8042_cap;
+        self.root_mmio_mouse_cap = root_mmio_mouse_cap;
         self.untyped_count = untyped_made;
         Ok(())
     }

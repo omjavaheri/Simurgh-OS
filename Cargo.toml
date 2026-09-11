@@ -28,6 +28,7 @@ members = [
     "subsystems/drivers/driver-virtio-blk",
     "subsystems/drivers/driver-virtio-net",
     "subsystems/drivers/driver-i8042",
+    "subsystems/drivers/driver-mouse",
     "subsystems/vfs-service/vfs-router",
     "subsystems/vfs-service/fs-native",
     "subsystems/netstack",

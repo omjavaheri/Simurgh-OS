@@ -286,6 +286,17 @@ pub enum PeripheralKindRaw {
     /// own doc comment). Absent entirely on aarch64/riscv64, where no
     /// such device exists.
     Input = 5,
+    /// The PS/2 mouse, on the SAME i8042 controller `Input` describes
+    /// above — a separate kind (not a second `Input` entry) because
+    /// `kernel-core::state::populate_from_boot_info`'s own Step 3e/3f
+    /// each pick only the FIRST matching-kind entry from the discovered
+    /// list, and the keyboard and mouse need two INDEPENDENT boot
+    /// capabilities (two different `irq` values, two different
+    /// `SyscallOp::IrqBind` calls) — see `Pointer`'s own doc comment
+    /// parity with `Input` above for the rest of the "synthesized, not
+    /// bus-discovered" reasoning, which applies identically here except
+    /// `irq` is `hal_x86_64::pic::MOUSE_IRQ_VECTOR`.
+    Pointer = 6,
 }
 
 /// One discovered MMIO-transport peripheral (virtio-mmio on QEMU's

@@ -6625,6 +6625,246 @@ mod i8042_ring_index_tests {
     }
 }
 
+// ============================================================================
+// PS/2 mouse — real interrupt-driven IRQ12 delivery, now with a real
+// consuming driver process (mouse-input plan, Stages 1a+1b combined).
+// Stage 1a proved the IRQ path itself (slave-PIC unmask, the real
+// controller-level mouse-enable sequence, real vector delivery, a real
+// port-0x60 read, a real dual-EOI cascade ack); this section now also
+// spawns `driver-mouse` as a genuine isolated process and wires it as a
+// new real IPC client of Compositor — mirrors the i8042 section above
+// exactly, one architectural generation later.
+//
+// Architecture note: same "no #[cfg(target_arch)], no arch crate named"
+// posture as the i8042 section above — `khal().read_ps2_mouse_byte_and_
+// ack` is how this reaches the one real x86_64-specific operation it
+// needs.
+//
+// **Real finding, Stage 1a's own checkpoint-only attempt**: a
+// checkpoint with no consuming process (the exact shape that worked
+// for the keyboard pipeline's own Stage A) never once observed this
+// trampoline fire, despite `hal_x86_64::pic::enable_ps2_mouse`'s own
+// real controller handshake completing correctly (confirmed: a real
+// `0xFA` ACK byte) and a direct PIC IRR (Interrupt Request Register)
+// dump confirming the hardware DOES latch a real pending request on
+// IRQ12 (and its own cascade through the master's IRQ2) the moment a
+// real mouse event is injected. The real cause: this kernel keeps
+// maskable interrupts globally OFF except for the brief `sti`-`hlt`-
+// `cli` window inside `hal_x86_64::cpu::hlt_wait_for_irq` (`DRV_IRQ_
+// WAIT`'s own implementation) — a pending PIC request just sits
+// latched, un-serviced, until SOME thread happens to block there. The
+// keyboard pipeline's own Stage A "worked" on a checkpoint alone only
+// because other already-real drivers' own regular `DRV_IRQ_WAIT` calls
+// (virtio-blk/net self-checks, etc.) incidentally created enough such
+// windows during boot — not because a consumer-less checkpoint is
+// reliable in general. The real, load-bearing fix is Stage 1b below: a
+// real driver process that calls `DRV_IRQ_WAIT` in its own loop, the
+// same way `driver-i8042` already does for the keyboard.
+// ============================================================================
+
+/// Must match `driver_mouse::subsystem_entry::RING_CAPACITY` exactly.
+const MOUSE_RING_CAPACITY: u64 = 32;
+
+/// VA the raw packet-byte ring `SharedRegion` is mapped at in `driver-
+/// mouse`'s own address space — must stay numerically equal to
+/// `driver_mouse::subsystem_entry::DRV_QUEUE_VA`. Same layout as the
+/// i8042 ring: one `u64` "write count" header (offset 0) followed by
+/// `MOUSE_RING_CAPACITY` raw bytes (offset 8).
+pub const DRV_MOUSE_QUEUE_VA: usize = 0xD860_0000;
+/// VA `driver-mouse`'s own copy of its service `Endpoint`'s shared
+/// message page is mapped at — must stay numerically equal to
+/// `driver_mouse::subsystem_entry::DRV_MSG_VA`.
+pub const DRV_MOUSE_MSG_VA: usize = 0xD870_0000;
+/// VA Compositor's own copy of the SAME shared message page is mapped
+/// at — clear of every other Compositor-owned VA (`SHARED_VA`/`FB_VA`/
+/// `CONFIRM_VA`/`COMPOSITOR_I8042_VA`).
+const COMPOSITOR_MOUSE_VA: usize = 0xD8C0_0000;
+
+/// Physical base of the raw packet-byte ring `SharedRegion` — `usize::
+/// MAX` until `spawn_mouse_driver` has run.
+static mut G_MOUSE_QUEUE_PHYS: usize = usize::MAX;
+/// The `Notification` id the mouse IRQ line is bound to — `u32::MAX`
+/// until `spawn_mouse_driver` has run.
+static mut G_MOUSE_NOTIF_ID: u32 = u32::MAX;
+
+/// The trampoline `SyscallOp::IrqBind` installs for the PS/2 mouse's own
+/// IRQ line. Reads and acknowledges the real packet byte through
+/// `HalInterface::read_ps2_mouse_byte_and_ack` (which internally uses
+/// the real dual-EOI slave-PIC cascade ack), writes it directly into the
+/// ring `SharedRegion` at [`G_MOUSE_QUEUE_PHYS`] (same "kernel writes
+/// physical memory the driver process has mapped" pattern
+/// `i8042_irq_trampoline` already established), then signals the bound
+/// Notification.
+///
+/// Verified on a real QEMU x86_64 boot (2026-09-11): a checkpoint-only
+/// attempt at this stage (no consuming process) never once observed
+/// this trampoline fire — see this section's own module doc comment for
+/// the real, root-caused reason (this kernel only ever services a
+/// maskable interrupt inside `hal_x86_64::cpu::hlt_wait_for_irq`, so
+/// nothing fires without a real thread blocked in `DRV_IRQ_WAIT` —
+/// confirmed instead via a direct PIC IRR register dump showing the
+/// hardware really does latch the request). `driver-mouse`'s own real
+/// `DRV_IRQ_WAIT` loop is what actually exercises this trampoline.
+pub fn mouse_irq_trampoline(irq: hal_core::interrupt::IrqId) {
+    let hal = khal();
+    let Some(byte) = hal.read_ps2_mouse_byte_and_ack(irq.as_u32()) else {
+        return; // Not actually a mouse-capable platform — unreachable in
+        // practice (only ever installed by `spawn_mouse_driver`'s own
+        // `IrqBind`, itself gated on a real `root_mmio_mouse_cap`), kept
+        // as a defensive no-op matching every other trampoline's own
+        // posture in this file.
+    };
+
+    // SAFETY: single-core; `G_MOUSE_QUEUE_PHYS` is written once by
+    // `spawn_mouse_driver`, before this trampoline can ever run.
+    unsafe {
+        let phys = core::ptr::addr_of!(G_MOUSE_QUEUE_PHYS).read();
+        if phys != usize::MAX {
+            let write_count = (phys as *const u64).read_volatile();
+            let byte_offset = 8 + (write_count % MOUSE_RING_CAPACITY) as usize;
+            ((phys + byte_offset) as *mut u8).write_volatile(byte);
+            (phys as *mut u64).write_volatile(write_count.wrapping_add(1));
+        }
+    }
+
+    let nid = unsafe { core::ptr::addr_of!(G_MOUSE_NOTIF_ID).read() };
+    if nid == u32::MAX {
+        return;
+    }
+    let k = kstate();
+    let Some(notif) = k.notification_mut(kernel_cap::NotificationId::new(nid)) else {
+        return;
+    };
+    let woken = notif.signal(1);
+    let now = hal.now_ns();
+    for &tid in woken.as_slice() {
+        k.wake_blocked(tid, now);
+    }
+}
+
+/// Spawns `driver-mouse` from its own separately-built ELF, wires it to
+/// Compositor, and binds it to the real, interrupt-driven mouse IRQ —
+/// mirrors `spawn_i8042_driver`'s own shape exactly (see that function's
+/// own doc comment for the full capability-slot rationale, identical
+/// here): slot 0 (service `Endpoint` to Compositor), slot 1 (IRQ
+/// `Notification`), slot 2 (shared "tell Compositor" `Notification`).
+///
+/// Requires Compositor to already be spawned. Returns `None` (and logs)
+/// if no `Pointer`-kind peripheral was discovered at boot — expected on
+/// aarch64/riscv64 — or on any allocation failure.
+pub fn spawn_mouse_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<ThreadId> {
+    let k = kstate();
+    let mmio_cap = k.root_mmio_mouse_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_mouse_driver: no Pointer-kind peripheral was discovered at boot\r\n");
+        return None;
+    }
+
+    // SAFETY: `G_COMPOSITOR_TID` is written once by `compositor_demo_
+    // start`, before this function can ever be reached.
+    let comp_tid = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }?;
+    let comp_cs = k.tcb(comp_tid)?.cap_space;
+    let comp_addr_space = k.tcb(comp_tid)?.addr_space;
+    let comp_root_pt = k.addr_space_mut(comp_addr_space)?.root_phys().as_usize();
+
+    const DRV_MOUSE_STACK_VMA: usize = 0xC0B0_0000;
+    const DRV_MOUSE_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_MOUSE_STACK_VMA, DRV_MOUSE_STACK_LEN)?;
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    // Slot 0 on both sides: the service Endpoint + its own shared
+    // message page.
+    let ep_cap = wire_service_endpoint(
+        hal,
+        caller,
+        comp_cs,
+        comp_root_pt,
+        COMPOSITOR_MOUSE_VA,
+        drv_cs,
+        drv_root_pt,
+        DRV_MOUSE_MSG_VA,
+        CapabilityRights::READ | CapabilityRights::WRITE,
+    )?;
+
+    // The raw packet-byte ring SharedRegion — private to this edge, same
+    // "trusted bootstrap, no Map ceremony" pattern DRV_I8042_QUEUE_VA
+    // already uses.
+    let src_cs = k.tcb(caller)?.cap_space;
+    let queue_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::SharedRegion, count: 1 },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => {
+            klog!("spawn_mouse_driver: failed to retype the ring SharedRegion\r\n");
+            return None;
+        }
+    };
+    let queue_id = k.cap_space(src_cs)?.lookup(queue_cap)?.object.id;
+    let queue_phys = k.shared_region(kernel_cap::SharedRegionId::new(queue_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(queue_phys as *mut u8, 0, 4096) };
+    let queue_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(queue_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(drv_root_pt, DRV_MOUSE_QUEUE_VA, queue_phys, 4096, 1 | 2 | 8, queue_pool, 2) == u32::MAX {
+        klog!("spawn_mouse_driver: map_range error (ring)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before `IrqBind`
+    // below installs `mouse_irq_trampoline`.
+    unsafe { core::ptr::addr_of_mut!(G_MOUSE_QUEUE_PHYS).write(queue_phys) };
+
+    // Slot 1 on driver-mouse's own side: the IRQ-bound Notification.
+    let notif_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Notification, count: 1 },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => {
+            klog!("spawn_mouse_driver: failed to retype the IRQ Notification\r\n");
+            return None;
+        }
+    };
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::IrqBind { mmio: mmio_cap, notification: notif_cap, handler: mouse_irq_trampoline },
+        hal,
+    ) {
+        Ok(SyscallReturn::Done) => {}
+        _ => {
+            klog!("spawn_mouse_driver: IrqBind failed\r\n");
+            return None;
+        }
+    }
+    grant_cap_into(k, src_cs, notif_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    let notif_id = k.cap_space(src_cs)?.lookup(notif_cap)?.object.id.as_u32();
+    // SAFETY: single-core boot sequencing; written here, before real
+    // interrupts are ever enabled.
+    unsafe { core::ptr::addr_of_mut!(G_MOUSE_NOTIF_ID).write(notif_id) };
+
+    // Slot 2 on both sides: the shared "tell Compositor" Notification.
+    wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    klog!("spawn_mouse_driver: driver-mouse spawned and wired to Compositor (real IRQ12, slave-PIC dual-EOI cascade)\r\n");
+    let _ = ep_cap; // boot-log value only
+
+    // NOT a context switch — same "linear boot sequence, scheduler picks
+    // it up later" reasoning as `spawn_i8042_driver`'s own tail comment.
+    Some(drv_tid)
+}
+
 /// Spawns the Netstack process from its own separately-built ELF
 /// (`netstack_elf`) — the real replacement for this crate's own,
 /// removed direct-driving of `driver-virtio-net` (`netstack::

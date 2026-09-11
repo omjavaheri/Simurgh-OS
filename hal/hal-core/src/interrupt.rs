@@ -207,6 +207,22 @@ pub trait InterruptController {
     fn read_i8042_scancode_and_ack(&self, _irq: IrqId) -> Option<u8> {
         None
     }
+
+    /// Reads and acknowledges the PS/2 mouse's own legacy ISA IRQ12
+    /// packet byte (mouse input plan, Stage 1) — the SAME i8042 data
+    /// port [`read_i8042_scancode_and_ack`] reads, routed to a DIFFERENT
+    /// line (IRQ12, a slave-PIC line, needing the two-EOI cascade
+    /// acknowledgment `hal_x86_64::pic::send_eoi_slave`'s own doc
+    /// comment covers — [`read_i8042_scancode_and_ack`]'s own single-EOI
+    /// master-line path is not correct for this line). Same calling-
+    /// context requirement as that method.
+    ///
+    /// Default `None`: same "this platform has no such capability"
+    /// convention as [`InterruptController::msi_message`]/
+    /// [`read_i8042_scancode_and_ack`]'s own doc comments.
+    fn read_ps2_mouse_byte_and_ack(&self, _irq: IrqId) -> Option<u8> {
+        None
+    }
 }
 
 #[cfg(test)]

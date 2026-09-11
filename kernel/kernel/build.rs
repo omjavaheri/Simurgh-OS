@@ -656,5 +656,30 @@ fn main() {
             "cargo:rustc-env=DRIVER_I8042_ELF_PATH={}",
             i8042_path.canonicalize().unwrap().display()
         );
+
+        // `driver-mouse-bin` (mouse-input plan, Stage 1b) — x86_64-only,
+        // same reason as `driver-i8042-bin` just above.
+        let mouse_build_alias = "cargo xbuild-subsystem-driver-mouse-x86_64".to_string();
+        let mouse_path = std::path::PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(dm_target_dir_name)
+            .join("debug")
+            .join("driver-mouse-bin");
+
+        if !mouse_path.exists() {
+            panic!(
+                "kernel build.rs: driver-mouse-bin binary not found at {} (target_arch = {target_arch}).\n\
+                 Build it first with: {mouse_build_alias}",
+                mouse_path.display()
+            );
+        }
+
+        println!("cargo:rerun-if-changed={}", mouse_path.display());
+        println!(
+            "cargo:rustc-env=DRIVER_MOUSE_ELF_PATH={}",
+            mouse_path.canonicalize().unwrap().display()
+        );
     }
 }

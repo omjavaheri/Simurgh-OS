@@ -223,6 +223,9 @@ xbuild-subsystem-security-broker-intermediary-riscv64 = "build -p security-broke
 # exists on aarch64/riscv64, so this is the only one of these aliases
 # for driver-i8042.
 xbuild-subsystem-driver-i8042-x86_64 = "build -p driver-i8042 --bin driver-i8042-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the real PS/2 mouse driver's own separately-built ELF
+# (mouse-input plan, Stage 1b) — x86_64-only, same reason as driver-i8042.
+xbuild-subsystem-driver-mouse-x86_64 = "build -p driver-mouse --bin driver-mouse-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)

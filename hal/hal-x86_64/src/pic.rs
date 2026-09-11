@@ -38,6 +38,17 @@
 //! not touch the IMCR (port 0x22/0x23, "disconnect the legacy PIC in
 //! favor of the I/O APIC") — nothing in this project ever enables I/O
 //! APIC routing, so there is nothing to disconnect from.
+//!
+//! **Mouse input plan, Stage 1a**: the PS/2 mouse's own IRQ12 is a
+//! SLAVE-PIC line (real hardware topology: slave line 4, cascaded into
+//! the master through the master's own IRQ2) — a structurally different
+//! case from keyboard IRQ1 (a master-PIC line) in two real ways this
+//! file's own [`unmask_irq12`]/[`send_eoi_slave`] exist to handle: the
+//! master's own cascade line must stay unmasked too, and a slave-line
+//! interrupt needs TWO EOIs, slave-then-master, not one. The mouse also
+//! needs a real controller-level enable sequence ([`enable_ps2_mouse`])
+//! the keyboard never did, since the i8042 controller's auxiliary port
+//! boots disabled on real hardware.
 //! ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -111,6 +122,15 @@ pub const PIC2_OFFSET: u8 = 88;
 /// from.
 pub const KEYBOARD_IRQ_VECTOR: u32 = PIC1_OFFSET as u32 + 1;
 
+/// The PS/2 mouse's own CPU vector after remap (mouse input plan, Stage
+/// 1a) — `PIC2_OFFSET + 4` (real-hardware topology: PS/2 mouse is IRQ12,
+/// the slave PIC's own line 4 — IRQ8 is the slave's line 0, so IRQ12 is
+/// line 4). The single source of truth both [`init`]/[`unmask_irq12`]
+/// and `kernel_arch_glue`'s own synthetic `MmioRegionDescriptor`
+/// construction (for `SyscallOp::IrqBind`) import from — same role
+/// [`KEYBOARD_IRQ_VECTOR`] already has for IRQ1.
+pub const MOUSE_IRQ_VECTOR: u32 = PIC2_OFFSET as u32 + 4;
+
 /// Clears bit `line` (0-7) in a PIC interrupt-mask byte — pure logic,
 /// exercised by this file's own unit tests below without touching real
 /// hardware ports.
@@ -173,11 +193,141 @@ pub unsafe fn unmask_irq1() {
     }
 }
 
+/// Unmasks IRQ12 (the PS/2 mouse's own line, real-hardware-topology
+/// slave line 4 — mouse input plan, Stage 1a). Unlike [`unmask_irq1`],
+/// this is not a single-register write: IRQ12 is a SLAVE-PIC line,
+/// cascaded into the master through the master's own IRQ2, so the
+/// master's line 2 must ALSO stay unmasked (`init`'s own mask-everything
+/// step masked it, exactly like every other line) — a slave interrupt
+/// the master itself is still blocking never reaches the CPU at all,
+/// regardless of the slave's own mask state. Must run after [`init`].
+///
+/// # Safety
+/// Same one-time-hardware-init contract as [`unmask_irq1`].
+pub unsafe fn unmask_irq12() {
+    // SAFETY: forwarded from this function's own contract; same read-
+    // modify-write reasoning as `unmask_irq1`, applied to both PICs
+    // (master's own cascade line 2, then slave's own line 4).
+    unsafe {
+        let master_mask = inb(PIC1_DATA);
+        outb(PIC1_DATA, unmask_bit(master_mask, 2));
+        let slave_mask = inb(PIC2_DATA);
+        outb(PIC2_DATA, unmask_bit(slave_mask, 4));
+    }
+}
+
 /// The i8042 controller's own data port — where a keyboard scancode byte
 /// lands once IRQ1 fires. Colocated here (not a separate module) since
 /// every real caller reads this port and sends the PIC EOI ([`send_eoi`])
 /// together, in the same IRQ handler.
 const I8042_DATA_PORT: u16 = 0x60;
+
+/// The i8042 controller's own command/status port — same port
+/// `hal_x86_64::power`'s own `reboot` already uses for its reset pulse
+/// (this file's own private copy, per this file's own "small self-
+/// contained duplicate" convention — see the module doc comment above
+/// [`inb`]).
+const I8042_COMMAND_PORT: u16 = 0x64;
+
+const I8042_STATUS_OUTPUT_FULL: u8 = 1 << 0; // a byte is waiting at I8042_DATA_PORT
+const I8042_STATUS_INPUT_FULL: u8 = 1 << 1; // the controller hasn't consumed the last byte yet
+
+/// Real hardware ceiling on how long this file ever spins waiting for
+/// the i8042 controller to catch up — matches `power.rs::reboot`'s own
+/// `spins < 1_000_000` bound (real hardware/QEMU both respond in far
+/// fewer iterations; this exists only so a genuinely wedged/absent
+/// controller can't hang boot forever).
+const MAX_POLL_SPINS: u32 = 1_000_000;
+
+/// # Safety
+/// Same contract as [`inb`] — polls `I8042_COMMAND_PORT`, architecturally
+/// safe.
+unsafe fn wait_for_input_buffer_empty() {
+    let mut spins = 0u32;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        while inb(I8042_COMMAND_PORT) & I8042_STATUS_INPUT_FULL != 0 && spins < MAX_POLL_SPINS {
+            spins += 1;
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as [`inb`] — polls `I8042_COMMAND_PORT`, architecturally
+/// safe.
+unsafe fn wait_for_output_buffer_full() {
+    let mut spins = 0u32;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        while inb(I8042_COMMAND_PORT) & I8042_STATUS_OUTPUT_FULL == 0 && spins < MAX_POLL_SPINS {
+            spins += 1;
+        }
+    }
+}
+
+/// Real i8042 controller commands (Intel/AMI 8042 datasheet convention
+/// every real PC-compatible controller — and QEMU's own i8042 emulation
+/// — implements identically; this is not a QEMU-only shortcut).
+const CMD_ENABLE_AUX_DEVICE: u8 = 0xA8;
+const CMD_READ_CONFIG_BYTE: u8 = 0x20;
+const CMD_WRITE_CONFIG_BYTE: u8 = 0x60;
+const CMD_WRITE_TO_AUX: u8 = 0xD4;
+const CONFIG_AUX_INTERRUPT_ENABLE: u8 = 1 << 1; // "enable IRQ12" bit in the config byte
+const CONFIG_AUX_CLOCK_DISABLE: u8 = 1 << 5; // must be CLEARED to let the mouse's own clock run
+const MOUSE_CMD_ENABLE_DATA_REPORTING: u8 = 0xF4; // starts real PS/2 packet streaming
+
+/// Real PS/2 controller init that turns the mouse on — unlike the
+/// keyboard, which the controller already streams by default, the
+/// auxiliary (mouse) port boots DISABLED on real hardware and in QEMU's
+/// own i8042 emulation alike; without this sequence, `unmask_irq12`
+/// alone unmasks a line the device itself never drives. Real protocol,
+/// not a QEMU-only shortcut (Intel/AMI 8042 controller command set):
+/// enable the aux port, flip the controller's own config byte to permit
+/// its IRQ and clock, then tell the mouse itself (via the controller's
+/// own "next byte goes to the mouse" gate) to start streaming real
+/// motion/button packets.
+///
+/// # Safety
+/// Same one-time-hardware-init contract as [`init`] — must run once, on
+/// the boot core, after [`init`]/[`unmask_irq12`], before `sti`.
+pub unsafe fn enable_ps2_mouse() {
+    // SAFETY: forwarded from this function's own contract; every step
+    // below is the documented real controller command sequence, each
+    // preceded by the real handshake wait its own datasheet requires.
+    unsafe {
+        wait_for_input_buffer_empty();
+        outb(I8042_COMMAND_PORT, CMD_ENABLE_AUX_DEVICE);
+
+        wait_for_input_buffer_empty();
+        outb(I8042_COMMAND_PORT, CMD_READ_CONFIG_BYTE);
+        wait_for_output_buffer_full();
+        let config = inb(I8042_DATA_PORT);
+
+        let new_config = (config | CONFIG_AUX_INTERRUPT_ENABLE) & !CONFIG_AUX_CLOCK_DISABLE;
+        wait_for_input_buffer_empty();
+        outb(I8042_COMMAND_PORT, CMD_WRITE_CONFIG_BYTE);
+        wait_for_input_buffer_empty();
+        outb(I8042_DATA_PORT, new_config);
+
+        wait_for_input_buffer_empty();
+        outb(I8042_COMMAND_PORT, CMD_WRITE_TO_AUX);
+        wait_for_input_buffer_empty();
+        outb(I8042_DATA_PORT, MOUSE_CMD_ENABLE_DATA_REPORTING);
+        // The mouse itself replies with a real ACK (0xFA) on the same
+        // data port — drained here so it doesn't get misread as the
+        // first byte of the first real motion packet by the IRQ12
+        // trampoline. Not checked against 0xFA: a real mouse that
+        // doesn't ACK also won't send motion packets, so a missing/
+        // malformed ACK is already self-evident from the absence of
+        // any further real data, per this project's own "an honest gap
+        // beats a guessed answer" convention — no special-cased error
+        // path needed here. Confirmed on a real QEMU x86_64 boot
+        // (2026-09-11) to actually be `0xFA` — a real, working PS/2
+        // mouse ACK, not a hypothetical.
+        wait_for_output_buffer_full();
+        let _ack = inb(I8042_DATA_PORT);
+    }
+}
 
 /// Reads the i8042 keyboard's own pending scancode byte. Must be called
 /// from the IRQ1 handler itself (reading this port is how the real
@@ -196,6 +346,22 @@ pub unsafe fn read_scancode() -> u8 {
     unsafe { inb(I8042_DATA_PORT) }
 }
 
+/// Reads the PS/2 mouse's own pending packet byte. Real PS/2 hardware
+/// routes BOTH the keyboard and the mouse through this SAME data port
+/// (0x60) — which device a given byte came from is determined entirely
+/// by which IRQ line fired (IRQ1 → keyboard, IRQ12 → mouse), never by
+/// the port itself; this function is a named alias of the identical
+/// port read [`read_scancode`] already performs, kept separate only so
+/// each IRQ handler's own call site self-documents which device it's
+/// servicing.
+///
+/// # Safety
+/// Same contract as [`read_scancode`], for the IRQ12 handler.
+pub unsafe fn read_mouse_byte() -> u8 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { inb(I8042_DATA_PORT) }
+}
+
 /// Acknowledges a master-PIC-line interrupt (IRQ0-7) — must be called by
 /// the servicing `IrqHandler` itself, in kernel/interrupt context, for
 /// every PIC-routed interrupt this project services (see this file's own
@@ -209,10 +375,38 @@ pub unsafe fn read_scancode() -> u8 {
 /// Must only be called from the IRQ handler actually servicing the
 /// master-PIC-sourced interrupt currently being acknowledged — an
 /// out-of-context call would prematurely clear the PIC's in-service bit.
+/// Real-hardware note (kept accurate now that [`send_eoi_slave`] below
+/// exists too): this function alone is correct ONLY for a master-PIC
+/// line (IRQ0-7, e.g. i8042's own IRQ1) — a slave-PIC line (IRQ8-15,
+/// e.g. the PS/2 mouse's own IRQ12) needs [`send_eoi_slave`] instead;
+/// see that function's own doc comment for why one EOI is not enough
+/// there.
 pub unsafe fn send_eoi() {
     const OCW2_EOI: u8 = 0x20;
     // SAFETY: forwarded from this function's own contract.
     unsafe { outb(PIC1_COMMAND, OCW2_EOI) };
+}
+
+/// Acknowledges a slave-PIC-line interrupt (IRQ8-15, e.g. the PS/2
+/// mouse's own IRQ12) — the two-EOI cascade requirement [`send_eoi`]'s
+/// own doc comment already names: the slave PIC's own in-service bit
+/// must be cleared first (`PIC2_COMMAND`), THEN the master's (`PIC1_
+/// COMMAND`), since the master ALSO latched an in-service bit for its
+/// own cascade line (IRQ2) the moment the slave raised it — leaving
+/// that master-side bit set would silently stop ALL further slave-PIC
+/// interrupts (any IRQ8-15 line), not just the one just serviced, even
+/// though the individual line's own mask bit is still clear.
+///
+/// # Safety
+/// Same contract as [`send_eoi`], for a slave-PIC-sourced interrupt.
+pub unsafe fn send_eoi_slave() {
+    const OCW2_EOI: u8 = 0x20;
+    // SAFETY: forwarded from this function's own contract; order matters
+    // per this function's own doc comment (slave first, then master).
+    unsafe {
+        outb(PIC2_COMMAND, OCW2_EOI);
+        outb(PIC1_COMMAND, OCW2_EOI);
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +423,15 @@ mod tests {
     #[test]
     fn keyboard_irq_vector_is_master_offset_plus_one() {
         assert_eq!(KEYBOARD_IRQ_VECTOR, PIC1_OFFSET as u32 + 1);
+    }
+
+    #[test]
+    fn mouse_irq_vector_is_slave_offset_plus_four() {
+        assert_eq!(MOUSE_IRQ_VECTOR, PIC2_OFFSET as u32 + 4);
+        // IRQ12 must land on the SLAVE PIC's own vector range, never the
+        // master's — a real, easy-to-get-backwards mistake this test
+        // guards against (mixing up PIC1_OFFSET/PIC2_OFFSET).
+        assert!(MOUSE_IRQ_VECTOR >= PIC2_OFFSET as u32 && MOUSE_IRQ_VECTOR < PIC2_OFFSET as u32 + 8);
     }
 
     #[test]

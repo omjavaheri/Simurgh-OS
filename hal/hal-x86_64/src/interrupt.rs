@@ -469,6 +469,25 @@ impl InterruptController for InterruptCtrl {
         Some(byte)
     }
 
+    /// Real override — mouse input plan, Stage 1. See `hal_core::
+    /// interrupt::InterruptController::read_ps2_mouse_byte_and_ack`'s
+    /// own doc comment. Uses [`crate::pic::send_eoi_slave`], NOT
+    /// [`crate::pic::send_eoi`] — IRQ12 is a slave-PIC line (`pic`'s own
+    /// module doc comment on Stage 1a covers the real two-EOI cascade
+    /// requirement this differs on from `read_i8042_scancode_and_ack`'s
+    /// own master-line path just above).
+    fn read_ps2_mouse_byte_and_ack(&self, _irq: IrqId) -> Option<u8> {
+        // SAFETY: same calling-context contract as `read_i8042_scancode_
+        // and_ack` just above, for the mouse's own IRQ12 trampoline
+        // (this crate's own only real caller).
+        let byte = unsafe { crate::pic::read_mouse_byte() };
+        // SAFETY: same IRQ12-handler-context contract as the read above;
+        // `pic::send_eoi_slave`'s own doc comment requires exactly this
+        // calling context.
+        unsafe { crate::pic::send_eoi_slave() };
+        Some(byte)
+    }
+
     fn send_ipi(&self, target_core: usize, vector: u8) -> Result<(), HalError> {
         if target_core as u32 >= self.ipi_target_core_count.get() {
             return Err(HalError::InvalidIpiTarget);
