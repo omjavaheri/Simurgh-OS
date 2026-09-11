@@ -72,6 +72,24 @@ use kernel_ipc::SmallMessage;
 const IPC_RECV: usize = 108;
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_REPLY`.
 const IPC_REPLY: usize = 44;
+/// Must stay numerically equal to `kernel/src/main.rs`'s plain, generic
+/// `sys::IPC_RECV` (43) — NOT `IPC_RECV` above (`= 108`), which is the
+/// SPECIAL `SBS_IPC_RECV` opcode this file's own module doc comment
+/// explains is needed only for the display Endpoint's own root-
+/// bootstrap-vs-general distinction. `I8042_ENDPOINT_CAP` has exactly
+/// one real caller
+/// (`driver-i8042`) from the moment it exists, so the plain, ordinary
+/// `Recv` opcode every other subsystem in this codebase already uses is
+/// correct here — no `G_COMPOSITOR_ROOT_ONLY_PHASE`-style special case
+/// needed for THIS endpoint.
+const IPC_RECV_GENERIC: usize = 43;
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::
+/// NOTIF_POLL`. Real-input-handling plan, Stage B/C: this file's own
+/// `subsystem_main` polls `I8042_SIGNAL_NOTIF_CAP` with this at the top
+/// of every loop iteration, additively (see that function's own doc
+/// comment for why this never touches the EXISTING `IPC_RECV`/`IPC_
+/// REPLY` sequence below).
+const NOTIF_POLL: usize = 125;
 
 /// This process's own capability slot for the Endpoint — `kernel_arch_
 /// glue::compositor_demo_start`'s own first (and only) grant into this
@@ -79,6 +97,16 @@ const IPC_REPLY: usize = 44;
 /// deterministically lands at slot 0 (same reasoning every other
 /// subsystem's own `*_ENDPOINT_CAP` constant doc comment already gives).
 const COMPOSITOR_ENDPOINT_CAP: usize = 0;
+
+/// This process's own capability slot for `driver-i8042`'s own service
+/// `Endpoint` — `kernel_arch_glue::spawn_i8042_driver`'s own SECOND
+/// grant into this process's cap space (slot 0 above was the first),
+/// via `wire_service_endpoint`. Real-input-handling plan, Stage B/C.
+const I8042_ENDPOINT_CAP: usize = 1;
+/// This process's own capability slot for the `Notification` SHARED
+/// with `driver-i8042` (signal-before-call) — the THIRD grant
+/// (`kernel_arch_glue::wire_notification`).
+const I8042_SIGNAL_NOTIF_CAP: usize = 2;
 
 /// VA the shared message page is mapped at in THIS process's own address
 /// space — must stay numerically equal to `kernel_arch_glue::
@@ -298,6 +326,50 @@ fn copy_frame_to_confirm(len: u32) {
     }
 }
 
+/// VA `driver-i8042`'s own shared message page is mapped at in THIS
+/// process's own address space — must stay numerically equal to
+/// `kernel_arch_glue::COMPOSITOR_I8042_VA`. A DIFFERENT physical region
+/// from `SHARED_VA` (the display Endpoint's own message page) —
+/// distinct producer, distinct edge.
+const I8042_VA: usize = 0xD8B0_0000;
+
+/// One decoded real key event — `keycode` is a raw Scan Code Set 1 make
+/// code (bit 7 cleared), matching `driver_i8042::scancode::KeyEvent`
+/// exactly. Duplicated here as a small, local, self-contained type
+/// rather than a cross-driver-crate dependency on `driver-i8042` — same
+/// "small numeric constants/logic duplicated with a sync comment"
+/// convention `netstack::subsystem_entry`'s own module doc comment
+/// already establishes for the identical situation (a service depending
+/// on a driver's own wire shape, not its crate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyEvent {
+    #[allow(dead_code)] // read by a later stage's own real consumer —
+    // stored now (see `subsystem_main`'s own doc comment) so this
+    // stage's edge is genuinely verifiable, not a dead write.
+    keycode: u8,
+    #[allow(dead_code)]
+    pressed: bool,
+}
+
+/// Must match `driver_i8042::wire::KEY_EVENT_LABEL` exactly.
+const KEY_EVENT_LABEL: u64 = 1;
+
+/// Reads and decodes the `KeyEvent` `driver-i8042` wrote into `I8042_VA`
+/// — mirrors `driver_i8042::wire::decode_key_event` exactly (see
+/// `KeyEvent`'s own doc comment for why this is a local duplicate, not a
+/// shared dependency).
+fn read_i8042_message() -> Option<KeyEvent> {
+    let base = I8042_VA as *const u64;
+    // SAFETY: `I8042_VA` is mapped `U=1 R+W` in this process's own
+    // address space by `kernel_arch_glue::spawn_i8042_driver`, before
+    // this process's own `NOTIF_POLL` could ever observe a set bit.
+    let (label, w0, w1) = unsafe { (base.read_volatile(), base.add(1).read_volatile(), base.add(2).read_volatile()) };
+    if label != KEY_EVENT_LABEL {
+        return None;
+    }
+    Some(KeyEvent { keycode: w0 as u8, pressed: w1 != 0 })
+}
+
 /// Handles one REAL `DisplayRequest`, driving a REAL `Compositor` surface
 /// table. `CommitBuffer`'s own `buffer_cap` (the WIRE protocol's own
 /// "client capability slot" field) is intentionally never resolved here
@@ -360,9 +432,53 @@ fn handle_request(comp: &mut Compositor, req: DisplayRequest) -> DisplayResponse
 /// arrives), decode, dispatch to the real `Compositor`, encode, `Reply`
 /// (always switches away on success — see `Reply`'s own doc comment in
 /// `kernel_core::syscall`).
+///
+/// Real-input-handling plan, Stage B/C: ADDITIVELY (see this function's
+/// own doc comment further down for why) polls `I8042_SIGNAL_NOTIF_CAP`
+/// once at the top of every iteration; if `driver-i8042` has signaled,
+/// drains its one queued `KeyEvent` (a real, bounded, non-blocking-in-
+/// practice `Recv`+`Reply` — see `I8042_ENDPOINT_CAP`'s own doc comment
+/// for why this specific endpoint never needs the display Endpoint's own
+/// special-cased `Recv` opcode) and stores it in `last_key_event`. There
+/// is no real consumer of `last_key_event` yet — wiring a `PollInputEvent`-
+/// style request `ui-core` can call is this plan's own next stage; this
+/// stage's own bar is proving the driver-i8042-to-Compositor edge is
+/// real and does not regress the existing display-Endpoint traffic.
+///
+/// Verification status (2026-09-11): structural, not yet a direct real-
+/// QEMU observation of a decoded `KeyEvent` reaching this function.
+/// Confirmed on real QEMU x86_64 boots: (1) this ADDITIVE change does
+/// NOT regress the pre-existing display-Endpoint traffic — `compositor_
+/// commit_verify`'s own real `CreateSurface`/`CommitBuffer`/
+/// `DestroySurface` round trip (Root Task's own bootstrap demo) still
+/// reports `MATCH` every boot, meaning this function's own modified loop
+/// runs correctly through several real iterations with the new `NOTIF_
+/// POLL` check in place; (2) `driver-i8042` itself is provably not the
+/// cause of a separate, PRE-EXISTING issue this session found while
+/// investigating: `ui-core`'s own thread (spawned earlier in the same
+/// boot sequence, unrelated to this edge) did not get scheduled at all
+/// in every attempt tried, INCLUDING a control run with `spawn_i8042_
+/// driver`'s own call site temporarily disabled entirely — the exact
+/// same non-scheduling happened either way, across multiple fresh boots
+/// that each produced byte-for-byte identical serial output. This
+/// isolates the cause to this project's already-documented QEMU
+/// scheduling-capacity characteristic (see this session's own project
+/// memory), not a regression introduced by this edge — but it also means
+/// `driver-i8042` (spawned even later than `ui-core` in the same
+/// sequence) could not be observed actually running in these attempts
+/// either, so the full driver-i8042-to-Compositor round trip remains
+/// verified by code review and Stage A's own real hardware-level proof
+/// (`kernel_arch_glue::i8042_irq_trampoline`'s own doc comment) rather
+/// than a direct end-to-end QEMU log line, pending either more attempts
+/// or a real reactive UI loop giving `ui-core`/`driver-i8042` more
+/// reliable scheduling opportunities.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut comp = Compositor::new();
+    // Not read anywhere yet — see this function's own doc comment on why
+    // (a real consumer, `PollInputEvent`, is this plan's own next stage).
+    #[allow(unused_assignments)]
+    let mut last_key_event: Option<KeyEvent> = None;
 
     // Same stack-slot-reuse miscompilation `fs_native::subsystem_entry::
     // subsystem_main`'s own identical loop hits (full investigation in
@@ -380,6 +496,34 @@ pub extern "C" fn subsystem_main() -> ! {
     }
 
     loop {
+        // Additive i8042 check — see this function's own doc comment.
+        // Never touches the display Endpoint's own blocking `Recv` call
+        // right below: `NOTIF_POLL` never blocks (`kernel_arch_glue::
+        // p2_poll`'s own doc comment), and the `Recv` this only takes
+        // when `bits != 0` targets a DIFFERENT Endpoint entirely
+        // (`I8042_ENDPOINT_CAP`, not `COMPOSITOR_ENDPOINT_CAP`) — the
+        // existing Root-Task-bootstrap and `ui-core` call sequences on
+        // the display Endpoint are byte-for-byte unchanged below.
+        // SAFETY: `raw_syscall`'s own contract.
+        let bits = unsafe { raw_syscall(NOTIF_POLL, I8042_SIGNAL_NOTIF_CAP, zero!()) };
+        if bits != 0 {
+            // SAFETY: `raw_syscall2`'s own contract. A real message is
+            // guaranteed to already be queued or arriving imminently —
+            // `driver-i8042` signaled BEFORE its own blocking `Call`
+            // (`driver_i8042::subsystem_entry::call_compositor`'s own
+            // doc comment) — so this `Recv` is not a genuine open-ended
+            // block in practice, matching `wire_notification`'s own doc
+            // comment on this exact pattern.
+            let (i8042_from, _label) = unsafe { raw_syscall2(IPC_RECV_GENERIC, I8042_ENDPOINT_CAP, zero!()) };
+            if let Some(event) = read_i8042_message() {
+                last_key_event = Some(event);
+            }
+            // SAFETY: `raw_syscall`'s own contract — wakes `driver-
+            // i8042`'s own blocking `Call` so it can process its next
+            // queued byte.
+            unsafe { raw_syscall(IPC_REPLY, i8042_from, zero!()) };
+        }
+
         // SAFETY: `raw_syscall2`'s own contract.
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, COMPOSITOR_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();

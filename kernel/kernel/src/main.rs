@@ -323,6 +323,15 @@ const UI_CORE_COMPOSITOR_SHARED_VA: usize = 0xD840_0000;
 #[cfg(target_arch = "x86_64")]
 const UI_CORE_COMPOSITOR_FB_VA: usize = 0xD850_0000;
 
+/// `driver-i8042-bin`'s own separately-built ELF image (real-input-
+/// handling plan, Stage B) — x86_64-only: no i8042 device exists on
+/// aarch64/riscv64 (`hal_manifest::raw::PeripheralKindRaw::Input`'s own
+/// doc comment), so this crate has no linker script for those targets
+/// and `build.rs` only emits `DRIVER_I8042_ELF_PATH` when building for
+/// x86_64 — this `static` is gated to match.
+#[cfg(target_arch = "x86_64")]
+static DRIVER_I8042_ELF: &[u8] = include_bytes!(env!("DRIVER_I8042_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -1258,6 +1267,19 @@ mod sys {
     /// capability-gated power control is a tracked follow-up, not a
     /// silent scope cut specific to this opcode.
     pub const POWER_CONTROL: usize = 124;
+    /// `a0` = notification capability slot. `SyscallOp::Poll` — never
+    /// blocks (see `kernel_arch_glue::p2_poll`'s own doc comment).
+    /// Returns the notification's own pending bit-set in `a0`,
+    /// draining it on read, same as `NOTIF_WAIT`'s own return value —
+    /// the difference is purely "block until non-zero" (`NOTIF_WAIT`)
+    /// vs. "return whatever is pending right now, even zero"
+    /// (`NOTIF_POLL`). Real-input-handling plan, Stage B/C: Compositor's
+    /// own additive loop uses this at the top of every iteration to
+    /// check its i8042-signal Notification without blocking its main
+    /// `SBS_IPC_RECV` — the same "no 'any of N' syscall exists" gap
+    /// `wire_notification`'s own doc comment describes, solved by
+    /// polling instead of a genuine multi-endpoint `Wait`.
+    pub const NOTIF_POLL: usize = 125;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3236,6 +3258,15 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
             };
         }
+        sys::NOTIF_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let bits = kernel_arch_glue::p2_poll(hal, caller, a0 as u32);
+            return TrapOutcome::Resume(bits as usize);
+        }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate()
@@ -3927,17 +3958,23 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             if let (Some(am_tid), Some(bm_tid), Some(ui_tid)) = (account_manager_tid_x86, backup_manager_tid_x86, ui_core_tid_x86) {
                 wire_account_manager_hub_notification_fanin_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, bm_tid, ui_tid);
             }
-            // Real i8042 keyboard input, Stage A (this session's own
-            // real-input-handling plan): binds IRQ1 to a real
-            // Notification via the 8259 PIC remap `hal_x86_64::pic`
-            // performs at boot — see `kernel_arch_glue::wire_i8042_irq`'s
-            // own doc comment. x86_64-only call site (the function
-            // itself is architecture-generic, per `kernel-arch-glue`'s
-            // own module doc comment) since no other architecture this
-            // project targets has this device.
-            let _ = kernel_arch_glue::wire_i8042_irq(
+            // Real i8042 keyboard input, Stage B (this project's own
+            // real-input-handling plan): spawns `driver-i8042` as a real
+            // isolated process, binds it to the real IRQ1 (8259-PIC-
+            // remapped) Notification, and wires it as a new real IPC
+            // client of Compositor — see `kernel_arch_glue::spawn_i8042_
+            // driver`'s own doc comment. Must run AFTER Compositor is
+            // spawned (`spawn_ui_core_x86`'s own call, above, already
+            // requires this too) — that function's own doc comment
+            // documents the same precondition. x86_64-only call site
+            // (the function itself is architecture-generic, per `kernel-
+            // arch-glue`'s own module doc comment) since no other
+            // architecture this project targets has this device.
+            let _ = kernel_arch_glue::spawn_i8042_driver(
                 kernel_arch_glue::khal(),
                 kernel_arch_glue::kstate().root_thread,
+                DRIVER_I8042_ELF,
+                elf_loader::machine::EM_X86_64,
             );
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
@@ -6378,6 +6415,15 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
             };
         }
+        sys::NOTIF_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let bits = kernel_arch_glue::p2_poll(hal, caller, x0 as u32);
+            return TrapOutcome::Resume(bits as usize);
+        }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate()
@@ -8019,6 +8065,15 @@ fn simurgh_syscall(
                 kernel_arch_glue::SignalOutcome::Ok => TrapOutcome::Resume(1),
                 kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
             };
+        }
+        sys::NOTIF_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let bits = kernel_arch_glue::p2_poll(hal, caller, a0 as u32);
+            return TrapOutcome::Resume(bits as usize);
         }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();

@@ -218,6 +218,11 @@ xbuild-subsystem-mm-service-riscv64 = "build -p mm-service --bin mm-service-bin 
 xbuild-subsystem-security-broker-intermediary-x86_64  = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-security-broker-intermediary-aarch64 = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-security-broker-intermediary-riscv64 = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the real i8042 keyboard driver's own separately-built
+# ELF (real-input-handling plan, Stage B) — x86_64-only: no such device
+# exists on aarch64/riscv64, so this is the only one of these aliases
+# for driver-i8042.
+xbuild-subsystem-driver-i8042-x86_64 = "build -p driver-i8042 --bin driver-i8042-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)

@@ -623,4 +623,38 @@ fn main() {
         "cargo:rustc-env=UI_CORE_ELF_PATH={}",
         ui_path.canonicalize().unwrap().display()
     );
+
+    // `driver-i8042-bin` (real-input-handling plan, Stage B) — x86_64
+    // ONLY, unlike every ELF above: no i8042 device exists on aarch64/
+    // riscv64 (`hal_manifest::raw::PeripheralKindRaw::Input`'s own doc
+    // comment), so `driver-i8042` has no linker script and cannot even
+    // be built for those targets. `main.rs`'s own consumption of
+    // `DRIVER_I8042_ELF_PATH` is `#[cfg(target_arch = "x86_64")]`-gated
+    // to match — this is the first ELF embed in this build script that
+    // is genuinely architecture-conditional, not just architecture-
+    // parameterized.
+    if target_arch == "x86_64" {
+        let i8042_build_alias = "cargo xbuild-subsystem-driver-i8042-x86_64".to_string();
+        let i8042_path = std::path::PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(dm_target_dir_name)
+            .join("debug")
+            .join("driver-i8042-bin");
+
+        if !i8042_path.exists() {
+            panic!(
+                "kernel build.rs: driver-i8042-bin binary not found at {} (target_arch = {target_arch}).\n\
+                 Build it first with: {i8042_build_alias}",
+                i8042_path.display()
+            );
+        }
+
+        println!("cargo:rerun-if-changed={}", i8042_path.display());
+        println!(
+            "cargo:rustc-env=DRIVER_I8042_ELF_PATH={}",
+            i8042_path.canonicalize().unwrap().display()
+        );
+    }
 }

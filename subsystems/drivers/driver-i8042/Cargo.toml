@@ -1,0 +1,38 @@
+# ============================================================================
+# driver-i8042
+#
+# The real i8042 PS/2 keyboard driver process — decodes real Scan Code
+# Set 1 bytes the kernel's own IRQ1 trampoline queues (`hal_x86_64::pic`
+# + `kernel_arch_glue::i8042_irq_trampoline`) into structured key events
+# and pushes them to the Compositor service. x86_64-only: no such device
+# exists on aarch64/riscv64 (see `hal_manifest::raw::PeripheralKindRaw::
+# Input`'s own doc comment).
+#
+# `#![no_std]`. `rlib` for now (the process entry shim lands with the
+# layer-2 TCB-load path) — same shape as `driver-virtio-blk`/`driver-
+# virtio-net`.
+# ============================================================================
+[package]
+name        = "driver-i8042"
+description = "Real i8042 PS/2 keyboard driver for Simurgh (real-input-handling plan, Stage B)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "driver-i8042-bin"
+path = "src/bin/driver-i8042-bin.rs"
+# Same reasoning as driver-virtio-blk-bin's own `[[bin]]`: a host `cargo
+# test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
+[dependencies]
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly, same reasoning as driver-virtio-blk's own dependency on it.
+kernel-ipc = { path = "../../../kernel/kernel-ipc" }

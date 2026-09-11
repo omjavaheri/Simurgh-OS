@@ -2286,6 +2286,24 @@ pub fn p2_signal(hal: &HalInterface, caller: ThreadId, notif_cap: u32, bits: u64
     }
 }
 
+/// `NOTIF_POLL` opcode: `SyscallOp::Poll` — never blocks (`kernel_core::
+/// syscall::KernelState::do_poll`'s own doc comment), unlike `p2_wait_
+/// general`'s own `Wait`, so this wrapper needs none of that function's
+/// `Reschedule`/switch handling — a direct value return is the whole
+/// contract. Drains the notification's own sticky bits on read (same
+/// "poll never blocks, drains what it reads" semantic `do_poll`
+/// documents) — used by a server (e.g. Compositor) to check, at the top
+/// of its own main loop, whether ANY of several `wire_notification`-
+/// fanned-in clients have something waiting, before committing to a
+/// blocking `Recv` on one specific `Endpoint`.
+pub fn p2_poll(hal: &HalInterface, caller: ThreadId, notif_cap: u32) -> u64 {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Poll { notification: kernel_cap::CapId::new(notif_cap) }, hal) {
+        Ok(SyscallReturn::Value(bits)) => bits,
+        _ => 0,
+    }
+}
+
 /// `IPC_REPLY` demo opcode: `SyscallOp::Reply`. Like `Call`, always a
 /// switch (`do_reply` never returns a `Resume`-worthy outcome to the
 /// replying thread itself — see that function's own doc comment).
@@ -6294,13 +6312,14 @@ pub fn spawn_virtio_net_driver(
 }
 
 // ============================================================================
-// i8042 keyboard — real interrupt-driven IRQ1 delivery. Stage A of this
-// session's real-input-handling work: proves the IRQ path itself (8259
-// PIC remap, real vector delivery, a real port-0x60 read, a real PIC EOI
-// that lets the SAME line keep firing across repeated keypresses) with
-// no consuming driver process yet — a later stage grants the
-// Notification this wires up into a real `driver-i8042` process and adds
-// a real ring consumer there.
+// i8042 keyboard — real interrupt-driven IRQ1 delivery, now with a real
+// consuming driver process (Stage B of this project's real-input-
+// handling plan). Stage A proved the IRQ path itself (8259 PIC remap,
+// real vector delivery, a real port-0x60 read, a real PIC EOI that lets
+// the SAME line keep firing across repeated keypresses) with no
+// consumer at all; this stage spawns `driver-i8042` as a genuine
+// isolated process, hands it the IRQ-bound Notification Stage A already
+// created, and wires it as a new real IPC client of Compositor.
 //
 // Architecture note: this whole section holds no `#[cfg(target_arch)]`
 // and names no architecture crate, per this file's own module doc
@@ -6316,91 +6335,92 @@ pub fn spawn_virtio_net_driver(
 // already establishes for Block/Network.
 // ============================================================================
 
-const I8042_RING_CAPACITY: usize = 32;
+/// Must match `driver_i8042::subsystem_entry::RING_CAPACITY` exactly —
+/// two independently-built binaries agreeing on a raw physical-memory
+/// layout, same numeric-agreement convention as every VA constant in
+/// this file.
+const I8042_RING_CAPACITY: u64 = 32;
 
-/// A small, fixed-capacity ring buffer for raw scancode bytes, pushed by
-/// [`i8042_irq_trampoline`] (real interrupt context) and drained by
-/// whatever later stage adds a real consumer. Oldest-byte-drop-on-
-/// overflow: real keyboard input rate makes 32 bytes ample headroom in
-/// practice, and dropping the oldest (rather than refusing the newest,
-/// or growing unbounded) keeps the most recently typed key visible,
-/// which matters more for a UI input device than perfectly lossless
-/// delivery of a byte the user has almost certainly already moved past.
-struct I8042Ring {
-    bytes: [u8; I8042_RING_CAPACITY],
-    /// Monotonically increasing counters (never reset, wrap is harmless
-    /// since only `write - read` is ever compared) — same shape as this
-    /// crate's own `KernelState` scheduler tick counters use for the
-    /// identical "only the difference matters" reason.
-    write: u32,
-    read: u32,
-}
+/// VA the raw-scancode ring `SharedRegion` is mapped at in `driver-
+/// i8042`'s own address space — must stay numerically equal to
+/// `driver_i8042::subsystem_entry::DRV_QUEUE_VA`. Layout: one `u64`
+/// "write count" header (offset 0) followed by `I8042_RING_CAPACITY`
+/// raw scancode bytes (offset 8) — [`i8042_irq_trampoline`] is the sole
+/// producer (via [`G_I8042_QUEUE_PHYS`]), `driver-i8042`'s own
+/// `subsystem_entry` is the sole consumer.
+pub const DRV_I8042_QUEUE_VA: usize = 0xD820_0000;
+/// VA `driver-i8042`'s own copy of its service `Endpoint`'s shared
+/// message page is mapped at — must stay numerically equal to
+/// `driver_i8042::subsystem_entry::DRV_MSG_VA`.
+pub const DRV_I8042_MSG_VA: usize = 0xD830_0000;
+/// VA Compositor's own copy of the SAME shared message page is mapped
+/// at — deliberately a DIFFERENT numeric value from `DRV_I8042_MSG_VA`
+/// (unlike `COMPOSITOR_SHARED_VA`'s own "same numeric value, different
+/// address space" convention): Compositor already owns `SHARED_VA`/
+/// `FB_VA`/`CONFIRM_VA`, so this just needs to be clear of those, not
+/// numerically matched to anything.
+const COMPOSITOR_I8042_VA: usize = 0xD8B0_0000;
 
-impl I8042Ring {
-    const fn new() -> Self {
-        Self { bytes: [0; I8042_RING_CAPACITY], write: 0, read: 0 }
-    }
-
-    /// Pushes one byte, silently discarding the oldest still-unread byte
-    /// if the ring is already full — see this type's own doc comment.
-    fn push(&mut self, byte: u8) {
-        let idx = (self.write as usize) % I8042_RING_CAPACITY;
-        self.bytes[idx] = byte;
-        self.write = self.write.wrapping_add(1);
-        if self.write.wrapping_sub(self.read) as usize > I8042_RING_CAPACITY {
-            self.read = self.write.wrapping_sub(I8042_RING_CAPACITY as u32);
-        }
-    }
-
-    /// Pops the oldest unread byte, or `None` if the ring is empty.
-    #[cfg_attr(not(test), allow(dead_code))] // no real consumer until the
-    // follow-up stage that adds `driver-i8042` — kept here (not added
-    // later) so this type's push/pop pairing is tested as one unit now.
-    fn pop(&mut self) -> Option<u8> {
-        if self.read == self.write {
-            return None;
-        }
-        let idx = (self.read as usize) % I8042_RING_CAPACITY;
-        let byte = self.bytes[idx];
-        self.read = self.read.wrapping_add(1);
-        Some(byte)
-    }
-}
-
-static mut G_I8042_RING: I8042Ring = I8042Ring::new();
-/// The `Notification` id `wire_i8042_irq` binds IRQ1 to — `u32::MAX`
-/// until that function has run. Same single-core-boot-scratch pattern as
-/// every other `G_*` global in this file (e.g. `G_DRV_NET_MMIO_PHYS`).
+/// Physical base of the raw-scancode ring `SharedRegion` — `usize::MAX`
+/// until `spawn_i8042_driver` has run. Same single-core-boot-scratch
+/// pattern as every other `G_*_PHYS` global in this file (e.g.
+/// `G_DRV_NET_RX_PHYS`).
+static mut G_I8042_QUEUE_PHYS: usize = usize::MAX;
+/// The `Notification` id the i8042 IRQ line is bound to — `u32::MAX`
+/// until `spawn_i8042_driver` has run.
 static mut G_I8042_NOTIF_ID: u32 = u32::MAX;
 
 /// The trampoline `SyscallOp::IrqBind` installs for the i8042 keyboard's
 /// own IRQ line. Reads and acknowledges the real scancode byte through
-/// `HalInterface::read_i8042_scancode_and_ack`, pushes it into
-/// [`G_I8042_RING`], then signals the bound Notification — same "ack the
-/// device in kernel/interrupt context, never deferred to userspace"
-/// discipline `virtio_net_irq_trampoline` already established.
+/// `HalInterface::read_i8042_scancode_and_ack`, writes it directly into
+/// the ring `SharedRegion` at [`G_I8042_QUEUE_PHYS`] (the SAME "kernel
+/// writes physical memory the driver process has mapped" pattern
+/// `G_DRV_NET_RX_PHYS`'s own doc comment establishes), then signals the
+/// bound Notification — same "ack the device in kernel/interrupt
+/// context, never deferred to userspace" discipline `virtio_net_irq_
+/// trampoline` already established.
+///
+/// Verified on real QEMU x86_64 boots (2026-09-11), before this ring
+/// moved into a `SharedRegion` (Stage A's own private-static version):
+/// real keystrokes injected via QEMU's own monitor `sendkey` (which
+/// drives the actual emulated i8042 hardware, not a shortcut) produced
+/// the exact, textbook PC/AT Scan Code Set 1 make/break byte pairs for
+/// every key sent (`A` → `0x1e`/`0x9e`, `D` → `0x20`/`0xa0`, `E` →
+/// `0x12`/`0x92`), across two independent boots and six total keypress
+/// events, with the SAME line firing correctly on every repeat — direct
+/// proof the PIC EOI is real and working, not just a single first
+/// interrupt getting through. The write target changed (a physical
+/// `SharedRegion` instead of a private kernel static); the read/ack/EOI
+/// logic proven then is byte-for-byte unchanged here.
 pub fn i8042_irq_trampoline(irq: hal_core::interrupt::IrqId) {
     let hal = khal();
     let Some(byte) = hal.read_i8042_scancode_and_ack(irq.as_u32()) else {
         return; // Not actually an i8042-capable platform — unreachable
-        // in practice (this trampoline is only ever installed by `wire_
-        // i8042_irq`'s own `IrqBind`, itself gated on a real `root_mmio_
-        // i8042_cap`), kept as a defensive no-op rather than a panic,
-        // matching every other trampoline's own "malformed/unexpected
-        // state degrades gracefully" posture in this file.
+        // in practice (this trampoline is only ever installed by `spawn_
+        // i8042_driver`'s own `IrqBind`, itself gated on a real `root_
+        // mmio_i8042_cap`), kept as a defensive no-op rather than a
+        // panic, matching every other trampoline's own "malformed/
+        // unexpected state degrades gracefully" posture in this file.
     };
 
-    // SAFETY: single-core; only this trampoline ever touches
-    // `G_I8042_RING`.
+    // SAFETY: single-core; `G_I8042_QUEUE_PHYS` is written once by
+    // `spawn_i8042_driver`, before this trampoline can ever run (real
+    // interrupts stay masked until well after boot wiring completes).
+    // `phys` names a real `SharedRegion` that function retyped and
+    // zeroed, mapped `U=1 R+W` into `driver-i8042`'s own address space —
+    // this trampoline writes it directly via its own identity-mapped
+    // kernel address, same pattern `G_DRV_NET_RX_PHYS`'s own write
+    // sites use.
     unsafe {
-        let ring = &mut *core::ptr::addr_of_mut!(G_I8042_RING);
-        ring.push(byte);
+        let phys = core::ptr::addr_of!(G_I8042_QUEUE_PHYS).read();
+        if phys != usize::MAX {
+            let write_count = (phys as *const u64).read_volatile();
+            let byte_offset = 8 + (write_count % I8042_RING_CAPACITY) as usize;
+            ((phys + byte_offset) as *mut u8).write_volatile(byte);
+            (phys as *mut u64).write_volatile(write_count.wrapping_add(1));
+        }
     }
 
-    // SAFETY: single-core; written once by `wire_i8042_irq`, before this
-    // trampoline can ever run (real interrupts stay masked, per every
-    // other one-time hardware-init function in this project, until well
-    // after boot wiring completes).
     let nid = unsafe { core::ptr::addr_of!(G_I8042_NOTIF_ID).read() };
     if nid == u32::MAX {
         return;
@@ -6416,53 +6436,113 @@ pub fn i8042_irq_trampoline(irq: hal_core::interrupt::IrqId) {
     }
 }
 
-/// Binds the i8042 keyboard's own IRQ line to a fresh `Notification` —
-/// real interrupt delivery only, no consuming driver process yet (see
-/// this section's own module doc comment). Returns `false` (and logs)
-/// if no `Input`-kind peripheral was discovered at boot (`KernelState::
-/// root_mmio_i8042_cap` still the sentinel) — expected, not an error, on
-/// aarch64/riscv64.
+/// Spawns `driver-i8042` from its own separately-built ELF (`drv_elf`),
+/// grants it THREE capabilities (deterministic slots, matching `driver_
+/// i8042::subsystem_entry`'s own fixed constants exactly): slot 0 (the
+/// service `Endpoint` to Compositor, via [`wire_service_endpoint`]),
+/// slot 1 (the i8042 IRQ line's own `Notification`, via `IrqBind`), slot
+/// 2 (a `Notification` SHARED with Compositor, via [`wire_notification`]
+/// — signal-before-call, the same real, working pattern this project's
+/// account-manager hub work already established). Pre-maps the raw-
+/// scancode ring `SharedRegion` directly into the driver's own address
+/// space at `DRV_I8042_QUEUE_VA` (trusted bootstrap, no `Map` ceremony —
+/// same pattern `DRV_QUEUE_VA` uses for `driver-virtio-blk`).
 ///
-/// Verified on real QEMU x86_64 boots (2026-09-11) with a temporary
-/// per-keypress checkpoint (removed before this stage's own commit,
-/// per this project's established checkpoint-tracing convention): real
-/// keystrokes injected via QEMU's own monitor `sendkey` (which drives
-/// the actual emulated i8042 hardware, not a shortcut) produced the
-/// exact, textbook PC/AT Scan Code Set 1 make/break byte pairs for every
-/// key sent (`A` → `0x1e`/`0x9e`, `D` → `0x20`/`0xa0`, `E` →
-/// `0x12`/`0x92`), across two independent boots and six total keypress
-/// events, with the SAME line firing correctly on every repeat — direct
-/// proof the PIC EOI (this section's own module doc comment on why it's
-/// required) is real and working, not just a single first interrupt
-/// getting through. No regression to the rest of the boot sequence
-/// (device-manager/security-broker/native-loader/profile-policy/store/
-/// shell all completed their own existing real checks in the same
-/// boots), no crash.
-pub fn wire_i8042_irq(hal: &HalInterface, caller: ThreadId) -> bool {
+/// Requires Compositor to already be spawned (`G_COMPOSITOR_TID`,
+/// written by `compositor_demo_start`) — same "wire two ALREADY-SPAWNED
+/// processes together" precondition [`wire_service_endpoint`]'s own doc
+/// comment documents.
+///
+/// Returns `None` (and logs) if no `Input`-kind peripheral was
+/// discovered at boot (`KernelState::root_mmio_i8042_cap` still the
+/// sentinel) — expected, not an error, on aarch64/riscv64 — or on any
+/// allocation failure.
+pub fn spawn_i8042_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<ThreadId> {
     let k = kstate();
     let mmio_cap = k.root_mmio_i8042_cap;
     if mmio_cap == CapId::new(u32::MAX) {
-        klog!("wire_i8042_irq: no Input-kind peripheral was discovered at boot\r\n");
-        return false;
+        klog!("spawn_i8042_driver: no Input-kind peripheral was discovered at boot\r\n");
+        return None;
     }
 
-    let notif_cap = match k.dispatch(
+    // SAFETY: `G_COMPOSITOR_TID` is written once by `compositor_demo_
+    // start`, before this function can ever be reached (Compositor must
+    // already be spawned — this function's own doc comment).
+    let comp_tid = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }?;
+    let comp_cs = k.tcb(comp_tid)?.cap_space;
+    let comp_addr_space = k.tcb(comp_tid)?.addr_space;
+    let comp_root_pt = k.addr_space_mut(comp_addr_space)?.root_phys().as_usize();
+
+    const DRV_I8042_STACK_VMA: usize = 0xC0A0_0000;
+    const DRV_I8042_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_I8042_STACK_VMA, DRV_I8042_STACK_LEN)?;
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    // Slot 0 on both sides: the service Endpoint + its own shared
+    // message page.
+    let ep_cap = wire_service_endpoint(
+        hal,
+        caller,
+        comp_cs,
+        comp_root_pt,
+        COMPOSITOR_I8042_VA,
+        drv_cs,
+        drv_root_pt,
+        DRV_I8042_MSG_VA,
+        CapabilityRights::READ | CapabilityRights::WRITE,
+    )?;
+
+    // The raw-scancode ring SharedRegion — private to this edge (kernel
+    // writes it directly, driver-i8042 reads it directly), never granted
+    // as a capability into either process (same "trusted bootstrap, no
+    // Map ceremony" pattern DRV_QUEUE_VA/DRV_NET_RX_VA already use).
+    let src_cs = k.tcb(caller)?.cap_space;
+    let queue_cap = match k.dispatch(
         caller,
         hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Notification,
-            count: 1,
-        },
+        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::SharedRegion, count: 1 },
         hal,
     ) {
         Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
         _ => {
-            klog!("wire_i8042_irq: failed to retype a Notification\r\n");
-            return false;
+            klog!("spawn_i8042_driver: failed to retype the ring SharedRegion\r\n");
+            return None;
         }
     };
+    let queue_id = k.cap_space(src_cs)?.lookup(queue_cap)?.object.id;
+    let queue_phys = k.shared_region(kernel_cap::SharedRegionId::new(queue_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(queue_phys as *mut u8, 0, 4096) };
+    let queue_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(queue_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(drv_root_pt, DRV_I8042_QUEUE_VA, queue_phys, 4096, 1 | 2 | 8, queue_pool, 2) == u32::MAX {
+        klog!("spawn_i8042_driver: map_range error (ring)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before `IrqBind`
+    // below installs `i8042_irq_trampoline`.
+    unsafe { core::ptr::addr_of_mut!(G_I8042_QUEUE_PHYS).write(queue_phys) };
 
+    // Slot 1 on driver-i8042's own side: the IRQ-bound Notification.
+    let notif_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Notification, count: 1 },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => {
+            klog!("spawn_i8042_driver: failed to retype the IRQ Notification\r\n");
+            return None;
+        }
+    };
     match k.dispatch(
         caller,
         hal.now_ns(),
@@ -6471,62 +6551,77 @@ pub fn wire_i8042_irq(hal: &HalInterface, caller: ThreadId) -> bool {
     ) {
         Ok(SyscallReturn::Done) => {}
         _ => {
-            klog!("wire_i8042_irq: IrqBind failed\r\n");
-            return false;
+            klog!("spawn_i8042_driver: IrqBind failed\r\n");
+            return None;
         }
     }
-
-    let Some(src_cs) = k.tcb(caller).map(|t| t.cap_space) else {
-        return false;
-    };
-    let Some(notif_id) =
-        k.cap_space(src_cs).and_then(|cs| cs.lookup(notif_cap)).map(|c| c.object.id.as_u32())
-    else {
-        return false;
-    };
+    grant_cap_into(k, src_cs, notif_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    let notif_id = k.cap_space(src_cs)?.lookup(notif_cap)?.object.id.as_u32();
     // SAFETY: single-core boot sequencing; written here, before real
-    // interrupts are ever enabled (`sti` runs later, per every other
-    // one-time hardware-init function's own contract in this project).
+    // interrupts are ever enabled.
     unsafe { core::ptr::addr_of_mut!(G_I8042_NOTIF_ID).write(notif_id) };
 
-    klog!("wire_i8042_irq: bound (real IRQ1, vector-routed via 8259 PIC remap)\r\n");
-    true
+    // Slot 2 on both sides: the shared "tell Compositor" Notification.
+    wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    klog!("spawn_i8042_driver: driver-i8042 spawned and wired to Compositor (real IRQ1, vector-routed via 8259 PIC remap)\r\n");
+    let _ = ep_cap; // boot-log value only, per this function's own doc comment
+
+    // NOT a context switch, unlike `spawn_virtio_net_driver`'s own tail:
+    // this function is called deep in a LINEAR sequence of spawns inside
+    // `caller`'s (Root Task's) own boot sequence, not from a dedicated
+    // syscall trigger — `spawn_process_from_elf` already made `drv_tid`
+    // `Runnable` (`note_ready`), so the scheduler picks it up once this
+    // whole boot sequence eventually hands off control, same pattern
+    // `spawn_ui_core_x86`'s own tail already establishes.
+    Some(drv_tid)
 }
 
 #[cfg(test)]
-mod i8042_ring_tests {
-    use super::{I8042Ring, I8042_RING_CAPACITY};
+mod i8042_ring_index_tests {
+    use super::I8042_RING_CAPACITY;
 
-    #[test]
-    fn pop_on_empty_ring_returns_none() {
-        let mut ring = I8042Ring::new();
-        assert_eq!(ring.pop(), None);
+    /// Pure re-derivation of `i8042_irq_trampoline`'s own byte-offset
+    /// arithmetic — real physical-memory access can't be exercised in a
+    /// host test, but the index math it depends on can be, and is worth
+    /// its own test given a fencepost error here would silently corrupt
+    /// unrelated ring slots.
+    fn byte_offset(write_count: u64) -> usize {
+        8 + (write_count % I8042_RING_CAPACITY) as usize
     }
 
     #[test]
-    fn push_then_pop_returns_the_same_byte_in_order() {
-        let mut ring = I8042Ring::new();
-        ring.push(0x1E); // 'A' make code, Set 1
-        ring.push(0x9E); // 'A' break code, Set 1
-        assert_eq!(ring.pop(), Some(0x1E));
-        assert_eq!(ring.pop(), Some(0x9E));
-        assert_eq!(ring.pop(), None);
+    fn offsets_wrap_at_ring_capacity() {
+        assert_eq!(byte_offset(0), 8);
+        assert_eq!(byte_offset(I8042_RING_CAPACITY - 1), 8 + I8042_RING_CAPACITY as usize - 1);
+        assert_eq!(byte_offset(I8042_RING_CAPACITY), 8); // wraps back to the first slot
+        assert_eq!(byte_offset(I8042_RING_CAPACITY + 5), 13);
+    }
+
+    /// Re-derivation of `driver_i8042::subsystem_entry::subsystem_main`'s
+    /// own "drop oldest if we fell behind" clamp — the consumer-side
+    /// counterpart to the producer's drop-oldest-on-overflow behavior
+    /// (`kernel_arch_glue::i8042_irq_trampoline`'s own doc comment).
+    fn clamp_read_count(read_count: u64, write_count: u64) -> u64 {
+        if write_count.wrapping_sub(read_count) > I8042_RING_CAPACITY {
+            write_count - I8042_RING_CAPACITY
+        } else {
+            read_count
+        }
     }
 
     #[test]
-    fn overflowing_the_ring_drops_the_oldest_byte_not_the_newest() {
-        let mut ring = I8042Ring::new();
-        for i in 0..(I8042_RING_CAPACITY as u32 + 3) {
-            ring.push(i as u8);
-        }
-        // The first 3 pushed bytes (0, 1, 2) were dropped; the oldest
-        // SURVIVING byte is 3, the newest is CAPACITY + 2.
-        assert_eq!(ring.pop(), Some(3));
-        let mut last = None;
-        while let Some(b) = ring.pop() {
-            last = Some(b);
-        }
-        assert_eq!(last, Some((I8042_RING_CAPACITY as u32 + 2) as u8));
+    fn falling_behind_by_more_than_capacity_drops_the_oldest_bytes() {
+        // Consumer never read anything (`read_count == 0`) and the
+        // producer has already written CAPACITY + 5 bytes — the first 5
+        // are gone; the clamp must skip straight to byte 5, not try to
+        // read the (overwritten) byte 0.
+        assert_eq!(clamp_read_count(0, I8042_RING_CAPACITY + 5), 5);
+    }
+
+    #[test]
+    fn staying_within_capacity_never_clamps() {
+        assert_eq!(clamp_read_count(3, I8042_RING_CAPACITY + 2), 3);
     }
 }
 
