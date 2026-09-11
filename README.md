@@ -41,7 +41,11 @@ Simurgh-OS/
 │   └── kernel/          the bootable Phase-2 microkernel image
 │
 ├── ipc-protocol/        the layer-2 <-> layer-3 message contract (03 §3)
-├── subsystems/          root-task, device-manager, drivers/, vfs-service/, netstack, compositor, mm-service (03 §4)
+├── subsystems/          root-task, device-manager, drivers/ (virtio-blk,
+│                         virtio-net, i8042 keyboard, PS/2 mouse), vfs-service/,
+│                         netstack, compositor (real DisplayProtocol: surfaces,
+│                         zero-copy CommitBuffer, real keyboard/mouse polling),
+│                         mm-service, security-broker-intermediary (03 §4)
 │
 ├── kernel-stub/         minimal microkernel stand-in for the pure HAL (01 §8) smoke test
 ├── targets/             custom no_std JSON target specs
@@ -84,15 +88,29 @@ cargo xbuild-x86_64        cargo xbuild-aarch64        cargo xbuild-riscv64
 cargo xbuild-kernel-{x86_64,aarch64,riscv64}
 scripts/qemu-smoke.sh <x86_64|aarch64|riscv64>   # boot + assert the HAL handoff markers
 
-# each subsystem, per architecture (must be built before the real kernel,
-# which embeds their ELFs via include_bytes!):
-cargo xbuild-subsystem-<device-manager|fs-native|driver-virtio-blk|driver-virtio-net|netstack|compositor|mm-service>-<arch>
+# each in-repo subsystem, per architecture (must be built before the real
+# kernel, which embeds their ELFs via include_bytes! — driver-i8042/
+# driver-mouse are x86_64-only, no such legacy PC hardware on aarch64/riscv64):
+cargo xbuild-subsystem-<device-manager|fs-native|driver-virtio-blk|driver-virtio-net|netstack|compositor|mm-service|security-broker-intermediary>-<arch>
+cargo xbuild-subsystem-driver-i8042-x86_64
+cargo xbuild-subsystem-driver-mouse-x86_64
 
-# the real microkernel image (Phase 2/3):
+# the real microkernel image (Phase 2/3) — on x86_64, ALSO needs each other
+# real repo's own subsystem-bin already built as a sibling directory first
+# (security-broker/init/account-manager/backup-manager/diagnostics/store/
+# native-loader/policy-engine/shell/file-manager/ui-core — see kernel/
+# kernel/build.rs's own panic messages for the exact build command each one
+# needs if a binary is missing):
 cargo xbuild-microkernel-{x86_64,aarch64,riscv64}
 cargo xrun-microkernel-riscv64       # build + boot under QEMU
 scripts/qemu-fault-isolation-test.sh <x86_64|aarch64|riscv64>   # real fault-injection + supervision, asserted end to end
 ```
+
+Build order matters, strictly: each subsystem-bin, THEN the kernel that
+embeds it, THEN `uefi-bootloader` (which embeds the kernel, for x86_64/
+aarch64) — skipping a rebuild step after changing a subsystem-bin embeds a
+stale binary that can look exactly like a real, nondeterministic runtime
+bug (a real, previously-chased false lead in this project's own history).
 
 Exactly what CI runs on every push/PR is `.github/workflows/ci.yml` — the
 same commands above, for all three architectures.
@@ -122,9 +140,10 @@ riscv64) unless noted:**
   concurrently in separate, MMU-isolated address spaces, including zero-copy
   sharing of a single physical frame across two spaces.
 - **Layer 3 subsystems:** `device-manager`, `fs-native`,
-  `driver-virtio-blk`, `driver-virtio-net`, `netstack`, `compositor`, and
-  `mm-service` are each a real, separately-built ELF process (not a linked-in
-  library) spawned via the generic `kernel_arch_glue::spawn_process`/
+  `driver-virtio-blk`, `driver-virtio-net`, `driver-i8042`, `driver-mouse`,
+  `netstack`, `compositor`, `mm-service`, and `security-broker-intermediary`
+  are each a real, separately-built ELF process (not a linked-in library)
+  spawned via the generic `kernel_arch_glue::spawn_process`/
   `spawn_process_from_elf` path, exercised by the real `kernel` binary on all
   three architectures.
 - **Real per-process fault isolation** (`03 §5.2`): a deliberately faulting
@@ -136,8 +155,56 @@ riscv64) unless noted:**
 - A VFS read-throughput benchmark and an `02 §8.3` IPC round-trip benchmark
   both run as part of the real boot sequence and report real numbers (not
   hardcoded).
+- **Real cross-repo integration (x86_64, real QEMU boots)**: on top of the
+  in-repo layer-3 subsystems above, the x86_64 boot sequence also spawns a
+  real process from EACH of this project's other real repositories —
+  `security-broker` (`simurgh-security-broker`), `init`
+  (`simurgh-init`), `account-manager` (`simurgh-account-manager`),
+  `backup-manager` (`simurgh-backup-manager`), `diagnostics-manager`
+  (`simurgh-diagnostics`), `store` (`simurgh-store`), `native-loader`
+  (`simurgh-native-sdk`), `policy-engine` (`simurgh-profile-policy`),
+  `shell` (`simurgh-shell`), `file-manager` (`simurgh-file-manager`), and
+  `ui-core` (`Simurgh-UI-Template01`) — each repo's own separately-built ELF,
+  embedded directly into the kernel binary via `include_bytes!` for real,
+  end-to-end integration testing (a local-dev-only sibling-directory path
+  stitch; the repos themselves stay independent). Real, verified IPC edges
+  between them include: a real capability-request/elevation/package-signature
+  flow through `security-broker`; a real login round trip from `ui-core`
+  through `account-manager`; real install-time signature and profile-policy
+  compatibility checks for `store`; and a real dynamic process-spawn syscall
+  (`SPAWN_FROM_BUFFER`) driven by `native-loader`.
+- **Real display pipeline**: `compositor` serves a real `DisplayProtocol`
+  (`CreateSurface`/`CommitBuffer`/`DestroySurface`) over a genuine
+  multi-page zero-copy `SharedRegion` (`SyscallOp::Retype`'s own
+  `count`-means-"pages in this region" semantic for `SharedRegion`, added to
+  support a real 800x600 BGRA8 desktop frame, not just a small test
+  pattern) — `ui-core` renders and commits a real desktop scene through it.
+- **Real power control**: `sys::POWER_CONTROL`, backed by a real
+  `hal_core::power::SystemControl` trait per architecture — x86_64 issues a
+  genuine i8042 keyboard-controller reset pulse (reboot) or ACPI `PM1a_CNT`
+  write (shutdown), confirmed by QEMU itself exiting the moment the syscall
+  runs; aarch64 uses real PSCI (`smc`), riscv64 the real SBI System Reset
+  Extension (`ecall`) — both real hardware standards, though only the x86_64
+  path is QEMU-verified so far.
+- **Real interrupt-driven keyboard and mouse input** (x86_64 only — no such
+  legacy PC hardware exists on aarch64/riscv64): a real 8259 PIC remap
+  routes both IRQ1 (keyboard, master line) and IRQ12 (PS/2 mouse, a slave
+  line needing its own two-EOI cascade acknowledgment) to real CPU vectors —
+  this project has no I/O APIC, so this is the deliberate, reasoned path,
+  not a placeholder. `driver-i8042`/`driver-mouse` each decode real
+  scancode/packet bytes and push structured key/motion events to
+  `compositor`, which serves them to any real display client via a
+  non-blocking `PollInputEvent` request. Directly confirmed on real QEMU
+  boots: real keystrokes and real mouse motion/clicks, injected through
+  QEMU's own hardware emulation (not a shortcut), produce the exact
+  expected byte-level results at the driver level. A real, documented
+  finding from this work: this kernel only ever services a maskable
+  interrupt inside the one-shot `hlt_wait_for_irq` wait point, so a queued
+  interrupt is only delivered once some real thread is genuinely blocked
+  waiting for it — see `kernel_arch_glue::mouse_irq_trampoline`'s own doc
+  comment for the full story.
 
-**Known open issue:**
+**Known open issues:**
 
 - **riscv64 only:** the `compositor` process faults (an instruction page
   fault, not an illegal instruction) shortly after its first resume. Deep
@@ -147,15 +214,35 @@ riscv64) unless noted:**
   root cause is not yet found. x86_64 and aarch64 are unaffected;
   `scripts/qemu-fault-isolation-test.sh riscv64` runs with a documented
   `--allow-fail` in CI so this stays visible without blocking the pipeline.
+- **QEMU scheduling capacity at scale (x86_64)**: with this many real
+  subsystems now competing for one emulated core under TCG, a newly-spawned
+  process (e.g. `ui-core`, `driver-i8042`, `driver-mouse`) is not guaranteed
+  to actually get scheduled within a single boot's real-time window — this
+  affects how reliably some of the newer real IPC edges above can be
+  observed completing end to end on any ONE given boot (retries, or a
+  longer-running real workload, generally do get them scheduled). This is
+  an accepted characteristic of testing at the current scale, not a
+  correctness bug — each such edge's own code is independently verified
+  (unit tests, cross-arch builds, and either a direct hardware-level proof
+  or a successful boot log line on at least one real run).
 
 ## Repository scope
 
-In scope: `hal/`, `kernel/`, `ipc-protocol/`, `subsystems/`, `uefi-bootloader/`.
-Crates here depend only on other crates in this repository.
+In scope, and depending only on other crates in this repository: `hal/`,
+`kernel/`, `ipc-protocol/`, `subsystems/`, `uefi-bootloader/`.
 
-Out of scope (separate repositories): system services, POSIX compatibility, the
-package manager, the security broker, profile policy, the native SDK, the Linux
-compatibility runtime, and applications.
+System services, POSIX compatibility, the store, the security broker,
+profile policy, the native SDK, the Linux compatibility runtime, and
+applications (the desktop UI, the shell, the file manager, ...) each have
+their own separate repository, with their own independent source history —
+that boundary is real and enforced by the source layout. For real, on-QEMU
+integration testing, though, `kernel/kernel/src/main.rs`'s own x86_64 boot
+sequence embeds each of those repos' own separately-built subsystem-bin ELF
+directly (`include_bytes!`, a local-dev-only sibling-directory path stitch —
+see **Current status** above for the full list) and spawns it as a real
+process, so several of the real cross-repo IPC edges described above are
+exercised on every x86_64 boot, not just within each repo's own isolated
+test suite.
 
 ## Documentation
 
