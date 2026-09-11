@@ -277,6 +277,27 @@ impl PeripheralDiscovery {
             }
         }
 
+        // The i8042 PS/2 keyboard: not a PCI/virtio device at all, so the
+        // ECAM scan above can never find it — synthesized directly here
+        // instead, exactly once, unconditionally (real hardware, not a
+        // QEMU-only trick: every x86_64 PC-compatible machine and every
+        // x86_64 QEMU machine type this project targets has one, same
+        // "present on every real platform, no discovery needed" fact
+        // `power.rs`'s own `reboot` doc comment already relies on for
+        // this identical device). `mmio_base`/`mmio_size`/`config_space_
+        // base` are all `0` (`PeripheralKindRaw::Input`'s own doc
+        // comment covers why) — `irq` is the one real field `SyscallOp::
+        // IrqBind` actually consumes.
+        if device_count < MAX_SCAN {
+            devices[device_count] = PeripheralDevice::new(
+                PeripheralKind::Input,
+                0,
+                0,
+                crate::pic::KEYBOARD_IRQ_VECTOR,
+            );
+            device_count += 1;
+        }
+
         for (i, d) in devices.iter_mut().enumerate().take(device_count) {
             d.device_index = i as u32;
         }

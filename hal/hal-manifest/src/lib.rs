@@ -218,6 +218,7 @@ mod dynamic {
         Network,
         Gpu,
         Console,
+        Input,
     }
 
     impl From<PeripheralKindRaw> for PeripheralKind {
@@ -228,6 +229,7 @@ mod dynamic {
                 PeripheralKindRaw::Network => Self::Network,
                 PeripheralKindRaw::Gpu => Self::Gpu,
                 PeripheralKindRaw::Console => Self::Console,
+                PeripheralKindRaw::Input => Self::Input,
             }
         }
     }

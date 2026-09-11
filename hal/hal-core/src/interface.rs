@@ -85,6 +85,17 @@
 //!     controller has no message-signaled path", and the caller falls
 //!     back to whatever native routing that architecture's own HAL
 //!     discovery already resolved.
+//!   - v8 (kernel-arch-glue, real i8042 keyboard input): `read_i8042_
+//!     scancode_and_ack` added, wrapping `hal_core::interrupt::
+//!     InterruptController::read_i8042_scancode_and_ack` — same "default
+//!     `None` means this platform has no such capability" shape as
+//!     `msi_message` above, needed for the identical reason:
+//!     `kernel-arch-glue`'s own module doc comment forbids it from
+//!     holding any `#[cfg(target_arch)]` or naming an architecture
+//!     crate, so its i8042 IRQ trampoline cannot itself issue the raw
+//!     x86 port-I/O instructions a real scancode read/PIC EOI requires —
+//!     this method is how it reaches that ONE arch-specific operation
+//!     without doing so.
 //! ============================================================================
 
 use crate::cpu::CpuAbstraction;
@@ -306,6 +317,30 @@ unsafe fn trampoline_msi_message<I: InterruptController>(
     }
 }
 
+/// `found` is written `true`/`false` (not an `Option` in the return
+/// type), same reasoning as [`trampoline_msi_message`]'s own doc comment.
+unsafe fn trampoline_read_i8042_scancode_and_ack<I: InterruptController>(
+    state: *const (),
+    irq: u32,
+    found: *mut bool,
+) -> u8 {
+    // SAFETY: `state` was produced by `build_interface` from a `&I` and
+    // remains valid per that function's safety contract; `found` is a
+    // valid `*mut bool` owned by `HalInterface::read_i8042_scancode_and_
+    // ack`'s own call site below.
+    let ctrl = unsafe { &*(state as *const I) };
+    match ctrl.read_i8042_scancode_and_ack(IrqId::new(irq)) {
+        Some(byte) => {
+            unsafe { found.write(true) };
+            byte
+        }
+        None => {
+            unsafe { found.write(false) };
+            0
+        }
+    }
+}
+
 unsafe fn trampoline_reboot<P: crate::power::SystemControl>(state: *const ()) -> ! {
     // SAFETY: `state` was produced by `build_interface` from a `&P` and
     // remains valid per that function's safety contract.
@@ -347,6 +382,7 @@ pub struct HalInterface {
     timer_cancel: unsafe fn(*const ()),
     interrupt_register_irq: unsafe fn(*const (), u32, IrqHandler) -> bool,
     interrupt_msi_message: unsafe fn(*const (), u32, *mut bool) -> (u64, u32),
+    interrupt_read_i8042_scancode_and_ack: unsafe fn(*const (), u32, *mut bool) -> u8,
     power_reboot: unsafe fn(*const ()) -> !,
     power_shutdown: unsafe fn(*const ()) -> !,
 }
@@ -597,6 +633,28 @@ impl HalInterface {
         }
     }
 
+    /// Reads and acknowledges the i8042 keyboard's own IRQ1 scancode
+    /// byte, or `None` if this platform's own `InterruptController` has
+    /// no such device/mechanism (every architecture except x86_64, in
+    /// this project's current scope — see `hal_core::interrupt::
+    /// InterruptController::read_i8042_scancode_and_ack`'s own doc
+    /// comment). Must only be called from the `IrqHandler` currently
+    /// servicing this exact line.
+    pub fn read_i8042_scancode_and_ack(&self, irq: u32) -> Option<u8> {
+        let mut found = false;
+        // SAFETY: `interrupt_state`/`interrupt_read_i8042_scancode_and_
+        // ack` were produced together by `build_interface`; `&mut found`
+        // is a valid `*mut bool` for the duration of this call.
+        let byte = unsafe {
+            (self.interrupt_read_i8042_scancode_and_ack)(self.interrupt_state, irq, &mut found)
+        };
+        if found {
+            Some(byte)
+        } else {
+            None
+        }
+    }
+
     /// Performs a full hardware reset. Does not return. See
     /// `hal_core::power::SystemControl::reboot`.
     pub fn reboot(&self) -> ! {
@@ -660,6 +718,7 @@ where
         timer_cancel: trampoline_cancel_timer::<T>,
         interrupt_register_irq: trampoline_register_irq::<I>,
         interrupt_msi_message: trampoline_msi_message::<I>,
+        interrupt_read_i8042_scancode_and_ack: trampoline_read_i8042_scancode_and_ack::<I>,
         power_reboot: trampoline_reboot::<P>,
         power_shutdown: trampoline_shutdown::<P>,
     }

@@ -6293,6 +6293,243 @@ pub fn spawn_virtio_net_driver(
     Some((ep_cap.as_u32(), save, into))
 }
 
+// ============================================================================
+// i8042 keyboard — real interrupt-driven IRQ1 delivery. Stage A of this
+// session's real-input-handling work: proves the IRQ path itself (8259
+// PIC remap, real vector delivery, a real port-0x60 read, a real PIC EOI
+// that lets the SAME line keep firing across repeated keypresses) with
+// no consuming driver process yet — a later stage grants the
+// Notification this wires up into a real `driver-i8042` process and adds
+// a real ring consumer there.
+//
+// Architecture note: this whole section holds no `#[cfg(target_arch)]`
+// and names no architecture crate, per this file's own module doc
+// comment — `khal().read_i8042_scancode_and_ack` is how it reaches the
+// one real x86_64-specific operation (raw port I/O) it needs without
+// doing so itself (`hal_core::interface`'s own "v8" growth-history entry
+// has the full rationale). On aarch64/riscv64 this section is not
+// arch-gated OUT at all — it simply never does anything, because
+// `KernelState::root_mmio_i8042_cap` stays the boot-time sentinel there
+// (no `Input`-kind peripheral is ever discovered on those platforms) —
+// the exact same "architecture-generic code, arch-specific behavior
+// purely from boot DATA" shape `root_mmio_net_cap`'s own doc comment
+// already establishes for Block/Network.
+// ============================================================================
+
+const I8042_RING_CAPACITY: usize = 32;
+
+/// A small, fixed-capacity ring buffer for raw scancode bytes, pushed by
+/// [`i8042_irq_trampoline`] (real interrupt context) and drained by
+/// whatever later stage adds a real consumer. Oldest-byte-drop-on-
+/// overflow: real keyboard input rate makes 32 bytes ample headroom in
+/// practice, and dropping the oldest (rather than refusing the newest,
+/// or growing unbounded) keeps the most recently typed key visible,
+/// which matters more for a UI input device than perfectly lossless
+/// delivery of a byte the user has almost certainly already moved past.
+struct I8042Ring {
+    bytes: [u8; I8042_RING_CAPACITY],
+    /// Monotonically increasing counters (never reset, wrap is harmless
+    /// since only `write - read` is ever compared) — same shape as this
+    /// crate's own `KernelState` scheduler tick counters use for the
+    /// identical "only the difference matters" reason.
+    write: u32,
+    read: u32,
+}
+
+impl I8042Ring {
+    const fn new() -> Self {
+        Self { bytes: [0; I8042_RING_CAPACITY], write: 0, read: 0 }
+    }
+
+    /// Pushes one byte, silently discarding the oldest still-unread byte
+    /// if the ring is already full — see this type's own doc comment.
+    fn push(&mut self, byte: u8) {
+        let idx = (self.write as usize) % I8042_RING_CAPACITY;
+        self.bytes[idx] = byte;
+        self.write = self.write.wrapping_add(1);
+        if self.write.wrapping_sub(self.read) as usize > I8042_RING_CAPACITY {
+            self.read = self.write.wrapping_sub(I8042_RING_CAPACITY as u32);
+        }
+    }
+
+    /// Pops the oldest unread byte, or `None` if the ring is empty.
+    #[cfg_attr(not(test), allow(dead_code))] // no real consumer until the
+    // follow-up stage that adds `driver-i8042` — kept here (not added
+    // later) so this type's push/pop pairing is tested as one unit now.
+    fn pop(&mut self) -> Option<u8> {
+        if self.read == self.write {
+            return None;
+        }
+        let idx = (self.read as usize) % I8042_RING_CAPACITY;
+        let byte = self.bytes[idx];
+        self.read = self.read.wrapping_add(1);
+        Some(byte)
+    }
+}
+
+static mut G_I8042_RING: I8042Ring = I8042Ring::new();
+/// The `Notification` id `wire_i8042_irq` binds IRQ1 to — `u32::MAX`
+/// until that function has run. Same single-core-boot-scratch pattern as
+/// every other `G_*` global in this file (e.g. `G_DRV_NET_MMIO_PHYS`).
+static mut G_I8042_NOTIF_ID: u32 = u32::MAX;
+
+/// The trampoline `SyscallOp::IrqBind` installs for the i8042 keyboard's
+/// own IRQ line. Reads and acknowledges the real scancode byte through
+/// `HalInterface::read_i8042_scancode_and_ack`, pushes it into
+/// [`G_I8042_RING`], then signals the bound Notification — same "ack the
+/// device in kernel/interrupt context, never deferred to userspace"
+/// discipline `virtio_net_irq_trampoline` already established.
+pub fn i8042_irq_trampoline(irq: hal_core::interrupt::IrqId) {
+    let hal = khal();
+    let Some(byte) = hal.read_i8042_scancode_and_ack(irq.as_u32()) else {
+        return; // Not actually an i8042-capable platform — unreachable
+        // in practice (this trampoline is only ever installed by `wire_
+        // i8042_irq`'s own `IrqBind`, itself gated on a real `root_mmio_
+        // i8042_cap`), kept as a defensive no-op rather than a panic,
+        // matching every other trampoline's own "malformed/unexpected
+        // state degrades gracefully" posture in this file.
+    };
+
+    // SAFETY: single-core; only this trampoline ever touches
+    // `G_I8042_RING`.
+    unsafe {
+        let ring = &mut *core::ptr::addr_of_mut!(G_I8042_RING);
+        ring.push(byte);
+    }
+
+    // SAFETY: single-core; written once by `wire_i8042_irq`, before this
+    // trampoline can ever run (real interrupts stay masked, per every
+    // other one-time hardware-init function in this project, until well
+    // after boot wiring completes).
+    let nid = unsafe { core::ptr::addr_of!(G_I8042_NOTIF_ID).read() };
+    if nid == u32::MAX {
+        return;
+    }
+    let k = kstate();
+    let Some(notif) = k.notification_mut(kernel_cap::NotificationId::new(nid)) else {
+        return;
+    };
+    let woken = notif.signal(1);
+    let now = hal.now_ns();
+    for &tid in woken.as_slice() {
+        k.wake_blocked(tid, now);
+    }
+}
+
+/// Binds the i8042 keyboard's own IRQ line to a fresh `Notification` —
+/// real interrupt delivery only, no consuming driver process yet (see
+/// this section's own module doc comment). Returns `false` (and logs)
+/// if no `Input`-kind peripheral was discovered at boot (`KernelState::
+/// root_mmio_i8042_cap` still the sentinel) — expected, not an error, on
+/// aarch64/riscv64.
+///
+/// Verified on real QEMU x86_64 boots (2026-09-11) with a temporary
+/// per-keypress checkpoint (removed before this stage's own commit,
+/// per this project's established checkpoint-tracing convention): real
+/// keystrokes injected via QEMU's own monitor `sendkey` (which drives
+/// the actual emulated i8042 hardware, not a shortcut) produced the
+/// exact, textbook PC/AT Scan Code Set 1 make/break byte pairs for every
+/// key sent (`A` → `0x1e`/`0x9e`, `D` → `0x20`/`0xa0`, `E` →
+/// `0x12`/`0x92`), across two independent boots and six total keypress
+/// events, with the SAME line firing correctly on every repeat — direct
+/// proof the PIC EOI (this section's own module doc comment on why it's
+/// required) is real and working, not just a single first interrupt
+/// getting through. No regression to the rest of the boot sequence
+/// (device-manager/security-broker/native-loader/profile-policy/store/
+/// shell all completed their own existing real checks in the same
+/// boots), no crash.
+pub fn wire_i8042_irq(hal: &HalInterface, caller: ThreadId) -> bool {
+    let k = kstate();
+    let mmio_cap = k.root_mmio_i8042_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("wire_i8042_irq: no Input-kind peripheral was discovered at boot\r\n");
+        return false;
+    }
+
+    let notif_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype {
+            untyped: CapId::new(0),
+            target_type: KernelObjectType::Notification,
+            count: 1,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => {
+            klog!("wire_i8042_irq: failed to retype a Notification\r\n");
+            return false;
+        }
+    };
+
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::IrqBind { mmio: mmio_cap, notification: notif_cap, handler: i8042_irq_trampoline },
+        hal,
+    ) {
+        Ok(SyscallReturn::Done) => {}
+        _ => {
+            klog!("wire_i8042_irq: IrqBind failed\r\n");
+            return false;
+        }
+    }
+
+    let Some(src_cs) = k.tcb(caller).map(|t| t.cap_space) else {
+        return false;
+    };
+    let Some(notif_id) =
+        k.cap_space(src_cs).and_then(|cs| cs.lookup(notif_cap)).map(|c| c.object.id.as_u32())
+    else {
+        return false;
+    };
+    // SAFETY: single-core boot sequencing; written here, before real
+    // interrupts are ever enabled (`sti` runs later, per every other
+    // one-time hardware-init function's own contract in this project).
+    unsafe { core::ptr::addr_of_mut!(G_I8042_NOTIF_ID).write(notif_id) };
+
+    klog!("wire_i8042_irq: bound (real IRQ1, vector-routed via 8259 PIC remap)\r\n");
+    true
+}
+
+#[cfg(test)]
+mod i8042_ring_tests {
+    use super::{I8042Ring, I8042_RING_CAPACITY};
+
+    #[test]
+    fn pop_on_empty_ring_returns_none() {
+        let mut ring = I8042Ring::new();
+        assert_eq!(ring.pop(), None);
+    }
+
+    #[test]
+    fn push_then_pop_returns_the_same_byte_in_order() {
+        let mut ring = I8042Ring::new();
+        ring.push(0x1E); // 'A' make code, Set 1
+        ring.push(0x9E); // 'A' break code, Set 1
+        assert_eq!(ring.pop(), Some(0x1E));
+        assert_eq!(ring.pop(), Some(0x9E));
+        assert_eq!(ring.pop(), None);
+    }
+
+    #[test]
+    fn overflowing_the_ring_drops_the_oldest_byte_not_the_newest() {
+        let mut ring = I8042Ring::new();
+        for i in 0..(I8042_RING_CAPACITY as u32 + 3) {
+            ring.push(i as u8);
+        }
+        // The first 3 pushed bytes (0, 1, 2) were dropped; the oldest
+        // SURVIVING byte is 3, the newest is CAPACITY + 2.
+        assert_eq!(ring.pop(), Some(3));
+        let mut last = None;
+        while let Some(b) = ring.pop() {
+            last = Some(b);
+        }
+        assert_eq!(last, Some((I8042_RING_CAPACITY as u32 + 2) as u8));
+    }
+}
+
 /// Spawns the Netstack process from its own separately-built ELF
 /// (`netstack_elf`) — the real replacement for this crate's own,
 /// removed direct-driving of `driver-virtio-net` (`netstack::

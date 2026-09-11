@@ -131,6 +131,16 @@ pub struct KernelState {
     /// `CapId::new(u32::MAX)` if none was found or the cap space was
     /// full.
     pub root_mmio_net_cap: CapId,
+    /// The capability, in the Root Task's own cap space, naming the
+    /// FIRST `Input`-kind `MmioRegion` the boot-time HAL peripheral scan
+    /// discovered (`populate_from_boot_info`'s Step 3e) — x86_64's i8042
+    /// PS/2 keyboard, synthesized (not bus-discovered — `hal_manifest::
+    /// raw::PeripheralKindRaw::Input`'s own doc comment) directly by
+    /// `hal_x86_64::peripheral::PeripheralDiscovery::new`. Empty (and
+    /// this stays the sentinel below) on aarch64/riscv64, where no such
+    /// device exists. `CapId::new(u32::MAX)` if none was found or the
+    /// cap space was full, same sentinel as `root_mmio_net_cap`.
+    pub root_mmio_i8042_cap: CapId,
     /// How many `UntypedMemory` objects the boot path created.
     pub untyped_count: u32,
 
@@ -439,6 +449,7 @@ impl KernelState {
         root_page_table_cap: CapId::new(u32::MAX),
         root_mmio_blk_cap: CapId::new(u32::MAX),
         root_mmio_net_cap: CapId::new(u32::MAX),
+        root_mmio_i8042_cap: CapId::new(u32::MAX),
         untyped_count: 0,
         map_pool_base: 0,
         map_pool_len: 0,
@@ -685,6 +696,40 @@ impl KernelState {
             })
             .unwrap_or(CapId::new(u32::MAX));
 
+        // Step 3e: same as Step 3c/3d, for the first `Input`-kind device
+        // — `root_mmio_i8042_cap`'s own doc comment covers the rationale
+        // (unblocks a real i8042 keyboard driver, per this project's own
+        // session record on real input handling). Unlike Block/Network,
+        // this entry is never bus-discovered (`PeripheralKindRaw::
+        // Input`'s own doc comment) — it is still found the exact same
+        // way here, by filtering `hardware_manifest.peripheral_devices()`
+        // for the matching kind, since `hal_x86_64::peripheral` already
+        // synthesized it into that same list at boot.
+        let root_mmio_i8042_cap = boot
+            .hardware_manifest
+            .peripheral_devices()
+            .iter()
+            .find(|d| d.kind == PeripheralKindRaw::Input)
+            .and_then(|d| {
+                self.alloc_mmio_region_direct(MmioRegionDescriptor {
+                    phys_base: d.mmio_base,
+                    size: d.mmio_size,
+                    irq: d.irq,
+                    config_space_base: d.config_space_base,
+                })
+            })
+            .and_then(|mmio_id| {
+                let cap = Capability::full(ObjectRef::new(
+                    KernelObjectKind::MmioRegion,
+                    ObjectId::new(mmio_id.as_u32()),
+                ));
+                self.cap_space_mut(root_cs)
+                    .expect("root cap space exists")
+                    .insert_root(cap)
+                    .ok()
+            })
+            .unwrap_or(CapId::new(u32::MAX));
+
         // Step 4: schedule the Root Task.
         self.sched
             .admit(root_tid, SchedulerMode::Interactive, kernel_sched::MAX_PRIORITY, None)
@@ -703,6 +748,7 @@ impl KernelState {
         self.root_page_table_cap = root_page_table_cap;
         self.root_mmio_blk_cap = root_mmio_blk_cap;
         self.root_mmio_net_cap = root_mmio_net_cap;
+        self.root_mmio_i8042_cap = root_mmio_i8042_cap;
         self.untyped_count = untyped_made;
         Ok(())
     }

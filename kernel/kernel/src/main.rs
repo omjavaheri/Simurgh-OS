@@ -3927,6 +3927,18 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             if let (Some(am_tid), Some(bm_tid), Some(ui_tid)) = (account_manager_tid_x86, backup_manager_tid_x86, ui_core_tid_x86) {
                 wire_account_manager_hub_notification_fanin_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, bm_tid, ui_tid);
             }
+            // Real i8042 keyboard input, Stage A (this session's own
+            // real-input-handling plan): binds IRQ1 to a real
+            // Notification via the 8259 PIC remap `hal_x86_64::pic`
+            // performs at boot — see `kernel_arch_glue::wire_i8042_irq`'s
+            // own doc comment. x86_64-only call site (the function
+            // itself is architecture-generic, per `kernel-arch-glue`'s
+            // own module doc comment) since no other architecture this
+            // project targets has this device.
+            let _ = kernel_arch_glue::wire_i8042_irq(
+                kernel_arch_glue::khal(),
+                kernel_arch_glue::kstate().root_thread,
+            );
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },

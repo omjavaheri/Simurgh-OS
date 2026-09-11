@@ -444,6 +444,31 @@ impl InterruptController for InterruptCtrl {
         Ok(())
     }
 
+    /// Real override — see `hal_core::interrupt::InterruptController::
+    /// read_i8042_scancode_and_ack`'s own doc comment for why this
+    /// method exists at all. Does not validate `irq` against
+    /// `pic::KEYBOARD_IRQ_VECTOR`: this is deliberately a thin,
+    /// unconditional forward, matching `end_of_interrupt`'s own "trust
+    /// the caller, which is always this project's own IRQ dispatch path"
+    /// posture — a caller invoking this for any OTHER vector would
+    /// simply get a real i8042 data-port read that has nothing to do
+    /// with that vector, not a validated error, exactly as reading a
+    /// hardware port out of context always behaves.
+    fn read_i8042_scancode_and_ack(&self, _irq: IrqId) -> Option<u8> {
+        // SAFETY: this project's own IRQ dispatch (`dispatch_vector`)
+        // only ever invokes a registered `IrqHandler` from real
+        // interrupt-handling context, and this method's own doc comment
+        // requires callers to only call it from the handler servicing
+        // IRQ1 — both hold for this crate's own i8042 trampoline, the
+        // only real caller.
+        let byte = unsafe { crate::pic::read_scancode() };
+        // SAFETY: same IRQ1-handler-context contract as the read above;
+        // `pic::send_eoi`'s own doc comment requires exactly this
+        // calling context.
+        unsafe { crate::pic::send_eoi() };
+        Some(byte)
+    }
+
     fn send_ipi(&self, target_core: usize, vector: u8) -> Result<(), HalError> {
         if target_core as u32 >= self.ipi_target_core_count.get() {
             return Err(HalError::InvalidIpiTarget);

@@ -134,6 +134,16 @@ pub mod power;
 /// aarch64 port.
 pub mod peripheral;
 
+/// 8259 PIC remap/mask/EOI — the legacy ISA interrupt routing this
+/// project has no I/O APIC alternative for yet, needed so a real device
+/// with no PCI config space (i8042) can deliver an IRQ to a CPU vector
+/// at all. See this module's own doc comment for the full rationale.
+/// Not an `hal_core` trait implementation (no cross-arch abstraction
+/// exists for legacy PIC routing) — a plain x86_64-only module, used
+/// directly by `hal_x86_64_rust_entry` (this file) and by `kernel_arch_
+/// glue`'s own x86_64-only i8042 IRQ trampoline.
+pub mod pic;
+
 /// Optional direct hardware access (hal_direct::HalDirectAccess) for
 /// x86_64, only compiled when this crate's "hal-direct-support"
 /// feature is enabled (see Cargo.toml) — per section 1's requirement
@@ -389,6 +399,21 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     }
     interrupt::set_global_controller(&hal.interrupt);
     interrupt::set_global_timer(&hal.timer);
+
+    // Remap the legacy 8259 PIC pair and mask every line, then unmask
+    // IRQ1 (the i8042 keyboard) — `pic`'s own module doc comment has the
+    // full rationale for why this project uses PIC remap rather than an
+    // I/O APIC path. Same ordering contract as the interrupt-controller
+    // setup just above: after the IDT is loaded (already true here —
+    // `Cpu::bootstrap_current_core`, Step 1), before `sti` is ever
+    // issued (still true here — `boot.S` never emits it before
+    // `kernel_main` drops to Ring 3).
+    // SAFETY: boot core, called exactly once, before any interrupt can
+    // legitimately be taken — see `pic::init`'s own doc comment.
+    unsafe {
+        pic::init();
+        pic::unmask_irq1();
+    }
 
     // ------------------------------------------------------------------
     // Step 5: assemble BootInfo (hal-core/src/boot.rs) from everything

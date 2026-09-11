@@ -272,6 +272,20 @@ pub enum PeripheralKindRaw {
     Gpu = 3,
     /// virtio-console (`device_id` = 3).
     Console = 4,
+    /// A legacy ISA input device with no virtio device-id and no PCI
+    /// config space at all — x86_64's i8042 PS/2 keyboard controller,
+    /// specifically. Unlike every other kind above, an `Input` entry is
+    /// never discovered by walking a bus (there is nothing to enumerate
+    /// — i8042's presence is architectural, not probed); it is
+    /// synthesized directly by the arch's own peripheral-discovery code
+    /// (`hal_x86_64::peripheral`) with `mmio_base`/`mmio_size`/
+    /// `config_space_base` all `0` (this device has none of those) and
+    /// `irq` set to its real, remapped CPU vector
+    /// (`hal_x86_64::pic::KEYBOARD_IRQ_VECTOR`) — the one field `Syscall
+    /// Op::IrqBind` actually needs (`kernel-core::syscall::do_irq_bind`'s
+    /// own doc comment). Absent entirely on aarch64/riscv64, where no
+    /// such device exists.
+    Input = 5,
 }
 
 /// One discovered MMIO-transport peripheral (virtio-mmio on QEMU's

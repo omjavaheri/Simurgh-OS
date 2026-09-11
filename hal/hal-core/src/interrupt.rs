@@ -186,6 +186,27 @@ pub trait InterruptController {
     fn msi_message(&self, _irq: IrqId) -> Option<(u64, u32)> {
         None
     }
+
+    /// Reads and acknowledges the i8042 PS/2 keyboard's own legacy ISA
+    /// IRQ1 scancode byte, for a controller that actually routes that
+    /// line (x86_64's 8259 PIC pair, per `hal_x86_64::pic`'s own module
+    /// doc comment — this project has no I/O APIC path, so PIC remap is
+    /// the only mechanism that gets IRQ1 to a CPU vector at all). Must
+    /// only be called by the `IrqHandler` currently servicing exactly
+    /// this line (same "acknowledge in kernel/interrupt context, never
+    /// deferred to userspace" discipline every other IRQ trampoline in
+    /// this project already follows) — a call outside that context reads
+    /// undefined hardware state.
+    ///
+    /// Default `None`: same "this platform has no such capability"
+    /// convention as [`InterruptController::msi_message`]'s own doc
+    /// comment — ARM64's GICv3 and RISC-V's PLIC have no i8042/8259
+    /// concept at all (there is no PS/2 keyboard controller on those
+    /// platforms in this project's scope), so this default covers both
+    /// without either crate needing an explicit override.
+    fn read_i8042_scancode_and_ack(&self, _irq: IrqId) -> Option<u8> {
+        None
+    }
 }
 
 #[cfg(test)]
