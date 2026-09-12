@@ -3952,7 +3952,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 wire_backup_manager_to_store_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, bm_tid);
             }
             kernel_arch_glue::set_shell_tid(spawn_shell_x86(kernel_arch_glue::khal()));
-            spawn_file_manager_x86(kernel_arch_glue::khal());
+            let file_manager_tid_x86 = spawn_file_manager_x86(kernel_arch_glue::khal());
             let ui_core_tid_x86 = spawn_ui_core_x86(kernel_arch_glue::khal());
             // ui-core <-> account-manager real login edge (2026-09-11):
             // wired here (not inside `spawn_ui_core_x86`) since it needs
@@ -3968,6 +3968,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             }
             if let (Some(am_tid), Some(bm_tid), Some(ui_tid)) = (account_manager_tid_x86, backup_manager_tid_x86, ui_core_tid_x86) {
                 wire_account_manager_hub_notification_fanin_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, bm_tid, ui_tid);
+            }
+            // ui-core <-> file-manager real browse edge (2026-09-12):
+            // same "wire after both spawn" pattern as the login edge
+            // above — see `wire_ui_core_to_file_manager_x86`'s own doc
+            // comment.
+            if let (Some(fm_tid), Some(ui_tid)) = (file_manager_tid_x86, ui_core_tid_x86) {
+                wire_ui_core_to_file_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), fm_tid, ui_tid);
             }
             // Real i8042 keyboard input, Stage B (this project's own
             // real-input-handling plan): spawns `driver-i8042` as a real
@@ -5251,6 +5258,79 @@ fn wire_ui_core_to_account_manager_x86(
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): ui-core<->account-manager wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires `ui-core`'s own new file-browser edge into `file-manager`'s own
+/// new receiving `Endpoint` (`simurgh-file-manager::fm_core::
+/// subsystem_entry::BROWSE_ENDPOINT_CAP`, slot 1 — `fm-core`'s own
+/// FIRST server role; every earlier edge had `fm-core` as a client
+/// only). Same shape as `wire_ui_core_to_account_manager_x86` just
+/// above (a single `wire_service_endpoint` call, no `Notification`
+/// fan-in needed — `file-manager` has exactly one real caller into this
+/// new `Endpoint` today, `ui-core`), and the same "wire after both
+/// spawn" ordering `spawn_file_manager_x86`/`spawn_ui_core_x86`'s own
+/// call sites already establish.
+#[cfg(target_arch = "x86_64")]
+fn wire_ui_core_to_file_manager_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    file_manager_tid: kernel_cap::ThreadId,
+    ui_core_tid: kernel_cap::ThreadId,
+) {
+    // Confirmed match to `simurgh-file-manager::fm_core::subsystem_
+    // entry::BROWSE_VA`.
+    const FM_VA: usize = 0xD820_0000;
+    // Next free slot in `ui-core`'s own VA space, after `UI_CORE_CLIENT_
+    // VA` (`0xD870_0000`, the account-manager login edge above).
+    const UI_CORE_FM_CLIENT_VA: usize = 0xD880_0000;
+    let Some(fm_tcb) = k.tcb(file_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->file-manager wiring skipped (could not resolve file-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (fm_cs, fm_addr_space) = (fm_tcb.cap_space, fm_tcb.addr_space);
+    let Some(ui_tcb) = k.tcb(ui_core_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->file-manager wiring skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (ui_cs, ui_addr_space) = (ui_tcb.cap_space, ui_tcb.addr_space);
+    let Some(fm_root_pt) = k.addr_space_mut(fm_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->file-manager wiring skipped (could not resolve file-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_root_pt) = k.addr_space_mut(ui_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->file-manager wiring skipped (could not resolve ui-core's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        fm_cs,
+        fm_root_pt,
+        FM_VA,
+        ui_cs,
+        ui_root_pt,
+        UI_CORE_FM_CLIENT_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired ui-core <-> file-manager real IPC edge (browse)\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core<->file-manager wiring skipped (out of resources)\r\n"
             ));
         }
     }
