@@ -42,9 +42,10 @@ Simurgh-OS/
 │
 ├── ipc-protocol/        the layer-2 <-> layer-3 message contract (03 §3)
 ├── subsystems/          root-task, device-manager, drivers/ (virtio-blk,
-│                         virtio-net, i8042 keyboard, PS/2 mouse), vfs-service/,
-│                         netstack, compositor (real DisplayProtocol: surfaces,
-│                         zero-copy CommitBuffer, real keyboard/mouse polling),
+│                         virtio-net, i8042 keyboard, PS/2 mouse, NVMe),
+│                         vfs-service/, netstack, compositor (real
+│                         DisplayProtocol: surfaces, zero-copy CommitBuffer,
+│                         real keyboard/mouse polling, real output query),
 │                         mm-service, security-broker-intermediary (03 §4)
 │
 ├── kernel-stub/         minimal microkernel stand-in for the pure HAL (01 §8) smoke test
@@ -141,11 +142,25 @@ riscv64) unless noted:**
   sharing of a single physical frame across two spaces.
 - **Layer 3 subsystems:** `device-manager`, `fs-native`,
   `driver-virtio-blk`, `driver-virtio-net`, `driver-i8042`, `driver-mouse`,
-  `netstack`, `compositor`, `mm-service`, and `security-broker-intermediary`
-  are each a real, separately-built ELF process (not a linked-in library)
-  spawned via the generic `kernel_arch_glue::spawn_process`/
-  `spawn_process_from_elf` path, exercised by the real `kernel` binary on all
-  three architectures.
+  `driver-nvme`, `netstack`, `compositor`, `mm-service`, and
+  `security-broker-intermediary` are each a real, separately-built ELF
+  process (not a linked-in library) spawned via the generic
+  `kernel_arch_glue::spawn_process`/`spawn_process_from_elf` path,
+  exercised by the real `kernel` binary on all three architectures
+  (`driver-i8042`/`driver-mouse`/`driver-nvme` are x86_64-only — no such
+  hardware exists on aarch64/riscv64).
+- **Real NVMe block driver** (x86_64 only): a real NVMe controller is
+  discovered by PCI class code (not vendor id, unlike every virtio
+  device), and `driver-nvme` speaks the real Admin/I/O queue protocol
+  directly against the base spec (register bring-up, Identify Namespace,
+  Create I/O Queue, Read/Write). QEMU-verified: booting with a real
+  `-device nvme` attached, the controller is discovered, a real
+  capability is granted, and the driver process is spawned with its BAR0
+  window and all five queue/data pages really mapped — with no effect on
+  the rest of the boot. The controller's own real register handshake
+  succeeding is not yet directly observable in the boot log (a documented
+  next step, `driver-nvme`'s own module doc comment) — no real consumer
+  (a filesystem) is wired to it yet either.
 - **Real per-process fault isolation** (`03 §5.2`): a deliberately faulting
   driver process is terminated by the kernel without affecting any other
   process; `device-manager` supervises it end to end — starts it, detects the
@@ -179,6 +194,10 @@ riscv64) unless noted:**
   `count`-means-"pages in this region" semantic for `SharedRegion`, added to
   support a real 800x600 BGRA8 desktop frame, not just a small test
   pattern) — `ui-core` renders and commits a real desktop scene through it.
+  `QueryOutputs` reports the real single 800x600 output; `SubscribeInput`
+  stays `Unsupported` by design — superseded by the real, working
+  `PollInputEvent` poll, not an unbuilt gap (`compositor`'s own doc
+  comment has the full reasoning).
 - **Real power control**: `sys::POWER_CONTROL`, backed by a real
   `hal_core::power::SystemControl` trait per architecture — x86_64 issues a
   genuine i8042 keyboard-controller reset pulse (reboot) or ACPI `PM1a_CNT`
