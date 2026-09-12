@@ -482,11 +482,13 @@ const OP_DP_DESTROY_SURFACE: u8 = 3;
 const OP_DP_SUBSCRIBE_INPUT: u8 = 4;
 const OP_DP_QUERY_OUTPUTS: u8 = 5;
 const OP_DP_POLL_INPUT_EVENT: u8 = 6;
+const OP_DP_POLL_MOUSE_EVENT: u8 = 7;
 
 /// Encodes a `DisplayRequest` into a `SmallMessage`.
 ///
 /// Word layout by variant:
-/// - `CreateSurface`, `SubscribeInput`, `QueryOutputs`, `PollInputEvent`: `[]`
+/// - `CreateSurface`, `SubscribeInput`, `QueryOutputs`, `PollInputEvent`,
+///   `PollMouseEvent`: `[]`
 /// - `CommitBuffer`: `[surface, buffer_cap, width, height]`
 /// - `DestroySurface`: `[surface]`
 pub fn encode_display_request(req: &DisplayRequest) -> SmallMessage {
@@ -505,6 +507,7 @@ pub fn encode_display_request(req: &DisplayRequest) -> SmallMessage {
         DisplayRequest::SubscribeInput => (OP_DP_SUBSCRIBE_INPUT, [0, 0, 0, 0]),
         DisplayRequest::QueryOutputs => (OP_DP_QUERY_OUTPUTS, [0, 0, 0, 0]),
         DisplayRequest::PollInputEvent => (OP_DP_POLL_INPUT_EVENT, [0, 0, 0, 0]),
+        DisplayRequest::PollMouseEvent => (OP_DP_POLL_MOUSE_EVENT, [0, 0, 0, 0]),
     };
     let n = match op {
         OP_DP_COMMIT_BUFFER => 4,
@@ -554,6 +557,7 @@ pub fn decode_display_request(msg: &SmallMessage) -> Result<DisplayRequest, Deco
         OP_DP_SUBSCRIBE_INPUT => Ok(DisplayRequest::SubscribeInput),
         OP_DP_QUERY_OUTPUTS => Ok(DisplayRequest::QueryOutputs),
         OP_DP_POLL_INPUT_EVENT => Ok(DisplayRequest::PollInputEvent),
+        OP_DP_POLL_MOUSE_EVENT => Ok(DisplayRequest::PollMouseEvent),
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -569,6 +573,8 @@ const OP_DPR_OUTPUT_TOPOLOGY: u8 = 5;
 const OP_DPR_ERROR: u8 = 6;
 const OP_DPR_INPUT_EVENT: u8 = 7;
 const OP_DPR_NO_INPUT_PENDING: u8 = 8;
+const OP_DPR_MOUSE_EVENT: u8 = 9;
+const OP_DPR_NO_MOUSE_EVENT_PENDING: u8 = 10;
 
 /// Encodes a `DisplayResponse` into a `SmallMessage`.
 ///
@@ -579,6 +585,8 @@ const OP_DPR_NO_INPUT_PENDING: u8 = 8;
 /// - `Error`: `[code]`
 /// - `InputEvent`: `[keycode, pressed]`
 /// - `NoInputPending`: `[]`
+/// - `MouseEvent`: `[dx as u16 as u64, dy as u16 as u64, left|right<<1|middle<<2]`
+/// - `NoMouseEventPending`: `[]`
 pub fn encode_display_response(resp: &DisplayResponse) -> SmallMessage {
     let (op, words): (u8, [u64; 4]) = match *resp {
         DisplayResponse::SurfaceCreated { surface } => (OP_DPR_SURFACE_CREATED, [surface.0 as u64, 0, 0, 0]),
@@ -604,9 +612,20 @@ pub fn encode_display_response(resp: &DisplayResponse) -> SmallMessage {
             (OP_DPR_INPUT_EVENT, [keycode as u64, pressed as u64, 0, 0])
         }
         DisplayResponse::NoInputPending => (OP_DPR_NO_INPUT_PENDING, [0, 0, 0, 0]),
+        DisplayResponse::MouseEvent { dx, dy, left, right, middle } => (
+            OP_DPR_MOUSE_EVENT,
+            [
+                dx as u16 as u64,
+                dy as u16 as u64,
+                left as u64 | ((right as u64) << 1) | ((middle as u64) << 2),
+                0,
+            ],
+        ),
+        DisplayResponse::NoMouseEventPending => (OP_DPR_NO_MOUSE_EVENT_PENDING, [0, 0, 0, 0]),
     };
     let n = match op {
         OP_DPR_OUTPUT_TOPOLOGY => 4,
+        OP_DPR_MOUSE_EVENT => 3,
         OP_DPR_INPUT_EVENT => 2,
         OP_DPR_SURFACE_CREATED | OP_DPR_ERROR => 1,
         _ => 0,
@@ -671,6 +690,17 @@ pub fn decode_display_response(msg: &SmallMessage) -> Result<DisplayResponse, De
             })
         }
         OP_DPR_NO_INPUT_PENDING => Ok(DisplayResponse::NoInputPending),
+        OP_DPR_MOUSE_EVENT => {
+            need(3)?;
+            Ok(DisplayResponse::MouseEvent {
+                dx: w[0] as u16 as i16,
+                dy: w[1] as u16 as i16,
+                left: w[2] & 1 != 0,
+                right: w[2] & 2 != 0,
+                middle: w[2] & 4 != 0,
+            })
+        }
+        OP_DPR_NO_MOUSE_EVENT_PENDING => Ok(DisplayResponse::NoMouseEventPending),
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -1380,6 +1410,7 @@ mod tests {
         display_request_roundtrip(DisplayRequest::SubscribeInput);
         display_request_roundtrip(DisplayRequest::QueryOutputs);
         display_request_roundtrip(DisplayRequest::PollInputEvent);
+        display_request_roundtrip(DisplayRequest::PollMouseEvent);
     }
 
     fn display_response_roundtrip(resp: DisplayResponse) {
@@ -1413,6 +1444,23 @@ mod tests {
             pressed: false,
         });
         display_response_roundtrip(DisplayResponse::NoInputPending);
+        display_response_roundtrip(DisplayResponse::MouseEvent {
+            dx: 5,
+            dy: -3,
+            left: true,
+            right: false,
+            middle: true,
+        });
+        // Negative dx too — proof the u16-roundtrip sign encoding works
+        // both ways, not just for dy.
+        display_response_roundtrip(DisplayResponse::MouseEvent {
+            dx: -128,
+            dy: 0,
+            left: false,
+            right: false,
+            middle: false,
+        });
+        display_response_roundtrip(DisplayResponse::NoMouseEventPending);
     }
 
     #[test]

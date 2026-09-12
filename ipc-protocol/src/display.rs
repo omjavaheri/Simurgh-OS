@@ -72,6 +72,18 @@ pub enum DisplayRequest {
     /// error — matching `SyscallOp::Poll`'s own "0 bits is not a
     /// failure" semantics).
     PollInputEvent,
+    /// The mouse-shaped counterpart of `PollInputEvent` — a non-blocking
+    /// check for one pending real mouse motion/button event, draining
+    /// the same real `driver-mouse` pipeline (`Simurgh-OS`'s own
+    /// `subsystems/drivers/driver-mouse`) Compositor's own internal
+    /// queue already receives, matching `PollInputEvent`'s own "poll,
+    /// not push" shape exactly — a separate request rather than folding
+    /// mouse events into `PollInputEvent` itself, since a client needs
+    /// to be able to drain keyboard and mouse independently (they queue
+    /// at different, unrelated rates). Reply: `MouseEvent` if one was
+    /// pending, `NoMouseEventPending` otherwise (a normal reply, not an
+    /// error, same reasoning as `PollInputEvent`'s own doc comment).
+    PollMouseEvent,
 }
 
 /// A reply from the compositor service.
@@ -119,6 +131,27 @@ pub enum DisplayResponse {
     /// `PollInputEvent` found nothing pending — a normal reply, not an
     /// error (see `DisplayRequest::PollInputEvent`'s own doc comment).
     NoInputPending,
+    /// `PollMouseEvent` found one real, pending mouse packet. `dx`/`dy`
+    /// keep PS/2's own raw sign convention (positive `dy` = real upward
+    /// motion, unflipped — see `driver_mouse::mouse_packet`'s own doc
+    /// comment, `Simurgh-OS`'s own `subsystems/drivers/driver-mouse`
+    /// crate); flipping to screen-down-positive, if wanted, is a client
+    /// concern.
+    MouseEvent {
+        /// Raw X delta (PS/2 sign convention).
+        dx: i16,
+        /// Raw Y delta (PS/2 sign convention: positive = up).
+        dy: i16,
+        /// Left button held.
+        left: bool,
+        /// Right button held.
+        right: bool,
+        /// Middle button held.
+        middle: bool,
+    },
+    /// `PollMouseEvent` found nothing pending — a normal reply, not an
+    /// error (see `DisplayRequest::PollMouseEvent`'s own doc comment).
+    NoMouseEventPending,
 }
 
 /// Compositor error codes.

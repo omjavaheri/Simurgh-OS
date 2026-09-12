@@ -434,7 +434,12 @@ fn read_mouse_message() -> Option<MouseEvent> {
 /// comment already makes for `shared_cap`. Real per-connection
 /// capability resolution is a later `feat:` follow-up, not a correctness
 /// gap in what IS wired here.
-fn handle_request(comp: &mut Compositor, pending_key_event: &mut Option<KeyEvent>, req: DisplayRequest) -> DisplayResponse {
+fn handle_request(
+    comp: &mut Compositor,
+    pending_key_event: &mut Option<KeyEvent>,
+    pending_mouse_event: &mut Option<MouseEvent>,
+    req: DisplayRequest,
+) -> DisplayResponse {
     match req {
         DisplayRequest::CreateSurface => DisplayResponse::SurfaceCreated {
             surface: SurfaceHandle(comp.create_surface()),
@@ -507,6 +512,19 @@ fn handle_request(comp: &mut Compositor, pending_key_event: &mut Option<KeyEvent
         DisplayRequest::PollInputEvent => match pending_key_event.take() {
             Some(event) => DisplayResponse::InputEvent { keycode: event.keycode, pressed: event.pressed },
             None => DisplayResponse::NoInputPending,
+        },
+        // Real, mouse-shaped counterpart of `PollInputEvent` just above
+        // — drains (not peeks) `pending_mouse_event`, same `driver-
+        // virtio-net`-style "poll, not push" shape.
+        DisplayRequest::PollMouseEvent => match pending_mouse_event.take() {
+            Some(event) => DisplayResponse::MouseEvent {
+                dx: event.dx,
+                dy: event.dy,
+                left: event.left,
+                right: event.right,
+                middle: event.middle,
+            },
+            None => DisplayResponse::NoMouseEventPending,
         },
     }
 }
@@ -586,7 +604,6 @@ pub extern "C" fn subsystem_main() -> ! {
     // Same drain-on-real-poll shape as `last_key_event`, for `driver-
     // mouse` (mouse-input plan, Stage 1b). Not read anywhere yet either
     // — same "real consumer is a later stage" reasoning.
-    #[allow(unused_assignments)]
     let mut last_mouse_event: Option<MouseEvent> = None;
 
     // Same stack-slot-reuse miscompilation `fs_native::subsystem_entry::
@@ -656,7 +673,7 @@ pub extern "C" fn subsystem_main() -> ! {
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, COMPOSITOR_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();
         let resp = match decode_display_request(&req_msg) {
-            Ok(req) => handle_request(&mut comp, &mut last_key_event, req),
+            Ok(req) => handle_request(&mut comp, &mut last_key_event, &mut last_mouse_event, req),
             Err(_) => DisplayResponse::Error {
                 code: DisplayErrorCode::Unsupported,
             },
@@ -678,7 +695,8 @@ mod tests {
     fn query_outputs_reports_the_real_single_800x600_output() {
         let mut comp = Compositor::new();
         let mut pending_key = None;
-        let resp = handle_request(&mut comp, &mut pending_key, DisplayRequest::QueryOutputs);
+        let mut pending_mouse = None;
+        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::QueryOutputs);
         assert_eq!(
             resp,
             DisplayResponse::OutputTopology {
@@ -694,12 +712,30 @@ mod tests {
     fn subscribe_input_stays_unsupported_superseded_by_poll_input_event() {
         let mut comp = Compositor::new();
         let mut pending_key = None;
-        let resp = handle_request(&mut comp, &mut pending_key, DisplayRequest::SubscribeInput);
+        let mut pending_mouse = None;
+        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::SubscribeInput);
         assert_eq!(
             resp,
             DisplayResponse::Error {
                 code: DisplayErrorCode::Unsupported,
             }
         );
+    }
+
+    #[test]
+    fn poll_mouse_event_drains_a_pending_event_then_reports_none() {
+        let mut comp = Compositor::new();
+        let mut pending_key = None;
+        let mut pending_mouse = Some(MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false });
+
+        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::PollMouseEvent);
+        assert_eq!(
+            resp,
+            DisplayResponse::MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false }
+        );
+        assert!(pending_mouse.is_none(), "PollMouseEvent must drain, not peek");
+
+        let resp2 = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::PollMouseEvent);
+        assert_eq!(resp2, DisplayResponse::NoMouseEventPending);
     }
 }
