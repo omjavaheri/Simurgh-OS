@@ -446,6 +446,24 @@ fn handle_request(fs: &mut MemFs, registry: &mut PathRegistry, req: FsRequest) -
                 code: FsErrorCode::BadPath,
             },
         },
+        FsRequest::Delete { path } => match registry.resolve(path) {
+            Some(p) => match fs.delete(p) {
+                Ok(()) => FsResponse::Deleted,
+                Err(e) => FsResponse::Error { code: error_code(e) },
+            },
+            None => FsResponse::Error {
+                code: FsErrorCode::BadPath,
+            },
+        },
+        FsRequest::Rename { from, to } => match (registry.resolve(from), registry.resolve(to)) {
+            (Some(from_path), Some(to_path)) => match fs.rename(from_path, to_path) {
+                Ok(()) => FsResponse::Renamed,
+                Err(e) => FsResponse::Error { code: error_code(e) },
+            },
+            _ => FsResponse::Error {
+                code: FsErrorCode::BadPath,
+            },
+        },
     }
 }
 

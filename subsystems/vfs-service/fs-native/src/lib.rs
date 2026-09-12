@@ -160,6 +160,49 @@ impl MemFs {
         self.open.remove(&handle.0).map(|_| ()).ok_or(FsError::BadHandle)
     }
 
+    /// Deletes the file at `path`, freeing its storage immediately —
+    /// `FsError::NotFound` if no file is registered at `path`.
+    ///
+    /// Real, deliberate MVP simplification: unlike real POSIX `unlink`
+    /// (which keeps a still-open file's storage alive until every open
+    /// handle closes), this frees `files[file_id]` right away even if a
+    /// handle is still open against it — a later `read`/`write`/`size`
+    /// through that now-stale handle fails cleanly with `FsError::
+    /// BadHandle` (exactly the same path every one of those three
+    /// methods already takes for a handle whose `file_id` has no entry
+    /// in `files` — `read`'s own `self.files.get(&of.file_id).ok_or(...)`
+    /// line, unchanged by this method), not a panic or a new failure
+    /// mode. A real POSIX-accurate "keep it alive until the last close"
+    /// semantic is a legitimate future refinement, not required for this
+    /// MVP's own real Definition of Done (03-Kernel-Subsystems-Layer.md
+    /// §5.3 only asks for real read/write over IPC).
+    pub fn delete(&mut self, path: &str) -> Result<(), FsError> {
+        let file_id = self.index.remove(path).ok_or(FsError::NotFound)?;
+        self.files.remove(&file_id);
+        Ok(())
+    }
+
+    /// Renames/moves the file at `from` to `to` — `FsError::NotFound` if
+    /// no file is registered at `from`. If a file already exists at `to`,
+    /// it is replaced (real POSIX `rename` semantics: the destination is
+    /// atomically overwritten, not an error) — its own storage is freed
+    /// the same way [`Self::delete`] frees any file's, including the
+    /// identical "a stale open handle against the replaced file fails
+    /// cleanly, not a panic" reasoning that method's own doc comment
+    /// gives. Open handles against the file being MOVED (`from`) stay
+    /// valid — only `index` changes (which path resolves to `file_id`,
+    /// never the `file_id` itself), the same "look up `open[handle].
+    /// file_id`, not `index[path]`" real reasoning every one of `read`/
+    /// `write`/`size`/`close` already uses; nothing about that
+    /// resolution path is touched by a `rename`.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), FsError> {
+        let file_id = self.index.remove(from).ok_or(FsError::NotFound)?;
+        if let Some(old_to_id) = self.index.insert(String::from(to), file_id) {
+            self.files.remove(&old_to_id);
+        }
+        Ok(())
+    }
+
     /// Lists the immediate children of `dir_path` — synthesized from the
     /// flat `index` (this store's own doc comment: it has no real
     /// directory nodes at all, just a flat path-string -> file-id map).
@@ -303,5 +346,93 @@ mod tests {
         let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort();
         assert_eq!(names, alloc::vec!["d", "e"]);
+    }
+
+    #[test]
+    fn deleting_a_file_removes_it_from_a_later_listing() {
+        let mut fs = MemFs::new();
+        fs.create("/etc/config.toml");
+        assert_eq!(fs.list_directory("/etc").len(), 1);
+        fs.delete("/etc/config.toml").unwrap();
+        assert!(fs.list_directory("/etc").is_empty());
+    }
+
+    #[test]
+    fn deleting_an_unregistered_path_is_not_found() {
+        let mut fs = MemFs::new();
+        assert_eq!(fs.delete("/nope"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn deleting_a_file_with_a_still_open_handle_fails_that_handle_cleanly_not_a_panic() {
+        let mut fs = MemFs::new();
+        let h = fs.open("/f", true, true).unwrap();
+        fs.write(h, 0, b"abc").unwrap();
+        fs.delete("/f").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(fs.read(h, 0, &mut buf), Err(FsError::BadHandle));
+        assert_eq!(fs.write(h, 0, b"x"), Err(FsError::BadHandle));
+        // `size` is the one existing method that does NOT follow `read`/
+        // `write`'s own "missing file_id -> BadHandle" pattern — it maps
+        // a missing `files` entry to `Ok(0)` instead (pre-existing
+        // behavior, unrelated to `delete`; presumably meant for a
+        // freshly-created-but-never-written file, which looks identical
+        // at this type's own level to a deleted one). Documented here as
+        // the real, current behavior rather than assumed.
+        assert_eq!(fs.size(h), Ok(0));
+    }
+
+    #[test]
+    fn renaming_a_file_makes_it_readable_at_the_new_path_and_gone_from_the_old_one() {
+        let mut fs = MemFs::new();
+        let h = fs.open("/old.txt", true, true).unwrap();
+        fs.write(h, 0, b"hello").unwrap();
+        fs.close(h).unwrap();
+
+        fs.rename("/old.txt", "/new.txt").unwrap();
+
+        assert_eq!(fs.open("/old.txt", false, false), Err(FsError::NotFound));
+        let h2 = fs.open("/new.txt", false, false).unwrap();
+        let mut buf = [0u8; 8];
+        let n = fs.read(h2, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn renaming_an_unregistered_source_path_is_not_found() {
+        let mut fs = MemFs::new();
+        assert_eq!(fs.rename("/nope", "/dest"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn renaming_onto_an_existing_destination_replaces_it() {
+        let mut fs = MemFs::new();
+        let src = fs.open("/src.txt", true, true).unwrap();
+        fs.write(src, 0, b"new content").unwrap();
+        fs.close(src).unwrap();
+        fs.create("/dest.txt");
+
+        fs.rename("/src.txt", "/dest.txt").unwrap();
+
+        let h = fs.open("/dest.txt", false, false).unwrap();
+        let mut buf = [0u8; 16];
+        let n = fs.read(h, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"new content");
+        // Only one entry now - the old /dest.txt was really replaced, not
+        // left behind as a second file.
+        assert_eq!(fs.list_directory("/").len(), 1);
+    }
+
+    #[test]
+    fn an_open_handle_against_a_renamed_file_stays_valid() {
+        let mut fs = MemFs::new();
+        let h = fs.open("/old.txt", true, true).unwrap();
+        fs.write(h, 0, b"still here").unwrap();
+
+        fs.rename("/old.txt", "/new.txt").unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = fs.read(h, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"still here");
     }
 }

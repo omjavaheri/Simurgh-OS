@@ -148,6 +148,32 @@ pub enum FsRequest {
         /// Client capability slot naming the destination `SharedRegion`.
         shared_cap: u32,
     },
+    /// Deletes the file named by `path`. Reply: `Deleted` or `Error`
+    /// (`NotFound` if no file is registered at `path`). Real, deliberate
+    /// MVP simplification (`fs_native::MemFs::delete`'s own doc comment
+    /// has the full reasoning): frees the file's storage immediately even
+    /// if a handle is still open against it — real POSIX `unlink`'s own
+    /// "keep it alive until the last close" semantic is a legitimate
+    /// future refinement, not required for this MVP's own real
+    /// Definition of Done (§5.3 only asks for real read/write over IPC).
+    Delete {
+        /// Registered path id naming the file to delete.
+        path: PathId,
+    },
+    /// Renames/moves the file named by `from` to `to` (both already-
+    /// registered path ids). Reply: `Renamed` or `Error` (`NotFound` if
+    /// no file is registered at `from`). If a file already exists at
+    /// `to`, it is replaced — real POSIX `rename` semantics (the
+    /// destination is atomically overwritten, not an error), matching
+    /// `fs_native::MemFs::rename`'s own doc comment. An open handle
+    /// against the file being moved stays valid — only the PATH
+    /// resolution changes, never the underlying file identity.
+    Rename {
+        /// Registered path id naming the file to move.
+        from: PathId,
+        /// Registered path id naming the destination.
+        to: PathId,
+    },
 }
 
 /// Maximum directory entries [`FsResponse::DirEntries`] carries in one
@@ -223,6 +249,10 @@ pub enum FsResponse {
         /// Whether more entries exist beyond this page.
         more: bool,
     },
+    /// `Delete` succeeded.
+    Deleted,
+    /// `Rename` succeeded.
+    Renamed,
     /// The request failed. `code` is a `FsErrorCode`.
     Error {
         /// Machine-readable error code.

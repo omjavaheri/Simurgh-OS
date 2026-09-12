@@ -57,6 +57,8 @@ const OP_STAT: u8 = 4;
 const OP_CLOSE: u8 = 5;
 const OP_REGISTER_PATH: u8 = 6;
 const OP_LIST_DIRECTORY: u8 = 7;
+const OP_DELETE: u8 = 8;
+const OP_RENAME: u8 = 9;
 
 /// Encodes a `FsRequest` into a `SmallMessage`.
 ///
@@ -68,6 +70,8 @@ const OP_LIST_DIRECTORY: u8 = 7;
 /// - `Close`: `[handle]`
 /// - `RegisterPath`: `[len, shared_cap]`
 /// - `ListDirectory`: `[path, start_index, shared_cap]`
+/// - `Delete`: `[path]`
+/// - `Rename`: `[from, to]`
 pub fn encode_fs_request(req: &FsRequest) -> SmallMessage {
     let (op, words): (u8, [u64; 4]) = match *req {
         FsRequest::Open { path, flags } => {
@@ -100,9 +104,11 @@ pub fn encode_fs_request(req: &FsRequest) -> SmallMessage {
             OP_LIST_DIRECTORY,
             [path.0 as u64, start_index as u64, shared_cap as u64, 0],
         ),
+        FsRequest::Delete { path } => (OP_DELETE, [path.0 as u64, 0, 0, 0]),
+        FsRequest::Rename { from, to } => (OP_RENAME, [from.0 as u64, to.0 as u64, 0, 0]),
     };
     let n = match op {
-        OP_OPEN | OP_REGISTER_PATH => 2,
+        OP_OPEN | OP_REGISTER_PATH | OP_RENAME => 2,
         OP_LIST_DIRECTORY => 3,
         OP_READ | OP_WRITE => 4,
         _ => 1,
@@ -184,6 +190,19 @@ pub fn decode_fs_request(msg: &SmallMessage) -> Result<FsRequest, DecodeError> {
                 shared_cap: w[2] as u32,
             })
         }
+        OP_DELETE => {
+            need(1)?;
+            Ok(FsRequest::Delete {
+                path: PathId(w[0] as u32),
+            })
+        }
+        OP_RENAME => {
+            need(2)?;
+            Ok(FsRequest::Rename {
+                from: PathId(w[0] as u32),
+                to: PathId(w[1] as u32),
+            })
+        }
         _ => Err(DecodeError::UnknownOpcode),
     }
 }
@@ -202,6 +221,8 @@ const OP_FR_CLOSED: u8 = 5;
 const OP_FR_ERROR: u8 = 6;
 const OP_FR_PATH_REGISTERED: u8 = 7;
 const OP_FR_DIR_ENTRIES: u8 = 8;
+const OP_FR_DELETED: u8 = 9;
+const OP_FR_RENAMED: u8 = 10;
 
 /// Encodes a `FsResponse` into a `SmallMessage`.
 ///
@@ -214,6 +235,8 @@ const OP_FR_DIR_ENTRIES: u8 = 8;
 /// - `PathRegistered`: `[path]`
 /// - `Error`: `[code]`
 /// - `DirEntries`: `[count, more]`
+/// - `Deleted`: `[]`
+/// - `Renamed`: `[]`
 pub fn encode_fs_response(resp: &FsResponse) -> SmallMessage {
     let (op, words): (u8, [u64; 2]) = match *resp {
         FsResponse::Opened { handle } => (OP_FR_OPENED, [handle.0 as u64, 0]),
@@ -224,10 +247,12 @@ pub fn encode_fs_response(resp: &FsResponse) -> SmallMessage {
         FsResponse::PathRegistered { path } => (OP_FR_PATH_REGISTERED, [path.0 as u64, 0]),
         FsResponse::Error { code } => (OP_FR_ERROR, [code as u64, 0]),
         FsResponse::DirEntries { count, more } => (OP_FR_DIR_ENTRIES, [count as u64, more as u64]),
+        FsResponse::Deleted => (OP_FR_DELETED, [0, 0]),
+        FsResponse::Renamed => (OP_FR_RENAMED, [0, 0]),
     };
     let n = if op == OP_FR_STAT || op == OP_FR_DIR_ENTRIES {
         2
-    } else if op == OP_FR_CLOSED {
+    } else if op == OP_FR_CLOSED || op == OP_FR_DELETED || op == OP_FR_RENAMED {
         0
     } else {
         1
@@ -291,6 +316,8 @@ pub fn decode_fs_response(msg: &SmallMessage) -> Result<FsResponse, DecodeError>
                 more: w[1] != 0,
             })
         }
+        OP_FR_DELETED => Ok(FsResponse::Deleted),
+        OP_FR_RENAMED => Ok(FsResponse::Renamed),
         OP_FR_ERROR => {
             need(1)?;
             let code = match w[0] {
@@ -1285,6 +1312,11 @@ mod tests {
             start_index: 32,
             shared_cap: 6,
         });
+        roundtrip(FsRequest::Delete { path: PathId(5) });
+        roundtrip(FsRequest::Rename {
+            from: PathId(5),
+            to: PathId(8),
+        });
     }
 
     #[test]
@@ -1341,6 +1373,8 @@ mod tests {
         });
         fs_response_roundtrip(FsResponse::DirEntries { count: 32, more: true });
         fs_response_roundtrip(FsResponse::DirEntries { count: 3, more: false });
+        fs_response_roundtrip(FsResponse::Deleted);
+        fs_response_roundtrip(FsResponse::Renamed);
     }
 
     #[test]
