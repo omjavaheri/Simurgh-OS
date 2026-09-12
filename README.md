@@ -227,6 +227,15 @@ riscv64) unless noted:**
   scheduled within this session's QEMU attempts — the same accepted
   scheduling-capacity variance the next bullet describes, not a new
   issue).
+- **Real self-check reporting for `simurgh-init` (`sys::IN_REPORT`,
+  2026-09-12)**: found via a cross-repo audit — `simurgh-init` was the
+  one ported repo with no `*_REPORT` opcode at all (every sibling
+  subsystem has one, `NL_REPORT`/`FM_REPORT`/`UI_REPORT`/etc.), so its
+  own `subsystem_main` discarded both `self_check`'s real started-unit
+  count and `real_spawn_demo`'s real success `bool` entirely — a
+  silently-broken DAG resolution or a broken real spawn left ZERO
+  observable trace on real hardware. `a0` = started-unit count, `a1` =
+  spawn-demo success. Cross-arch-built clean on all 3 targets.
 - **Real interrupt-driven keyboard and mouse input** (x86_64 only — no such
   legacy PC hardware exists on aarch64/riscv64): a real 8259 PIC remap
   routes both IRQ1 (keyboard, master line) and IRQ12 (PS/2 mouse, a slave

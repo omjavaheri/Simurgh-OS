@@ -1304,6 +1304,14 @@ mod sys {
     /// `state_code` is `0..=6`, both far under a `usize`'s own width on
     /// every target this project builds for).
     pub const PS_LIST_ENTRY: usize = 126;
+    /// `a0` = `simurgh-init`'s own real `self_check`-started-unit count;
+    /// `a1` = its own real `real_spawn_demo` `bool` (`0`/`1`). Same
+    /// "prove a real value, not just survival" reasoning `NL_REPORT`'s
+    /// own doc comment gives — `simurgh-init` was the one ported repo
+    /// with no such report opcode at all (found via a cross-repo audit,
+    /// 2026-09-12), so a silently-broken DAG resolution or a broken real
+    /// spawn left zero observable trace on real hardware before this.
+    pub const IN_REPORT: usize = 127;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -4076,6 +4084,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                     "native-loader (U-mode, x86_64): real request_capability round trip to security-broker returned Err\r\n"
                 ));
             }
+            return TrapOutcome::Resume(0);
+        }
+        sys::IN_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode, x86_64): self_check started {a0} unit(s), real_spawn_demo succeeded={}\r\n",
+                a1 == 1
+            ));
             return TrapOutcome::Resume(0);
         }
         sys::SB_REPORT => {
@@ -7234,6 +7249,13 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             }
             return TrapOutcome::Resume(0);
         }
+        sys::IN_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode, aarch64): self_check started {x0} unit(s), real_spawn_demo succeeded={}\r\n",
+                x1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
         sys::SB_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "security-broker (U-mode, aarch64): served a real service call from requester#{x0}, granted={}\r\n",
@@ -7976,6 +7998,13 @@ fn simurgh_syscall(
                     "native-loader (U-mode): real request_capability round trip to security-broker returned Err\r\n"
                 ));
             }
+            return TrapOutcome::Resume(0);
+        }
+        sys::IN_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode): self_check started {a0} unit(s), real_spawn_demo succeeded={}\r\n",
+                a1 == 1
+            ));
             return TrapOutcome::Resume(0);
         }
         sys::SB_REPORT => {
