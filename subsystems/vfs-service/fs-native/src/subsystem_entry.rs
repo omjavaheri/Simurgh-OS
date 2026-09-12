@@ -46,7 +46,7 @@
 
 use crate::MemFs;
 use ipc_protocol::codec::{decode_fs_request, encode_fs_response};
-use ipc_protocol::fs::FsErrorCode;
+use ipc_protocol::fs::{FsErrorCode, DIR_ENTRY_MAX_NAME_BYTES, DIR_ENTRY_SLOT_BYTES, MAX_DIR_ENTRIES_PER_REPLY};
 use ipc_protocol::{FileHandle, FsRequest, FsResponse, PathId};
 use kernel_ipc::SmallMessage;
 
@@ -411,7 +411,57 @@ fn handle_request(fs: &mut MemFs, registry: &mut PathRegistry, req: FsRequest) -
                 },
             }
         }
+        FsRequest::ListDirectory { path, start_index, shared_cap: _ } => match registry.resolve(path) {
+            Some(p) => {
+                let entries = fs.list_directory(p);
+                let start = start_index as usize;
+                if start > entries.len() {
+                    return FsResponse::Error {
+                        code: FsErrorCode::NotFound,
+                    };
+                }
+                let page = &entries[start..];
+                let take = page.len().min(MAX_DIR_ENTRIES_PER_REPLY as usize);
+                let page_bytes = DIR_ENTRY_SLOT_BYTES * MAX_DIR_ENTRIES_PER_REPLY as usize;
+                // SAFETY: `FS_DATA_VA` is mapped `U=1 R+W` in this
+                // process's own address space (same contract as `Read`'s
+                // own slice above); `page_bytes` (2048) is comfortably
+                // within `FS_DATA_LEN` (4096, checked at compile time by
+                // `ipc_protocol::fs`'s own doc comment sizing rationale).
+                let out = unsafe { core::slice::from_raw_parts_mut(FS_DATA_VA as *mut u8, page_bytes) };
+                for (i, entry) in page[..take].iter().enumerate() {
+                    let slot = &mut out[i * DIR_ENTRY_SLOT_BYTES..(i + 1) * DIR_ENTRY_SLOT_BYTES];
+                    slot.fill(0);
+                    slot[0] = entry.is_dir as u8;
+                    let name = truncate_name_to_wire_limit(&entry.name);
+                    slot[1] = name.len() as u8;
+                    slot[2..2 + name.len()].copy_from_slice(name.as_bytes());
+                }
+                FsResponse::DirEntries {
+                    count: take as u32,
+                    more: start + take < entries.len(),
+                }
+            }
+            None => FsResponse::Error {
+                code: FsErrorCode::BadPath,
+            },
+        },
     }
+}
+
+/// Truncates `name` to at most [`DIR_ENTRY_MAX_NAME_BYTES`] bytes, on a
+/// real UTF-8 char boundary (never splitting a multi-byte character in
+/// half, which would hand the client an invalid UTF-8 tail) — a plain
+/// byte-count cutoff would be wrong for any non-ASCII file name.
+fn truncate_name_to_wire_limit(name: &str) -> &str {
+    if name.len() <= DIR_ENTRY_MAX_NAME_BYTES {
+        return name;
+    }
+    let mut end = DIR_ENTRY_MAX_NAME_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// fs-native's process entry point. Pre-seeds one real file (matching

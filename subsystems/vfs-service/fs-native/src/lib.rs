@@ -159,6 +159,54 @@ impl MemFs {
     pub fn close(&mut self, handle: Handle) -> Result<(), FsError> {
         self.open.remove(&handle.0).map(|_| ()).ok_or(FsError::BadHandle)
     }
+
+    /// Lists the immediate children of `dir_path` — synthesized from the
+    /// flat `index` (this store's own doc comment: it has no real
+    /// directory nodes at all, just a flat path-string -> file-id map).
+    /// Every registered path that starts with `dir_path` (normalized to
+    /// end with exactly one `/`) contributes either a real file entry
+    /// (nothing left after the prefix but a bare name, no further `/`)
+    /// or one deduplicated synthesized subdirectory entry (the first
+    /// path segment after the prefix, when more path follows it) — the
+    /// same "common prefix" technique flat object stores (S3 and
+    /// similar) use to fake a real directory listing over what is
+    /// really just a flat key space. Order matches `index`'s own sorted
+    /// iteration order (a `BTreeMap`) — real, deterministic, not
+    /// insertion-order-dependent, but not a "directories first" grouping
+    /// either (that is a presentation concern, not this store's).
+    pub fn list_directory(&self, dir_path: &str) -> Vec<DirEntry> {
+        let mut prefix = String::from(dir_path);
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let mut entries: Vec<DirEntry> = Vec::new();
+        for path in self.index.keys().filter(|p| p.starts_with(prefix.as_str())) {
+            let rest = &path[prefix.len()..];
+            if rest.is_empty() {
+                continue; // the directory path itself, registered as its own entry.
+            }
+            match rest.find('/') {
+                Some(slash_idx) => {
+                    let dir_name = &rest[..slash_idx];
+                    if !entries.iter().any(|e| e.is_dir && e.name == dir_name) {
+                        entries.push(DirEntry { name: String::from(dir_name), is_dir: true });
+                    }
+                }
+                None => entries.push(DirEntry { name: String::from(rest), is_dir: false }),
+            }
+        }
+        entries
+    }
+}
+
+/// One entry [`MemFs::list_directory`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    /// The entry's own bare name (no path prefix, no trailing `/`).
+    pub name: String,
+    /// `true` if this entry is a synthesized subdirectory, `false` if it
+    /// is a real file.
+    pub is_dir: bool,
 }
 
 #[cfg(test)]
@@ -208,5 +256,52 @@ mod tests {
         fs.close(h).unwrap();
         let mut buf = [0u8; 4];
         assert_eq!(fs.read(h, 0, &mut buf), Err(FsError::BadHandle));
+    }
+
+    #[test]
+    fn list_directory_returns_direct_files_and_synthesizes_one_subdir_entry() {
+        let mut fs = MemFs::new();
+        fs.create("/home/alice/notes.txt");
+        fs.create("/home/alice/todo.txt");
+        fs.create("/home/alice/photos/beach.png");
+        fs.create("/home/alice/photos/mountain.png");
+        fs.create("/home/bob/other.txt"); // a sibling, must not appear.
+
+        let mut entries = fs.list_directory("/home/alice");
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            entries,
+            alloc::vec![
+                DirEntry { name: String::from("notes.txt"), is_dir: false },
+                DirEntry { name: String::from("photos"), is_dir: true },
+                DirEntry { name: String::from("todo.txt"), is_dir: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn list_directory_works_with_or_without_a_trailing_slash() {
+        let mut fs = MemFs::new();
+        fs.create("/etc/config.toml");
+        assert_eq!(fs.list_directory("/etc"), fs.list_directory("/etc/"));
+    }
+
+    #[test]
+    fn list_directory_of_an_empty_or_unknown_path_is_an_empty_list_not_an_error() {
+        let fs = MemFs::new();
+        assert!(fs.list_directory("/does/not/exist").is_empty());
+    }
+
+    #[test]
+    fn a_deeply_nested_file_only_contributes_its_own_first_level_subdir_once() {
+        let mut fs = MemFs::new();
+        fs.create("/a/b/c/d/deep.txt");
+        fs.create("/a/b/c/e/deep2.txt");
+        let entries = fs.list_directory("/a/b/c");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.is_dir));
+        let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, alloc::vec!["d", "e"]);
     }
 }

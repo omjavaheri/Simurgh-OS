@@ -126,7 +126,57 @@ pub enum FsRequest {
         /// Client capability slot naming the source `SharedRegion`.
         shared_cap: u32,
     },
+    /// Lists up to [`MAX_DIR_ENTRIES_PER_REPLY`] entries of the
+    /// directory named by `path`, starting at `start_index` (0-based,
+    /// in the filesystem service's own stable listing order) — bounded
+    /// pagination, not a single unbounded reply, for a directory with
+    /// more entries than fit one page: a caller that gets back `more:
+    /// true` (`FsResponse::DirEntries`'s own doc comment) calls again
+    /// with `start_index` advanced by the `count` it just received.
+    /// Entries themselves are written into `shared_cap`
+    /// (`dir_entry_layout`'s own doc comment has the exact byte
+    /// layout) — never inlined in the `SmallMessage`, the same "bulk
+    /// data travels through a shared region" rule `Read`/`Write`/
+    /// `RegisterPath` already follow. Reply: `DirEntries` or `Error`
+    /// (`NotFound` if `path` names neither a real file nor any real
+    /// path with `path` as a directory-prefix).
+    ListDirectory {
+        /// Registered path id naming the directory to list.
+        path: PathId,
+        /// 0-based index of the first entry this reply should contain.
+        start_index: u32,
+        /// Client capability slot naming the destination `SharedRegion`.
+        shared_cap: u32,
+    },
 }
+
+/// Maximum directory entries [`FsResponse::DirEntries`] carries in one
+/// reply — a real, bounded batch (`FsRequest::ListDirectory`'s own doc
+/// comment covers the pagination this implies), sized so `MAX_DIR_
+/// ENTRIES_PER_REPLY * DIR_ENTRY_SLOT_BYTES` fits comfortably within one
+/// 4096-byte `SharedRegion` page (32 * 64 = 2048 bytes).
+pub const MAX_DIR_ENTRIES_PER_REPLY: u32 = 32;
+
+/// Byte layout of ONE directory-entry slot within `ListDirectory`'s own
+/// `shared_cap` region — a fixed-size record (not a variable-length,
+/// offset-table layout), the same "simple fixed slots over a real
+/// offset table" MVP simplification this codebase's other real
+/// shared-region layouts already make (e.g. `driver_virtio_blk::layout`
+/// module doc comment):
+///   `+0`  `kind` (1 byte): `0` = file, `1` = directory.
+///   `+1`  `name_len` (1 byte): real UTF-8 byte length of `name`, `<=
+///         62`.
+///   `+2`  `name` (62 bytes): UTF-8 bytes, left-aligned, the tail past
+///         `name_len` left as whatever `shared_cap` already held
+///         (a reader must only ever look at the first `name_len`
+///         bytes — matching `RegisterPath`'s own "caller-provided
+///         length, not a null terminator" convention).
+/// Entry `i` (0-based, within one reply) starts at byte offset
+/// `i * DIR_ENTRY_SLOT_BYTES`.
+pub const DIR_ENTRY_SLOT_BYTES: usize = 64;
+/// The real cap on `name_len` within one [`DIR_ENTRY_SLOT_BYTES`] slot —
+/// `DIR_ENTRY_SLOT_BYTES - 2` (the `kind`/`name_len` header bytes).
+pub const DIR_ENTRY_MAX_NAME_BYTES: usize = DIR_ENTRY_SLOT_BYTES - 2;
 
 /// A reply from the VFS layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +209,19 @@ pub enum FsResponse {
     PathRegistered {
         /// The newly assigned id.
         path: PathId,
+    },
+    /// `ListDirectory` succeeded. `count` (`<= MAX_DIR_ENTRIES_PER_
+    /// REPLY`) entries were written into the request's own `shared_cap`
+    /// (`DIR_ENTRY_SLOT_BYTES`'s own doc comment has the exact layout).
+    /// `more` is `true` iff the directory has further entries beyond
+    /// `start_index + count` — the caller's own cue to call again with
+    /// `start_index` advanced (`FsRequest::ListDirectory`'s own doc
+    /// comment).
+    DirEntries {
+        /// Entries actually written into the shared region this reply.
+        count: u32,
+        /// Whether more entries exist beyond this page.
+        more: bool,
     },
     /// The request failed. `code` is a `FsErrorCode`.
     Error {
