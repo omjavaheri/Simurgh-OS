@@ -311,6 +311,16 @@ pub struct BootReport {
     /// time discovery evidence, matching `untyped_objects`' own role for
     /// memory.
     pub peripheral_devices: u32,
+    /// Number of compute devices (GPU/NPU-class PCI functions —
+    /// `hal_core::compute::ComputeDeviceDiscovery`) HAL discovered.
+    /// Same "boot-time discovery evidence, no consumer yet" role
+    /// [`peripheral_devices`] already documents — today this is
+    /// consumed internally only by each `hal-<arch>::power`'s own
+    /// per-device power-domain bookkeeping, never surfaced anywhere a
+    /// real boot log could confirm it, until this field. Read straight
+    /// from `boot.hardware_manifest`, same source as `peripheral_
+    /// devices`.
+    pub compute_devices: u32,
     /// The Root Task's thread id (raw).
     pub root_thread: u32,
     /// The thread the scheduler would run first (should be the Root Task).
@@ -360,6 +370,7 @@ pub fn build(
         untyped_objects: state.untyped_count,
         total_untyped_bytes: state.total_untyped_bytes(),
         peripheral_devices: boot.hardware_manifest.peripheral_device_count,
+        compute_devices: boot.hardware_manifest.compute_device_count,
         root_thread: state.root_thread.as_u32(),
         first_scheduled,
     };
@@ -8685,6 +8696,30 @@ pub const SBI_TARGET_MM_SERVICE: u32 = 1;
 /// `security_broker_tid`/`security_broker_cs` must already be spawned
 /// (`spawn_security_broker`'s own return value) — this is exactly why
 /// `root_task::Service::SecurityBrokerIntermediary` boots LAST.
+///
+/// **Real, open bug found via QEMU (2026-09-12), aarch64-only, NOT yet
+/// root-caused**: on a real aarch64 boot, right after `spawn_security_
+/// broker_aarch64`'s own log line prints (that spawn itself succeeds),
+/// the very next step — THIS function's own call to `spawn_process_from_
+/// elf` for the intermediary ELF, or the `TrapOutcome::SwitchTo` right
+/// after it returns (`sys::SBI_DEMO_START`'s own match arm, `kernel/
+/// kernel/src/main.rs`) — crashes with `unsafe precondition(s) violated:
+/// ptr::write_volatile requires that the pointer argument is aligned and
+/// non-null`. x86_64 and riscv64 both run this exact same shared
+/// function without incident (riscv64 never reaches it at all, blocked
+/// earlier by the already-tracked Compositor spawn fault; x86_64 reaches
+/// it and completes cleanly, real `minted a REAL capability...` log
+/// lines confirmed on a real boot the same session this was found). A 4x
+/// stack-size bump on the intermediary's own spawn (`SBI_STACK_LEN`,
+/// mirroring `spawn_security_broker_aarch64`'s own `SB_STACK_LEN`
+/// precedent for an unrelated, already-fixed x86_64 stack overflow) was
+/// tried and ruled out — identical crash, same spot, on a second real
+/// boot. Not chased further this session: an unaligned/null raw pointer
+/// write deep in either ELF-loading or aarch64's own context-switch path
+/// needs real instruction-level tracing (the SAME class of tooling gap
+/// this project's own riscv64 Compositor spawn fault has been blocked on
+/// across many sessions — see `.claude/IMPLEMENTATION-PLAN.md` Sessions
+/// 25/27/36/37) to safely root-cause rather than guess at blindly.
 pub fn security_broker_intermediary_demo_start(
     hal: &HalInterface,
     caller: ThreadId,
@@ -8710,6 +8745,15 @@ pub fn security_broker_intermediary_demo_start(
     };
 
     const SBI_STACK_VMA: usize = 0xC042_0000;
+    // `// TODO(bug)`: a real, open, aarch64-only crash right after this
+    // spawn — see this function's own module-level "known issues" doc
+    // comment (added 2026-09-12) for the full, honest record. A 4x stack
+    // bump (mirroring `spawn_security_broker_aarch64`'s own `SB_STACK_
+    // LEN` precedent for an unrelated, already-fixed x86_64 stack
+    // overflow) was tried and DID NOT fix it — same crash, same spot,
+    // confirmed via a second real QEMU boot — so stack size is ruled
+    // out, not the answer; kept at the original size rather than
+    // carrying an unexplained, unhelpful bump.
     const SBI_STACK_LEN: usize = 4096 * 16;
     let (sbi_tid, sbi_cs, _stack_phys) =
         spawn_process_from_elf(hal, k, sbi_elf, expected_machine, SBI_STACK_VMA, SBI_STACK_LEN)?;

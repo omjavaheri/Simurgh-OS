@@ -205,6 +205,14 @@ riscv64) unless noted:**
   runs; aarch64 uses real PSCI (`smc`), riscv64 the real SBI System Reset
   Extension (`ecall`) — both real hardware standards, though only the x86_64
   path is QEMU-verified so far.
+- **Real compute-device discovery (`hal_core::compute::
+  ComputeDeviceDiscovery`)**, QEMU-verified on all three architectures
+  (2026-09-12): the boot summary now prints a real `compute devices` count
+  (`BootReport::compute_devices`, straight from the same hardware manifest
+  `peripheral devices` already used) — confirmed via real QEMU boots on
+  x86_64 (`1`), aarch64 (`0`), and riscv64 (`0`), all real, honest numbers
+  for what each machine type actually exposes, not a guess. Previously this
+  discovery ran at boot but had no observable log line anywhere.
 - **Real interrupt-driven keyboard and mouse input** (x86_64 only — no such
   legacy PC hardware exists on aarch64/riscv64): a real 8259 PIC remap
   routes both IRQ1 (keyboard, master line) and IRQ12 (PS/2 mouse, a slave
@@ -233,6 +241,19 @@ riscv64) unless noted:**
   root cause is not yet found. x86_64 and aarch64 are unaffected;
   `scripts/qemu-fault-isolation-test.sh riscv64` runs with a documented
   `--allow-fail` in CI so this stays visible without blocking the pipeline.
+- **aarch64 only, newly found (2026-09-12):** `security-broker-intermediary`
+  (the Issue #28 capability-minting demo) crashes the boot right after
+  `security-broker` itself is spawned — `unsafe precondition(s) violated:
+  ptr::write_volatile requires that the pointer argument is aligned and
+  non-null`, either inside the intermediary's own ELF spawn or the
+  context-switch immediately after. x86_64 and riscv64 are unaffected
+  (riscv64 never reaches this point at all, blocked earlier by the bug
+  above). A stack-size bump (the fix for a similar-looking, already-solved
+  x86_64 crash on the SAME process's own primary spawn) was tried and ruled
+  out — identical crash on a second real boot. Not yet root-caused; needs
+  real instruction-level tracing, the same tooling gap the riscv64 bug above
+  has been blocked on. See `kernel_arch_glue::security_broker_intermediary_
+  demo_start`'s own doc comment for the full record.
 - **QEMU scheduling capacity at scale (x86_64)**: with this many real
   subsystems now competing for one emulated core under TCG, a newly-spawned
   process (e.g. `ui-core`, `driver-i8042`, `driver-mouse`) is not guaranteed
