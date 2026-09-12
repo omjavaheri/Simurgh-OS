@@ -1,0 +1,41 @@
+# ============================================================================
+# driver-nvme  (03-Kernel-Subsystems-Layer.md §2.1's own driver list)
+#
+# A real NVMe block driver — a separate process that implements
+# `driver_framework::DeviceDriver`, the same contract `driver-virtio-blk`
+# already does, driving real NVMe Admin/I/O queues over a real, PCI-
+# discovered controller (`hal_manifest::raw::PeripheralKindRaw::Nvme`,
+# discovered by PCI class code, not vendor id — `hal_x86_64::peripheral`'s
+# own doc comment). x86_64-only for now (this project's only architecture
+# with a real PCI/ECAM bus scan wired to NVMe discovery today).
+#
+# `#![no_std]`. `rlib` for the library, plus a `subsystem-bin` `[[bin]]`
+# — same two-crate-target shape every other real driver in this workspace
+# already uses.
+# ============================================================================
+[package]
+name        = "driver-nvme"
+description = "Real NVMe block driver for Simurgh (03-Kernel-Subsystems-Layer.md driver list)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "driver-nvme-bin"
+path = "src/bin/driver-nvme-bin.rs"
+# Same reasoning as driver-virtio-blk-bin's own `[[bin]]`: a host `cargo
+# test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
+[dependencies]
+driver-framework = { path = "../driver-framework" }
+ipc-protocol     = { path = "../../../ipc-protocol" }
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly, same reasoning as driver-virtio-blk's own dependency on it.
+kernel-ipc       = { path = "../../../kernel/kernel-ipc" }

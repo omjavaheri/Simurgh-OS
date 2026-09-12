@@ -226,6 +226,10 @@ xbuild-subsystem-driver-i8042-x86_64 = "build -p driver-i8042 --bin driver-i8042
 # Same shape, for the real PS/2 mouse driver's own separately-built ELF
 # (mouse-input plan, Stage 1b) — x86_64-only, same reason as driver-i8042.
 xbuild-subsystem-driver-mouse-x86_64 = "build -p driver-mouse --bin driver-mouse-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the real NVMe block driver's own separately-built ELF
+# (03-Kernel-Subsystems-Layer.md's own driver list) — x86_64-only, same
+# reason as driver-i8042 (NVMe discovery only exists in hal_x86_64 today).
+xbuild-subsystem-driver-nvme-x86_64 = "build -p driver-nvme --bin driver-nvme-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)
