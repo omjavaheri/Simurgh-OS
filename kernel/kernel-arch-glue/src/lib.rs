@@ -7932,6 +7932,49 @@ pub fn khal() -> &'static HalInterface {
     unsafe { &*core::ptr::addr_of!(G_HAL).read() }
 }
 
+/// Encodes a [`kernel_core::tcb::ThreadState`] as a small, stable wire
+/// byte — the real per-process-introspection primitive `simurgh-shell`'s
+/// own `ps` command needed (that repo's own README long flagged `ps` as
+/// "not a real process table - no kernel syscall exposes real per-
+/// process introspection yet", honest about the gap rather than faking
+/// one). Values are deliberately NOT `ThreadState`'s own discriminant
+/// order (kept independent so a future `kernel-core` variant reorder
+/// never silently renumbers an already-shipped wire value) — a client
+/// mirrors this exact mapping (`simurgh-shell::shell_core::subsystem_
+/// entry`'s own copy).
+fn thread_state_wire_code(state: kernel_core::tcb::ThreadState) -> u8 {
+    use kernel_core::tcb::ThreadState;
+    match state {
+        ThreadState::Inactive => 0,
+        ThreadState::Runnable => 1,
+        ThreadState::BlockedOnSend => 2,
+        ThreadState::BlockedOnRecv => 3,
+        ThreadState::BlockedOnReply => 4,
+        ThreadState::BlockedOnNotification => 5,
+        ThreadState::Exited => 6,
+    }
+}
+
+/// Real per-process-introspection query: `idx` is a raw `ThreadId` table
+/// index (`0..kernel_core::config::MAX_THREADS`, the TCB table's own
+/// fixed capacity — a caller iterates every index in that range, since
+/// the table is a sparse `[Option<Tcb>; MAX_THREADS]`, `Retype`/
+/// `Terminate` leaving real holes, not a dense/compacted list). Returns
+/// `Some((tid, state_code))` (`state_code` per [`thread_state_wire_
+/// code`]) if a live TCB occupies that slot, `None` if it does not
+/// (`idx` out of range, or a genuinely empty/reclaimed slot) — a normal,
+/// expected outcome for most slots on a real boot (`MAX_THREADS` is 96;
+/// this project spawns nowhere near that many processes yet), not an
+/// error.
+pub fn ps_list_entry(idx: usize) -> Option<(u32, u8)> {
+    if idx >= kernel_core::config::MAX_THREADS {
+        return None;
+    }
+    let k = kstate();
+    let tcb = k.tcb(ThreadId::new(idx as u32))?;
+    Some((idx as u32, thread_state_wire_code(tcb.state)))
+}
+
 
 /// The in-kernel milestone demo (02-Microkernel-Layer.md §8.1 / §8.2 /
 /// §8.5): retype an `Endpoint`, exercise capability revocation, retype

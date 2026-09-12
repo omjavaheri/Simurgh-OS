@@ -1291,6 +1291,19 @@ mod sys {
     /// `wire_notification`'s own doc comment describes, solved by
     /// polling instead of a genuine multi-endpoint `Wait`.
     pub const NOTIF_POLL: usize = 125;
+    /// `a0` = raw `ThreadId` table index (`0..kernel_core::config::
+    /// MAX_THREADS`). Real per-process-introspection query for
+    /// `simurgh-shell`'s own `ps` command (that repo's own README long
+    /// flagged `ps` as not a real process table — no kernel syscall
+    /// exposed this before). Returns `usize::MAX` if `a0` is out of
+    /// range or that TCB slot is empty (`kernel_arch_glue::ps_list_
+    /// entry`'s own doc comment — a normal, expected outcome for most
+    /// slots, not an error); otherwise `(tid << 8) | state_code`
+    /// (`kernel_arch_glue`'s own `thread_state_wire_code` mapping) — tid
+    /// fits comfortably in the remaining bits (`MAX_THREADS` is 96,
+    /// `state_code` is `0..=6`, both far under a `usize`'s own width on
+    /// every target this project builds for).
+    pub const PS_LIST_ENTRY: usize = 126;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3277,6 +3290,12 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
             let bits = kernel_arch_glue::p2_poll(hal, caller, a0 as u32);
             return TrapOutcome::Resume(bits as usize);
+        }
+        sys::PS_LIST_ENTRY => {
+            return TrapOutcome::Resume(match kernel_arch_glue::ps_list_entry(a0) {
+                Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
+                None => usize::MAX,
+            });
         }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();
@@ -6542,6 +6561,12 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             let bits = kernel_arch_glue::p2_poll(hal, caller, x0 as u32);
             return TrapOutcome::Resume(bits as usize);
         }
+        sys::PS_LIST_ENTRY => {
+            return TrapOutcome::Resume(match kernel_arch_glue::ps_list_entry(x0) {
+                Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
+                None => usize::MAX,
+            });
+        }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate()
@@ -8192,6 +8217,12 @@ fn simurgh_syscall(
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
             let bits = kernel_arch_glue::p2_poll(hal, caller, a0 as u32);
             return TrapOutcome::Resume(bits as usize);
+        }
+        sys::PS_LIST_ENTRY => {
+            return TrapOutcome::Resume(match kernel_arch_glue::ps_list_entry(a0) {
+                Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
+                None => usize::MAX,
+            });
         }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();

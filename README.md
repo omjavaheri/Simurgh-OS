@@ -213,6 +213,20 @@ riscv64) unless noted:**
   x86_64 (`1`), aarch64 (`0`), and riscv64 (`0`), all real, honest numbers
   for what each machine type actually exposes, not a guess. Previously this
   discovery ran at boot but had no observable log line anywhere.
+- **Real per-process introspection (`sys::PS_LIST_ENTRY`, 2026-09-12)**:
+  `simurgh-shell`'s own `ps` command long flagged itself as "not a live
+  process table — no kernel syscall exposes real per-process
+  introspection yet." One new syscall closes that gap: `a0` = a raw
+  `ThreadId` table index (`0..kernel_core::config::MAX_THREADS`), reply
+  encodes `(tid << 8) | state_code` for a live TCB slot or `usize::MAX`
+  for an empty one (`kernel_arch_glue::ps_list_entry`). Real, honest
+  scope: the kernel tracks no human-readable process NAME anywhere, only
+  `tid` + lifecycle state — `simurgh-shell`'s own `ps` now shows real
+  data for both of those, cross-arch-built clean, but has not yet been
+  directly observed replying on a live boot (shell's own thread was not
+  scheduled within this session's QEMU attempts — the same accepted
+  scheduling-capacity variance the next bullet describes, not a new
+  issue).
 - **Real interrupt-driven keyboard and mouse input** (x86_64 only — no such
   legacy PC hardware exists on aarch64/riscv64): a real 8259 PIC remap
   routes both IRQ1 (keyboard, master line) and IRQ12 (PS/2 mouse, a slave
