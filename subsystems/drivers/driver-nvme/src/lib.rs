@@ -21,13 +21,25 @@
 //! base spec's own PCIe register layout and Admin/I/O command formats,
 //! and is host-tested wherever the logic is pure (bit-packing, queue
 //! index/doorbell arithmetic, completion phase-bit tracking — see this
-//! file's own `#[cfg(test)]` module). The actual real-hardware MMIO
-//! handshake (`Nvme::do_probe`) has NOT yet been run against a real QEMU
-//! `-device nvme` boot — that verification, plus the kernel-side spawn
-//! glue (`kernel_arch_glue::spawn_nvme_driver`, not written yet) needed
-//! to even reach that point, is separate, later work. Flagged here
-//! rather than silently implied, matching this project's own "an honest
-//! gap beats a guessed answer" convention.
+//! file's own `#[cfg(test)]` module).
+//!
+//! **Real QEMU verification (2026-09-12)**: booted with a real
+//! `-device nvme` attached — `hal_x86_64::peripheral`'s own class-code
+//! scan found it (`peripheral devices: 3`, up from 2 with no NVMe
+//! attached), `KernelState::root_mmio_nvme_cap` resolved to a real
+//! capability, and `kernel_arch_glue::spawn_nvme_driver` spawned this
+//! process with a real BAR0 window and all five queue/data pages
+//! actually mapped (`spawn_nvme_driver: driver-nvme spawned` in the real
+//! boot log), with no crash or hang anywhere else in the rest of the
+//! boot sequence. What this does NOT yet directly confirm: whether
+//! `Nvme::do_probe`'s own real MMIO handshake against the controller
+//! (the admin queue bring-up, Identify Namespace, I/O queue creation)
+//! actually completes successfully — `subsystem_main` does not currently
+//! report `probe()`'s own outcome anywhere observable, so that is
+//! structural correctness (spec-literal register offsets/bit positions,
+//! host-tested) plus real capability/mapping proof, not yet a directly
+//! observed successful handshake. A follow-up report opcode (mirroring
+//! other subsystems' own `*_REPORT` pattern) would close that last gap.
 //!
 //! MVP scope, matching `driver-virtio-blk`'s own: one request in flight
 //! at a time, one logical block per request, a fixed one-page (4096

@@ -17,16 +17,17 @@
 //! `driver_nvme::Nvme` — mirrors `driver_virtio_blk::subsystem_entry`'s
 //! own IPC-serving shape exactly, `Nvme` in place of `VirtioBlk`.
 //!
-//! Position in the system: **not yet wired to a real spawn path** — no
-//! `kernel_arch_glue::spawn_nvme_driver` exists yet (this crate's own
-//! `lib.rs` module doc comment covers the full, honest status). The
-//! capability-slot/VA layout below is this driver's own DESIGN for what
-//! that future spawn function must grant: an `Endpoint` at slot 0 (every
-//! other real driver's own "first grant into an empty cap space"
-//! convention), a BAR0 MMIO capability, and five page-sized `SharedRegion`
-//! capabilities (admin SQ/CQ, I/O SQ/CQ, one shared Identify/I/O data
-//! buffer) — all pre-mapped directly the same trusted way `spawn_virtio_
-//! blk_driver` already pre-maps its own two regions.
+//! Position in the system: `kernel_arch_glue::spawn_nvme_driver` spawns
+//! this process via `spawn_process_from_elf`, grants it an `Endpoint` at
+//! slot 0 (every other real driver's own "first grant into an empty cap
+//! space" convention), and pre-maps a real BAR0 MMIO window plus five
+//! page-sized `SharedRegion`s (admin SQ/CQ, I/O SQ/CQ, one shared
+//! Identify/I/O data buffer) at the exact VAs below — see that
+//! function's own doc comment for its real, honest scope: it spawns a
+//! real process that runs its own real `probe()`, but nothing calls
+//! into its `Endpoint` yet (no other real subsystem in this codebase
+//! talks to an NVMe device today), so it simply idles in `subsystem_
+//! main`'s own `Recv` loop once `probe()` returns.
 //! ============================================================================
 
 use driver_framework::DeviceDriver;

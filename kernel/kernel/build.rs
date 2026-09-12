@@ -681,5 +681,31 @@ fn main() {
             "cargo:rustc-env=DRIVER_MOUSE_ELF_PATH={}",
             mouse_path.canonicalize().unwrap().display()
         );
+
+        // `driver-nvme-bin` — x86_64-only, same reason as `driver-i8042-
+        // bin`/`driver-mouse-bin` just above (NVMe discovery only exists
+        // in `hal_x86_64::peripheral` today).
+        let nvme_build_alias = "cargo xbuild-subsystem-driver-nvme-x86_64".to_string();
+        let nvme_path = std::path::PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(dm_target_dir_name)
+            .join("debug")
+            .join("driver-nvme-bin");
+
+        if !nvme_path.exists() {
+            panic!(
+                "kernel build.rs: driver-nvme-bin binary not found at {} (target_arch = {target_arch}).\n\
+                 Build it first with: {nvme_build_alias}",
+                nvme_path.display()
+            );
+        }
+
+        println!("cargo:rerun-if-changed={}", nvme_path.display());
+        println!(
+            "cargo:rustc-env=DRIVER_NVME_ELF_PATH={}",
+            nvme_path.canonicalize().unwrap().display()
+        );
     }
 }

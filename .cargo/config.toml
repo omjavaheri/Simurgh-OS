@@ -124,6 +124,27 @@ rustflags = [
 # `compiler-builtins-mem` so the bare-metal image needs no external libc
 # for `memcpy`/`memset`/…
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Host `cargo test` stack size
+#
+# `kernel-core`'s own `KernelState` is a large, fixed-size struct (one
+# array slot per MAX_THREADS/MAX_ENDPOINTS/etc. kernel object) that
+# several host tests bind as a local. On a host debug build (no
+# guaranteed move elision) that genuinely overflows the Windows default
+# thread stack (~1 MiB) — a real, previously-latent margin issue: it
+# first surfaced as ONE test overflowing, and patching that one test's
+# own stack size just moved the same overflow onto the next test that
+# happened to sit closest to the edge, proving this is a systemic
+# per-test margin problem, not a one-off. `RUST_MIN_STACK` is what the
+# standard test harness reads for the stack size it gives every spawned
+# test thread — fixing it globally here, rather than patching individual
+# tests one at a time as `KernelState` continues to grow, is not a
+# kernel/correctness change: the real `no_std` target builds/boots fine
+# regardless (this is a host `cargo test` artifact only).
+# ----------------------------------------------------------------------------
+[env]
+RUST_MIN_STACK = "67108864"
+
 [alias]
 xbuild-x86_64  = "build -p hal-x86_64  --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-aarch64 = "build -p hal-arm64   --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"

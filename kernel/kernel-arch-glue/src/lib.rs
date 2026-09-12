@@ -6865,6 +6865,158 @@ pub fn spawn_mouse_driver(
     Some(drv_tid)
 }
 
+/// Retypes a fresh `SharedRegion` page, zeroes it, writes its OWN
+/// physical base into its own first 8 bytes (`driver_virtio_blk::
+/// layout::PHYS_BASE_OFFSET`'s own doc comment — the convention `driver_
+/// nvme::Nvme::phys_of` relies on, since a driver process has no VA->PA
+/// translation syscall of its own), then pre-maps it at `target_va` in
+/// `drv_root_pt` (trusted bootstrap, no `Map` ceremony — same pattern
+/// every other driver spawn function in this file already uses).
+/// Returns the region's own physical base, or `None` on any allocation/
+/// mapping failure (the caller logs which page failed).
+fn retype_and_map_nvme_page(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    caller: ThreadId,
+    src_cs: kernel_cap::CapSpaceId,
+    drv_root_pt: usize,
+    target_va: usize,
+) -> Option<usize> {
+    let region_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::SharedRegion, count: 1 },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => return None,
+    };
+    let region_id = k.cap_space(src_cs)?.lookup(region_cap)?.object.id;
+    let region_phys = k.shared_region(kernel_cap::SharedRegionId::new(region_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(region_phys as *mut u8, 0, 4096) };
+    // SAFETY: `region_phys` is identity-addressable, freshly zeroed above.
+    unsafe { (region_phys as *mut u64).write_volatile(region_phys as u64) };
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(drv_root_pt, target_va, region_phys, 4096, 1 | 2 | 8, pool, 2) == u32::MAX {
+        return None;
+    }
+    Some(region_phys)
+}
+
+/// Spawns `driver-nvme` from its own separately-built ELF (`drv_elf`),
+/// grants it an `Endpoint` (slot 0 — every other real driver's own
+/// "first grant into an empty cap space" convention), pre-maps the
+/// controller's own BAR0 register window directly (trusted bootstrap,
+/// same pattern `spawn_virtio_blk_driver`'s own MMIO-window pre-map
+/// uses), and retypes+pre-maps five fresh `SharedRegion` pages (admin
+/// SQ/CQ, I/O SQ/CQ, one shared Identify/I/O data buffer —
+/// `driver_nvme::subsystem_entry`'s own module doc comment names the
+/// exact VA each lands at, matching this function's own targets one for
+/// one).
+///
+/// Real, honest scope note: unlike `spawn_i8042_driver`/`spawn_mouse_
+/// driver`, this function does NOT bind an IRQ or wire this driver to
+/// any consumer yet — `driver_nvme::Nvme`'s own MVP scope is polling-
+/// only (`lib.rs`'s own module doc comment), and no other real subsystem
+/// in this codebase calls into an NVMe block device yet (`fs-native`
+/// still only ever talks to the `Block`-kind virtio-blk device via
+/// `spawn_virtio_blk_driver`). This spawns a real, isolated process that
+/// runs its own real `probe()` against whatever real NVMe controller
+/// `hal_x86_64::peripheral` discovered — genuinely testable end to end
+/// on a real QEMU boot with `-device nvme` attached — but with nobody
+/// calling into its `Endpoint` yet, so it simply idles in its own `Recv`
+/// loop once `probe()` returns, exactly like every other driver process
+/// with no client does.
+///
+/// Returns `None` (and logs) if no `Nvme`-kind peripheral was discovered
+/// at boot (`KernelState::root_mmio_nvme_cap` still the sentinel —
+/// expected on every boot without a real `-device nvme` attached, and on
+/// every non-x86_64 architecture), or on any allocation/mapping failure.
+pub fn spawn_nvme_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<ThreadId> {
+    let k = kstate();
+    let mmio_cap = k.root_mmio_nvme_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_nvme_driver: no Nvme-kind peripheral was discovered at boot\r\n");
+        return None;
+    }
+    let src_cs = k.tcb(caller)?.cap_space;
+    let mmio_id = kernel_cap::MmioRegionId::new(
+        k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32(),
+    );
+    let mmio = *k.mmio_region(mmio_id)?;
+
+    const DRV_NVME_STACK_VMA: usize = 0xC0C0_0000;
+    const DRV_NVME_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_NVME_STACK_VMA, DRV_NVME_STACK_LEN)?;
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    let ep_cap = match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Endpoint, count: 1 },
+        hal,
+    ) {
+        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
+        _ => {
+            klog!("spawn_nvme_driver: failed to retype the Endpoint\r\n");
+            return None;
+        }
+    };
+    grant_cap_into(k, src_cs, ep_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // BAR0 register window — real device MMIO, not RAM (nothing to zero
+    // or copy into it first, same reasoning `spawn_virtio_blk_driver`'s
+    // own MMIO pre-map gives).
+    const DRV_NVME_BAR0_VA: usize = 0xD840_0000;
+    let bar0_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(bar0_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(drv_root_pt, DRV_NVME_BAR0_VA, mmio.phys_base as usize, 4096, 1 | 2 | 8, bar0_pool, 2) == u32::MAX {
+        klog!("spawn_nvme_driver: map_range error (BAR0)\r\n");
+        return None;
+    }
+
+    // Five queue/data/message pages — `driver_nvme::subsystem_entry`'s
+    // own module doc comment names each of these VAs exactly.
+    const DRV_NVME_ADMIN_SQ_VA: usize = 0xD841_0000;
+    const DRV_NVME_ADMIN_CQ_VA: usize = 0xD842_0000;
+    const DRV_NVME_IO_SQ_VA: usize = 0xD843_0000;
+    const DRV_NVME_IO_CQ_VA: usize = 0xD844_0000;
+    const DRV_NVME_DATA_VA: usize = 0xD845_0000;
+    const DRV_NVME_MSG_VA: usize = 0xD846_0000;
+    for (name, va) in [
+        ("admin SQ", DRV_NVME_ADMIN_SQ_VA),
+        ("admin CQ", DRV_NVME_ADMIN_CQ_VA),
+        ("I/O SQ", DRV_NVME_IO_SQ_VA),
+        ("I/O CQ", DRV_NVME_IO_CQ_VA),
+        ("data buffer", DRV_NVME_DATA_VA),
+        ("message page", DRV_NVME_MSG_VA),
+    ] {
+        if retype_and_map_nvme_page(k, hal, caller, src_cs, drv_root_pt, va).is_none() {
+            klog!("spawn_nvme_driver: failed to retype/map the {} page\r\n", name);
+            return None;
+        }
+    }
+
+    klog!("spawn_nvme_driver: driver-nvme spawned (real BAR0 + queue pages mapped, no client wired yet)\r\n");
+
+    // NOT a context switch — same "linear boot sequence, scheduler picks
+    // it up later" reasoning as `spawn_i8042_driver`'s own tail comment.
+    Some(drv_tid)
+}
+
 /// Spawns the Netstack process from its own separately-built ELF
 /// (`netstack_elf`) — the real replacement for this crate's own,
 /// removed direct-driving of `driver-virtio-net` (`netstack::

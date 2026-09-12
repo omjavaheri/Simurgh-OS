@@ -337,6 +337,12 @@ static DRIVER_I8042_ELF: &[u8] = include_bytes!(env!("DRIVER_I8042_ELF_PATH"));
 #[cfg(target_arch = "x86_64")]
 static DRIVER_MOUSE_ELF: &[u8] = include_bytes!(env!("DRIVER_MOUSE_ELF_PATH"));
 
+/// `driver-nvme-bin`'s own separately-built ELF image — x86_64-only,
+/// same reasoning as `DRIVER_I8042_ELF` (NVMe discovery only exists in
+/// `hal_x86_64::peripheral` today).
+#[cfg(target_arch = "x86_64")]
+static DRIVER_NVME_ELF: &[u8] = include_bytes!(env!("DRIVER_NVME_ELF_PATH"));
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -3992,6 +3998,20 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 kernel_arch_glue::khal(),
                 kernel_arch_glue::kstate().root_thread,
                 DRIVER_MOUSE_ELF,
+                elf_loader::machine::EM_X86_64,
+            );
+            // Real NVMe block driver (03-Kernel-Subsystems-Layer.md's own
+            // driver list): spawns `driver-nvme` as a real isolated
+            // process with a real, mapped BAR0 + queue pages — see
+            // `kernel_arch_glue::spawn_nvme_driver`'s own doc comment for
+            // its real, honest scope (no client wired to it yet). Only
+            // actually spawns anything on a boot with a real
+            // `-device nvme` attached (`root_mmio_nvme_cap` sentinel
+            // otherwise) — a no-op, not a failure, on every other boot.
+            let _ = kernel_arch_glue::spawn_nvme_driver(
+                kernel_arch_glue::khal(),
+                kernel_arch_glue::kstate().root_thread,
+                DRIVER_NVME_ELF,
                 elf_loader::machine::EM_X86_64,
             );
             let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
