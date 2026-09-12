@@ -295,6 +295,24 @@ const FILE_MANAGER_FS_SHARED_VA: usize = 0xD800_0000;
 #[cfg(target_arch = "x86_64")]
 const FILE_MANAGER_FS_DATA_VA: usize = 0xD810_0000;
 
+/// VA `simurgh-init`'s own copy of the shared `fs-native` message page is
+/// mapped at, in ITS OWN address space (`spawn_init_x86`'s own
+/// `kernel_arch_glue::wire_file_manager_to_fs_native` call) — must stay
+/// numerically equal to `simurgh-init::init-core::subsystem_entry::
+/// FS_SHARED_VA`. Deliberately the SAME numeric value as [`FILE_MANAGER_
+/// FS_SHARED_VA`] — safe to reuse, same "independently chosen in a
+/// different address space" reasoning that constant's own doc comment
+/// gives.
+#[cfg(target_arch = "x86_64")]
+const INIT_FS_SHARED_VA: usize = 0xD800_0000;
+
+/// VA `simurgh-init`'s own copy of the shared `fs-native` bulk-data page
+/// is mapped at — must stay numerically equal to `simurgh-init::
+/// init-core::subsystem_entry::FS_DATA_VA`. Same reasoning as
+/// [`INIT_FS_SHARED_VA`].
+#[cfg(target_arch = "x86_64")]
+const INIT_FS_DATA_VA: usize = 0xD810_0000;
+
 /// `ui-core-bin`'s own separately-built ELF image — same packaging as
 /// `FILE_MANAGER_ELF` (see its own doc comment): the ELEVENTH layer-4/5/6
 /// process this project spawns (`Simurgh-UI-Template01`, a separate git
@@ -4088,8 +4106,9 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         }
         sys::IN_REPORT => {
             kernel_arch_glue::log(format_args!(
-                "init (U-mode, x86_64): self_check started {a0} unit(s), real_spawn_demo succeeded={}\r\n",
-                a1 == 1
+                "init (U-mode, x86_64): self_check started {a0} unit(s), real_spawn_demo succeeded={}, real_manifest_read_demo succeeded={}\r\n",
+                a1 & 1 == 1,
+                a1 & 2 == 2
             ));
             return TrapOutcome::Resume(0);
         }
@@ -4487,7 +4506,16 @@ fn spawn_security_broker_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap:
 /// x86_64 counterpart of `spawn_init` (riscv64) — see that function's own
 /// doc comment for the full rationale. Same shape as
 /// `spawn_security_broker_x86`, the first layer-4 process this project
-/// spawned this way.
+/// spawned this way. Now also wires the real `init` <-> `fs-native` IPC
+/// edge right after spawning (2026-09-12) — same real reasoning `spawn_
+/// file_manager_x86`'s own doc comment gives for the identical edge:
+/// closes `simurgh-init`'s own "no VFS access" gap (REPO-simurgh-init.md
+/// §3 permits IPC to `Simurgh-OS`'s own services; it forbids seeing their
+/// code, which this real client does not do). Reuses `kernel_arch_glue::
+/// wire_file_manager_to_fs_native` as-is rather than duplicating an
+/// identical kernel-side function — every one of its parameters is a
+/// plain value, nothing file-manager-specific is baked into its body
+/// (that function's own doc comment).
 #[cfg(target_arch = "x86_64")]
 fn spawn_init_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
     let k = kernel_arch_glue::kstate();
@@ -4502,11 +4530,36 @@ fn spawn_init_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> 
         INIT_STACK_VMA,
         INIT_STACK_LEN,
     ) {
-        Some((tid, _cap_space, _stack_phys)) => {
+        Some((tid, cap_space, _stack_phys)) => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): spawned init (tid {}) from its OWN separately-built ELF image (simurgh-init repo)\r\n",
                 tid.as_u32()
             ));
+            let root_pt = k
+                .tcb(tid)
+                .map(|t| t.addr_space)
+                .and_then(|addr_space| k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()));
+            match root_pt {
+                Some(root_pt) => {
+                    match kernel_arch_glue::wire_file_manager_to_fs_native(
+                        hal,
+                        cap_space,
+                        root_pt,
+                        INIT_FS_SHARED_VA,
+                        INIT_FS_DATA_VA,
+                    ) {
+                        Some(()) => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): wired init <-> fs-native real IPC edge\r\n"
+                        )),
+                        None => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): init<->fs-native wiring skipped (fs-native not ready or out of resources)\r\n"
+                        )),
+                    }
+                }
+                None => kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): init<->fs-native wiring skipped (could not resolve init's own address space)\r\n"
+                )),
+            }
             Some(tid)
         }
         None => {
@@ -7251,8 +7304,9 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
         }
         sys::IN_REPORT => {
             kernel_arch_glue::log(format_args!(
-                "init (U-mode, aarch64): self_check started {x0} unit(s), real_spawn_demo succeeded={}\r\n",
-                x1 == 1
+                "init (U-mode, aarch64): self_check started {x0} unit(s), real_spawn_demo succeeded={}, real_manifest_read_demo succeeded={} (not wired on this arch yet)\r\n",
+                x1 & 1 == 1,
+                x1 & 2 == 2
             ));
             return TrapOutcome::Resume(0);
         }
@@ -8002,8 +8056,9 @@ fn simurgh_syscall(
         }
         sys::IN_REPORT => {
             kernel_arch_glue::log(format_args!(
-                "init (U-mode): self_check started {a0} unit(s), real_spawn_demo succeeded={}\r\n",
-                a1 == 1
+                "init (U-mode): self_check started {a0} unit(s), real_spawn_demo succeeded={}, real_manifest_read_demo succeeded={} (not wired on this arch yet)\r\n",
+                a1 & 1 == 1,
+                a1 & 2 == 2
             ));
             return TrapOutcome::Resume(0);
         }
