@@ -328,17 +328,44 @@ riscv64) unless noted:**
   real instruction-level tracing, the same tooling gap the riscv64 bug above
   has been blocked on. See `kernel_arch_glue::security_broker_intermediary_
   demo_start`'s own doc comment for the full record.
-- **QEMU scheduling capacity at scale (x86_64)**: with this many real
-  subsystems now competing for one emulated core under TCG, a newly-spawned
-  process (e.g. `ui-core`, `driver-i8042`, `driver-mouse`) is not guaranteed
-  to actually get scheduled within a single boot's real-time window — this
-  affects how reliably some of the newer real IPC edges above can be
-  observed completing end to end on any ONE given boot (retries, or a
-  longer-running real workload, generally do get them scheduled). This is
-  an accepted characteristic of testing at the current scale, not a
-  correctness bug — each such edge's own code is independently verified
-  (unit tests, cross-arch builds, and either a direct hardware-level proof
-  or a successful boot log line on at least one real run).
+- **QEMU scheduling capacity at scale (x86_64) — getting worse, not yet
+  fixed, deliberately deferred (2026-09-15)**: with this many real
+  subsystems now competing for one emulated core under TCG, a
+  newly-spawned process (e.g. `ui-core`, `driver-i8042`, `driver-mouse`)
+  is not guaranteed to actually get scheduled within a single boot's
+  real-time window — this affects how reliably some of the newer real
+  IPC edges above can be observed completing end to end on any ONE given
+  boot (retries, or a longer-running real workload, generally do get
+  them scheduled). Previously treated as a minor, accepted characteristic
+  of testing at the current scale; re-measured while verifying the new
+  `device-manager` `POWER_CONTROL` edge above and found meaningfully
+  worse than that framing suggested: `device-manager` itself —
+  `Service::BOOT_ORDER[0]`, the FIRST real subsystem spawned every boot —
+  was not observed reaching its own fault-isolation demo's terminal
+  `state=Failed` even once across multiple real x86_64 QEMU boots this
+  session, including one run given a full 400 real seconds (not just
+  90-150s) to do so; it never even reached a single `Restarting`
+  transition past the first `Running`. `scripts/qemu-fault-isolation-
+  test.sh` — the automated CI check for 03-Kernel-Subsystems-Layer.md
+  §5.2's real fault-injection acceptance criterion — depends on reaching
+  exactly that marker, so this is no longer just "some newer edges are
+  unreliable to observe," it is a real, growing risk to this project's
+  own primary automated correctness check on x86_64 (aarch64/riscv64
+  already run with real, separate open bugs blocking them from reaching
+  this point at all, above). Each individual real IPC edge's own code
+  stays independently verified regardless (unit tests, cross-arch
+  builds, and either a direct hardware-level proof or a successful boot
+  log line on at least one real run) — this is a scheduling/capacity
+  problem, not a correctness regression in any of them.
+  **Deliberately not investigated further right now** — Omid's own
+  2026-09-16 direction: log it here and move on, prioritizing finishing
+  the OS's remaining feature work over chasing this now; likely real
+  angles for whoever picks this up next: a real vruntime/fairness
+  audit now that the process count has grown this much since the
+  scheduler's original tuning, giving `device-manager` (or the whole
+  fault-isolation demo) an earlier/reserved scheduling slot, or
+  increasing the preemption quantum/frequency so more real work fits in
+  one boot's practical time budget.
 
 ## Repository scope
 
