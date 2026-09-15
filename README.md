@@ -315,6 +315,35 @@ riscv64) unless noted:**
   root cause is not yet found. x86_64 and aarch64 are unaffected;
   `scripts/qemu-fault-isolation-test.sh riscv64` runs with a documented
   `--allow-fail` in CI so this stays visible without blocking the pipeline.
+  A prior live-GDB session (WSL, `qemu-system-riscv64 -s -S` + `gdb-
+  multiarch`) narrowed the exact fault to `ra` pointing inside
+  `AtomicUsize::load`'s own compiler-generated memory-ordering jump table,
+  called from `compositor-bin`'s own `BumpAllocator::alloc` — i.e., the
+  VERY FIRST real heap allocation `subsystem_main` makes. **Continued
+  2026-09-16, with one real disproof and one real new finding**: with a
+  fully rebuilt, current `compositor-bin`, a live breakpoint on the exact
+  `jr a0` instruction inside `atomic_load`'s own jump-table dispatch
+  (`0xc000e14c`) caught a REAL, successful execution of this path —
+  `a0 = 0xc000e150`, matching the table's own correctly-populated static
+  contents exactly (`x/2gx` confirmed the live memory matches the file on
+  disk) — disproving "the jump table itself is corrupted/unrelocated" as
+  a general, constant explanation; at least one real invocation of this
+  exact dispatch works correctly. Continuing to wait for the ACTUAL fault
+  (removing that breakpoint, arming one on `common_trap_entry` with
+  `$scause == 0xc` instead) ran for 20+ real minutes of genuine QEMU CPU
+  time (confirmed alive and running throughout, not hung) without ever
+  reaching it — a striking contrast to the original 2026-09-xx live
+  session, which reportedly hit the identical fault "almost instantly."
+  This strongly suggests the bug's own reproducibility is now entangled
+  with the SAME growing QEMU scheduling-capacity pressure documented
+  above (more real subsystems now compete for one vCPU than when this bug
+  was first live-debugged) — not a fixed, deterministic condition
+  anymore. Whoever continues this should either wait considerably longer
+  under live GDB, or — likely more productive — resolve the scheduling-
+  capacity item first, then return to this with the concrete jump-table
+  lead above already in hand rather than re-deriving it. Investigation
+  scripts and a fresh disassembly are preserved at `/tmp/simurgh-debug`
+  in WSL for whoever picks this up next.
 - **aarch64 only, newly found (2026-09-12):** `security-broker-intermediary`
   (the Issue #28 capability-minting demo) crashes the boot right after
   `security-broker` itself is spawned — `unsafe precondition(s) violated:
