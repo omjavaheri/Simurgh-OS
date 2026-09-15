@@ -208,6 +208,14 @@ static BACKUP_MANAGER_ELF: &[u8] = include_bytes!(env!("BACKUP_MANAGER_ELF_PATH"
 /// path-stitch reason.
 static DIAGNOSTICS_MANAGER_ELF: &[u8] = include_bytes!(env!("DIAGNOSTICS_MANAGER_ELF_PATH"));
 
+/// `log-collector-native-bin`'s own separately-built ELF image — unlike
+/// every other subsystem ELF near this one, IN-TREE (`subsystems/log-
+/// collector-native`, this same repo) — the real, kernel-side Log
+/// Collector service `simurgh-diagnostics::diagnostics-manager`'s own
+/// long-existing `RealLogCollector` client transport had no peer to talk
+/// to until this crate existed (see that repo's own README).
+static LOG_COLLECTOR_ELF: &[u8] = include_bytes!(env!("LOG_COLLECTOR_ELF_PATH"));
+
 /// `store-bin`'s own separately-built ELF image — same packaging as
 /// `DIAGNOSTICS_MANAGER_ELF` (see its own doc comment): the SIXTH
 /// layer-4 process this project spawns (`simurgh-store`, a separate git
@@ -1330,6 +1338,15 @@ mod sys {
     /// 2026-09-12), so a silently-broken DAG resolution or a broken real
     /// spawn left zero observable trace on real hardware before this.
     pub const IN_REPORT: usize = 127;
+    /// `a0` = `1` iff `simurgh-diagnostics`'s own real log-collector
+    /// round-trip demo (push one real event via `ReportEvent`, pull it
+    /// back via `NextEvent`, confirm it decodes to the SAME event)
+    /// succeeded, `0` otherwise; `a1` unused. A SEPARATE opcode from
+    /// `DG_REPORT` (which reports an unrelated, already-existing
+    /// simulated-network-send proof) — see `simurgh-diagnostics::
+    /// diagnostics-manager::subsystem_entry::real_log_collector_round_
+    /// trip_demo`'s own doc comment for the full reasoning.
+    pub const DG_LC_REPORT: usize = 128;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3971,7 +3988,15 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             let account_manager_tid_x86 = spawn_account_manager_x86(kernel_arch_glue::khal());
             let backup_manager_tid_x86 = spawn_backup_manager_x86(kernel_arch_glue::khal());
             kernel_arch_glue::set_backup_manager_tid(backup_manager_tid_x86);
-            kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager_x86(kernel_arch_glue::khal()));
+            let diagnostics_manager_tid_x86 = spawn_diagnostics_manager_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_diagnostics_manager_tid(diagnostics_manager_tid_x86);
+            // log-collector-native's own real peer edge — see
+            // `wire_log_collector_to_diagnostics_manager_x86`'s own doc
+            // comment for why this is x86_64-only for this first pass.
+            let log_collector_tid_x86 = spawn_log_collector_native_x86(kernel_arch_glue::khal());
+            if let (Some(lc_tid), Some(dg_tid)) = (log_collector_tid_x86, diagnostics_manager_tid_x86) {
+                wire_log_collector_to_diagnostics_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), lc_tid, dg_tid);
+            }
             let store_tid_x86 = spawn_store_x86(kernel_arch_glue::khal());
             kernel_arch_glue::set_native_loader_tid(spawn_native_loader_x86(kernel_arch_glue::khal()));
             let policy_engine_tid_x86 = spawn_policy_engine_x86(kernel_arch_glue::khal());
@@ -4148,6 +4173,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::DG_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "diagnostics-manager (U-mode, x86_64): simulated POST http://localhost:1366 (batch size {a0}), simulated response status={a1}\r\n"
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DG_LC_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "diagnostics-manager (U-mode, x86_64): real log-collector-native round trip (report then retrieve one real event) succeeded={}\r\n",
+                a0 == 1
             ));
             return TrapOutcome::Resume(0);
         }
@@ -4674,6 +4706,40 @@ fn spawn_diagnostics_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): diagnostics-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `log-collector-native-bin` — the real, kernel-side Log
+/// Collector service (`LOG_COLLECTOR_ELF`'s own doc comment). Same shape
+/// as `spawn_diagnostics_manager_x86`, x86_64-only for this first pass
+/// (`wire_log_collector_to_diagnostics_manager_x86`'s own doc comment).
+#[cfg(target_arch = "x86_64")]
+fn spawn_log_collector_native_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const LOG_COLLECTOR_STACK_VMA: usize = 0xC04B_0000;
+    const LOG_COLLECTOR_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        LOG_COLLECTOR_ELF,
+        elf_loader::machine::EM_X86_64,
+        LOG_COLLECTOR_STACK_VMA,
+        LOG_COLLECTOR_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned log-collector-native (tid {}) from its OWN separately-built ELF image (in-tree, Simurgh-OS repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): log-collector-native spawn skipped (out of resources)\r\n"
             ));
             None
         }
@@ -5418,6 +5484,86 @@ fn wire_ui_core_to_file_manager_x86(
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): ui-core<->file-manager wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires log-collector-native's real `Endpoint` into diagnostics-
+/// manager's own capability space, plus one shared message+bulk page
+/// into both — `simurgh-diagnostics::diagnostics-manager::subsystem_
+/// entry`'s own already-fixed client constants (`LC_ENDPOINT_CAP = 0`,
+/// `LC_SHARED_VA = 0xD940_0000`) chose these values before this server
+/// existed; `log-collector-native::subsystem_entry`'s own `SHARED_VA`
+/// confirms the same VA on the server's own side (this function's own
+/// `server_va` argument below).
+///
+/// **x86_64-only for this first pass** — same conservative convention
+/// `wire_ui_core_to_file_manager_x86`/`wire_file_manager_to_fs_native`
+/// established for every OTHER brand-new real IPC edge in this project:
+/// prove one architecture end-to-end via real QEMU verification before
+/// wiring the other two (`simurgh-init`'s own VFS read client is the
+/// most recent precedent for this exact reasoning).
+///
+/// Only ONE real client is wired (`wire_service_endpoint`'s own doc
+/// comment: "Not yet multi-client-safe"): diagnostics-manager exercises
+/// BOTH of log-collector-native's real opcodes itself (`ReportEvent`
+/// then `NextEvent`, a real push-then-pull round trip — see that repo's
+/// own README for why this is the deliberately narrower v1 scope, not a
+/// live device-manager crash feed).
+#[cfg(target_arch = "x86_64")]
+fn wire_log_collector_to_diagnostics_manager_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    log_collector_tid: kernel_cap::ThreadId,
+    diagnostics_manager_tid: kernel_cap::ThreadId,
+) {
+    const LOG_COLLECTOR_SHARED_VA: usize = 0xD940_0000;
+    let Some(lc_tcb) = k.tcb(log_collector_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (could not resolve log-collector's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (lc_cs, lc_addr_space) = (lc_tcb.cap_space, lc_tcb.addr_space);
+    let Some(dg_tcb) = k.tcb(diagnostics_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (could not resolve diagnostics-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (dg_cs, dg_addr_space) = (dg_tcb.cap_space, dg_tcb.addr_space);
+    let Some(lc_root_pt) = k.addr_space_mut(lc_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (could not resolve log-collector's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(dg_root_pt) = k.addr_space_mut(dg_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (could not resolve diagnostics-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        lc_cs,
+        lc_root_pt,
+        LOG_COLLECTOR_SHARED_VA,
+        dg_cs,
+        dg_root_pt,
+        LOG_COLLECTOR_SHARED_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired log-collector-native <-> diagnostics-manager real IPC edge\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (out of resources)\r\n"
             ));
         }
     }

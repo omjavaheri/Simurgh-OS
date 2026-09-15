@@ -35,6 +35,7 @@ members = [
     "subsystems/netstack",
     "subsystems/compositor",
     "subsystems/mm-service",
+    "subsystems/log-collector-native",
     "subsystems/security-broker-intermediary",
     "kernel-stub",
     "uefi-bootloader",

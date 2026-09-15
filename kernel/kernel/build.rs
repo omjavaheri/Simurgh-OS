@@ -230,6 +230,35 @@ fn main() {
         mm_service_path.canonicalize().unwrap().display()
     );
 
+    // Same as above, for `log-collector-native-bin` (04-System-Services-
+    // Policy-Layer-v2.md §2.2) — the real Log Collector service, another
+    // real IPC SERVER (like fs-native/compositor/mm-service), and the
+    // real peer `simurgh-diagnostics`'s own long-existing client
+    // transport (`RealLogCollector`, a separate, out-of-tree repo) talks
+    // to.
+    let log_collector_build_alias = format!("cargo xbuild-subsystem-log-collector-native-{target_arch}");
+    let log_collector_path = std::path::PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("target")
+        .join(dm_target_dir_name)
+        .join("debug")
+        .join("log-collector-native-bin");
+
+    if !log_collector_path.exists() {
+        panic!(
+            "kernel build.rs: log-collector-native-bin binary not found at {} (target_arch = {target_arch}).\n\
+             Build it first with: {log_collector_build_alias}",
+            log_collector_path.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", log_collector_path.display());
+    println!(
+        "cargo:rustc-env=LOG_COLLECTOR_ELF_PATH={}",
+        log_collector_path.canonicalize().unwrap().display()
+    );
+
     // Same as above, for `security-broker-bin` — the first LAYER-4 process
     // this project spawns as a real Simurgh-OS subsystem (REPO-simurgh-
     // security-broker.md §1), not a layer-3 one. Unlike every ELF above,

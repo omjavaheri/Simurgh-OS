@@ -232,6 +232,13 @@ xbuild-subsystem-compositor-riscv64 = "build -p compositor --bin compositor-bin 
 xbuild-subsystem-mm-service-x86_64  = "build -p mm-service --bin mm-service-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-mm-service-aarch64 = "build -p mm-service --bin mm-service-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 xbuild-subsystem-mm-service-riscv64 = "build -p mm-service --bin mm-service-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the real Log Collector service's own separately-built
+# ELF (04-System-Services-Policy-Layer-v2.md §2.2) — another real IPC
+# SERVER (like fs-native/compositor/mm-service), the real peer
+# `simurgh-diagnostics`'s own long-existing client transport talks to.
+xbuild-subsystem-log-collector-native-x86_64  = "build -p log-collector-native --bin log-collector-native-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-log-collector-native-aarch64 = "build -p log-collector-native --bin log-collector-native-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-log-collector-native-riscv64 = "build -p log-collector-native --bin log-collector-native-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 # Same shape, for the CapGrant/CapRevoke intermediary's own separately-
 # built ELF (Issue #28) — another real IPC SERVER (like fs-native/
 # compositor/mm-service), and the first process that itself issues a real

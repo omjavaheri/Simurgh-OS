@@ -46,7 +46,8 @@ Simurgh-OS/
 │                         vfs-service/, netstack, compositor (real
 │                         DisplayProtocol: surfaces, zero-copy CommitBuffer,
 │                         real keyboard/mouse polling, real output query),
-│                         mm-service, security-broker-intermediary (03 §4)
+│                         mm-service, log-collector-native (04 §2.2),
+│                         security-broker-intermediary (03 §4)
 │
 ├── kernel-stub/         minimal microkernel stand-in for the pure HAL (01 §8) smoke test
 ├── targets/             custom no_std JSON target specs
@@ -92,7 +93,7 @@ scripts/qemu-smoke.sh <x86_64|aarch64|riscv64>   # boot + assert the HAL handoff
 # each in-repo subsystem, per architecture (must be built before the real
 # kernel, which embeds their ELFs via include_bytes! — driver-i8042/
 # driver-mouse are x86_64-only, no such legacy PC hardware on aarch64/riscv64):
-cargo xbuild-subsystem-<device-manager|fs-native|driver-virtio-blk|driver-virtio-net|netstack|compositor|mm-service|security-broker-intermediary>-<arch>
+cargo xbuild-subsystem-<device-manager|fs-native|driver-virtio-blk|driver-virtio-net|netstack|compositor|mm-service|log-collector-native|security-broker-intermediary>-<arch>
 cargo xbuild-subsystem-driver-i8042-x86_64
 cargo xbuild-subsystem-driver-mouse-x86_64
 
@@ -142,13 +143,16 @@ riscv64) unless noted:**
   sharing of a single physical frame across two spaces.
 - **Layer 3 subsystems:** `device-manager`, `fs-native`,
   `driver-virtio-blk`, `driver-virtio-net`, `driver-i8042`, `driver-mouse`,
-  `driver-nvme`, `netstack`, `compositor`, `mm-service`, and
-  `security-broker-intermediary` are each a real, separately-built ELF
-  process (not a linked-in library) spawned via the generic
-  `kernel_arch_glue::spawn_process`/`spawn_process_from_elf` path,
-  exercised by the real `kernel` binary on all three architectures
-  (`driver-i8042`/`driver-mouse`/`driver-nvme` are x86_64-only — no such
-  hardware exists on aarch64/riscv64).
+  `driver-nvme`, `netstack`, `compositor`, `mm-service`,
+  `log-collector-native`, and `security-broker-intermediary` are each a
+  real, separately-built ELF process (not a linked-in library) spawned
+  via the generic `kernel_arch_glue::spawn_process`/
+  `spawn_process_from_elf` path, exercised by the real `kernel` binary
+  on all three architectures (`driver-i8042`/`driver-mouse`/
+  `driver-nvme`/`log-collector-native` are x86_64-only — the first three
+  because no such hardware exists on aarch64/riscv64, `log-collector-
+  native` as a deliberate, conservative first pass for a brand-new real
+  IPC edge — see the dedicated bullet below).
 - **Real NVMe block driver** (x86_64 only): a real NVMe controller is
   discovered by PCI class code (not vendor id, unlike every virtio
   device), and `driver-nvme` speaks the real Admin/I/O queue protocol
@@ -253,6 +257,29 @@ riscv64) unless noted:**
   interrupt is only delivered once some real thread is genuinely blocked
   waiting for it — see `kernel_arch_glue::mouse_irq_trampoline`'s own doc
   comment for the full story.
+
+- **Real Log Collector service (`log-collector-native`, 2026-09-15,
+  x86_64 only)**: `04-System-Services-Policy-Layer-v2.md` §2.2's
+  layer-3 mechanism half, and the first real peer `simurgh-diagnostics`
+  (a separate repo) ever had — that repo's own `RealLogCollector` client
+  transport existed complete and tested with nothing on the other end
+  (confirmed by direct research before this crate existed: no
+  `LogCollector` code anywhere in this repo). Two real opcodes on one
+  `Endpoint`: `NextEvent` (drains the oldest queued event) and
+  `ReportEvent` (enqueues one, captured verbatim as an opaque byte blob
+  — this server never parses a single `RawCrashEvent` field, since it
+  never needs to, `log-collector-native::log_wire`'s own module doc
+  comment has the full reasoning); a real, bounded (8-entry,
+  oldest-evicted-first) FIFO queue. Wired the same `wire_service_
+  endpoint` way every other single-client real edge in this project
+  uses (`wire_ui_core_to_file_manager_x86`'s own precedent) — real QEMU
+  confirmed the grant + shared-page mapping succeed and boot proceeds
+  cleanly afterward with zero panics, though `simurgh-diagnostics`'s own
+  round-trip proof (push one real event, pull it back, confirm it
+  matches) was not directly observed within two independent 150s boot
+  windows — the same already-known, already-accepted QEMU
+  scheduling-capacity limit this project's other real edges have hit at
+  this system's current scale.
 
 **Known open issues:**
 

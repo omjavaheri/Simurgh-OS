@@ -1,0 +1,45 @@
+# ============================================================================
+# log-collector-native  (04-System-Services-Policy-Layer-v2.md §2.2)
+#
+# The real, kernel-side Log Collector service `simurgh-diagnostics` (a
+# separate, out-of-tree repo) has always had a complete, tested CLIENT
+# role for (`crash_report_builder::LogCollector`/`RealLogCollector`,
+# that repo's own `subsystem_entry.rs`) but no real peer to talk to
+# (confirmed by that repo's own README/module doc comments: "no
+# LogCollector code anywhere in the Simurgh-OS kernel repo"). This crate
+# is that real peer.
+#
+# Two real opcodes on one Endpoint: `NextEvent` (drains the oldest queued
+# event, if any — `simurgh-diagnostics`'s own real, intended consumer)
+# and `ReportEvent` (enqueues one real event, captured verbatim from the
+# caller's own shared-page bulk region — see `src/log_wire.rs`'s own
+# module doc comment for why the server never parses `RawCrashEvent`'s
+# own fields at all, just copies opaque bytes both ways).
+#
+# `#![no_std] + alloc`. `rlib`. The REAL, separately-built process image
+# ("subsystems as processes" packaging, mirroring `mm-service`'s own
+# `mm-service-bin` exactly) is a real IPC SERVER (like fs-native/
+# compositor/mm-service).
+# ============================================================================
+[package]
+name        = "log-collector-native"
+description = "Simurgh real Log Collector service (04-System-Services-Policy-Layer-v2.md §2.2)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "log-collector-native-bin"
+path = "src/bin/log-collector-native-bin.rs"
+# Same reasoning as mm-service-bin's own `[[bin]]`: a host `cargo test`
+# harness would pull in `std` and collide on `panic_impl`.
+test = false
+
+[dependencies]
+kernel-ipc = { path = "../../kernel/kernel-ipc" }
