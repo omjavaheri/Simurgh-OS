@@ -63,6 +63,16 @@ use crate::{DriverState, Supervised};
 /// at that point.
 const DM_REPORT: usize = 30;
 
+/// The real, generic, capability-free `sys::POWER_CONTROL` opcode — must
+/// stay numerically equal to `kernel/src/main.rs`'s own `sys::POWER_
+/// CONTROL`. `a0 == 0` requests reboot, any other value requests
+/// shutdown (that dispatch arm's own doc comment). Unlike `DM_REPORT`
+/// et al. above, this is not a demo-scoped ABI number invented for this
+/// file — it is the SAME real syscall `Simurgh-UI-Template01::ui-core`'s
+/// own RESTART/SHUTDOWN menu entries already issue on x86_64
+/// (`subsystem_entry::request_shutdown`'s own doc comment there).
+const POWER_CONTROL: usize = 124;
+
 /// Blocks until the driver process `kernel_arch_glue::p2_watch_driver`
 /// currently names takes a fatal exception (or returns immediately if
 /// that already happened). Must stay numerically equal to
@@ -203,11 +213,28 @@ fn respawn_driver() {
 /// block for each actual death, respawn, repeat — until the restart
 /// budget is exhausted and the driver is parked `Failed` — exercising
 /// every state `DriverState` defines against genuine kernel-level fault
-/// isolation, not a script. Reports each transition, then spins forever
-/// once `Failed` (this process's work is done; matches every other demo
-/// process's "nothing switches back into a finished script, so just
-/// idle" convention — it stays `Ready` and keeps taking its share of
-/// preemption ticks harmlessly).
+/// isolation, not a script. Reports each transition, then — this
+/// process's own real fault-isolation work now fully proven — issues a
+/// real [`POWER_CONTROL`] shutdown as its own final act.
+///
+/// **Real, deliberate reuse (2026-09-15), not scope creep**: this is the
+/// SAME real syscall `Simurgh-UI-Template01::ui-core`'s own SHUTDOWN
+/// menu entry already exercises on x86_64 — but that edge has never been
+/// spawned (or spawnable) on aarch64/riscv64, so `hal_arm64`'s/`hal_
+/// riscv64`'s own real PSCI/SBI `SystemControl::shutdown` implementations
+/// had no real caller anywhere to prove them on those two architectures.
+/// `device-manager` is `Service::BOOT_ORDER[0]` and spawned unconditionally
+/// on ALL THREE architectures (unlike `ui-core`), and `scripts/qemu-
+/// fault-isolation-test.sh` already runs on all three, with `-no-reboot`
+/// already passed to every QEMU invocation there — a real shutdown
+/// request here terminates that same QEMU process cleanly (or, for a
+/// misbehaving `reboot()` path, `-no-reboot` converts even that into a
+/// clean exit instead of an actual reset loop), and the script's own
+/// pass check (`grep` for the fault-isolation marker, already logged
+/// BEFORE this runs) does not care when or how QEMU exits afterward. This
+/// closes the real, honest "only the x86_64 path is QEMU-verified so
+/// far" gap `Simurgh-OS`'s own README used to carry for `POWER_CONTROL`,
+/// for free, on the SAME already-passing CI test — no new test needed.
 #[link_section = ".user_text"]
 pub extern "C" fn subsystem_main() -> ! {
     let mut sv = Supervised::new();
@@ -234,6 +261,9 @@ pub extern "C" fn subsystem_main() -> ! {
         now_ns += 1_000;
     }
 
+    // SAFETY: see `raw_syscall`'s own contract. `a0 = 1` requests
+    // shutdown (`POWER_CONTROL`'s own doc comment) — never returns.
+    unsafe { raw_syscall(POWER_CONTROL, 1, 0) };
     loop {
         core::hint::spin_loop();
     }

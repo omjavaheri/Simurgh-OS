@@ -207,8 +207,32 @@ riscv64) unless noted:**
   genuine i8042 keyboard-controller reset pulse (reboot) or ACPI `PM1a_CNT`
   write (shutdown), confirmed by QEMU itself exiting the moment the syscall
   runs; aarch64 uses real PSCI (`smc`), riscv64 the real SBI System Reset
-  Extension (`ecall`) — both real hardware standards, though only the x86_64
-  path is QEMU-verified so far.
+  Extension (`ecall`) — both real hardware standards. **A real caller now
+  exists on all three architectures (2026-09-15)**: `device-manager`
+  (`Service::BOOT_ORDER[0]`, spawned unconditionally everywhere, unlike
+  `Simurgh-UI-Template01::ui-core`'s own SHUTDOWN menu entry, which is
+  x86_64-only) issues a real shutdown as its own final act once its
+  fault-isolation demo reaches `Failed` — reusing the exact same
+  already-verified `POWER_CONTROL` syscall, on the SAME already-passing
+  `scripts/qemu-fault-isolation-test.sh` (which already passes
+  `-no-reboot` to every QEMU invocation there, so a real shutdown or
+  reboot request both terminate that QEMU process cleanly, and the
+  script's own pass check — a `grep` for the fault-isolation marker,
+  already logged before this runs — is unaffected either way). Real,
+  honest status: this has NOT yet been directly observed firing on any
+  architecture — `device-manager` itself was not observed reaching
+  `Failed` within any of this session's own QEMU attempts (up to 400
+  real seconds on x86_64), the same already-accepted QEMU
+  scheduling-capacity limit this project's README has documented at
+  length elsewhere, now visibly worse as more real subsystems compete
+  for one vCPU. Real QEMU boots on all three architectures DID confirm
+  zero regression from this change: x86_64 stays panic-free through the
+  identical point every other recent boot already reached; aarch64 and
+  riscv64 each hit their own, already-documented, unrelated open bugs
+  (the aarch64 `security-broker-intermediary` crash and the riscv64
+  compositor instruction-page-fault, both below) at the SAME points they
+  always have, confirming this change did not introduce or move either
+  failure.
 - **Real compute-device discovery (`hal_core::compute::
   ComputeDeviceDiscovery`)**, QEMU-verified on all three architectures
   (2026-09-12): the boot summary now prints a real `compute devices` count
