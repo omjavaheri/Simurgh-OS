@@ -1347,6 +1347,18 @@ mod sys {
     /// diagnostics-manager::subsystem_entry::real_log_collector_round_
     /// trip_demo`'s own doc comment for the full reasoning.
     pub const DG_LC_REPORT: usize = 128;
+    /// `a0` = `1` iff `simurgh-native-sdk`'s own real `de-framework::
+    /// display::DisplayClient` round trip to Compositor (`CreateSurface`
+    /// -> `CommitBuffer` -> `QueryOutputs` -> `DestroySurface`, all via
+    /// `sys::IPC_CALL`) succeeded, `0` otherwise; `a1` names which step
+    /// failed when it did not (`0..=3` in that same order). A SECOND,
+    /// independent real Compositor client alongside `ui-core`'s own
+    /// (`UI_REPORT`) — proves `de-framework`'s own `DisplayClient` trait
+    /// has a real, working transport now, not just the mock every host
+    /// test exercised until this opcode existed. Same "prove a real
+    /// value, not just survival" reasoning `NL_REPORT`'s own doc comment
+    /// gives.
+    pub const NL_DISPLAY_REPORT: usize = 129;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -4183,6 +4195,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             ));
             return TrapOutcome::Resume(0);
         }
+        sys::NL_DISPLAY_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "native-loader (U-mode, x86_64): real de-framework DisplayClient round trip to Compositor (CreateSurface->CommitBuffer->QueryOutputs->DestroySurface) succeeded={}, failed_step={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
         sys::SPAWN_KNOWN_ELF => {
             let k = kernel_arch_glue::kstate();
             let caller = k.sched.running().unwrap_or(k.root_thread);
@@ -4819,6 +4838,16 @@ fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::T
             ));
             wire_native_loader_to_security_broker_x86(hal, k, tid, cap_space);
             wire_security_broker_notification_fanin_x86(hal, k, cap_space);
+            // Called AFTER the notification fan-in above, not before: that
+            // call's own grant must land at the ALREADY-ESTABLISHED slot 1
+            // (`SB_NOTIF_CAP` in `simurgh-native-sdk::native-loader::
+            // subsystem_entry`, a fixed constant real code already relies
+            // on) — each cap-space grant is a deterministic, sequential
+            // free-list allocation (this file's own `wire_security_broker_
+            // notification_fanin_x86` doc comment), so inserting a THIRD
+            // grant ahead of the notification's own would silently shift
+            // it to slot 2 and break that already-working edge.
+            wire_native_loader_to_compositor_x86(hal, k, tid, cap_space);
             // `sys::SPAWN_FROM_BUFFER`'s own real app-upload buffer
             // (`APP_BUFFER_VA`'s own doc comment) — real-IPC plan style
             // wiring, but no capability at all (`kernel_arch_glue::
@@ -4913,6 +4942,60 @@ fn wire_native_loader_to_security_broker_x86(
         )),
         None => kernel_arch_glue::log(format_args!(
             "root task (x86_64): native-loader<->security-broker wiring skipped (out of resources)\r\n"
+        )),
+    }
+}
+
+/// Wires a THIRD, independent real client to Compositor —
+/// `simurgh-native-sdk`'s own `native-loader`, proving `de-framework::
+/// display::DisplayClient` has a real transport (this repo's own README
+/// used to flag this as "still library-only... no IPC transport to the
+/// Compositor Service yet"). Reuses `kernel_arch_glue::wire_ui_core_to_
+/// compositor` as-is — that function is already generic over the target
+/// cap space/address space/VAs despite its name (it just derives another
+/// grant of Compositor's own Endpoint, this project's own established
+/// "second/third independent client" pattern `wire_file_manager_to_fs_
+/// native` set the precedent for). Safe to call here because Compositor's
+/// own root-task demo (`compositor_demo_start`) always completes earlier
+/// in this same boot sequence, well before `spawn_native_loader_x86`
+/// itself runs — the same "never concurrent callers" reasoning `spawn_
+/// ui_core_x86`'s own call to this function already relies on. Reuses
+/// `UI_CORE_COMPOSITOR_SHARED_VA`/`UI_CORE_COMPOSITOR_FB_VA` — safe to
+/// reuse the exact same VAs `ui-core` maps them at, since every process
+/// has its own independent address space (no collision possible between
+/// two different processes' own page tables).
+#[cfg(target_arch = "x86_64")]
+fn wire_native_loader_to_compositor_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    native_loader_tid: kernel_cap::ThreadId,
+    native_loader_cs: kernel_cap::CapSpaceId,
+) {
+    let Some(nl_tcb) = k.tcb(native_loader_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->Compositor wiring skipped (could not resolve native-loader's own TCB)\r\n"
+        ));
+        return;
+    };
+    let nl_addr_space = nl_tcb.addr_space;
+    let Some(nl_root_pt) = k.addr_space_mut(nl_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->Compositor wiring skipped (could not resolve native-loader's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_ui_core_to_compositor(
+        hal,
+        native_loader_cs,
+        nl_root_pt,
+        UI_CORE_COMPOSITOR_SHARED_VA,
+        UI_CORE_COMPOSITOR_FB_VA,
+    ) {
+        Some(()) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired native-loader <-> Compositor real IPC edge (de-framework DisplayClient)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->Compositor wiring skipped (Compositor not ready or out of resources)\r\n"
         )),
     }
 }

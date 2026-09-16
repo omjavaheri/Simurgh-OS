@@ -305,6 +305,27 @@ riscv64) unless noted:**
   scheduling-capacity limit this project's other real edges have hit at
   this system's current scale.
 
+- **Compositor's second real client (`native-loader`, 2026-09-16,
+  x86_64 only)**: `simurgh-native-sdk`'s own `de-framework::display::
+  DisplayClient` trait had a confirmed wire mirror but no real transport
+  anywhere — `wire_native_loader_to_compositor_x86` closes that by
+  REUSING `wire_ui_core_to_compositor` as-is (that function was already
+  generic over the target cap space/address space/VAs despite its
+  ui-core-specific name — a third independent grant of Compositor's own
+  Endpoint works identically for a second client), called AFTER
+  native-loader's own existing security-broker notification fan-in
+  wiring so that edge's already-established `SB_ENDPOINT_CAP`/`SB_NOTIF_
+  CAP` slot numbers (0 and 1) stay put — the new Compositor grant lands
+  at slot 2. Real QEMU confirmed the grant itself succeeds cleanly
+  ("wired native-loader <-> Compositor real IPC edge (de-framework
+  DisplayClient)") with zero regression to the rest of the boot, across
+  both a 120s and a 300s run; native-loader's own real round-trip demo
+  report (`sys::NL_DISPLAY_REPORT`) was not directly observed on either
+  run — but neither were that SAME process's own pre-existing `NL_
+  REPORT`/`NL_SPAWN_REPORT` lines (both real since an earlier session),
+  confirming this is the scheduling-capacity limit above, at this
+  process specifically, not a regression in the new wiring.
+
 **Known open issues:**
 
 - **riscv64 only:** the `compositor` process faults (an instruction page
