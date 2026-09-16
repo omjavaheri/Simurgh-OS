@@ -1374,6 +1374,24 @@ mod sys {
     /// "prove a real value, not just survival" reasoning `NL_REPORT`'s
     /// own doc comment gives.
     pub const DRV_NVME_PROBE_REPORT: usize = 130;
+    /// `a0` = `1` iff `driver-virtio-blk`'s own real `VirtioBlk::probe()`
+    /// succeeded, `0` otherwise; `a1` = the real `DeviceInfo::
+    /// sector_count` it returned when it did, `0` otherwise. Same
+    /// "`subsystem_main` used to discard `probe()`'s own real `Result`
+    /// entirely" gap [`DRV_NVME_PROBE_REPORT`]'s own doc comment
+    /// describes, found via the same audit. x86_64 dispatch only for
+    /// now (this opcode's own real caller is spawned on all three
+    /// architectures when a Block-kind peripheral is discovered, but
+    /// only x86_64 gets a dispatch arm here today — aarch64/riscv64 are
+    /// a real, honest follow-up, not silently dropped).
+    pub const DRV_VBLK_PROBE_REPORT: usize = 131;
+    /// `a0` = `1` iff `driver-virtio-net`'s own real `VirtioNet::
+    /// probe()` succeeded, `0` otherwise; `a1` unused (no real
+    /// `DeviceInfo`-equivalent value for a network device — `probe`'s
+    /// own success is the only real signal). Same reasoning and same
+    /// "x86_64 dispatch only for now" scope as [`DRV_VBLK_PROBE_REPORT`]'s
+    /// own doc comment.
+    pub const DRV_VNET_PROBE_REPORT: usize = 132;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -4220,6 +4238,20 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::DRV_NVME_PROBE_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "driver-nvme (U-mode, x86_64): real Nvme::probe() (BAR0/queue MMIO handshake) succeeded={}, sector_count={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DRV_VBLK_PROBE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "driver-virtio-blk (U-mode, x86_64): real VirtioBlk::probe() succeeded={}, sector_count={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DRV_VNET_PROBE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "driver-virtio-net (U-mode, x86_64): real VirtioNet::probe() succeeded={}\r\n",
                 a0 == 1
             ));
             return TrapOutcome::Resume(0);

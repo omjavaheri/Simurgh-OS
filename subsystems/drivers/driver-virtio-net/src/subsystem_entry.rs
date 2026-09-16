@@ -415,9 +415,21 @@ fn new_driver_for_this_transport() -> crate::VirtioNet {
 /// boot), every request answers `Failed { code: ProbeFailed }` — mirrors
 /// `driver-virtio-blk::subsystem_entry::subsystem_main`'s own documented
 /// behavior exactly.
+///
+/// **Real probe() reporting (2026-09-16, x86_64 only)**: same fix, same
+/// scope, same "no kernel dispatch arm on aarch64/riscv64 yet" honesty
+/// note as `driver-virtio-blk::subsystem_entry::subsystem_main`'s own
+/// identical doc comment — reported via `sys::DRV_VNET_PROBE_REPORT`.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut drv = new_driver_for_this_transport();
+    #[cfg(target_arch = "x86_64")]
+    {
+        const DRV_VNET_PROBE_REPORT: usize = 132;
+        // SAFETY: `raw_syscall`'s own contract. Never blocks.
+        unsafe { raw_syscall(DRV_VNET_PROBE_REPORT, drv.probe().is_ok() as usize, 0) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     let _ = drv.probe();
 
     loop {

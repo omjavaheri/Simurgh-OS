@@ -177,6 +177,27 @@ riscv64) unless noted:**
   nvme's own thread competing with an ever-growing set of real
   subsystems for one vCPU), not a regression in this change. No real
   consumer (a filesystem) is wired to it yet either.
+- **`driver-virtio-blk`/`driver-virtio-net` probe() reporting (2026-09-16,
+  x86_64 dispatch only)**: same gap and same fix as `driver-nvme`'s own
+  bullet above, found via the same audit — both drivers' own
+  `subsystem_main` discarded `probe()`'s own real `Result` entirely
+  (`let _ = drv.probe();`), on every architecture each is spawned on
+  (unlike NVMe, both are cross-arch). `sys::DRV_VBLK_PROBE_REPORT`/
+  `DRV_VNET_PROBE_REPORT` now report the real outcome, but ONLY have a
+  kernel dispatch arm on x86_64 today — issuing either on aarch64/riscv64
+  would hit an unhandled syscall, so the report call itself is `#[cfg(
+  target_arch = "x86_64")]`-gated at the call site, a real, honest scope
+  cut rather than a silent one. The standard fault-isolation test suite
+  (no block/network device attached at all) confirms zero regression
+  (identical serial output to before this change); a real, ad-hoc QEMU
+  boot with `-device virtio-blk-pci`/`-device virtio-net-pci` attached
+  confirmed both devices are really discovered and usable (root task's
+  own existing block read/write and ARP/ICMP demos both still pass), but
+  neither driver's own separately-spawned process was observed reaching
+  its own `probe()`/report point within a 240s window — this project's
+  own already-accepted QEMU scheduling-capacity variance, consistent
+  with every other recently-added report opcode this session, not a
+  regression.
 - **Real per-process fault isolation** (`03 §5.2`): a deliberately faulting
   driver process is terminated by the kernel without affecting any other
   process; `device-manager` supervises it end to end — starts it, detects the

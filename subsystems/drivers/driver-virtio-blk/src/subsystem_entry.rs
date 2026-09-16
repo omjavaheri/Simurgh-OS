@@ -389,9 +389,33 @@ fn new_driver_for_this_transport() -> crate::VirtioBlk {
 /// ever receives is answered `Failed { code: ProbeFailed }` — the
 /// process still runs and answers IPC (so a client waiting on `Call`
 /// never hangs), it simply never becomes ready.
+///
+/// **Real probe() reporting (2026-09-16, x86_64 only)**: `probe()`'s
+/// own real `Result` used to be discarded entirely (`let _ = drv.
+/// probe();`), the same observability gap found and fixed across
+/// `driver-nvme`/`driver-virtio-net` in the same audit — reported via
+/// `sys::DRV_VBLK_PROBE_REPORT` now. x86_64 only: this opcode has no
+/// kernel dispatch arm on aarch64/riscv64 yet (`DRV_VBLK_PROBE_REPORT`'s
+/// own doc comment in `Simurgh-OS/kernel/kernel/src/main.rs`), so
+/// issuing it there would hit an unhandled syscall — gated accordingly.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut drv = new_driver_for_this_transport();
+    #[cfg(target_arch = "x86_64")]
+    {
+        const DRV_VBLK_PROBE_REPORT: usize = 131;
+        match drv.probe() {
+            Ok(info) => {
+                // SAFETY: `raw_syscall`'s own contract. Never blocks.
+                unsafe { raw_syscall(DRV_VBLK_PROBE_REPORT, 1, info.sector_count as usize) };
+            }
+            Err(_) => {
+                // SAFETY: `raw_syscall`'s own contract. Never blocks.
+                unsafe { raw_syscall(DRV_VBLK_PROBE_REPORT, 0, 0) };
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     let _ = drv.probe();
 
     loop {
