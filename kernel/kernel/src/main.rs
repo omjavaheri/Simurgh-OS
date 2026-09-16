@@ -1392,6 +1392,19 @@ mod sys {
     /// "x86_64 dispatch only for now" scope as [`DRV_VBLK_PROBE_REPORT`]'s
     /// own doc comment.
     pub const DRV_VNET_PROBE_REPORT: usize = 132;
+    /// `a0` = `1` iff `simurgh-store`'s own real (simulated) catalog
+    /// lookup succeeded, `0` otherwise; `a1` = how many packages were
+    /// resolved this way during `self_check`. Same "point this at a
+    /// placeholder address and simulate the round trip — no real TCP/IP
+    /// stack is reachable from a bare-metal Simurgh-OS user process
+    /// today" convention Omid's own 2026-09-10 direction already
+    /// established for `simurgh-diagnostics::DG_REPORT` (a REAL
+    /// wall-clock delay via `NOW_NS`, not a fixed spin count, followed by
+    /// a simulated success) — `PackageLookup` was the one seam in
+    /// `simurgh-store` still exercised only against `SelfCheckCatalog`
+    /// even on real hardware; this closes that gap the same
+    /// already-established way, not a new invention.
+    pub const ST_CATALOG_REPORT: usize = 133;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -4252,6 +4265,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::DRV_VNET_PROBE_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "driver-virtio-net (U-mode, x86_64): real VirtioNet::probe() succeeded={}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::ST_CATALOG_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "store (U-mode, x86_64): real (simulated) catalog lookup round trip succeeded={}, packages_resolved={a1}\r\n",
                 a0 == 1
             ));
             return TrapOutcome::Resume(0);
