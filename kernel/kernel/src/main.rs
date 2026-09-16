@@ -1405,6 +1405,20 @@ mod sys {
     /// even on real hardware; this closes that gap the same
     /// already-established way, not a new invention.
     pub const ST_CATALOG_REPORT: usize = 133;
+    /// `a0` = how many real crash reports `simurgh-diagnostics`'s own
+    /// real periodic-flush scheduler just queued via `poll_log_
+    /// collector`; `a1` = `1` iff `flush_pending_reports` was then
+    /// actually attempted (only when something was pending), `0`
+    /// otherwise. Fired once per scheduler TICK that actually found real
+    /// work to do — not every idle tick (same "only report when
+    /// something real happened" discipline `simurgh-backup-manager::
+    /// BM_REPORT`'s own scheduler loop already established), so this
+    /// stays a real, honest signal rather than log spam. Closes the real
+    /// gap this crate's own README long flagged: `flush_pending_reports`
+    /// existed and was tested, but nothing called it on a real interval
+    /// — `subsystem_main` used to prove the underlying IPC mechanism
+    /// once (`DG_LC_REPORT`) then just park forever.
+    pub const DG_FLUSH_REPORT: usize = 134;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -4273,6 +4287,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             kernel_arch_glue::log(format_args!(
                 "store (U-mode, x86_64): real (simulated) catalog lookup round trip succeeded={}, packages_resolved={a1}\r\n",
                 a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DG_FLUSH_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "diagnostics-manager (U-mode, x86_64): real periodic-flush scheduler tick queued {a0} report(s), flush attempted={}\r\n",
+                a1 == 1
             ));
             return TrapOutcome::Resume(0);
         }
