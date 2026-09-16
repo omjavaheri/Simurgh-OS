@@ -4118,6 +4118,20 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             if let (Some(fm_tid), Some(ui_tid)) = (file_manager_tid_x86, ui_core_tid_x86) {
                 wire_ui_core_to_file_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), fm_tid, ui_tid);
             }
+            // ui-core <-> profile-policy real switch_profile edge
+            // (2026-09-16): same "wire after both spawn" pattern as the
+            // login/browse edges above. The Endpoint grant (`wire_ui_
+            // core_to_policy_engine_x86`) must run BEFORE the notification
+            // fan-in upgrade (`wire_policy_engine_notification_fanin_
+            // x86`) — that call's own Notification grant must land at the
+            // NEXT free slot, after this edge's own Endpoint — see either
+            // function's own doc comment.
+            if let (Some(ui_tid), Some(pe_tid)) = (ui_core_tid_x86, policy_engine_tid_x86) {
+                wire_ui_core_to_policy_engine_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), ui_tid, pe_tid);
+            }
+            if let (Some(pe_tid), Some(store_tid), Some(ui_tid)) = (policy_engine_tid_x86, store_tid_x86, ui_core_tid_x86) {
+                wire_policy_engine_notification_fanin_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), pe_tid, store_tid, ui_tid);
+            }
             // Real i8042 keyboard input, Stage B (this project's own
             // real-input-handling plan): spawns `driver-i8042` as a real
             // isolated process, binds it to the real IRQ1 (8259-PIC-
@@ -5442,6 +5456,126 @@ fn wire_store_to_policy_engine_x86(
                 "root task (x86_64): store<->profile-policy wiring skipped (out of resources)\r\n"
             ));
         }
+    }
+}
+
+/// Wires the `Simurgh-UI-Template01::ui-core` <-> `simurgh-profile-policy`
+/// real `switch_profile` IPC edge (Omid's own 2026-09-16 direction: a
+/// PROFILE submenu in `ui-core`, one entry per real `ProfileKind`) — a
+/// SECOND real `Endpoint` into policy-engine's own cap space, lands at
+/// slot 1 (slot 0 already holds `store`'s own compatibility-check
+/// `Endpoint`, `wire_store_to_policy_engine_x86`'s own doc comment).
+/// Same "takes both tids as explicit parameters" shape as that function
+/// for the identical reason — policy-engine has no `G_*_TID_X86` global.
+/// Must run AFTER `wire_store_to_policy_engine_x86` (slot ordering) and
+/// BEFORE `wire_policy_engine_notification_fanin_x86` (that function's
+/// own Notification grant must land at slot 2, after this edge's own
+/// Endpoint).
+#[cfg(target_arch = "x86_64")]
+fn wire_ui_core_to_policy_engine_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    ui_core_tid: kernel_cap::ThreadId,
+    policy_engine_tid: kernel_cap::ThreadId,
+) {
+    const POLICY_ENGINE_UI_VA: usize = 0xD960_0000;
+    const UI_CORE_PP_VA: usize = 0xD890_0000;
+    let Some(pe_tcb) = k.tcb(policy_engine_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->profile-policy wiring skipped (could not resolve policy-engine's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (pe_cs, pe_addr_space) = (pe_tcb.cap_space, pe_tcb.addr_space);
+    let Some(ui_tcb) = k.tcb(ui_core_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->profile-policy wiring skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (ui_cs, ui_addr_space) = (ui_tcb.cap_space, ui_tcb.addr_space);
+    let Some(pe_root_pt) = k.addr_space_mut(pe_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->profile-policy wiring skipped (could not resolve policy-engine's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_root_pt) = k.addr_space_mut(ui_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->profile-policy wiring skipped (could not resolve ui-core's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        pe_cs,
+        pe_root_pt,
+        POLICY_ENGINE_UI_VA,
+        ui_cs,
+        ui_root_pt,
+        UI_CORE_PP_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired ui-core <-> profile-policy real IPC edge (switch_profile)\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core<->profile-policy wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the shared `Notification` fan-in (real-IPC plan Phase 2) across
+/// `simurgh-profile-policy` and its now-TWO real clients (`store`'s own
+/// compatibility-check edge, `ui-core`'s own new `switch_profile` edge
+/// above) — policy-engine went from one direct-`Call` client (no fan-in
+/// needed, `wire_store_to_policy_engine_x86`'s own doc comment) to two,
+/// the same upgrade `simurgh-security-broker`'s own fan-in already went
+/// through for an identical reason. Lands at slot 2 in policy-engine's
+/// own cap space (slots 0/1 already hold the two `Endpoint`s above).
+///
+/// Bit assignment (a plain caller-defined `u64` OR-mask — the kernel
+/// never interprets it, same convention every other fan-in in this
+/// project already uses): `STORE_BIT = 1`, `UI_CORE_BIT = 2`.
+#[cfg(target_arch = "x86_64")]
+fn wire_policy_engine_notification_fanin_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    policy_engine_tid: kernel_cap::ThreadId,
+    store_tid: kernel_cap::ThreadId,
+    ui_core_tid: kernel_cap::ThreadId,
+) {
+    let Some(pe_cs) = k.tcb(policy_engine_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): profile-policy notification fan-in skipped (could not resolve policy-engine's own TCB)\r\n"
+        ));
+        return;
+    };
+    let Some(store_cs) = k.tcb(store_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): profile-policy notification fan-in skipped (could not resolve store's own TCB)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_cs) = k.tcb(ui_core_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): profile-policy notification fan-in skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let targets = [pe_cs, store_cs, ui_cs];
+    match kernel_arch_glue::wire_notification(hal, k.root_thread, &targets, kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE) {
+        Some(_) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired profile-policy notification fan-in (store, ui-core)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): profile-policy notification fan-in skipped (out of resources)\r\n"
+        )),
     }
 }
 
