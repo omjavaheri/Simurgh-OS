@@ -161,10 +161,22 @@ riscv64) unless noted:**
   `-device nvme` attached, the controller is discovered, a real
   capability is granted, and the driver process is spawned with its BAR0
   window and all five queue/data pages really mapped — with no effect on
-  the rest of the boot. The controller's own real register handshake
-  succeeding is not yet directly observable in the boot log (a documented
-  next step, `driver-nvme`'s own module doc comment) — no real consumer
-  (a filesystem) is wired to it yet either.
+  the rest of the boot. **Real probe() reporting (2026-09-16)**: closes
+  the "not yet directly observable" gap this bullet used to name —
+  `subsystem_main` used to discard `probe()`'s own real `Result`
+  entirely (`let _ = drv.probe();`); a new `sys::DRV_NVME_PROBE_REPORT`
+  opcode now reports the real outcome (`a0` = succeeded, `a1` =
+  `sector_count`). Confirmed via a real, ad-hoc QEMU boot with `-device
+  nvme` attached (not part of the standard test suite, which has no
+  block device at all): "spawn_nvme_driver: driver-nvme spawned (real
+  BAR0 + queue pages mapped, no client wired yet)" confirms the real
+  controller IS discovered and the process IS spawned with real state;
+  the `DRV_NVME_PROBE_REPORT` line itself was not directly observed
+  within a 240s window — the same already-accepted QEMU scheduling-
+  capacity variance this README documents at length elsewhere (driver-
+  nvme's own thread competing with an ever-growing set of real
+  subsystems for one vCPU), not a regression in this change. No real
+  consumer (a filesystem) is wired to it yet either.
 - **Real per-process fault isolation** (`03 §5.2`): a deliberately faulting
   driver process is terminated by the kernel without affecting any other
   process; `device-manager` supervises it end to end — starts it, detects the

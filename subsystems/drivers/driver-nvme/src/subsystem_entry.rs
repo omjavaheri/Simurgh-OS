@@ -174,22 +174,49 @@ macro_rules! zero {
     }};
 }
 
+/// Must stay numerically equal to `Simurgh-OS/kernel/kernel/src/
+/// main.rs`'s `sys::DRV_NVME_PROBE_REPORT` — reports `probe()`'s own
+/// real result to the kernel (this process has no serial-write access
+/// of its own, matching every other real U-mode subsystem's own "state
+/// report" opcode). Real, new: `subsystem_main` used to discard
+/// `probe()`'s own real `Result` entirely (`let _ = drv.probe();`) — the
+/// real capability grant and BAR0/queue-page mapping (`kernel_arch_
+/// glue::spawn_nvme_driver`) were already proven end to end in an
+/// earlier session, but nothing let `probe()`'s own real outcome reach
+/// the serial log. Every request this process serves was already
+/// answering honestly either way (`Failed { code: ProbeFailed }` on
+/// failure, this function's own doc comment below) — this closes an
+/// observability gap, not a correctness one.
+const DRV_NVME_PROBE_REPORT: usize = 130;
+
 /// The NVMe driver's process entry point. Runs `probe()` exactly once
-/// against the (design-stage, not-yet-really-granted — this file's own
-/// module doc comment) BAR0/queue regions, then serves REAL
+/// against the real, granted BAR0/queue regions (`kernel_arch_glue::
+/// spawn_nvme_driver`'s own doc comment — the capability grant and page
+/// mapping are real; whether `probe()` itself then succeeds depends on
+/// a real NVMe controller actually being present at boot), reports the
+/// real outcome via [`DRV_NVME_PROBE_REPORT`], then serves REAL
 /// `DriverRequest`s forever: `Recv`, decode, dispatch to the real
 /// `Nvme`, encode, `Reply`.
 ///
-/// If `probe()` fails (today, ALWAYS — no real capability grant exists
-/// yet), every request this process ever receives is answered `Failed {
-/// code: ProbeFailed }`, the same graceful "still answers IPC, never
-/// hangs a caller" behavior `driver_virtio_blk::subsystem_entry::
-/// subsystem_main`'s own doc comment describes for its own identical
-/// case.
+/// If `probe()` fails (no NVMe controller discovered, or the real MMIO
+/// handshake itself failed), every request this process ever receives
+/// is answered `Failed { code: ProbeFailed }`, the same graceful "still
+/// answers IPC, never hangs a caller" behavior `driver_virtio_blk::
+/// subsystem_entry::subsystem_main`'s own doc comment describes for its
+/// own identical case.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut drv = driver_nvme_instance();
-    let _ = drv.probe();
+    match drv.probe() {
+        Ok(info) => {
+            // SAFETY: `raw_syscall`'s own contract. Never blocks.
+            unsafe { raw_syscall(DRV_NVME_PROBE_REPORT, 1, info.sector_count as usize) };
+        }
+        Err(_) => {
+            // SAFETY: `raw_syscall`'s own contract. Never blocks.
+            unsafe { raw_syscall(DRV_NVME_PROBE_REPORT, 0, 0) };
+        }
+    }
 
     loop {
         // SAFETY: `raw_syscall2`'s own contract.

@@ -1359,6 +1359,21 @@ mod sys {
     /// value, not just survival" reasoning `NL_REPORT`'s own doc comment
     /// gives.
     pub const NL_DISPLAY_REPORT: usize = 129;
+    /// `a0` = `1` iff `driver-nvme`'s own real `Nvme::probe()` (the real
+    /// MMIO register/queue handshake against the granted BAR0 window)
+    /// succeeded, `0` otherwise; `a1` = the real `DeviceInfo::
+    /// sector_count` it returned when it did, `0` otherwise. Before this
+    /// opcode, `subsystem_main` discarded `probe()`'s own real `Result`
+    /// entirely (`let _ = drv.probe();`) — the real capability grant and
+    /// BAR0/queue-page mapping (`kernel_arch_glue::spawn_nvme_driver`)
+    /// were already proven end to end in an earlier session, but nothing
+    /// let `probe()`'s own real outcome reach the serial log; every
+    /// request this process serves before this opcode existed already
+    /// answered honestly (`Failed { code: ProbeFailed }` on any failure),
+    /// so this closes an observability gap, not a correctness one. Same
+    /// "prove a real value, not just survival" reasoning `NL_REPORT`'s
+    /// own doc comment gives.
+    pub const DRV_NVME_PROBE_REPORT: usize = 130;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -4198,6 +4213,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::NL_DISPLAY_REPORT => {
             kernel_arch_glue::log(format_args!(
                 "native-loader (U-mode, x86_64): real de-framework DisplayClient round trip to Compositor (CreateSurface->CommitBuffer->QueryOutputs->DestroySurface) succeeded={}, failed_step={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DRV_NVME_PROBE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "driver-nvme (U-mode, x86_64): real Nvme::probe() (BAR0/queue MMIO handshake) succeeded={}, sector_count={a1}\r\n",
                 a0 == 1
             ));
             return TrapOutcome::Resume(0);
