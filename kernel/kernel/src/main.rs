@@ -4092,40 +4092,62 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         }
         sys::DRV_IRQ_WAIT => {
             let hal = kernel_arch_glue::khal();
-            // Discovered ONCE, before the retry loop below — see
-            // riscv64's own identical `sys::DRV_IRQ_WAIT` arm (this
-            // file) and `kernel_arch_glue::drv_irq_wait_step`'s own doc
-            // comment for why re-discovering it on every iteration is a
-            // real bug, not a harmless simplification.
+            // Discovered ONCE, up front, and passed into BOTH calls
+            // below — see riscv64's own identical `sys::DRV_IRQ_WAIT` arm
+            // (this file) and `kernel_arch_glue::drv_irq_wait_step`'s own
+            // doc comment for why re-discovering it after a `Blocked`
+            // outcome is a real bug, not a harmless simplification:
+            // `do_wait`'s own `note_blocked` clears `sched.running()`, so
+            // a second generic re-discovery would silently fall back to
+            // `root_thread`.
             let caller = kernel_arch_glue::kstate()
                 .sched
                 .running()
                 .unwrap_or(kernel_arch_glue::kstate().root_thread);
-            // Real interrupt-driven idle wait — mirrors riscv64's/
-            // aarch64's own `sys::DRV_IRQ_WAIT` arm exactly (see either's
-            // own doc comment for the full rationale), substituting
-            // hal-x86_64's own `hlt_wait_for_irq()` (`sti; hlt; cli`,
-            // Ring 0's HLT-based idle) for hal_riscv64/hal_arm64's own
-            // `wfi()` — both gate the SAME class of "trap taken while
-            // already at the target privilege level" case; the LAPIC is
-            // already primed by `hal_x86_64_rust_entry`'s own
-            // `InterruptCtrl::bootstrap_current_core` call (unconditional
-            // at boot, not gated on this driver ever running), and the
-            // MSI-X vector this device's own interrupt uses was
-            // programmed by `wire_virtio_pci_transport` at spawn time.
-            loop {
-                match kernel_arch_glue::drv_irq_wait_step(hal, caller, a0 as u32) {
-                    kernel_arch_glue::IrqWaitOutcome::Ready(bits) => {
-                        return TrapOutcome::Resume(bits as usize);
-                    }
-                    kernel_arch_glue::IrqWaitOutcome::Blocked => {
-                        hal_x86_64::cpu::hlt_wait_for_irq();
-                    }
-                    kernel_arch_glue::IrqWaitOutcome::Error => {
-                        return TrapOutcome::Resume(0);
+            // Real interrupt-driven wait. **Real bug found via QEMU
+            // (2026-09-17)**: this arm used to loop in Ring 0 on
+            // `hal_x86_64::cpu::hlt_wait_for_irq()` (`sti; hlt; cli`)
+            // until the awaited IRQ arrived. That deterministically hung
+            // the ENTIRE boot right after `device-manager` reached
+            // `state=Running` — `driver-i8042`/`driver-mouse` wait on
+            // PS/2 keyboard/mouse IRQs that never arrive in an automated
+            // QEMU run (nobody types), so the core parked forever with
+            // ~20 other real subsystems sitting `Ready`, and the LAPIC
+            // one-shot preemption timer died the first time a tick landed
+            // at CPL 0 (`common_timer_entry` skips the `TickHandler` —
+            // the only thing that re-arms — for a Ring-0 tick). See
+            // `kernel_arch_glue::drv_irq_wait_yield`'s own doc comment for
+            // the full root-cause writeup of both interlocking halves.
+            //
+            // Correct behaviour is the same one `p2_wait_general` already
+            // uses for every OTHER blocking `Wait`: the driver thread is
+            // genuinely `Blocked`, so hand the CPU to whatever `pick_next`
+            // finds and let the IRQ trampoline's own `wake_blocked` make
+            // it runnable again. The LAPIC is already primed by
+            // `hal_x86_64_rust_entry`'s own `InterruptCtrl::bootstrap_
+            // current_core` call, and the MSI-X vector this device's own
+            // interrupt uses was programmed by `wire_virtio_pci_transport`
+            // at spawn time; U-mode threads run with `RFLAGS.IF = 1`
+            // (`init_user_context`), so switching to one keeps interrupts
+            // deliverable strictly MORE of the time than the old
+            // `sti`-`hlt`-`cli` window did.
+            return match kernel_arch_glue::drv_irq_wait_step(hal, caller, a0 as u32) {
+                kernel_arch_glue::IrqWaitOutcome::Ready(bits) => {
+                    TrapOutcome::Resume(bits as usize)
+                }
+                kernel_arch_glue::IrqWaitOutcome::Blocked => {
+                    match kernel_arch_glue::drv_irq_wait_yield(hal, caller) {
+                        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                        // Nothing else `Ready` — `drv_irq_wait_yield` has
+                        // already undone the block, so resuming with 0 is
+                        // a harmless immediate retry (the driver re-issues
+                        // `DRV_IRQ_WAIT`), exactly as `p2_wait_general`'s
+                        // own identical fallback does.
+                        None => TrapOutcome::Resume(0),
                     }
                 }
-            }
+                kernel_arch_glue::IrqWaitOutcome::Error => TrapOutcome::Resume(0),
+            };
         }
         sys::P2_PREEMPT_START => {
             // The cooperative §8.4 round-trip is done; spawn the fault-

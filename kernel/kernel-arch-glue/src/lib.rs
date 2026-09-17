@@ -7973,6 +7973,72 @@ pub fn drv_irq_wait_step(hal: &HalInterface, caller: ThreadId, notif_cap: u32) -
     }
 }
 
+/// Completes an [`IrqWaitOutcome::Blocked`] by handing the CPU to
+/// whatever `pick_next` finds, instead of idling the core in kernel
+/// context — the switch half of `DRV_IRQ_WAIT`, mirroring
+/// [`p2_wait_general`]'s own `Blocked` arm exactly (same `pick_next` →
+/// `dispatch` → `user_ctx_switch_ptrs` shape, same `note_ready` +
+/// re-`dispatch` fallback when nothing else is `Ready`).
+///
+/// **Real bug found via QEMU** (2026-09-17) — this function exists to
+/// fix a total, deterministic x86_64 boot stall right after
+/// `device-manager` reaches `state=Running`. [`p2_wait_general`]'s own
+/// doc comment asserted that `drv_irq_wait_step` was "correct only
+/// because a driver waiting on its OWN hardware IRQ genuinely has
+/// nothing else to do"; that premise is false, and was the bug. The
+/// *driver thread* has nothing else to do, but the *CPU* does: roughly
+/// twenty other real subsystems are `Ready` at that point in the boot.
+/// The old `kernel/src/main.rs` `DRV_IRQ_WAIT` arm looped in Ring 0 on
+/// `hal_x86_64::cpu::hlt_wait_for_irq` (`sti; hlt; cli`) until the
+/// awaited IRQ arrived — but `driver-i8042`/`driver-mouse` wait on
+/// PS/2 keyboard/mouse IRQs that NEVER arrive in an automated QEMU run,
+/// because nobody types. That parked the whole core forever.
+///
+/// The same comment's own escape hatch — "would instead starve every
+/// other Ready thread *until the timer eventually preempts it*" — could
+/// never fire either, because of a second, interlocking defect: the
+/// LAPIC preemption timer is a genuine one-shot under TCG (no
+/// TSC-deadline support, so `Timer::set_oneshot` falls back to
+/// `write_initial_count`, which does not auto-reload), and
+/// `hal_x86_64::cpu::common_timer_entry` returns WITHOUT calling the
+/// `TickHandler` when a tick lands at CPL 0 — and the `TickHandler`
+/// (`p2_tick`) is the only thing that re-arms the deadline. So the
+/// first tick that landed inside that Ring-0 halt loop silently killed
+/// the preemption timer for the rest of the boot. Observed CPU state at
+/// the stall was exactly `HLT=1 CPL=0 RFL=0x246` — literally the `hlt`
+/// inside `hlt_wait_for_irq`, interrupts enabled, timer dead.
+///
+/// Switching away instead of halting fixes both halves at once: other
+/// threads keep running, and because U-mode contexts are started with
+/// `RFLAGS.IF = 1` (`init_user_context`), every later timer tick lands
+/// at CPL 3, where the `TickHandler` really does run and really does
+/// re-arm. IRQ delivery is not weakened by dropping the `sti`-`hlt`
+/// window — a running U-mode thread has interrupts enabled
+/// continuously, which is strictly wider than that window was.
+///
+/// Returns `Some((save, into))` for `TrapOutcome::SwitchTo`, or `None`
+/// (→ resume the caller) when nothing else is `Ready`; in the `None`
+/// case the caller's block is UNDONE first, so it is never left
+/// `Blocked` in the scheduler's bookkeeping while actually running —
+/// the same silent-corruption class [`p2_wait_general`] and
+/// `KernelState::block_thread` each already guard.
+pub fn drv_irq_wait_yield(hal: &HalInterface, caller: ThreadId) -> Option<(*mut u8, *const u8)> {
+    let k = kstate();
+    let now = hal.now_ns();
+    // `drv_irq_wait_step`'s own `do_wait` already committed `caller` as
+    // `Blocked` (its `note_blocked`), so `pick_next` cannot return it.
+    let Some(next) = k.sched.pick_next(now) else {
+        let _ = k.sched.note_ready(caller, now);
+        let _ = k.sched.dispatch(caller, now);
+        return None;
+    };
+    if next == caller {
+        return None;
+    }
+    let _ = k.sched.dispatch(next, now);
+    k.user_ctx_switch_ptrs(caller, next)
+}
+
 /// Busy-park forever. The in-kernel demo threads have nothing to return
 /// to once their part is done; a real service would loop on `Recv`.
 fn park() -> ! {

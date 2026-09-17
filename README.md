@@ -442,40 +442,104 @@ riscv64) unless noted:**
 
 **Known open issues:**
 
-- **x86_64 — a real, pre-existing full scheduler stall right after
-  `device-manager` reaches `state=Running`, newly discovered (2026-09-17)
-  while chasing an unrelated `fm-core` bug.** Every real report/log line
-  downstream of that point (diagnostics, store, shell, ui-core,
-  file-manager, the whole TERMINAL edge) simply never appears — not
-  occasional QEMU scheduling-capacity flakiness (the already-documented,
-  accepted characteristic above), a genuine, total, reproducible hang: 4
-  real QEMU runs at 240s+ each, with/without PS/2, at 512M/1024M, never
-  produced one further log line. **Confirmed via a real bisection this is
-  NOT a regression from anything built today** — it reproduces
-  identically on `4d53dab` (the last commit before this session's work
-  started) and on current `HEAD`. It has plausibly been present, silent,
-  and masked by this project's own "boot far enough to see the new
-  feature's own log line, call it verified" testing habit for some time —
-  nobody previously waited the necessary 200+ real seconds PAST
-  `device-manager`'s own report to notice nothing after it ever runs.
-  QEMU monitor evidence at the stall (from the agent that first found
-  this while investigating the `fm-core` Write bug): vCPU `HLT=1`,
-  `CPL=0`, `RFL=0x246` (interrupts enabled but halted, 0% host CPU); PIC
-  state `pic0: irr=05 imr=f9 isr=02` — IRQ1 stuck IN-SERVICE with no EOI
-  ever issued, IRQ0 masked; disabling the PS/2 controller entirely did
-  NOT clear it, so the stuck PIC is a SYMPTOM, not the cause — the real
-  LAPIC timer (vector 32, TSC-deadline) appears to simply stop ticking
-  sometime after `"arming preemptive timer ... armed: true"` (the last
-  scheduler-relevant log line before every stalled run). Plausibly
-  related to the same preemptive-timer/i8042-IRQ area the `driver-mouse`/
-  `driver-i8042` work touched, but NOT yet confirmed — that is a
-  hypothesis from the log evidence, not a root-caused finding. Not yet
-  investigated further. This is a genuinely high-priority bug: it silently
-  blocks EVERY real IPC edge and report this project has built for the
-  second half of the x86_64 boot sequence from ever being observed live,
-  which calls into question how much of this session's own "QEMU-
-  verified" status for recent features actually completed a full
-  round trip vs. simply not having run long enough to hit this stall yet.
+- ~~**x86_64 — a real, pre-existing full scheduler stall right after
+  `device-manager` reaches `state=Running`**~~ — **ROOT-CAUSED AND FIXED
+  (2026-09-17)**, on a real x86_64 OVMF/QEMU boot. It was never a PIC or
+  LAPIC *programming* bug: it was a Ring-0 CPU-monopolization deadlock,
+  formed by two interlocking defects.
+
+  **Defect 1 (the blocker).** `kernel/src/main.rs`'s own `sys::DRV_IRQ_
+  WAIT` arm serviced a driver's IRQ wait by looping **in Ring 0** on
+  `hal_x86_64::cpu::hlt_wait_for_irq()` (`sti; hlt; cli`) until the
+  awaited interrupt arrived. `drv_irq_wait_step` correctly marked the
+  calling thread `Blocked`, but the kernel then parked the whole core
+  there instead of returning to the scheduler. `driver-i8042` and
+  `driver-mouse` — both spawned immediately before the stall point, as
+  every stalled boot log shows — wait on PS/2 keyboard/mouse IRQs that
+  **never arrive in an automated QEMU run, because nobody types**. So the
+  first of them to be scheduled parked the CPU permanently, with roughly
+  twenty other real subsystems sitting `Ready` behind it.
+  `p2_wait_general`'s own doc comment had already written the false
+  premise down in as many words — that `drv_irq_wait_step` was "correct
+  only because a driver waiting on its OWN hardware IRQ genuinely has
+  nothing else to do." The *driver thread* has nothing else to do; the
+  *CPU* has plenty.
+
+  **Defect 2 (why nothing rescued it).** That same comment's escape
+  hatch — "would instead starve every other Ready thread *until the timer
+  eventually preempts it*" — could never fire. Under TCG there is no
+  TSC-deadline support, so `Timer::set_oneshot` falls back to
+  `write_initial_count`, a genuine one-shot with no auto-reload; and
+  `hal_x86_64::cpu::common_timer_entry` returns WITHOUT invoking the
+  `TickHandler` when a tick lands at CPL 0 — while `p2_tick`, the
+  `TickHandler`, is the only thing that re-arms the deadline. So the
+  first timer tick that landed inside that Ring-0 halt loop silently
+  killed the preemption timer for the remainder of the boot.
+
+  **Own QEMU evidence** (independent of the original report, which it
+  confirms and extends): at the stall, `RIP=0x18400d2` — and
+  `llvm-nm` places `hal_x86_64::cpu::hlt_wait_for_irq` at exactly
+  `0x18400d0`, i.e. the core is halted two bytes into that function's own
+  `sti; hlt; cli`. `RFL=0x246` (IF=1), `CPL=0`, `HLT=1`, 0% host CPU.
+  `pic0: irr=05 imr=f9 isr=02` reproduced byte-for-byte; additionally
+  `pic1: irr=10 isr=00` — the mouse's own IRQ12 latched and pending on
+  the slave, unable to cascade through the master's IRQ2 while IRQ1 sat
+  stuck IN-SERVICE. Both stuck-PIC observations are downstream symptoms
+  of the halted core, exactly as the original report suspected, not the
+  cause.
+
+  **Fix:** `kernel_arch_glue::drv_irq_wait_yield` — the switch half of
+  `DRV_IRQ_WAIT`, mirroring `p2_wait_general`'s own `Blocked` arm exactly
+  (`pick_next` → `dispatch` → `user_ctx_switch_ptrs`, with the same
+  `note_ready` + re-`dispatch` fallback that keeps a caller from being
+  stranded `Blocked`-but-actually-running when nothing else is `Ready`).
+  The x86_64 `DRV_IRQ_WAIT` arm now hands the CPU to the next runnable
+  thread instead of halting the core, and the IRQ trampoline's existing
+  `wake_blocked` makes the driver runnable again when its interrupt
+  really does arrive. This closes Defect 2 as a side effect rather than
+  papering over it: because U-mode contexts start with `RFLAGS.IF = 1`
+  (`init_user_context`), every later timer tick now lands at CPL 3, where
+  the `TickHandler` genuinely runs and genuinely re-arms. IRQ delivery is
+  not weakened by dropping the `sti`-`hlt` window either — a running
+  U-mode thread has interrupts enabled continuously, which is strictly
+  wider than that window ever was.
+
+  **QEMU-verified on real x86_64 OVMF boots.** Before: 268 serial lines,
+  frozen forever at `device-manager ... state=Running` — re-confirmed
+  here across a full 285-second run, with the halted-core register/PIC
+  evidence above captured from it, before any code changed. After: the
+  boot runs *past* that point through the complete fault-isolation cycle
+  — `state=Restarting` 1 through 5, then `state=Failed
+  restarts_in_window=6` — and on to `root task (x86_64): real
+  POWER_CONTROL syscall - shutdown`, with QEMU genuinely powering itself
+  off instead of hanging. 292 lines, reproduced twice; a 270-second
+  window proved unnecessary, because the whole boot now reaches shutdown
+  in **13 real seconds**. All three architectures still build clean
+  (`cargo xbuild-microkernel-{x86_64,aarch64,riscv64}`) and `cargo test
+  -p kernel-core`'s 40 tests pass.
+
+  **Note this also resolves the x86_64 half of the "QEMU scheduling
+  capacity at scale" issue below.** That entry's central complaint — that
+  `device-manager` was never once observed reaching its terminal
+  `state=Failed` marker on x86_64, not even in a 400-second run, putting
+  `scripts/qemu-fault-isolation-test.sh`'s own acceptance criterion out
+  of reach — was this deadlock, not TCG capacity. That marker is now
+  reached well inside a single ordinary run.
+
+  **Known remaining work, deliberately not swept:** `kernel/src/main.rs`'s
+  **aarch64** (`hal_arm64::cpu::wfi()`) and **riscv64**
+  (`hal_riscv64::cpu::wfi()`) `DRV_IRQ_WAIT` arms still carry the
+  IDENTICAL Ring-0 monopolization loop. `drv_irq_wait_yield` is
+  architecture-erased and is a drop-in replacement for both. They were
+  left for a follow-up that can give each architecture its own real QEMU
+  verification — the same deliberate stance the `retype_one_from_any_
+  untyped` sweep above took, and neither architecture currently reaches
+  the driver stage where it would bite (both have their own separate open
+  bugs, below). Separately, `common_timer_entry`'s Ring-0 tick still
+  drops the tick without re-arming; with this fix nothing on x86_64
+  leaves `RFLAGS.IF = 1` in Ring 0 any more, so it has no live trigger,
+  but it remains a real latent hazard worth closing on its own terms
+  rather than relying on that.
 - **riscv64 — the boot-blocking crash is RESOLVED (2026-09-17); a
   SEPARATE, newly-exposed fault remains open.** The real root cause of
   what years of investigation above characterized as "the compositor
@@ -588,8 +652,25 @@ riscv64) unless noted:**
   happens strictly AFTER all real work and after the fault-isolation PASS
   marker, so it blocks nothing; it was simply never reachable before
   because the boot died earlier. Not investigated.
-- **QEMU scheduling capacity at scale (x86_64) — getting worse, not yet
-  fixed, deliberately deferred (2026-09-15)**: with this many real
+- **QEMU scheduling capacity at scale (x86_64) — LARGELY SUPERSEDED
+  (2026-09-17); read the correction first.** The most alarming claim in
+  this entry — that `device-manager` was never once observed reaching its
+  terminal `state=Failed` marker across multiple real x86_64 boots,
+  including one given a full 400 real seconds — was **misdiagnosed**. It
+  was not TCG scheduling capacity at all; it was the Ring-0
+  `DRV_IRQ_WAIT` deadlock root-caused and fixed in the entry above, which
+  parked the core permanently a few lines after `device-manager` first
+  reached `state=Running`. With that fixed, the entire boot — including
+  the full six-restart fault-isolation cycle and
+  `scripts/qemu-fault-isolation-test.sh`'s own PASS marker — completes in
+  about 13 real seconds. The generic observation below (that a
+  newly-spawned process may not get a scheduling turn within a given
+  boot's window) may still hold to some degree at this scale, but every
+  concrete measurement cited here was taken through the deadlock and
+  should not be trusted as evidence of a fairness or capacity problem.
+  The original entry is kept verbatim below for history:
+
+  With this many real
   subsystems now competing for one emulated core under TCG, a
   newly-spawned process (e.g. `ui-core`, `driver-i8042`, `driver-mouse`)
   is not guaranteed to actually get scheduled within a single boot's
