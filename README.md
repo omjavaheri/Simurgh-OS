@@ -795,16 +795,48 @@ riscv64) unless noted:**
   scheduling-capacity effect documented below, not a regression. Use
   `QEMU_FAULT_TEST_TIMEOUT=300` on aarch64.
 
-  **Known remaining work, deliberately not swept:** roughly 20 OTHER
-  `untyped: CapId::new(0)` `Retype` sites remain in `kernel-arch-glue`
-  (`wire_service_endpoint`, `wire_notification`, the
-  compositor/mm/netstack/driver spawns, ...). They carry the IDENTICAL
-  latent bug and will fail the same way as the system grows.
-  `retype_one_from_any_untyped` is a drop-in replacement for every one of
-  them — mechanical, and strictly safer (it tries slot 0 first, so
-  behaviour is identical wherever the current code already succeeds). They
-  were left for a follow-up that can give all three architectures their
-  own full QEMU verification.
+  **The remaining sites are now swept too (2026-09-17, follow-up).** What
+  the entry above deferred as "roughly 20 OTHER `untyped: CapId::new(0)`
+  `Retype` sites" turned out to be **30 in total: 28 in
+  `kernel-arch-glue/src/lib.rs` plus 2 more that had been missed entirely
+  because they live in a DIFFERENT file** — `kernel/kernel/src/main.rs`'s
+  own `alloc_root_frame` (which every riscv64 `sys::MAP_PAGE` call goes
+  through) and its `sys::RETYPE_ENDPOINT` opcode. All 30 are now
+  `retype_one_from_any_untyped`, which is `pub` for exactly that reason.
+  Every call site was read in context first rather than blind-replaced;
+  none had any reason to be pinned to a specific region, so there are no
+  deliberate exceptions left.
+
+  Two things are deliberately NOT converted, and both are correct as they
+  stand: the 20 `untyped: CapId::new(0)` occurrences in
+  `kernel-core/src/syscall.rs` are all inside `#[cfg(test)] mod tests`,
+  where the fixture builds exactly ONE untyped region and naming slot 0
+  is precisely the intent; and `carve_from_any_untyped`'s own raw-carve
+  sites were already fixed in their own earlier pass.
+
+  **QEMU-verified on all three architectures, no regression anywhere.**
+  Every one still reaches `state=Failed restarts_in_window=6` and its own
+  real `POWER_CONTROL` shutdown: x86_64 311 serial lines with QEMU
+  powering itself off in ~13s, aarch64 296 lines, riscv64 173 lines. All
+  four Issue #28 proofs still appear on x86_64 and aarch64, and riscv64's
+  own `MAP_PAGE`/`XCHECK` zero-copy proof still reports `ALL THREE AGREE`
+  — that one matters specifically because it is the live exercise of the
+  `alloc_root_frame` conversion. `fs_read_result`,
+  `compositor_commit_verify` and both `mm_query_*` results still report
+  `MATCH`, and no log contains a single retype failure line. The boot
+  reports also show why this fix is not theoretical: the three
+  architectures see **80, 22 and 1** untyped regions respectively, so
+  x86_64 is running at `MAX_UNTYPED` saturation while riscv64 has a
+  single region (where the helper provably cannot change behaviour at
+  all, since it tries slot 0 first). `cargo test` stays green and all
+  three `cargo xbuild-microkernel-*` builds stay clean with no new
+  warnings.
+
+  One incidental improvement worth recording: aarch64 reached the PASS
+  marker inside a **150s** window here, where the entry above needed
+  300s. That is the documented QEMU scheduling-capacity variance, not a
+  claim that the timeout guidance has changed — `QEMU_FAULT_TEST_TIMEOUT=300`
+  is still the safe value to use on aarch64.
 
 - **aarch64, newly exposed by the fix above (2026-09-17), minor:** after
   `root task (aarch64): real POWER_CONTROL syscall - shutdown`, the boot

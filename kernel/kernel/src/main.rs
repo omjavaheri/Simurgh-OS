@@ -8551,32 +8551,29 @@ static mut LAST_MAPPED_FRAME: usize = 0;
 #[cfg(target_arch = "riscv64")]
 static mut LAST_MAPPED_FRAME_CAP: u32 = 0;
 
-/// Retypes one page-sized `Untyped` object from the Root Task's first
-/// `UntypedMemory` capability, returning both the new Frame capability
-/// (for `SyscallOp::Map`'s `frame` argument) and its physical base (for
-/// `XCHECK`'s kernel-side read — `Map` itself does not hand this back).
-/// `None` if the retype or the cap lookup fails.
+/// Retypes one page-sized `Untyped` object out of whichever of the Root
+/// Task's `UntypedMemory` capabilities still has room, returning both the
+/// new Frame capability (for `SyscallOp::Map`'s `frame` argument) and its
+/// physical base (for `XCHECK`'s kernel-side read — `Map` itself does not
+/// hand this back). `None` if no region has room, or the cap lookup fails.
+///
+/// This used to say "the Root Task's FIRST `UntypedMemory` capability"
+/// and hardcode `CapId::new(0)`, which is the same latent untyped-
+/// exhaustion bug that really did crash the aarch64 boot — see
+/// `kernel_arch_glue::retype_one_from_any_untyped`'s own doc comment for
+/// the full, gdb-confirmed story. Every riscv64 `sys::MAP_PAGE` call
+/// comes through here, so it would have failed the same way once slot
+/// 0's own fragment filled.
 #[cfg(target_arch = "riscv64")]
 fn alloc_root_frame(
     k: &mut kernel_core::KernelState,
     hal: &hal_core::HalInterface,
 ) -> Option<(kernel_cap::CapId, usize)> {
-    use kernel_core::{SyscallOp, SyscallReturn};
     use kernel_mm::KernelObjectType;
 
-    let cap = match k.dispatch(
-        k.root_thread,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: kernel_cap::CapId::new(0),
-            target_type: KernelObjectType::Untyped,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let root = k.root_thread;
+    let cap =
+        kernel_arch_glue::retype_one_from_any_untyped(k, hal, root, KernelObjectType::Untyped, 1)?;
     let uid = kernel_cap::UntypedId::new(
         k.cap_space(k.root_cap_space)
             .and_then(|t| t.lookup(cap))
@@ -9670,18 +9667,18 @@ fn simurgh_syscall(
             0
         }
         sys::RETYPE_ENDPOINT => {
-            match k.dispatch(
-                root,
-                hal.now_ns(),
-                SyscallOp::Retype {
-                    untyped: kernel_cap::CapId::new(0),
-                    target_type: KernelObjectType::Endpoint,
-                    count: 1,
-                },
+            // `retype_one_from_any_untyped`, not a hardcoded
+            // `CapId::new(0)` — see that helper's own doc comment for the
+            // real aarch64 boot crash a pinned slot 0 caused.
+            match kernel_arch_glue::retype_one_from_any_untyped(
+                k,
                 hal,
+                root,
+                KernelObjectType::Endpoint,
+                1,
             ) {
-                Ok(SyscallReturn::NewCaps { cap, .. }) => cap.as_u32() as usize,
-                _ => usize::MAX,
+                Some(cap) => cap.as_u32() as usize,
+                None => usize::MAX,
             }
         }
         sys::MAP_PAGE => {

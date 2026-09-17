@@ -457,7 +457,13 @@ fn carve_from_any_untyped(state: &mut KernelState, align: u64, bytes: u64) -> Op
 /// exhausted region fails in `UntypedMemory::retype` — the reservation
 /// step itself — so nothing is reserved, created, or leaked by an
 /// attempt that does not succeed.
-fn retype_one_from_any_untyped(
+///
+/// `pub` because `kernel/kernel/src/main.rs` carries two real `Retype`
+/// sites of its own (`alloc_root_frame`'s riscv64 page frame and the
+/// `sys::RETYPE_ENDPOINT` opcode) that had the exact same hardcoded
+/// slot 0 and therefore need the exact same fix — not because anything
+/// outside this workspace should call it.
+pub fn retype_one_from_any_untyped(
     state: &mut KernelState,
     hal: &HalInterface,
     caller: ThreadId,
@@ -2592,19 +2598,7 @@ pub fn p2_ipc_demo_start(
     server_entry_vma: usize,
 ) -> Option<(u32, *mut u8, *const u8)> {
     let k = kstate();
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: kernel_cap::CapId::new(0),
-            target_type: kernel_mm::KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1)?;
     let server = k.alloc_tcb(k.root_cap_space, k.root_addr_space)?;
     // SAFETY: single-core; written once here, read only by
     // `p2_preempt_start` (which retires this thread once the demo's own
@@ -3073,15 +3067,7 @@ pub fn wire_service_endpoint(
     rights: CapabilityRights,
 ) -> Option<CapId> {
     let k = kstate();
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Endpoint, count: 1 },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
 
     let src_cs = k.tcb(caller)?.cap_space;
     grant_cap_into(k, src_cs, ep_cap, server_cs, rights)?;
@@ -3129,15 +3115,7 @@ pub fn wire_service_endpoint(
 /// this file uses; this return value is for a boot-log line only).
 pub fn wire_notification(hal: &HalInterface, caller: ThreadId, targets: &[kernel_cap::CapSpaceId], rights: CapabilityRights) -> Option<CapId> {
     let k = kstate();
-    let notif_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Notification, count: 1 },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let notif_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)?;
 
     let src_cs = k.tcb(caller)?.cap_space;
     for &target_cs in targets {
@@ -3255,19 +3233,7 @@ pub fn fs_demo_start(
     expected_machine: u16,
 ) -> Option<(u32, *mut u8, *const u8)> {
     let k = kstate();
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
 
     const FS_STACK_VMA: usize = 0xC040_0000;
     const FS_STACK_LEN: usize = 4096 * 16;
@@ -3337,19 +3303,7 @@ pub fn fs_demo_start(
     // (the genuine capability object, not a bare untyped carve like the
     // SmallMessage page just above), proving the capability actually
     // works end to end, not just compiling.
-    let region_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::SharedRegion,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let region_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
     // Resolve the freshly retyped capability back to its own
     // `SharedRegion` description to learn the physical base `map_range`
     // below needs — `Retype`'s own `NewCaps` return only carries the
@@ -4034,19 +3988,7 @@ pub fn compositor_demo_start(
     expected_machine: u16,
 ) -> Option<(u32, *mut u8, *const u8)> {
     let k = kstate();
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
 
     const COMPOSITOR_STACK_VMA: usize = 0xC050_0000;
     const COMPOSITOR_STACK_LEN: usize = 4096 * 16;
@@ -4089,19 +4031,8 @@ pub fn compositor_demo_start(
     // contiguous pages, per `do_retype`'s own `SharedRegion`-specific
     // "count means pages in this region" semantic — see that constant's
     // own doc comment.
-    let fb_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::SharedRegion,
-            count: COMPOSITOR_FB_PAGES,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let fb_cap =
+        retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, COMPOSITOR_FB_PAGES)?;
     let fb_id = k.cap_space(src_cs)?.lookup(fb_cap)?.object.id;
     let fb_phys = k.shared_region(kernel_cap::SharedRegionId::new(fb_id.as_u32()))?.phys_base.as_usize();
     grant_cap_into(k, src_cs, fb_cap, comp_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
@@ -4127,19 +4058,8 @@ pub fn compositor_demo_start(
     // VA region already established). Same `COMPOSITOR_FB_PAGES` page
     // count as the frame buffer itself — see `COMPOSITOR_FB_PAGES`'s own
     // doc comment for why the two must match.
-    let confirm_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::SharedRegion,
-            count: COMPOSITOR_FB_PAGES,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let confirm_cap =
+        retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, COMPOSITOR_FB_PAGES)?;
     let confirm_id = k.cap_space(src_cs)?.lookup(confirm_cap)?.object.id;
     let confirm_phys =
         k.shared_region(kernel_cap::SharedRegionId::new(confirm_id.as_u32()))?.phys_base.as_usize();
@@ -4486,19 +4406,7 @@ pub fn mm_demo_start(
     expected_machine: u16,
 ) -> Option<(u32, *mut u8, *const u8)> {
     let k = kstate();
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
 
     const MM_STACK_VMA: usize = 0xC0B0_0000;
     const MM_STACK_LEN: usize = 4096 * 16;
@@ -5896,19 +5804,7 @@ pub fn spawn_virtio_blk_driver(
         unsafe { core::ptr::addr_of_mut!(G_DRV_MMIO_PHYS).write(mmio.phys_base as usize) };
     }
 
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
 
     const DRV_STACK_VMA: usize = 0xC080_0000;
     const DRV_STACK_LEN: usize = 4096 * 16;
@@ -5959,19 +5855,7 @@ pub fn spawn_virtio_blk_driver(
     // granted it directly (kernel-arch-glue's own privileged pre-map
     // stands in for a `SyscallOp::Map` this trusted glue code has no
     // need to actually issue).
-    let region_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::SharedRegion,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let region_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
     let region_id = k.cap_space(src_cs)?.lookup(region_cap)?.object.id;
     let region_phys = k
         .shared_region(kernel_cap::SharedRegionId::new(region_id.as_u32()))?
@@ -6057,19 +5941,7 @@ pub fn spawn_virtio_blk_driver(
     // into`'s own doc comment on why that ordering is deterministic).
     // The driver process never needs to hold `root_mmio_blk_cap`
     // itself, matching the MMIO-window pre-map above.
-    let notif_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Notification,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let notif_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)?;
     match k.dispatch(
         caller,
         hal.now_ns(),
@@ -6514,19 +6386,7 @@ pub fn spawn_virtio_net_driver(
     // check already established.
     let is_pci = mmio.config_space_base != 0;
 
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
 
     const DRV_NET_STACK_VMA: usize = 0xC090_0000;
     const DRV_NET_STACK_LEN: usize = 4096 * 16;
@@ -6562,19 +6422,7 @@ pub fn spawn_virtio_net_driver(
     }
 
     // Retype and pre-map the RX queue's own `SharedRegion`.
-    let rx_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::SharedRegion,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let rx_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
     let rx_id = k.cap_space(src_cs)?.lookup(rx_cap)?.object.id;
     let rx_phys = k.shared_region(kernel_cap::SharedRegionId::new(rx_id.as_u32()))?.phys_base.as_usize();
     // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
@@ -6595,19 +6443,7 @@ pub fn spawn_virtio_net_driver(
     unsafe { core::ptr::addr_of_mut!(G_DRV_NET_RX_PHYS).write(rx_phys) };
 
     // Retype and pre-map the TX queue's own `SharedRegion` — same shape.
-    let tx_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::SharedRegion,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let tx_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
     let tx_id = k.cap_space(src_cs)?.lookup(tx_cap)?.object.id;
     let tx_phys = k.shared_region(kernel_cap::SharedRegionId::new(tx_id.as_u32()))?.phys_base.as_usize();
     unsafe { core::ptr::write_bytes(tx_phys as *mut u8, 0, 4096) };
@@ -6665,19 +6501,7 @@ pub fn spawn_virtio_net_driver(
     // above was the first grant, at slot 0). Used only by the TX
     // completion path — RX deliberately stays non-blocking-poll-only
     // (this crate's own `driver_virtio_net` module doc comment).
-    let notif_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Notification,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let notif_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)?;
     match k.dispatch(
         caller,
         hal.now_ns(),
@@ -6898,17 +6722,10 @@ pub fn spawn_i8042_driver(
     // as a capability into either process (same "trusted bootstrap, no
     // Map ceremony" pattern DRV_QUEUE_VA/DRV_NET_RX_VA already use).
     let src_cs = k.tcb(caller)?.cap_space;
-    let queue_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::SharedRegion, count: 1 },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => {
-            klog!("spawn_i8042_driver: failed to retype the ring SharedRegion\r\n");
-            return None;
-        }
+    let Some(queue_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)
+    else {
+        klog!("spawn_i8042_driver: failed to retype the ring SharedRegion\r\n");
+        return None;
     };
     let queue_id = k.cap_space(src_cs)?.lookup(queue_cap)?.object.id;
     let queue_phys = k.shared_region(kernel_cap::SharedRegionId::new(queue_id.as_u32()))?.phys_base.as_usize();
@@ -6925,17 +6742,10 @@ pub fn spawn_i8042_driver(
     unsafe { core::ptr::addr_of_mut!(G_I8042_QUEUE_PHYS).write(queue_phys) };
 
     // Slot 1 on driver-i8042's own side: the IRQ-bound Notification.
-    let notif_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Notification, count: 1 },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => {
-            klog!("spawn_i8042_driver: failed to retype the IRQ Notification\r\n");
-            return None;
-        }
+    let Some(notif_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)
+    else {
+        klog!("spawn_i8042_driver: failed to retype the IRQ Notification\r\n");
+        return None;
     };
     match k.dispatch(
         caller,
@@ -7191,17 +7001,10 @@ pub fn spawn_mouse_driver(
     // "trusted bootstrap, no Map ceremony" pattern DRV_I8042_QUEUE_VA
     // already uses.
     let src_cs = k.tcb(caller)?.cap_space;
-    let queue_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::SharedRegion, count: 1 },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => {
-            klog!("spawn_mouse_driver: failed to retype the ring SharedRegion\r\n");
-            return None;
-        }
+    let Some(queue_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)
+    else {
+        klog!("spawn_mouse_driver: failed to retype the ring SharedRegion\r\n");
+        return None;
     };
     let queue_id = k.cap_space(src_cs)?.lookup(queue_cap)?.object.id;
     let queue_phys = k.shared_region(kernel_cap::SharedRegionId::new(queue_id.as_u32()))?.phys_base.as_usize();
@@ -7218,17 +7021,10 @@ pub fn spawn_mouse_driver(
     unsafe { core::ptr::addr_of_mut!(G_MOUSE_QUEUE_PHYS).write(queue_phys) };
 
     // Slot 1 on driver-mouse's own side: the IRQ-bound Notification.
-    let notif_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Notification, count: 1 },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => {
-            klog!("spawn_mouse_driver: failed to retype the IRQ Notification\r\n");
-            return None;
-        }
+    let Some(notif_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)
+    else {
+        klog!("spawn_mouse_driver: failed to retype the IRQ Notification\r\n");
+        return None;
     };
     match k.dispatch(
         caller,
@@ -7276,15 +7072,7 @@ fn retype_and_map_nvme_page(
     drv_root_pt: usize,
     target_va: usize,
 ) -> Option<usize> {
-    let region_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::SharedRegion, count: 1 },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let region_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
     let region_id = k.cap_space(src_cs)?.lookup(region_cap)?.object.id;
     let region_phys = k.shared_region(kernel_cap::SharedRegionId::new(region_id.as_u32()))?.phys_base.as_usize();
     // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
@@ -7355,17 +7143,9 @@ pub fn spawn_nvme_driver(
     let drv_addr_space = k.tcb(drv_tid)?.addr_space;
     let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
 
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype { untyped: CapId::new(0), target_type: KernelObjectType::Endpoint, count: 1 },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => {
-            klog!("spawn_nvme_driver: failed to retype the Endpoint\r\n");
-            return None;
-        }
+    let Some(ep_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1) else {
+        klog!("spawn_nvme_driver: failed to retype the Endpoint\r\n");
+        return None;
     };
     grant_cap_into(k, src_cs, ep_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
 
@@ -7545,19 +7325,7 @@ pub fn spawn_netstack_service(
 
     // Slot 1: the "park" Endpoint — this function's own doc comment on
     // why NOBODY ever `Call`s it.
-    let park_ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let park_ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
     grant_cap_into(k, src_cs, park_ep_cap, ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
     // SAFETY: single-core; written once here, before any kernel-bypass
     // call (reached only after this function returns) can read either.
@@ -7617,19 +7385,7 @@ pub fn spawn_netstack_service(
     unsafe { core::ptr::addr_of_mut!(G_NETSTACK_BYPASS_SHARED_PHYS).write(bypass_shared_phys) };
 
     // Retype + map Netstack's own private status region.
-    let status_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::SharedRegion,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
-    };
+    let status_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
     let status_id = k.cap_space(src_cs)?.lookup(status_cap)?.object.id;
     let status_phys =
         k.shared_region(kernel_cap::SharedRegionId::new(status_id.as_u32()))?.phys_base.as_usize();
@@ -8435,21 +8191,9 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     klog!("root task: running (thread {})\r\n", root.as_u32());
 
     // 1. An endpoint for the round-trip.
-    let ep_cap = match k.dispatch(
-        root,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        other => {
-            klog!("root task: endpoint Retype failed: {:?}\r\n", other);
-            park();
-        }
+    let Some(ep_cap) = retype_one_from_any_untyped(k, hal, root, KernelObjectType::Endpoint, 1) else {
+        klog!("root task: endpoint Retype failed (no untyped region has room)\r\n");
+        park()
     };
     klog!("root task: endpoint cap slot = {}\r\n", ep_cap.as_u32());
 
@@ -8495,21 +8239,10 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
 
     // 2. A TCB for thread 2 (bound to the Root Task's own cap space by
     //    the MVP `Retype` - so thread 2 can use `ep_cap` directly).
-    let t2_cap = match k.dispatch(
-        root,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::ThreadControlBlock,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        other => {
-            klog!("root task: TCB Retype failed: {:?}\r\n", other);
-            park();
-        }
+    let Some(t2_cap) = retype_one_from_any_untyped(k, hal, root, KernelObjectType::ThreadControlBlock, 1)
+    else {
+        klog!("root task: TCB Retype failed (no untyped region has room)\r\n");
+        park()
     };
     let t2 = {
         let cs = k.root_cap_space;
@@ -8612,22 +8345,10 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     //     send`/`do_reply`'s fast_path_eligible dispatch-level saving
     //     (skipping `pick_next`) from the register-restore cost the
     //     other one adds on top.
-    let t3_cap = match k.dispatch(
-        root,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::ThreadControlBlock,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => Some(cap),
-        other => {
-            klog!("root task: bench TCB Retype failed: {:?} - skipping §8.3 benchmark\r\n", other);
-            None
-        }
-    };
+    let t3_cap = retype_one_from_any_untyped(k, hal, root, KernelObjectType::ThreadControlBlock, 1);
+    if t3_cap.is_none() {
+        klog!("root task: bench TCB Retype failed (no untyped region has room) - skipping §8.3 benchmark\r\n");
+    }
     if let Some(t3_cap) = t3_cap {
         let t3 = {
             let cs = k.root_cap_space;
@@ -8685,18 +8406,8 @@ fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
     //    alias ONE physical frame at two virtual addresses in the Root
     //    Task's address space and confirm both translate to it. This is
     //    the software-model view; step 7 does the same thing in hardware.
-    let frame_cap = match k.dispatch(
-        root,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: KernelObjectType::Untyped,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return,
+    let Some(frame_cap) = retype_one_from_any_untyped(k, hal, root, KernelObjectType::Untyped, 1) else {
+        return;
     };
     let frame_phys = {
         let uid = kernel_cap::UntypedId::new(
