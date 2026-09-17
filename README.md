@@ -359,6 +359,49 @@ riscv64) unless noted:**
   confirming this is the scheduling-capacity limit above, at this
   process specifically, not a regression in the new wiring.
 
+- **`ui-core` <-> `shell`, the real TERMINAL edge (2026-09-17, x86_64
+  only)**: `Simurgh-UI-Template01::ui-core`'s start menu had long carried
+  a `"TERMINAL"` entry with NO handler behind it at all, while
+  `simurgh-shell` was a genuinely complete interactive shell reachable
+  only over the serial console. Omid's own direction, chosen over
+  building a separate simpler interpreter inside `ui-core`: give
+  `shell-core` a real SECOND I/O transport so that window becomes a real
+  front-end onto the real shell. `wire_ui_core_to_shell_x86` is the
+  kernel half, mirroring `wire_ui_core_to_policy_engine_x86`'s shape.
+
+  Unlike every other single-client edge in this file it ALSO wires a
+  shared `Notification`, and that is **not** a fan-in across clients â€”
+  there is exactly one client. `simurgh-shell` already owns a real,
+  long-running serial REPL, so it cannot park in a blocking `Recv` the
+  way `fm-core` does without freezing the console it exists to serve; it
+  polls this `Notification` with the non-blocking `sys::NOTIF_POLL` once
+  per REPL iteration instead â€” the same shape Compositor already uses for
+  its own i8042 signal, applied here for a different structural reason.
+
+  Capability slots, assigned strictly by boot-time grant order and
+  documented on both sides: `shell` gets the `Endpoint` at slot 0 and the
+  `Notification` at slot 1 (its cap space is completely EMPTY beforehand
+  â€” `spawn_shell_x86` wires it only a shared page and no capability at
+  all); `ui-core` gets them at slots 6 and 7, so the call is placed after
+  `wire_policy_engine_notification_fanin_x86`, the last grant into
+  `ui-core`'s cap space before it.
+
+  **Real QEMU boot verified (2026-09-17, x86_64, native Windows
+  `qemu-system-x86_64` + OVMF)**: the new log line `root task (x86_64):
+  wired ui-core <-> shell real IPC edge (TERMINAL window)` appears in the
+  real serial output, in exactly the expected position â€” immediately
+  after `wired profile-policy notification fan-in (store, ui-core)` â€”
+  which is itself the direct confirmation that the boot-call order both
+  sides' fixed slot numbers depend on is what the constants assume. Boot
+  proceeds cleanly past it into the preemptive scheduler with zero panics
+  and no `UNHANDLED CPU EXCEPTION`. The end-to-end keystroke round trip
+  (click TERMINAL, type, `Enter`, real `Shell::execute` reply rendered
+  back) was NOT exercised â€” it needs a real injected mouse click plus
+  keystrokes, and neither `ui-core`'s nor `shell`'s own thread reported
+  within the boot window, the same already-known, already-accepted QEMU
+  scheduling-capacity limit the two entries above already document at
+  this system's current scale.
+
 **Known open issues:**
 
 - **riscv64 — the boot-blocking crash is RESOLVED (2026-09-17); a
