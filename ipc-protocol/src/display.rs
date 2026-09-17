@@ -121,12 +121,24 @@ pub enum DisplayResponse {
     /// a raw Scan Code Set 1 make code (bit 7 cleared) — see
     /// `driver_i8042::scancode`'s own doc comment (`Simurgh-OS`'s own
     /// `subsystems/drivers/driver-i8042` crate) for the full decode
-    /// scope (make/break only, no extended keys, no mouse).
+    /// scope (make/break, real `0xE0`-extended-key support, no mouse).
+    /// `extended` is `true` iff this key arrived via a real `0xE0`
+    /// prefix (arrow keys among them) — see `driver_i8042::scancode::
+    /// KeyEvent::extended`'s own doc comment for why this flag exists
+    /// (many extended keys reuse a non-extended key's own `keycode`).
+    /// On the wire (`ipc_protocol::codec`'s own `OP_DPR_INPUT_EVENT`
+    /// arm) `extended` packs into bit 7 of the `keycode` word — the same
+    /// "already-free reserved bit" decision `driver_i8042::wire::
+    /// EXTENDED_BIT`'s own doc comment makes one hop up this same
+    /// pipeline, kept as ONE wire-format idea rather than two
+    /// independently invented ones.
     InputEvent {
         /// Raw Scan Code Set 1 keycode (bit 7 already cleared).
         keycode: u8,
         /// `true` for a key-down (make), `false` for key-up (break).
         pressed: bool,
+        /// `true` iff this key arrived via a real `0xE0` prefix.
+        extended: bool,
     },
     /// `PollInputEvent` found nothing pending — a normal reply, not an
     /// error (see `DisplayRequest::PollInputEvent`'s own doc comment).

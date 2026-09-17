@@ -5,11 +5,17 @@
 //! (real, interrupt-driven — `DRV_IRQ_WAIT`, same primitive `driver-
 //! virtio-blk`/`driver-virtio-net` already use for their own IRQ
 //! completion waits) for `kernel_arch_glue::i8042_irq_trampoline`'s own
-//! ring to have new bytes, decodes each into a `scancode::KeyEvent`, and
-//! pushes it to the Compositor service over a dedicated `Endpoint`
-//! (`kernel_arch_glue::wire_service_endpoint`'s own edge) — signal-then-
-//! call, the same real, working pattern this project's account-manager
-//! hub work already established (`Simurgh-OS`'s own session record).
+//! ring to have new bytes, decodes each into a `scancode::KeyEvent` via
+//! ONE `scancode::Decoder` instance owned for this process's whole
+//! lifetime (not reconstructed per drain — a real `0xE0` prefix and its
+//! follow-up byte are not guaranteed to land in the same ring drain, so
+//! the decoder's own extended-prefix state must survive across `wait_
+//! for_irq` iterations; `scancode::Decoder`'s own doc comment has the
+//! full reasoning), and pushes each decoded event to the Compositor
+//! service over a dedicated `Endpoint` (`kernel_arch_glue::wire_service_
+//! endpoint`'s own edge) — signal-then-call, the same real, working
+//! pattern this project's account-manager hub work already established
+//! (`Simurgh-OS`'s own session record).
 //!
 //! Position in the system: `kernel_arch_glue::spawn_i8042_driver` spawns
 //! this process via `spawn_process_from_elf`. It is granted THREE
@@ -209,13 +215,16 @@ unsafe fn call_compositor(event: scancode::KeyEvent) {
 /// own write-count header reports (bounded to `RING_CAPACITY`, oldest
 /// dropped if this process fell behind — matches `kernel_arch_glue::
 /// i8042_irq_trampoline`'s own producer-side drop-oldest policy exactly,
-/// since both sides read the SAME monotonic counters), decode each, and
-/// `call_compositor` for every byte that decodes to a real key event
-/// (an 0xE0 extended-key prefix decodes to `None` and is skipped — see
-/// `scancode`'s own doc comment).
+/// since both sides read the SAME monotonic counters), decode each
+/// through the ONE process-lifetime `scancode::Decoder` (this function's
+/// own doc comment), and `call_compositor` for every byte that decodes
+/// to a real key event (a real `0xE0` extended-key prefix byte itself
+/// decodes to `None` — buffered into the decoder's own state, not a key
+/// event — see `scancode::Decoder::feed`'s own doc comment).
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut read_count: u64 = 0;
+    let mut decoder = scancode::Decoder::new();
     loop {
         // SAFETY: `wait_for_irq`'s own contract.
         unsafe { wait_for_irq() };
@@ -229,7 +238,7 @@ pub extern "C" fn subsystem_main() -> ! {
             // always within the range the write-count header covers.
             let byte = unsafe { read_ring_byte(read_count) };
             read_count += 1;
-            if let Some(event) = scancode::decode(byte) {
+            if let Some(event) = decoder.feed(byte) {
                 // SAFETY: `call_compositor`'s own contract.
                 unsafe { call_compositor(event) };
             }

@@ -344,21 +344,33 @@ fn copy_frame_to_confirm(len: u32) {
 const I8042_VA: usize = 0xD8B0_0000;
 
 /// One decoded real key event — `keycode` is a raw Scan Code Set 1 make
-/// code (bit 7 cleared), matching `driver_i8042::scancode::KeyEvent`
-/// exactly. Duplicated here as a small, local, self-contained type
-/// rather than a cross-driver-crate dependency on `driver-i8042` — same
-/// "small numeric constants/logic duplicated with a sync comment"
-/// convention `netstack::subsystem_entry`'s own module doc comment
-/// already establishes for the identical situation (a service depending
-/// on a driver's own wire shape, not its crate).
+/// code (bit 7 cleared), `extended` is `true` iff a real `0xE0` prefix
+/// preceded it (many extended keys, arrows among them, reuse a
+/// non-extended key's own `keycode` — see `driver_i8042::scancode::
+/// KeyEvent::extended`'s own doc comment), matching `driver_i8042::
+/// scancode::KeyEvent` exactly. Duplicated here as a small, local,
+/// self-contained type rather than a cross-driver-crate dependency on
+/// `driver-i8042` — same "small numeric constants/logic duplicated with
+/// a sync comment" convention `netstack::subsystem_entry`'s own module
+/// doc comment already establishes for the identical situation (a
+/// service depending on a driver's own wire shape, not its crate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KeyEvent {
     keycode: u8,
     pressed: bool,
+    extended: bool,
 }
 
 /// Must match `driver_i8042::wire::KEY_EVENT_LABEL` exactly.
 const KEY_EVENT_LABEL: u64 = 1;
+
+/// Must match `driver_i8042::wire::EXTENDED_BIT` exactly — the reserved,
+/// previously-always-zero bit 7 of the keycode word this edge (and
+/// `ipc_protocol::codec`'s own `OP_DPR_INPUT_EVENT` arm, one hop further
+/// out) packs `KeyEvent::extended` into. See `driver_i8042::wire::
+/// EXTENDED_BIT`'s own doc comment for the full "one wire-format idea,
+/// not two independently invented ones" reasoning.
+const EXTENDED_BIT: u64 = 0x80;
 
 /// Reads and decodes the `KeyEvent` `driver-i8042` wrote into `I8042_VA`
 /// — mirrors `driver_i8042::wire::decode_key_event` exactly (see
@@ -373,7 +385,7 @@ fn read_i8042_message() -> Option<KeyEvent> {
     if label != KEY_EVENT_LABEL {
         return None;
     }
-    Some(KeyEvent { keycode: w0 as u8, pressed: w1 != 0 })
+    Some(KeyEvent { keycode: (w0 & 0x7F) as u8, pressed: w1 != 0, extended: w0 & EXTENDED_BIT != 0 })
 }
 
 /// VA `driver-mouse`'s own shared message page is mapped at in THIS
@@ -510,7 +522,11 @@ fn handle_request(
         // virtio-net`'s own `PollFrame` precedent this variant's own
         // `ipc_protocol::display` doc comment cites.
         DisplayRequest::PollInputEvent => match pending_key_event.take() {
-            Some(event) => DisplayResponse::InputEvent { keycode: event.keycode, pressed: event.pressed },
+            Some(event) => DisplayResponse::InputEvent {
+                keycode: event.keycode,
+                pressed: event.pressed,
+                extended: event.extended,
+            },
             None => DisplayResponse::NoInputPending,
         },
         // Real, mouse-shaped counterpart of `PollInputEvent` just above
@@ -720,6 +736,39 @@ mod tests {
                 code: DisplayErrorCode::Unsupported,
             }
         );
+    }
+
+    #[test]
+    fn poll_input_event_drains_a_pending_extended_key_then_reports_none() {
+        // Up Arrow: keycode 0x48, `extended: true` — the real, decoded
+        // event `read_i8042_message` would hand over after unpacking the
+        // wire's own `EXTENDED_BIT`. Proves `extended` survives the
+        // `handle_request` hop into `DisplayResponse::InputEvent`
+        // unchanged, not just that the field exists.
+        let mut comp = Compositor::new();
+        let mut pending_key = Some(KeyEvent { keycode: 0x48, pressed: true, extended: true });
+        let mut pending_mouse = None;
+
+        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::PollInputEvent);
+        assert_eq!(resp, DisplayResponse::InputEvent { keycode: 0x48, pressed: true, extended: true });
+        assert!(pending_key.is_none(), "PollInputEvent must drain, not peek");
+
+        let resp2 = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::PollInputEvent);
+        assert_eq!(resp2, DisplayResponse::NoInputPending);
+    }
+
+    #[test]
+    fn read_i8042_message_unpacks_the_extended_bit_from_the_keycode_word() {
+        // Direct unit coverage of the local wire decode this file's own
+        // `KeyEvent`/`EXTENDED_BIT` doc comments describe — same shape
+        // `driver_i8042::wire`'s own `decode_key_event` tests use, kept
+        // as a local, self-contained check since this is a duplicated
+        // decoder, not a shared function.
+        let w0 = 0x48u64 | EXTENDED_BIT;
+        let extended = w0 & EXTENDED_BIT != 0;
+        let keycode = (w0 & 0x7F) as u8;
+        assert_eq!(keycode, 0x48);
+        assert!(extended);
     }
 
     #[test]

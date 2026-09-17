@@ -635,7 +635,10 @@ const OP_DPR_NO_MOUSE_EVENT_PENDING: u8 = 10;
 /// - `Committed`, `Destroyed`, `InputSubscribed`: `[]`
 /// - `OutputTopology`: `[output_count, primary_width, primary_height, primary_refresh_mhz]`
 /// - `Error`: `[code]`
-/// - `InputEvent`: `[keycode, pressed]`
+/// - `InputEvent`: `[keycode | (extended << 7), pressed]` — `extended`
+///   packs into bit 7 of the keycode word (always free before today: a
+///   `KeyEvent::keycode` is already `<= 0x7F`, see `DisplayResponse::
+///   InputEvent`'s own doc comment), not a third word.
 /// - `NoInputPending`: `[]`
 /// - `MouseEvent`: `[dx as u16 as u64, dy as u16 as u64, left|right<<1|middle<<2]`
 /// - `NoMouseEventPending`: `[]`
@@ -660,8 +663,9 @@ pub fn encode_display_response(resp: &DisplayResponse) -> SmallMessage {
             ],
         ),
         DisplayResponse::Error { code } => (OP_DPR_ERROR, [code as u64, 0, 0, 0]),
-        DisplayResponse::InputEvent { keycode, pressed } => {
-            (OP_DPR_INPUT_EVENT, [keycode as u64, pressed as u64, 0, 0])
+        DisplayResponse::InputEvent { keycode, pressed, extended } => {
+            let keycode_word = keycode as u64 | if extended { 0x80 } else { 0 };
+            (OP_DPR_INPUT_EVENT, [keycode_word, pressed as u64, 0, 0])
         }
         DisplayResponse::NoInputPending => (OP_DPR_NO_INPUT_PENDING, [0, 0, 0, 0]),
         DisplayResponse::MouseEvent { dx, dy, left, right, middle } => (
@@ -737,8 +741,9 @@ pub fn decode_display_response(msg: &SmallMessage) -> Result<DisplayResponse, De
         OP_DPR_INPUT_EVENT => {
             need(2)?;
             Ok(DisplayResponse::InputEvent {
-                keycode: w[0] as u8,
+                keycode: (w[0] & 0x7F) as u8,
                 pressed: w[1] != 0,
+                extended: w[0] & 0x80 != 0,
             })
         }
         OP_DPR_NO_INPUT_PENDING => Ok(DisplayResponse::NoInputPending),
@@ -1504,10 +1509,26 @@ mod tests {
         display_response_roundtrip(DisplayResponse::InputEvent {
             keycode: 0x1e,
             pressed: true,
+            extended: false,
         });
         display_response_roundtrip(DisplayResponse::InputEvent {
             keycode: 0x1e,
             pressed: false,
+            extended: false,
+        });
+        // Up Arrow: keycode 0x48, the same byte Numpad-8 (non-extended)
+        // uses on the wire — only `extended` tells them apart, so this
+        // is the real ambiguity this field exists to resolve, round-
+        // tripped through the full codec.
+        display_response_roundtrip(DisplayResponse::InputEvent {
+            keycode: 0x48,
+            pressed: true,
+            extended: true,
+        });
+        display_response_roundtrip(DisplayResponse::InputEvent {
+            keycode: 0x48,
+            pressed: false,
+            extended: true,
         });
         display_response_roundtrip(DisplayResponse::NoInputPending);
         display_response_roundtrip(DisplayResponse::MouseEvent {

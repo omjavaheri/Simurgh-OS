@@ -440,6 +440,75 @@ riscv64) unless noted:**
   scheduling-capacity limit the two entries above already document at
   this system's current scale.
 
+- **`driver-i8042` real extended-key (`0xE0`) support (2026-09-17,
+  x86_64 only)**: closes the gap the "Real interrupt-driven keyboard and
+  mouse input" entry above and `driver-i8042::scancode`'s own module doc
+  comment both used to name — a real `0xE0` prefix byte was dropped, not
+  buffered, so no arrow/Home/End/Insert/etc. keystroke ever reached a
+  consumer, even though the rest of the keyboard pipeline (scancode
+  decode -> Compositor -> `PollInputEvent`) was already real and working.
+  Omid's own immediate driver: `Simurgh-UI-Template01::ui-core`'s real
+  TERMINAL window (previous entry) has a real, working, server-side shell
+  history (`simurgh-shell::LineEditor`) with no key able to recall it from
+  the GUI.
+
+  `driver_i8042::scancode::Decoder` (replacing the old stateless `decode`
+  free function) now buffers a real `0xE0` byte across calls instead of
+  dropping it, and tags the byte that follows it with a real `extended:
+  bool` flag on `KeyEvent` — a genuine, COMPLETE hardware-discovery
+  capability (`00-Overview.md`'s own "hardware discovery is always
+  complete, only policy varies" principle): every real `0xE0`-prefixed key
+  this PS/2 controller can send decodes correctly now, not just the four
+  arrows, though only the four arrows have a real consumer today. The
+  4-byte Print Screen and 6-byte `0xE1`-prefixed Pause/Break sequences are
+  deliberately still NOT covered (named, not guessed at) — neither fits
+  this decoder's simple one-prefix-one-follow-up-byte shape, and neither
+  has a real consumer yet either.
+
+  **Wire-format decision, applied identically at both real hops this
+  pipeline already had** (`driver-i8042` -> Compositor's internal
+  `SmallMessage` edge, and Compositor -> any display client's real
+  `DisplayResponse::InputEvent`): `extended` packs into bit 7 of the
+  keycode word rather than growing either edge to a third word. This is
+  not a space-saving trick invented for this change — a `KeyEvent::
+  keycode` was ALREADY guaranteed `<= 0x7F` (Set 1's own make/break bit is
+  stripped into the separate `pressed` field before a `KeyEvent` exists at
+  all), so bit 7 of that word was always zero on both wires before today,
+  a genuinely free, reserved bit. `ipc_protocol::display::
+  DisplayResponse::InputEvent` gained the matching real `extended: bool`
+  field, `ipc_protocol::codec`'s `OP_DPR_INPUT_EVENT` arm packs/unpacks
+  it the same way, and `compositor::subsystem_entry`'s own local `KeyEvent`
+  duplicate (this project's standard "duplicated wire shape with a sync
+  comment" convention, not a shared crate) carries it through unchanged.
+
+  Consumer side (`Simurgh-UI-Template01`, same day): `ui-core::keymap::
+  decode` gained a third `extended: bool` parameter and two new
+  `InputAction` variants (`ArrowUp`/`ArrowDown`, keycodes `0x48`/`0x50` —
+  the SAME bytes Numpad-8/Numpad-2 use when NOT extended, the exact
+  ambiguity `extended` exists to resolve), wired into `simurgh-shell`'s
+  own already-real `LineEditor::history_up`/`history_down` via two new
+  `TerminalKey` wire variants. See that repo's own README for the full
+  story, including why Left/Right arrive correctly but are deliberately
+  not yet named as an `InputAction` (a separate, real gap: no rendered
+  cursor position in that crate's TERMINAL window yet).
+
+  New/changed tests: 4 new `scancode` tests (`Decoder`'s own stateful
+  buffering across calls, all four real arrow scancodes, the Numpad-vs-
+  arrow ambiguity), 2 new `wire` tests, 2 new `compositor` tests, plus
+  every existing `InputEvent`-shaped test across `ipc-protocol`/
+  `compositor` updated for the new field. `cargo test`/`cargo clippy` clean on
+  `driver-i8042`/`ipc-protocol`/`compositor`; `driver-i8042-bin` cross-
+  built clean for x86_64 (its only real target); the full microkernel
+  relinked clean after each of `driver-i8042-bin`/`ui-core-bin`/
+  `shell-bin` was rebuilt in turn. Not yet exercised with a real QEMU-
+  injected arrow keystroke (`qemu-system-x86_64 -monitor stdio` +
+  `sendkey up`) — the same already-known, already-accepted real-process-
+  scheduling-capacity limit the TERMINAL edge entry just above already
+  documents for this exact `ui-core`/`shell`/driver trio at this system's
+  current scale; verified instead by clean builds across all touched
+  crates plus full host-side unit coverage of the new encode/decode round
+  trip at every hop.
+
 **Known open issues:**
 
 - **fs-native's multi-client transport — two real kernel bugs found and
