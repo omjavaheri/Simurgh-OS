@@ -4141,7 +4141,12 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             if let (Some(store_tid), Some(bm_tid)) = (store_tid_x86, backup_manager_tid_x86) {
                 wire_backup_manager_to_store_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, bm_tid);
             }
-            kernel_arch_glue::set_shell_tid(spawn_shell_x86(kernel_arch_glue::khal()));
+            // Bound to a local (rather than passed straight into
+            // `set_shell_tid`) since the real ui-core <-> shell TERMINAL
+            // edge wired further below needs this same tid — see
+            // `wire_ui_core_to_shell_x86`'s own doc comment.
+            let shell_tid_x86 = spawn_shell_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_shell_tid(shell_tid_x86);
             let file_manager_tid_x86 = spawn_file_manager_x86(kernel_arch_glue::khal());
             let ui_core_tid_x86 = spawn_ui_core_x86(kernel_arch_glue::khal());
             // ui-core <-> account-manager real login edge (2026-09-11):
@@ -4179,6 +4184,18 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             }
             if let (Some(pe_tid), Some(store_tid), Some(ui_tid)) = (policy_engine_tid_x86, store_tid_x86, ui_core_tid_x86) {
                 wire_policy_engine_notification_fanin_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), pe_tid, store_tid, ui_tid);
+            }
+            // ui-core <-> shell real TERMINAL edge (2026-09-17): same
+            // "wire after both spawn" pattern as the login/browse/profile
+            // edges above. MUST run after `wire_policy_engine_
+            // notification_fanin_x86` — that call makes the last grant
+            // into ui-core's own cap space before this one, and this
+            // edge's own client-side constants assume its `Endpoint`
+            // lands at slot 6 and its doorbell `Notification` at slot 7.
+            // See `wire_ui_core_to_shell_x86`'s own doc comment for both
+            // sides' full slot derivation.
+            if let (Some(ui_tid), Some(shell_tid)) = (ui_core_tid_x86, shell_tid_x86) {
+                wire_ui_core_to_shell_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), ui_tid, shell_tid);
             }
             // Real i8042 keyboard input, Stage B (this project's own
             // real-input-handling plan): spawns `driver-i8042` as a real
@@ -5573,6 +5590,142 @@ fn wire_ui_core_to_policy_engine_x86(
         None => {
             kernel_arch_glue::log(format_args!(
                 "root task (x86_64): ui-core<->profile-policy wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the `Simurgh-UI-Template01::ui-core` <-> `simurgh-shell` real
+/// terminal IPC edge (Omid's own 2026-09-17 direction: `ui-core`'s start
+/// menu has long carried a `"TERMINAL"` entry with NO handler behind it
+/// at all, while `simurgh-shell` is a genuinely complete interactive
+/// shell reachable only over the serial console — that window becomes a
+/// real front-end onto the real shell, rather than a second, weaker
+/// interpreter built inside `ui-core`). Same "takes both tids as explicit
+/// parameters" shape as `wire_ui_core_to_policy_engine_x86` just above,
+/// for the identical reason: neither side has a `G_*_TID_X86` global
+/// usable here (`simurgh-shell`'s own `G_SHELL_TID` lives in
+/// `kernel-arch-glue` for the `SPAWN_KNOWN_ELF` caller check, is
+/// write-only from this file's perspective, and is set from the very
+/// call whose result this edge needs), and this is the only call site
+/// that ever wires it.
+///
+/// **Capability slots on BOTH sides, assigned strictly by boot-time grant
+/// order** (the same determinism every other wiring function in this file
+/// documents):
+///
+/// - **`simurgh-shell`**: the `Endpoint` lands at slot **0** and the
+///   `Notification` at slot **1** — this process's capability space is
+///   completely EMPTY beforehand. `spawn_shell_x86` wires it one shared
+///   page (`kernel_arch_glue::wire_shared_pages`, its debug-print
+///   channel) and no capability at all, since that page is shared only
+///   with the kernel's own dispatch code, never another process. This
+///   call is therefore the first and only grant `shell` ever receives.
+/// - **`ui-core`**: the `Endpoint` lands at slot **6** and the
+///   `Notification` at slot **7** — slot 0 Compositor
+///   (`spawn_ui_core_x86`), slot 1 account-manager's `Endpoint`, slot 2
+///   its hub `Notification`, slot 3 file-manager's `Endpoint`, slot 4
+///   policy-engine's `Endpoint`, slot 5 policy-engine's `Notification`.
+///   This call must therefore run AFTER
+///   `wire_policy_engine_notification_fanin_x86`, the last grant into
+///   `ui-core`'s own cap space before it.
+///
+/// Both sides' constants are mirrored in the two client/server crates:
+/// `simurgh-shell::shell_core::subsystem_entry::TERM_ENDPOINT_CAP`/
+/// `TERM_NOTIF_CAP`/`TERM_SHARED_VA` and `Simurgh-UI-Template01::ui-core::
+/// subsystem_entry::SHELL_ENDPOINT_CAP`/`SHELL_NOTIF_CAP`/
+/// `SHELL_SHARED_VA`.
+///
+/// `shell_va`/`ui_core_client_va` are each that process's own next free
+/// region: `0xD910_0000` for shell (past its own debug-print page's end,
+/// `0xD900_0000 + 4096`) and `0xD8A0_0000` for ui-core (past its own
+/// profile-policy page's end, `0xD890_0000 + 4096`). The two need not
+/// match each other — they are separate address spaces — only their own
+/// side of this wiring call.
+///
+/// Unlike every other single-client edge in this file, this one ALSO
+/// wires a shared `Notification`. That is not a fan-in across clients
+/// (there is exactly one client): `simurgh-shell` already owns a real,
+/// long-running serial REPL, so it cannot park in a blocking `Recv` the
+/// way `fm-core` does without freezing the serial console it exists to
+/// serve. It instead polls this `Notification` with the NON-blocking
+/// `sys::NOTIF_POLL` once per REPL iteration — the same shape Compositor
+/// already uses for its own i8042 signal. See `simurgh-shell::shell_core::
+/// subsystem_entry`'s own "Real terminal SERVICE role" section doc
+/// comment for the full reasoning.
+#[cfg(target_arch = "x86_64")]
+fn wire_ui_core_to_shell_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    ui_core_tid: kernel_cap::ThreadId,
+    shell_tid: kernel_cap::ThreadId,
+) {
+    const SHELL_VA: usize = 0xD910_0000;
+    const UI_CORE_SHELL_VA: usize = 0xD8A0_0000;
+    let Some(shell_tcb) = k.tcb(shell_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (could not resolve shell's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (shell_cs, shell_addr_space) = (shell_tcb.cap_space, shell_tcb.addr_space);
+    let Some(ui_tcb) = k.tcb(ui_core_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (ui_cs, ui_addr_space) = (ui_tcb.cap_space, ui_tcb.addr_space);
+    let Some(shell_root_pt) = k.addr_space_mut(shell_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (could not resolve shell's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_root_pt) = k.addr_space_mut(ui_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (could not resolve ui-core's own address space)\r\n"
+        ));
+        return;
+    };
+    if kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        shell_cs,
+        shell_root_pt,
+        SHELL_VA,
+        ui_cs,
+        ui_root_pt,
+        UI_CORE_SHELL_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    )
+    .is_none()
+    {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (out of resources)\r\n"
+        ));
+        return;
+    }
+    // The non-blocking doorbell half — must be granted AFTER the
+    // `Endpoint` above, on both sides, for the slot numbers in this
+    // function's own doc comment to hold. `shell` is listed first so its
+    // own grant order (Endpoint slot 0, Notification slot 1) is the same
+    // statement read top to bottom here and there.
+    let targets = [shell_cs, ui_cs];
+    match kernel_arch_glue::wire_notification(
+        hal,
+        k.root_thread,
+        &targets,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired ui-core <-> shell real IPC edge (TERMINAL window)\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core<->shell doorbell Notification skipped (out of resources) - the TERMINAL window will not reach the real shell\r\n"
             ));
         }
     }
