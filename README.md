@@ -442,6 +442,40 @@ riscv64) unless noted:**
 
 **Known open issues:**
 
+- **x86_64 — a real, pre-existing full scheduler stall right after
+  `device-manager` reaches `state=Running`, newly discovered (2026-09-17)
+  while chasing an unrelated `fm-core` bug.** Every real report/log line
+  downstream of that point (diagnostics, store, shell, ui-core,
+  file-manager, the whole TERMINAL edge) simply never appears — not
+  occasional QEMU scheduling-capacity flakiness (the already-documented,
+  accepted characteristic above), a genuine, total, reproducible hang: 4
+  real QEMU runs at 240s+ each, with/without PS/2, at 512M/1024M, never
+  produced one further log line. **Confirmed via a real bisection this is
+  NOT a regression from anything built today** — it reproduces
+  identically on `4d53dab` (the last commit before this session's work
+  started) and on current `HEAD`. It has plausibly been present, silent,
+  and masked by this project's own "boot far enough to see the new
+  feature's own log line, call it verified" testing habit for some time —
+  nobody previously waited the necessary 200+ real seconds PAST
+  `device-manager`'s own report to notice nothing after it ever runs.
+  QEMU monitor evidence at the stall (from the agent that first found
+  this while investigating the `fm-core` Write bug): vCPU `HLT=1`,
+  `CPL=0`, `RFL=0x246` (interrupts enabled but halted, 0% host CPU); PIC
+  state `pic0: irr=05 imr=f9 isr=02` — IRQ1 stuck IN-SERVICE with no EOI
+  ever issued, IRQ0 masked; disabling the PS/2 controller entirely did
+  NOT clear it, so the stuck PIC is a SYMPTOM, not the cause — the real
+  LAPIC timer (vector 32, TSC-deadline) appears to simply stop ticking
+  sometime after `"arming preemptive timer ... armed: true"` (the last
+  scheduler-relevant log line before every stalled run). Plausibly
+  related to the same preemptive-timer/i8042-IRQ area the `driver-mouse`/
+  `driver-i8042` work touched, but NOT yet confirmed — that is a
+  hypothesis from the log evidence, not a root-caused finding. Not yet
+  investigated further. This is a genuinely high-priority bug: it silently
+  blocks EVERY real IPC edge and report this project has built for the
+  second half of the x86_64 boot sequence from ever being observed live,
+  which calls into question how much of this session's own "QEMU-
+  verified" status for recent features actually completed a full
+  round trip vs. simply not having run long enough to hit this stall yet.
 - **riscv64 — the boot-blocking crash is RESOLVED (2026-09-17); a
   SEPARATE, newly-exposed fault remains open.** The real root cause of
   what years of investigation above characterized as "the compositor
