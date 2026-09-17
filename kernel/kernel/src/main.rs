@@ -3473,6 +3473,46 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                         // above.
                         unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
                     }
+                    // **Investigated and deliberately left unconditional
+                    // (2026-09-17)** — do NOT "fix" this into a
+                    // conditional `SwitchTo` fallback to match
+                    // `IPC_CALL`/`SBS_IPC_RECV`/`NOTIF_WAIT`'s own arms
+                    // above; it would provably never take the slow path.
+                    // Those three fall back because their `next` comes
+                    // from a general `pick_next`, so the resumed thread
+                    // can be ANY `Ready` thread — including one a TIMER
+                    // preempted mid-loop, which never entered the L4
+                    // register convention at all (the real crash
+                    // `SBS_IPC_RECV`'s own arm documents). `Reply` cannot
+                    // reach that case: `kernel_core::syscall::do_reply`
+                    // returns `Reschedule { next: Some(to) }`
+                    // unconditionally, never `pick_next`, and refuses
+                    // (`NotBlockedOnReply`) unless `to` is
+                    // `BlockedOnReply` — a state assigned in exactly two
+                    // places kernel-wide, both inside `do_send`'s own
+                    // `is_call` arms, i.e. only ever to a thread
+                    // suspended at its own `IPC_CALL` trap. So `into` is
+                    // ALWAYS a genuine fast-path participant, by the very
+                    // criterion `IPC_CALL`'s own arm uses for this
+                    // (`poke.is_some()`, which `p2_ipc_reply` likewise
+                    // always satisfies). Checked while chasing
+                    // `simurgh-file-manager`'s own open `fm-core` Write
+                    // bug (that repo's `G_LAST_REPLY_LABEL` doc comment
+                    // has the full story); this arm was ruled OUT as its
+                    // cause. One real, separate gap DID surface and is
+                    // still open: this is the only `SwitchToFast` site
+                    // whose `save` thread is left `Ready` rather than
+                    // blocked (`do_reply` calls `note_ready` on the
+                    // replier), so it is the only one where a narrow
+                    // `save_ipc_fast_context` can later be paired with a
+                    // FULL `restore_user_and_iretq` by the general
+                    // scheduler/timer path — resuming the replier with
+                    // stale `rcx`/`rdx`/`r8`-`r11`, which
+                    // `save_ipc_fast_context`'s own doc comment
+                    // ("callers must pass a blob this function fully
+                    // owns") forbids. Not fixed here: it needs its own
+                    // real on-device test, and the x86_64 boot currently
+                    // halts before one can be run.
                     TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
                 }
                 None => TrapOutcome::Resume(0),
