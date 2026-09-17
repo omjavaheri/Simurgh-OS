@@ -1781,6 +1781,50 @@ fn mm_bench_riscv64() {
             }};
         }
         const ITERS: usize = 200;
+        // `sum_ns / ITERS` written against the LITERAL divisor is a real,
+        // riscv64-ONLY fatal bug, not a style question — it was the cause
+        // of `FAULT: thread 0 ... (cause=0xd sepc=0xc0000398
+        // stval=0x84bc4da8)`, the load page fault that killed the Root
+        // Task on every riscv64 boot and stopped the boot sequence several
+        // steps before `umode_root`'s own device-manager fault-isolation
+        // demo.
+        //
+        // Why: LLVM lowers division by a compile-time constant to a
+        // magic-number multiply (`mulhu`), and RV64 cannot materialize the
+        // 64-bit magic multiplier as an immediate — it emits it into a
+        // CONSTANT POOL and loads it PC-relatively (`auipc a0, 0xc4bc5` /
+        // `ld a0, -0x5ec(a0)`). That pool is `.srodata.cst8`, which the
+        // linker places with the rest of the KERNEL's rodata (~0x84bc4da8,
+        // inside the kernel image), NOT inside the user image. `linker.ld`
+        // maps only `.user_text`/`.user_stack` U=1 (see its own "User
+        // (layer-3) Root Task image" block), so that address is simply
+        // absent from the Root Task's U-mode address space and the load
+        // traps. x86_64 and aarch64 are unaffected for a purely
+        // ISA-level reason: both materialize a 64-bit immediate in
+        // registers (`movabs` / `movz`+`movk`) with no memory reference at
+        // all, so the identical Rust source in `mm_bench_x86`/
+        // `mm_bench_aarch64` never leaves the user image.
+        //
+        // The fix pushes the divisor through the same `asm!` identity
+        // `zero!()` above already uses, making it opaque to LLVM. RV64
+        // then emits a plain hardware `divu` (the M extension is part of
+        // `riscv64gc`) — no constant pool, no reference out of
+        // `.user_text`. `checked_div(..).unwrap_or(0)` rather than `/`
+        // deliberately: a runtime divisor makes `/` emit a
+        // divide-by-zero panic branch, and a panic from `.user_text` would
+        // itself reference the kernel's `core::panicking` machinery it
+        // cannot reach.
+        //
+        // GENERAL INVARIANT this protects, for any future `.user_text`
+        // code on riscv64: nothing in `.user_text` may reference a symbol
+        // outside the user-mapped region. Division by a literal is the
+        // non-obvious way to violate it, because the reference is
+        // introduced by the back end, not written in the source.
+        let iters_opaque: usize = {
+            let mut v: usize = ITERS;
+            core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+            v
+        };
         let (mut min_ns, mut max_ns, mut sum_ns) = (usize::MAX, 0usize, 0usize);
         for _ in 0..ITERS {
             let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
@@ -1797,7 +1841,11 @@ fn mm_bench_riscv64() {
             sum_ns += dt;
         }
         raw_syscall(sys::REPORT, min_ns, zero!());
-        raw_syscall(sys::REPORT, sum_ns / ITERS, zero!());
+        raw_syscall(
+            sys::REPORT,
+            sum_ns.checked_div(iters_opaque).unwrap_or(0),
+            zero!(),
+        );
         raw_syscall(sys::REPORT, max_ns, zero!());
     }
 }
