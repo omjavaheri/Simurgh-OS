@@ -4830,6 +4830,7 @@ fn spawn_init_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> 
                 Some(root_pt) => {
                     match kernel_arch_glue::wire_file_manager_to_fs_native(
                         hal,
+                        tid,
                         cap_space,
                         root_pt,
                         INIT_FS_SHARED_VA,
@@ -5334,6 +5335,7 @@ fn spawn_file_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::Th
                 Some(root_pt) => {
                     match kernel_arch_glue::wire_file_manager_to_fs_native(
                         hal,
+                        tid,
                         cap_space,
                         root_pt,
                         FILE_MANAGER_FS_SHARED_VA,

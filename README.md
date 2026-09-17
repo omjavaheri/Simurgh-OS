@@ -442,6 +442,79 @@ riscv64) unless noted:**
 
 **Known open issues:**
 
+- **fs-native's multi-client transport — two real kernel bugs found and
+  fixed (2026-09-17), on a real x86_64 OVMF/QEMU boot.** Both were found
+  while chasing `simurgh-file-manager`'s own long-open "`fm-core`'s
+  `Write` reply decodes as `Opened`" bug (that repo's `G_LAST_REPLY_
+  LABEL` doc comment carries the full cross-repo history); both are
+  genuine correctness defects in this repo regardless of that bug's
+  final disposition.
+
+  **Bug 1 — every fs-native client shared ONE global message page.**
+  `kernel_arch_glue::wire_file_manager_to_fs_native` mapped fs-native's
+  own two physical pages (`G_FS_SHARED_PHYS`/`G_FS_DATA_PHYS`) into
+  *every* client, at the same fixed VAs (`0xD800_0000`/`0xD810_0000`),
+  so all clients shared a single request/reply buffer with no mutual
+  exclusion at all. Its own doc comment justified this with "Root Task
+  and `simurgh-file-manager` are NOT concurrent callers in practice" —
+  true when `fm-core` was the only non-root client, and silently false
+  from the moment `simurgh-init` was wired in **through that very same
+  function**. `init-core` runs a real `RegisterPath` -> `Open` ->
+  `Read` -> `Close` sequence against that shared buffer. Captured on a
+  real boot, with an in-kernel trace ring (recorded in memory and dumped
+  later, so it does not perturb the timing that defeated every earlier
+  `klog!`-based attempt at this bug):
+
+  ```
+  FSLIVE CALL  tid=20 label=…106   <- fm-core RegisterPath
+  FSLIVE REPLY tid=5  to=20 …107   <- fs-native PathRegistered (ok)
+  FSLIVE CALL  tid=20 label=…101   <- fm-core Open
+  FSLIVE CALL  tid=11 label=…106   <- init, on the SAME page, mid-sequence
+  ```
+
+  A second, independent symptom of the same defect showed up as an
+  `UNHANDLED CPU EXCEPTION … cr2(fault_va)=0x00000000d8100000` — a
+  second, on-demand `init` spawned via `SPAWN_KNOWN_ELF` writing the
+  well-known bulk VA it was never wired for. **Fix:** each client now
+  carves and is mapped its OWN private page pair, registered in
+  `G_FS_CLIENT_PAGES`; the kernel copies them into and out of
+  fs-native's own pages around the server's `Recv`/`Reply`. fs-native
+  itself is unchanged and still sees exactly one request at its own
+  fixed VAs, and Root Task — which drives its fs demo by writing those
+  pages directly through the kernel identity map — is deliberately left
+  unregistered, so its long-proven path is byte-for-byte untouched.
+
+  **Bug 2 — `G_FS_ROOT_ONLY_PHASE` was never cleared.** The flag's own
+  doc comment states it is "cleared once by `wire_file_manager_to_fs_
+  native`", and the sibling Compositor latch
+  (`G_COMPOSITOR_ROOT_ONLY_PHASE`) really is cleared by
+  `wire_ui_core_to_compositor` — but the fs clear was never actually
+  written. The flag therefore latched `true` for the life of the system
+  and `fs_native_recv` permanently took `p2_ipc_recv`'s narrow,
+  hardcoded-switch-to-Root-Task dispatch instead of the general one.
+  Real, QEMU-confirmed consequence: `fm-core` issues its first
+  `RegisterPath` `Call` and fs-native hands the core straight back to
+  Root Task rather than letting `pick_next` run the client it has queued
+  work for. **Fix:** clear it where its own contract always said it was
+  cleared.
+
+  **Verification status, stated honestly.** A real x86_64 OVMF/QEMU boot
+  with both fixes reaches device-manager's own
+  `state=Failed restarts_in_window=6` fault-isolation marker and a clean
+  `POWER_CONTROL` shutdown, with root's own fs demo still reporting
+  `fs_read_result … MATCH` and no faults — i.e. **no regression**. What
+  could *not* be verified on hardware is the end-to-end effect on
+  `fm-core`'s own `self_check`, because fs-native is never scheduled
+  again once the full subsystem set is up: `fm-core` gets its `Call`
+  queued and fs-native, merely `Ready` with a large vruntime deficit
+  after the boot demo's own 202 round trips, loses every `pick_next` to
+  the §8.4 demo's two infinite counting loops. That is the same
+  already-documented, already-accepted "QEMU scheduling-capacity at
+  scale" characteristic the entries below describe, now acute enough to
+  block this specific observation. Both fixes are therefore committed on
+  the strength of code-level proof plus a no-regression boot, **not** on
+  a green `fm-core self_check` — which remains open and unobserved.
+
 - ~~**x86_64 — a real, pre-existing full scheduler stall right after
   `device-manager` reaches `state=Running`**~~ — **ROOT-CAUSED AND FIXED
   (2026-09-17)**, on a real x86_64 OVMF/QEMU boot. It was never a PIC or

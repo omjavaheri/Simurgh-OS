@@ -2242,6 +2242,14 @@ pub fn p2_ipc_call(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32, labe
                 .tcb_mut(n)
                 .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
                 .map(|(from, m)| (from.as_u32() as usize, m.label as usize));
+            // This `Call` was delivered straight into fs-native's pending
+            // `Recv`, so the server is about to read the request page —
+            // stage THIS caller's own private pages in first. A no-op for
+            // every non-fs endpoint and for Root Task. See
+            // `G_FS_CLIENT_PAGES`' own doc comment.
+            if switching_into_fs_native(into) {
+                fs_copy_client_to_server(caller.as_u32());
+            }
             Some(IpcSwitch { save, into, poke })
         }
         _ => None,
@@ -2503,6 +2511,18 @@ pub fn p2_ipc_reply(hal: &HalInterface, caller: ThreadId, to_raw: u32, label: u6
             // just `user_ctx_switch_ptrs`) is needed here.
             let _ = k.sched.dispatch(n, hal.now_ns());
             let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+            // Hand the reply fs-native just wrote into its own staging
+            // pages back to the ONE client it belongs to, before that
+            // client is resumed to read it. Without this every client
+            // shared one buffer — see `G_FS_CLIENT_PAGES`' own doc
+            // comment for the real, QEMU-confirmed bug that caused.
+            // A no-op unless `caller` really is fs-native and `to` really
+            // is a registered client.
+            // SAFETY: single-core; `G_FS_TID` written once by
+            // `fs_demo_start`.
+            if unsafe { core::ptr::addr_of!(G_FS_TID).read() } == Some(caller) {
+                fs_copy_server_to_client(to_raw);
+            }
             // `do_reply` only ever sets `pending_msg` (never
             // `pending_from` — the woken caller already knows who it
             // `Call`ed, unlike a receiver waking to a fresh `Call`).
@@ -2703,6 +2723,137 @@ static mut G_FS_DATA_PHYS: usize = usize::MAX;
 /// Single-core; written once by `fs_demo_start`, read only afterward.
 static mut G_FS_TID: Option<ThreadId> = None;
 
+/// How many real, separately-spawned fs-native CLIENTS can be wired at
+/// once. Three exist today (`simurgh-init`, `simurgh-file-manager`, and —
+/// implicitly — Root Task, which is deliberately NOT registered here; see
+/// [`fs_copy_client_to_server`]). Sized with real headroom rather than
+/// exactly at today's count, matching every other fixed-capacity registry
+/// in this file.
+const FS_MAX_CLIENTS: usize = 8;
+
+/// Per-client PRIVATE `(msg_phys, data_phys)` page pair, keyed by the
+/// client's own raw `ThreadId`. `u32::MAX` = a free slot.
+///
+/// **This is the fix for a real, QEMU-confirmed cross-client corruption
+/// bug.** Before this, [`wire_file_manager_to_fs_native`] mapped the ONE
+/// pair of pages `fs_demo_start` carved (`G_FS_SHARED_PHYS`/
+/// `G_FS_DATA_PHYS`) into EVERY client, at the same fixed VAs — so all of
+/// fs-native's clients shared a single global request/reply buffer with no
+/// mutual exclusion whatsoever. That was justified in this function's own
+/// doc comment by "Root Task and simurgh-file-manager are NOT concurrent
+/// callers in practice", which was true when `simurgh-file-manager` was
+/// the only non-root client — and stopped being true the moment
+/// `simurgh-init` was wired to fs-native through this very same function.
+/// `init-core`'s own boot work runs a real `RegisterPath` -> `Open` ->
+/// `Read` -> `Close` sequence against that shared buffer, concurrently
+/// with `fm-core`'s own `self_check`, so whichever client wrote last won:
+/// `fm-core`'s `Write` reply slot routinely came back holding `init`'s
+/// `Opened`. Each client now gets its OWN pages, and the kernel copies
+/// them in/out around fs-native's own `Recv`/`Reply` (see
+/// [`fs_copy_client_to_server`]/[`fs_copy_server_to_client`]), so no two
+/// clients can ever observe each other's traffic.
+///
+/// # Safety
+/// Single-core; written only by `wire_file_manager_to_fs_native`, read by
+/// the copy helpers.
+static mut G_FS_CLIENT_PAGES: [(u32, usize, usize); FS_MAX_CLIENTS] = [(u32::MAX, 0, 0); FS_MAX_CLIENTS];
+
+/// Records `tid`'s own private page pair. Returns `false` (and registers
+/// nothing) once [`FS_MAX_CLIENTS`] slots are taken.
+fn fs_register_client(tid: u32, msg_phys: usize, data_phys: usize) -> bool {
+    // SAFETY: single-core; see `G_FS_CLIENT_PAGES`.
+    unsafe {
+        let base = core::ptr::addr_of_mut!(G_FS_CLIENT_PAGES).cast::<(u32, usize, usize)>();
+        for i in 0..FS_MAX_CLIENTS {
+            if base.add(i).read().0 == u32::MAX {
+                base.add(i).write((tid, msg_phys, data_phys));
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `tid`'s own `(msg_phys, data_phys)`, or `None` if `tid` is not a
+/// registered client (Root Task, or any non-fs thread).
+fn fs_client_pages(tid: u32) -> Option<(usize, usize)> {
+    // SAFETY: single-core; see `G_FS_CLIENT_PAGES`.
+    unsafe {
+        let base = core::ptr::addr_of!(G_FS_CLIENT_PAGES).cast::<(u32, usize, usize)>();
+        for i in 0..FS_MAX_CLIENTS {
+            let entry = base.add(i).read();
+            if entry.0 == tid {
+                return Some((entry.1, entry.2));
+            }
+        }
+    }
+    None
+}
+
+/// fs-native's OWN `(msg_phys, data_phys)` — the pages actually mapped
+/// into the server's address space, which now act as a staging window for
+/// whichever client is currently being served.
+fn fs_server_pages() -> Option<(usize, usize)> {
+    // SAFETY: single-core; both written once by `fs_demo_start`.
+    unsafe {
+        let msg = core::ptr::addr_of!(G_FS_SHARED_PHYS).read();
+        let data = core::ptr::addr_of!(G_FS_DATA_PHYS).read();
+        if msg == usize::MAX || data == usize::MAX {
+            None
+        } else {
+            Some((msg, data))
+        }
+    }
+}
+
+/// Copies `client_tid`'s own private request pages into fs-native's
+/// staging pages, immediately before the server is resumed to read them.
+///
+/// A `client_tid` with no registered pages is a deliberate no-op: Root
+/// Task drives its own fs demo by writing fs-native's pages DIRECTLY
+/// through the kernel's identity map (`write_shared_fs_message`), so it
+/// has no private pair to copy from and needs none — leaving it
+/// unregistered keeps that long-proven path byte-for-byte unchanged.
+pub fn fs_copy_client_to_server(client_tid: u32) {
+    if let (Some((cmsg, cdata)), Some((smsg, sdata))) = (fs_client_pages(client_tid), fs_server_pages()) {
+        // SAFETY: all four are valid, exclusively-owned, identity-mapped
+        // 4 KiB frames (carved by `fs_demo_start`/`wire_file_manager_to_
+        // fs_native`); single-core, so no concurrent access.
+        unsafe {
+            core::ptr::copy_nonoverlapping(cmsg as *const u8, smsg as *mut u8, 4096);
+            core::ptr::copy_nonoverlapping(cdata as *const u8, sdata as *mut u8, 4096);
+        }
+    }
+}
+
+/// Copies fs-native's staging pages back into `client_tid`'s own private
+/// pages, immediately after the server has written its reply and before
+/// the client is resumed. Same "unregistered = no-op" contract as
+/// [`fs_copy_client_to_server`].
+pub fn fs_copy_server_to_client(client_tid: u32) {
+    if let (Some((cmsg, cdata)), Some((smsg, sdata))) = (fs_client_pages(client_tid), fs_server_pages()) {
+        // SAFETY: same contract as `fs_copy_client_to_server`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(smsg as *const u8, cmsg as *mut u8, 4096);
+            core::ptr::copy_nonoverlapping(sdata as *const u8, cdata as *mut u8, 4096);
+        }
+    }
+}
+
+/// True iff `into` is fs-native's own saved context — i.e. the switch
+/// about to be performed resumes the fs server itself. Used by
+/// [`p2_ipc_call`] to spot "this `Call` was delivered straight into
+/// fs-native's pending `Recv`" without `IpcSwitch` having to carry a tid.
+fn switching_into_fs_native(into: *const u8) -> bool {
+    // SAFETY: single-core; `G_FS_TID` written once by `fs_demo_start`.
+    let fs_tid = match unsafe { core::ptr::addr_of!(G_FS_TID).read() } {
+        Some(t) => t,
+        None => return false,
+    };
+    kstate().thread_context_mut_ptr(fs_tid).map(|p| p as *const u8 == into).unwrap_or(false)
+}
+
+
 /// `G_FS_TID`, exposed to `kernel/kernel/src/main.rs` — needed by the
 /// `sys::SBS_IPC_RECV` dispatch arm to recognize fs-native as the CALLER
 /// of that syscall (`fs_native_recv`'s own doc comment for why this
@@ -2785,10 +2936,20 @@ pub fn fs_native_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -
     // SAFETY: single-core; only ever written by `fs_demo_start`/`wire_
     // file_manager_to_fs_native`, never concurrently with this read.
     let root_only_phase = unsafe { core::ptr::addr_of!(G_FS_ROOT_ONLY_PHASE).read() };
-    if root_only_phase {
-        return p2_ipc_recv(hal, caller, endpoint_raw);
+    let outcome = if root_only_phase {
+        p2_ipc_recv(hal, caller, endpoint_raw)
+    } else {
+        p2_ipc_recv_general(hal, caller, endpoint_raw)
+    };
+    // A message was already queued, so fs-native resumes its OWN trap
+    // holding it — stage that client's private request pages in before it
+    // reads them. The `Switch` arm needs no hook: fs-native is parking on
+    // an empty endpoint there, and whichever `Call` wakes it later goes
+    // through `p2_ipc_call`'s own copy-in instead. See `G_FS_CLIENT_PAGES`.
+    if let Some(IpcRecvOutcome::Immediate { from, .. }) = outcome {
+        fs_copy_client_to_server(from as u32);
     }
-    p2_ipc_recv_general(hal, caller, endpoint_raw)
+    outcome
 }
 
 /// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
@@ -3279,16 +3440,22 @@ pub fn fs_demo_start(
 /// grant of the SAME Endpoint object (sourced from fs-native's own cap
 /// table, slot 0 — `grant_cap_into` only needs SOME cap space already
 /// holding a valid reference to derive from; fs-native's own slot 0 is as
-/// good a source as Root Task's) and maps the SAME two physical pages
-/// (not fresh ones) into `file_manager`'s own address space.
+/// good a source as Root Task's).
 ///
-/// Root Task and `simurgh-file-manager` are NOT concurrent callers in
-/// practice — Root Task's own fs demo runs once, early in boot, and
-/// completes before `simurgh-file-manager` is even spawned (this file's
-/// own boot-sequence ordering) — so unlike `simurgh-security-broker`'s
-/// own 3-way fan-in, no shared `Notification` is needed here: fs-native's
-/// plain, single-`Endpoint` `Recv` loop already correctly serves whoever
-/// calls it next, Root Task or `simurgh-file-manager`, in either order.
+/// **Each client gets its own PRIVATE pair of message/data pages
+/// (2026-09-17).** This function used to map fs-native's own two physical
+/// pages (`G_FS_SHARED_PHYS`/`G_FS_DATA_PHYS`) into every client, on the
+/// stated reasoning that "Root Task and `simurgh-file-manager` are NOT
+/// concurrent callers in practice". That reasoning covered the only two
+/// callers that existed at the time and silently stopped holding when
+/// `simurgh-init` became a THIRD client through this very same function —
+/// `init-core` runs a real `RegisterPath` -> `Open` -> `Read` -> `Close`
+/// sequence concurrently with `fm-core`'s own `self_check`, on what was
+/// then one global buffer, and clobbered it. `G_FS_CLIENT_PAGES`' own doc
+/// comment has the full, QEMU-confirmed story. Fresh pages are carved and
+/// registered here; the kernel copies them in/out around fs-native's own
+/// `Recv`/`Reply`, so fs-native itself is unchanged and still sees exactly
+/// one request at its own fixed VAs.
 ///
 /// **Must be paired with `subsystem_entry.rs`'s own `IPC_RECV` = `sys::
 /// SBS_IPC_RECV` (NOT `sys::IPC_RECV`)** — see that constant's own doc
@@ -3296,6 +3463,7 @@ pub fn fs_demo_start(
 /// second, non-fixed caller.
 pub fn wire_file_manager_to_fs_native(
     hal: &HalInterface,
+    file_manager_tid: ThreadId,
     file_manager_cs: kernel_cap::CapSpaceId,
     file_manager_root_pt: usize,
     file_manager_msg_va: usize,
@@ -3320,11 +3488,29 @@ pub fn wire_file_manager_to_fs_native(
         return None;
     }
 
+    // This client's OWN private message/data frames — NOT fs-native's own
+    // pages (which `shared_phys`/`data_phys` above name, and which stay
+    // the server-side staging window the kernel copies to and from). See
+    // `G_FS_CLIENT_PAGES`' own doc comment for why sharing them was a real
+    // bug.
+    let client_msg_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    let client_data_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core — a
+    // client must not start out seeing another client's leftover bytes.
+    unsafe {
+        core::ptr::write_bytes(client_msg_phys as *mut u8, 0, 4096);
+        core::ptr::write_bytes(client_data_phys as *mut u8, 0, 4096);
+    }
+    if !fs_register_client(file_manager_tid.as_u32(), client_msg_phys, client_data_phys) {
+        klog!("wire_file_manager_to_fs_native: no free fs client slot (FS_MAX_CLIENTS)\r\n");
+        return None;
+    }
+
     let msg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(msg_pool as *mut u8, 0, 4096 * 2) };
-    if hal.map_range(file_manager_root_pt, file_manager_msg_va, shared_phys, 4096, 1 | 2 | 8, msg_pool, 2) == u32::MAX {
+    if hal.map_range(file_manager_root_pt, file_manager_msg_va, client_msg_phys, 4096, 1 | 2 | 8, msg_pool, 2) == u32::MAX {
         klog!("wire_file_manager_to_fs_native: map_range error (message page)\r\n");
         return None;
     }
@@ -3332,10 +3518,31 @@ pub fn wire_file_manager_to_fs_native(
     let data_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: same contract as `msg_pool` above.
     unsafe { core::ptr::write_bytes(data_pool as *mut u8, 0, 4096 * 2) };
-    if hal.map_range(file_manager_root_pt, file_manager_data_va, data_phys, 4096, 1 | 2 | 8, data_pool, 2) == u32::MAX {
+    if hal.map_range(file_manager_root_pt, file_manager_data_va, client_data_phys, 4096, 1 | 2 | 8, data_pool, 2) == u32::MAX {
         klog!("wire_file_manager_to_fs_native: map_range error (data page)\r\n");
         return None;
     }
+
+    // fs-native now has a genuine SECOND client, so its Root-Task-only
+    // bootstrap phase is over: `fs_native_recv` must go back to the
+    // GENERAL dispatch. `G_FS_ROOT_ONLY_PHASE`'s own doc comment has
+    // always specified exactly this ("cleared once by `wire_file_manager_
+    // to_fs_native`") — but the clear itself was never actually written,
+    // so the flag latched `true` for the whole life of the system and
+    // `fs_native_recv` permanently took `p2_ipc_recv`'s narrow,
+    // hardcoded-to-Root-Task switch. Real consequence, confirmed on a
+    // real x86_64 QEMU boot: `fm-core` issues its first `RegisterPath`
+    // `Call`, fs-native blocks in `Recv` and hands the core straight back
+    // to Root Task instead of letting `pick_next` run the client it has
+    // queued work for, and fs-native is never scheduled again — the
+    // client's `Call` is simply never served. `wire_ui_core_to_
+    // compositor`'s own identical `G_COMPOSITOR_ROOT_ONLY_PHASE` clear
+    // (this file, same shape) is the precedent this was missing.
+    //
+    // SAFETY: single-core; the only writer at this point in boot (well
+    // after `fs_demo_start`'s own write, which this call is always
+    // sequenced after).
+    unsafe { core::ptr::addr_of_mut!(G_FS_ROOT_ONLY_PHASE).write(false) };
 
     Some(())
 }
