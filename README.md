@@ -361,43 +361,52 @@ riscv64) unless noted:**
 
 **Known open issues:**
 
-- **riscv64 only:** the `compositor` process faults (an instruction page
-  fault, not an illegal instruction) shortly after its first resume. Deep
-  investigation across several sessions narrowed the search space
-  considerably (ruled out corrupted resume data, stack/heap sizing, and
-  confirmed it reproduces identically on two independent QEMU builds) but the
-  root cause is not yet found. x86_64 and aarch64 are unaffected;
-  `scripts/qemu-fault-isolation-test.sh riscv64` runs with a documented
-  `--allow-fail` in CI so this stays visible without blocking the pipeline.
-  A prior live-GDB session (WSL, `qemu-system-riscv64 -s -S` + `gdb-
-  multiarch`) narrowed the exact fault to `ra` pointing inside
-  `AtomicUsize::load`'s own compiler-generated memory-ordering jump table,
-  called from `compositor-bin`'s own `BumpAllocator::alloc` — i.e., the
-  VERY FIRST real heap allocation `subsystem_main` makes. **Continued
-  2026-09-16, with one real disproof and one real new finding**: with a
-  fully rebuilt, current `compositor-bin`, a live breakpoint on the exact
-  `jr a0` instruction inside `atomic_load`'s own jump-table dispatch
-  (`0xc000e14c`) caught a REAL, successful execution of this path —
-  `a0 = 0xc000e150`, matching the table's own correctly-populated static
-  contents exactly (`x/2gx` confirmed the live memory matches the file on
-  disk) — disproving "the jump table itself is corrupted/unrelocated" as
-  a general, constant explanation; at least one real invocation of this
-  exact dispatch works correctly. Continuing to wait for the ACTUAL fault
-  (removing that breakpoint, arming one on `common_trap_entry` with
-  `$scause == 0xc` instead) ran for 20+ real minutes of genuine QEMU CPU
-  time (confirmed alive and running throughout, not hung) without ever
-  reaching it — a striking contrast to the original 2026-09-xx live
-  session, which reportedly hit the identical fault "almost instantly."
-  This strongly suggests the bug's own reproducibility is now entangled
-  with the SAME growing QEMU scheduling-capacity pressure documented
-  above (more real subsystems now compete for one vCPU than when this bug
-  was first live-debugged) — not a fixed, deterministic condition
-  anymore. Whoever continues this should either wait considerably longer
-  under live GDB, or — likely more productive — resolve the scheduling-
-  capacity item first, then return to this with the concrete jump-table
-  lead above already in hand rather than re-deriving it. Investigation
-  scripts and a fresh disassembly are preserved at `/tmp/simurgh-debug`
-  in WSL for whoever picks this up next.
+- **riscv64 — the boot-blocking crash is RESOLVED (2026-09-17); a
+  SEPARATE, newly-exposed fault remains open.** The real root cause of
+  what years of investigation above characterized as "the compositor
+  process faults shortly after its first resume" turned out to be
+  upstream of Compositor entirely: `mm_bench_riscv64`'s own `sum_ns /
+  ITERS` (division by a compile-time literal) lowers, on RV64 only, to a
+  PC-relative load of an LLVM-emitted magic-number constant from a
+  `.srodata.cst8` pool that the linker places alongside the KERNEL's own
+  rodata — outside `.user_text`/`.user_stack`, the only regions
+  `linker.ld` maps `U=1` for the Root Task's own U-mode image. Every
+  riscv64 boot therefore faulted on that load, several steps before the
+  boot sequence could ever reach Compositor's own real spawn — the
+  original live-GDB findings above (the jump-table dispatch inside
+  `atomic_load`) were a real, correctly-observed trace, but of a
+  DIFFERENT, later fault that a fresh QEMU run could only reach
+  intermittently depending on scheduling luck, not the deterministic
+  blocker. Fixed by forcing the divisor through an opaque `asm!` identity
+  (the same technique `zero!()` already uses elsewhere in this file) so
+  LLVM cannot constant-fold it, emitting a plain hardware `divu` instead
+  — see `mm_bench_riscv64`'s own doc comment for the full writeup.
+  QEMU-verified: riscv64 now boots dramatically further — through the
+  full two-process IPC/paging benchmark, VFS read/write throughput,
+  driver probes, and both mm-service queries, reaching a real spawned
+  `security-broker` process (previously unreachable on this
+  architecture at all).
+  **New fault found immediately after, in the process (2026-09-17,
+  UNRESOLVED)**: right after `security-broker` spawns, a second thread
+  (tid 9) takes a fatal U-mode exception — `cause=0xc sepc=0x0
+  stval=0x0`, i.e. an instruction PAGE FAULT (the same trap `cause` the
+  original bug report above named) but at PC exactly `0` — a jump to a
+  null/never-set entry point, not a corrupted jump-table dispatch. The
+  kernel's own fault-isolation mechanism catches it and logs "terminating
+  IT, rest of the system continues," but in practice the boot then stalls
+  — no further log lines appear even after 150+ real QEMU seconds,
+  suggesting something later in the boot sequence is blocked waiting on
+  whatever that faulted thread was supposed to do (plausibly a genuine
+  `security-broker-intermediary`-adjacent path, given riscv64's boot
+  order spawns `security-broker` around the same relative point x86_64/
+  aarch64 do, and aarch64 has its own separate, still-open crash in
+  exactly that intermediary demo, below — worth checking whether these
+  two are related once someone picks this back up, rather than assuming
+  they are two coincidentally-similar bugs). Not yet root-caused; needs
+  real instruction-level tracing (`gdb-multiarch` in WSL,
+  `qemu-system-riscv64 -s -S`) on tid 9's own spawn path specifically.
+  `scripts/qemu-fault-isolation-test.sh riscv64` still needs
+  `--allow-fail` in CI until this second issue is also resolved.
 - **aarch64 only, newly found (2026-09-12):** `security-broker-intermediary`
   (the Issue #28 capability-minting demo) crashes the boot right after
   `security-broker` itself is spawned — `unsafe precondition(s) violated:
