@@ -1226,6 +1226,17 @@ pub fn spawn_process_from_elf(
         }
     };
 
+    // Page-granular record of every `PT_LOAD` mapping already
+    // established for this image: `(vaddr_start, vaddr_end, phys_start,
+    // perm)`, all page-aligned. It exists to close a SECOND, distinct
+    // ELF-layout bug in this same loop — see the "shared boundary page"
+    // comment inside the loop below. Eight entries is generous headroom:
+    // every subsystem ELF this workspace links has three `PT_LOAD`
+    // segments (`.text` / `.rodata` / `.bss`).
+    const MAX_LOAD_SEGS: usize = 8;
+    let mut mapped: [(usize, usize, usize, usize); MAX_LOAD_SEGS] = [(0, 0, 0, 0); MAX_LOAD_SEGS];
+    let mut mapped_n: usize = 0;
+
     for seg in segments {
         // **Real bug found via QEMU** (fs-native's own spawn — the
         // FIRST ELF this loader ever loaded whose linker output didn't
@@ -1273,28 +1284,6 @@ pub fn spawn_process_from_elf(
             return None;
         }
 
-        let seg_phys = carve(state, mem_size4k as u64)?;
-        // SAFETY: `seg_phys` is fresh untyped RAM, identity-addressable,
-        // `mem_size4k` bytes long. `elf_bytes[file_offset..file_end]` was
-        // just bounds-checked above. Zeroing first then copying only
-        // `file_size` bytes reproduces the ELF spec's standard
-        // ".bss inside PT_LOAD" convention (mem_size > file_size is
-        // zero-filled) — the same handling `elf-loader`'s own doc
-        // comment describes for `uefi-bootloader`'s use of this shape.
-        // The copy destination is offset by `page_off`: `seg_phys` now
-        // names the containing PAGE (per the alignment fix above), not
-        // `seg.vaddr` itself, so the segment's own bytes must start
-        // `page_off` bytes into it to land at the correct address once
-        // `aligned_vaddr + page_off` (== `seg.vaddr`) is mapped.
-        unsafe {
-            core::ptr::write_bytes(seg_phys as *mut u8, 0, mem_size4k);
-            core::ptr::copy_nonoverlapping(
-                elf_bytes.as_ptr().add(file_offset),
-                (seg_phys + page_off) as *mut u8,
-                file_size,
-            );
-        }
-
         // Per-segment permissions from the ELF's own p_flags, translated
         // to this workspace's R(1)/W(2)/X(4)/U(8) `map_range` bit
         // encoding — tighter than `spawn_process`'s one blanket R+X+U
@@ -1311,9 +1300,130 @@ pub fn spawn_process_from_elf(
             perm |= 4;
         }
 
-        if !step(aligned_vaddr, seg_phys, mem_size4k, perm) {
-            klog!("spawn_process_from_elf: map_range error (PT_LOAD segment)\r\n");
-            return None;
+        // **A SECOND real bug found via QEMU** (2026-09-17, riscv64's own
+        // `security-broker-intermediary` spawn) — the "shared boundary
+        // page" case, and the direct cause of riscv64's `FAULT: thread 9
+        // ... cause=0xc sepc=0x0 stval=0x0` (a jump to PC 0) right after
+        // `security-broker` spawned.
+        //
+        // Rounding `p_vaddr` down to its containing page (the already-
+        // documented fix above) is only HALF of what an ELF loader owes
+        // this layout. Two consecutive `PT_LOAD` segments are allowed to
+        // share one physical page of the file — and therefore one page of
+        // the address space — whenever the earlier one does not end on a
+        // page boundary. That is exactly what the riscv64 linker emits for
+        // several of this workspace's own subsystem binaries, e.g.
+        // `security-broker-intermediary-bin`:
+        //
+        //   LOAD  vaddr=0xc000c000 memsz=0x32e8 R    (.rodata .srodata.cst8)
+        //   LOAD  vaddr=0xc000f2e8 memsz=0x8d18 RW   (.sbss .bss)
+        //
+        // `.rodata`'s tail lives in page `0xc000f000`; `.sbss` starts at
+        // `0xc000f2e8`, which rounds DOWN to that very same page. The old
+        // loop carved a FRESH, freshly-ZEROED physical frame for every
+        // segment and mapped its whole page-rounded range unconditionally,
+        // so the second segment's mapping silently REPLACED the first
+        // one's page-table entry for the shared page. From the process's
+        // point of view the last 0x2e8 bytes of its own `.rodata` — here
+        // the trailing 704 bytes of `.rodata` plus the ENTIRE
+        // `.srodata.cst8` constant pool — simply read back as zeros. A
+        // zeroed jump-table / constant-pool entry is a null code pointer,
+        // and the process jumped straight to address 0.
+        //
+        // x86_64 and aarch64 never saw this because their linker output
+        // for the SAME crates page-aligns the `.bss` segment's own
+        // `p_vaddr` (0x40015000 / 0x80015000), leaving no shared page.
+        // Only riscv64's layout packs `.sbss` into `.rodata`'s last page.
+        //
+        // The fix is what every real ELF loader does: a page already
+        // mapped by an earlier segment is REUSED, not re-mapped. This
+        // segment's own bytes are copied into that existing frame, and
+        // the shared page's permissions become the UNION of both
+        // segments' (here R|W|U — unavoidable at page granularity, and
+        // what Linux's own loader produces for this layout too). Only the
+        // pages BEYOND the shared prefix get a fresh carve.
+        let mut overlap = 0usize;
+        let mut ov_phys = 0usize;
+        let mut ov_perm = 0usize;
+        for &(vs, ve, ph, pe) in mapped.iter().take(mapped_n) {
+            if aligned_vaddr >= vs && aligned_vaddr < ve {
+                // Both ends are page-aligned, so `overlap` is a whole
+                // number of pages and always >= 4096 > `page_off`.
+                overlap = core::cmp::min(ve - aligned_vaddr, mem_size4k);
+                ov_phys = ph + (aligned_vaddr - vs);
+                ov_perm = pe;
+                break;
+            }
+        }
+
+        // Bytes of THIS segment's file data that land inside the shared
+        // prefix. `page_off` of the shared page belongs to the EARLIER
+        // segment and must not be touched — that is the `.rodata` tail
+        // whose loss caused the bug.
+        let prefix_bytes = if overlap > 0 {
+            core::cmp::min(file_size, overlap - page_off)
+        } else {
+            0
+        };
+
+        if overlap > 0 {
+            // SAFETY: `ov_phys` is identity-addressable untyped RAM the
+            // earlier segment already carved and zeroed over its whole
+            // page-rounded length, so the `.bss`-style tail beyond that
+            // segment's own file data is ALREADY zero — nothing needs
+            // zero-filling here, only this segment's own file bytes (if
+            // any) copied in. `elf_bytes[file_offset..]` was bounds-
+            // checked above and `prefix_bytes <= file_size`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    elf_bytes.as_ptr().add(file_offset),
+                    (ov_phys + page_off) as *mut u8,
+                    prefix_bytes,
+                );
+            }
+            if !step(aligned_vaddr, ov_phys, overlap, perm | ov_perm) {
+                klog!("spawn_process_from_elf: map_range error (shared PT_LOAD boundary page)\r\n");
+                return None;
+            }
+        }
+
+        let rest = mem_size4k - overlap;
+        if rest > 0 {
+            let rest_vaddr = aligned_vaddr + overlap;
+            let seg_phys = carve(state, rest as u64)?;
+            // SAFETY: `seg_phys` is fresh untyped RAM, identity-
+            // addressable, `rest` bytes long. `elf_bytes[file_offset +
+            // prefix_bytes ..][.. file_size - prefix_bytes]` is inside the
+            // range bounds-checked above. Zeroing first then copying only
+            // the remaining file bytes reproduces the ELF spec's standard
+            // ".bss inside PT_LOAD" convention (mem_size > file_size is
+            // zero-filled) — the same handling `elf-loader`'s own doc
+            // comment describes for `uefi-bootloader`'s use of this shape.
+            // When there is no shared prefix (`overlap == 0`, the common
+            // case) `rest_vaddr == aligned_vaddr` and `prefix_bytes == 0`,
+            // so this is byte-for-byte the original behavior, including
+            // the `page_off` shift that puts the segment's bytes at their
+            // correct unaligned virtual address.
+            unsafe {
+                core::ptr::write_bytes(seg_phys as *mut u8, 0, rest);
+                core::ptr::copy_nonoverlapping(
+                    elf_bytes.as_ptr().add(file_offset + prefix_bytes),
+                    (seg_phys + if overlap > 0 { 0 } else { page_off }) as *mut u8,
+                    file_size - prefix_bytes,
+                );
+            }
+
+            if !step(rest_vaddr, seg_phys, rest, perm) {
+                klog!("spawn_process_from_elf: map_range error (PT_LOAD segment)\r\n");
+                return None;
+            }
+
+            if mapped_n == MAX_LOAD_SEGS {
+                klog!("spawn_process_from_elf: more than MAX_LOAD_SEGS PT_LOAD segments\r\n");
+                return None;
+            }
+            mapped[mapped_n] = (rest_vaddr, rest_vaddr + rest, seg_phys, perm);
+            mapped_n += 1;
         }
     }
 

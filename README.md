@@ -540,8 +540,11 @@ riscv64) unless noted:**
   leaves `RFLAGS.IF = 1` in Ring 0 any more, so it has no live trigger,
   but it remains a real latent hazard worth closing on its own terms
   rather than relying on that.
-- **riscv64 — the boot-blocking crash is RESOLVED (2026-09-17); a
-  SEPARATE, newly-exposed fault remains open.** The real root cause of
+- ~~**riscv64 — the boot-blocking crash**~~ — **BOTH riscv64 boot faults
+  are now ROOT-CAUSED AND FIXED (2026-09-17), and riscv64 boots end to
+  end for the first time.** They were two genuinely different bugs found
+  back to back; both writeups are kept in full below, since every earlier
+  theory about each was wrong. The real root cause of
   what years of investigation above characterized as "the compositor
   process faults shortly after its first resume" turned out to be
   upstream of Compositor entirely: `mm_bench_riscv64`'s own `sum_ns /
@@ -565,27 +568,113 @@ riscv64) unless noted:**
   driver probes, and both mm-service queries, reaching a real spawned
   `security-broker` process (previously unreachable on this
   architecture at all).
-  **New fault found immediately after, in the process (2026-09-17,
-  UNRESOLVED)**: right after `security-broker` spawns, a second thread
-  (tid 9) takes a fatal U-mode exception — `cause=0xc sepc=0x0
-  stval=0x0`, i.e. an instruction PAGE FAULT (the same trap `cause` the
-  original bug report above named) but at PC exactly `0` — a jump to a
-  null/never-set entry point, not a corrupted jump-table dispatch. The
-  kernel's own fault-isolation mechanism catches it and logs "terminating
-  IT, rest of the system continues," but in practice the boot then stalls
-  — no further log lines appear even after 150+ real QEMU seconds,
-  suggesting something later in the boot sequence is blocked waiting on
-  whatever that faulted thread was supposed to do (plausibly a genuine
-  `security-broker-intermediary`-adjacent path, given riscv64's boot
-  order spawns `security-broker` around the same relative point x86_64/
-  aarch64 do, and aarch64 has its own separate, still-open crash in
-  exactly that intermediary demo, below — worth checking whether these
-  two are related once someone picks this back up, rather than assuming
-  they are two coincidentally-similar bugs). Not yet root-caused; needs
-  real instruction-level tracing (`gdb-multiarch` in WSL,
-  `qemu-system-riscv64 -s -S`) on tid 9's own spawn path specifically.
-  `scripts/qemu-fault-isolation-test.sh riscv64` still needs
-  `--allow-fail` in CI until this second issue is also resolved.
+  **The SECOND fault exposed by that fix (tid 9, `cause=0xc sepc=0x0
+  stval=0x0`) is ALSO ROOT-CAUSED AND FIXED (2026-09-17).** With both
+  fixed, riscv64 now boots end to end — see "Outcome" at the bottom of
+  this entry.
+
+  For the record, because the two most obvious theories were both
+  wrong: this was NOT the `untyped: CapId::new(0)` / slot-0 exhaustion
+  bug that produced aarch64's superficially-similar crash at the very
+  same point in the boot (`retype_one_from_any_untyped`, below) — riscv64
+  boots off SBI, not UEFI, and its boot report says `UntypedMemory
+  objects : 1`, a SINGLE ~51 MiB region, so "slot 0 filled up while other
+  regions sat untouched" cannot even be expressed there. Nor was it the
+  Ring-0 `DRV_IRQ_WAIT` monopolization bug (above): riscv64 has no PS/2
+  drivers to park the core, and the apparent post-fault "stall" was never
+  a scheduler hang at all — it was simply the whole rest of the boot
+  never happening, because Root Task's own sequential boot step never
+  returned.
+
+  **Real root cause — a general ELF-loader bug in
+  `kernel_arch_glue::spawn_process_from_elf`, exposed only by riscv64's
+  linker output.** Two consecutive `PT_LOAD` segments are allowed to
+  SHARE one page of the address space whenever the earlier one does not
+  end on a page boundary, and that is exactly what the riscv64 linker
+  emits for several of this workspace's subsystem binaries. For
+  `security-broker-intermediary-bin`:
+
+  ```
+  LOAD  vaddr=0xc000c000 memsz=0x32e8 R    (.rodata + .srodata.cst8)
+  LOAD  vaddr=0xc000f2e8 memsz=0x8d18 RW   (.sbss + .bss)
+  ```
+
+  `.rodata`'s tail lives in page `0xc000f000`; `.sbss` starts at
+  `0xc000f2e8`, which rounds DOWN to that same page. The loader carved a
+  fresh, freshly-ZEROED physical frame per segment and mapped each
+  segment's whole page-rounded range unconditionally, so the `.bss`
+  segment's mapping silently REPLACED the `.rodata` segment's page-table
+  entry for the shared page. From the process's point of view the last
+  `0x2e8` bytes of its own `.rodata` — the trailing 704 bytes plus the
+  ENTIRE `.srodata.cst8` constant pool — read back as zeros. A zeroed
+  jump-table / constant-pool entry is a null code pointer, so the process
+  jumped straight to address `0`: `sepc=0x0 stval=0x0`, an instruction
+  page fault at PC exactly 0, precisely as observed. Note this is the
+  page-rounding HALF-fix's blind spot: an earlier, correct fix already
+  rounded `p_vaddr` DOWN to its containing page (for fs-native-bin's
+  unaligned `.data`), but nothing then stopped a later segment from
+  re-mapping a page an earlier one already owned.
+
+  **Why riscv64 only.** x86_64 and aarch64 link the SAME crates with the
+  `.bss` segment's own `p_vaddr` page-aligned (`0x40015000` /
+  `0x80015000`), leaving no shared page at all. Only riscv64's layout
+  packs `.sbss` into `.rodata`'s last page. Four of the nine in-tree
+  riscv64 subsystem ELFs have this overlap today
+  (`security-broker-intermediary-bin`, `mm-service-bin`,
+  `netstack-bin`, `log-collector-native-bin`); the others were merely
+  lucky that the clobbered rodata tail held nothing they dereferenced.
+
+  **How it was found**, since the symptom pointed nowhere useful: a
+  temporary `klog!` of the spawned thread's saved `UserContext` at both
+  `init_user_thread` time and at the `TrapOutcome::SwitchTo` handoff
+  proved the context was PERFECT on both sides (`sepc=0xc0000800`,
+  `sp=0xc0430000`, `satp=0x80000000000852e0`) — which ruled out every
+  "wrongly-computed entry PC / uninitialized context / clobbered TCB"
+  theory at once and moved the search from the spawn path to the
+  process's own first instructions, i.e. to what its address space
+  actually contained. `readelf -lW` on the embedded ELF then showed the
+  shared boundary page immediately.
+
+  **Fix:** `spawn_process_from_elf` now keeps a small page-granular
+  record of the `PT_LOAD` mappings it has already established, and a
+  page already mapped by an earlier segment is REUSED rather than
+  re-mapped: the later segment's own bytes are copied into that existing
+  frame (the earlier segment already zeroed its whole page-rounded
+  length, so a `.bss`-style tail needs no zero-fill), and the shared
+  page's permissions become the UNION of both segments' — here `R|W|U`,
+  unavoidable at page granularity and what Linux's own loader produces
+  for this layout too. Only the pages beyond the shared prefix get a
+  fresh carve. When there is no overlap (`overlap == 0`, every x86_64 and
+  aarch64 image and most riscv64 ones) the code path is byte-for-byte the
+  previous behavior.
+
+  **Outcome — QEMU-verified on a real riscv64 SBI boot.** Before: 124
+  serial lines, dead at the tid-9 null-PC fault, confirmed frozen across
+  a full 240-second run. After: **173 lines, the complete boot, ending in
+  `root task (riscv64): real POWER_CONTROL syscall - shutdown` with QEMU
+  powering itself off** well inside the same window. All four Issue #28
+  end-to-end proofs now appear on riscv64, matching x86_64 and aarch64
+  (`minted a REAL capability into security-broker's own cap space`,
+  `revoked the demo capability — 2 slot(s) freed across BOTH capability
+  spaces`, and both mm-service multi-target lines), and the boot runs the
+  whole fault-isolation cycle to `device-manager ... state=Failed
+  restarts_in_window=6` — `scripts/qemu-fault-isolation-test.sh`'s own
+  PASS marker, which riscv64 had never once reached. No `sepc=0x0` fault
+  remains; every `FAULT:` line left in the log is the INTENTIONAL
+  `faulty-driver` fault-injection demo. **`scripts/qemu-fault-isolation-
+  test.sh riscv64` no longer needs `--allow-fail`.** x86_64 and aarch64
+  re-verified for regression on real OVMF/AAVMF boots (both still reach
+  their own PASS marker); `cargo test -p kernel-core` 40/40 green; all
+  three architectures build clean.
+
+  **Known remaining work, deliberately not swept** (same stance as the
+  two entries above, so each gets its own real QEMU verification):
+  riscv64's own `sys::DRV_IRQ_WAIT` arm in `kernel/src/main.rs` still
+  carries the Ring-0 `hal_riscv64::cpu::wfi()` monopolization loop
+  documented above. It was investigated as a candidate explanation for
+  this entry's "stall" and is NOT involved — riscv64 reaches shutdown
+  with it untouched — but `drv_irq_wait_yield` remains a correct drop-in
+  for it whenever a riscv64 driver does start waiting on a real IRQ.
 - ~~**aarch64 only:** `security-broker-intermediary` crashes the boot~~ —
   **ROOT-CAUSED AND FIXED (2026-09-17)**, via real live GDB on a real
   aarch64 QEMU boot. The `ptr::write_volatile requires that the pointer
@@ -739,8 +828,11 @@ documentation.
 ## MVP Definition of Done
 
 Combined acceptance criteria of `01-HAL-Layer.md §8`, `02-Microkernel-Layer.md §8`,
-and `03-Kernel-Subsystems-Layer.md §5` — **met**, on all three architectures
-except the one open riscv64 issue noted under **Current status** above.
+and `03-Kernel-Subsystems-Layer.md §5` — **met**, on all three architectures.
+As of 2026-09-17 x86_64, aarch64 and riscv64 each complete a real QEMU boot
+through the full fault-isolation cycle to `scripts/qemu-fault-isolation-
+test.sh`'s own PASS marker; see **Current status** above for the remaining,
+non-blocking known issues.
 
 ## Contributing
 
