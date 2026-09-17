@@ -117,6 +117,44 @@ bug (a real, previously-chased false lead in this project's own history).
 Exactly what CI runs on every push/PR is `.github/workflows/ci.yml` — the
 same commands above, for all three architectures.
 
+## Live kernel debugging with GDB (read this before trying)
+
+Several sessions lost real time to the same four avoidable GDB problems
+and concluded "the tooling doesn't work" when it does. All four are
+solved; start from here rather than rediscovering them.
+
+Boot QEMU with `-s -S` (gdb stub on `:1234`, CPU halted at reset) and
+attach `gdb-multiarch`. Then:
+
+1. **Use the fully-qualified Rust symbol path.** `break
+   security_broker_intermediary_demo_start` can NEVER resolve — the ELF
+   only contains `kernel_arch_glue::security_broker_intermediary_demo_start`.
+   Confirm the real name FIRST with
+   `nm -C target/<arch>-hal/debug/kernel | grep <name>`; `nm` without
+   `-C` shows the mangled form (`_ZN16kernel_arch_glue39...`), and
+   either the demangled path or a raw `break *0x<addr>` works.
+2. **Use `hbreak`, not `break`.** On the x86_64/aarch64 UEFI path the
+   kernel is not in RAM at reset — the bootloader copies its `PT_LOAD`s
+   to `0x40200000` *later*, overwriting any software breakpoint bytes
+   planted beforehand, so the breakpoint silently never fires. Hardware
+   breakpoints survive this.
+3. **`set breakpoint pending on` explicitly.** Under `-batch`, the
+   "Make breakpoint pending on future shared library load?" prompt is
+   auto-answered **N**, so an unresolved breakpoint is silently DISCARDED
+   and the following `continue` runs the whole boot unbreaked — which
+   looks exactly like "the breakpoint didn't work".
+4. **`file` cannot handle spaces in this repo's path.** Symlink the ELF
+   somewhere clean (`ln -sf "$REPO/target/<arch>-hal/debug/kernel"
+   /tmp/kernel.elf`) and `file /tmp/kernel.elf`. Symbol addresses match
+   runtime addresses directly (the kernel is linked at a fixed
+   `0x40200000`), so no offset math is needed.
+
+Source listings show `No such file or directory` because the debug info
+carries Windows-style paths — cosmetic only; `info line *$pc`, `bt`,
+`info registers` and `x/` all work. Stepping with a scripted `while`
+loop over `next` + `info line *$pc` is what pinned the untyped-exhaustion
+bug below down to one exact source line.
+
 ## Current status (honest)
 
 The layer-2 MVP (`02-Microkernel-Layer.md §8`, all six acceptance criteria)
@@ -450,19 +488,72 @@ riscv64) unless noted:**
   `qemu-system-riscv64 -s -S`) on tid 9's own spawn path specifically.
   `scripts/qemu-fault-isolation-test.sh riscv64` still needs
   `--allow-fail` in CI until this second issue is also resolved.
-- **aarch64 only, newly found (2026-09-12):** `security-broker-intermediary`
-  (the Issue #28 capability-minting demo) crashes the boot right after
-  `security-broker` itself is spawned — `unsafe precondition(s) violated:
-  ptr::write_volatile requires that the pointer argument is aligned and
-  non-null`, either inside the intermediary's own ELF spawn or the
-  context-switch immediately after. x86_64 and riscv64 are unaffected
-  (riscv64 never reaches this point at all, blocked earlier by the bug
-  above). A stack-size bump (the fix for a similar-looking, already-solved
-  x86_64 crash on the SAME process's own primary spawn) was tried and ruled
-  out — identical crash on a second real boot. Not yet root-caused; needs
-  real instruction-level tracing, the same tooling gap the riscv64 bug above
-  has been blocked on. See `kernel_arch_glue::security_broker_intermediary_
-  demo_start`'s own doc comment for the full record.
+- ~~**aarch64 only:** `security-broker-intermediary` crashes the boot~~ —
+  **ROOT-CAUSED AND FIXED (2026-09-17)**, via real live GDB on a real
+  aarch64 QEMU boot. The `ptr::write_volatile requires that the pointer
+  argument is aligned and non-null` panic was a RED HERRING pointing
+  kilometres away from the real fault, and every earlier theory (aarch64
+  codegen, exception-level/MMU setup, the ELF spawn, the context switch,
+  stack size) was wrong.
+
+  **Real root cause — an untyped-memory capacity bug, not an aarch64 bug
+  at all.** `KernelState::from_boot_info` seeds the Root Task with one
+  `UntypedMemory` capability *per usable firmware memory fragment*, at
+  consecutive capability slots. Every `SyscallOp::Retype` in
+  `kernel-arch-glue` hardcoded `untyped: CapId::new(0)`, pinning every
+  retyped kernel object for the whole boot to the ONE region behind slot
+  0 — merely the FIRST fragment of a fragmented UEFI memory map, not the
+  bulk of RAM. Once that fragment's forward-only watermark filled,
+  `Retype` failed with `MmError::OutOfMemory` while the other regions sat
+  untouched. On aarch64 that tipped over at
+  `security_broker_intermediary_demo_start`'s own very first `Retype`, so
+  it `return None`ed *before* publishing its shared page — leaving
+  `G_SBI_SHARED_PHYS` at its `usize::MAX` sentinel for the next
+  `write_shared_sbi_message` to dereference. x86_64 was never immune; its
+  slot-0 fragment simply still had room. This is the exact bug class
+  `carve_from_any_untyped` already fixed for RAW carves — the
+  capability-level `Retype` sites were simply missed at the time.
+
+  **Fix:** `kernel_arch_glue::retype_one_from_any_untyped` (the
+  capability-level twin of `carve_from_any_untyped`) tries each untyped
+  capability in turn; probing is side-effect free on failure. Plus a
+  `sbi_shared_page_ready` sentinel guard so a failed `*_demo_start` can
+  never again surface as a misdirecting pointer panic instead of an
+  honest logged skip.
+
+  **QEMU-verified on a real aarch64 AAVMF/UEFI boot:** zero kernel panics
+  (was 1), and all four Issue #28 end-to-end proofs now appear, matching
+  x86_64 — `minted a REAL capability into security-broker's own cap space
+  at slot 1`, `revoked ... 2 slot(s) freed across BOTH capability spaces`,
+  plus both multi-target (mm-service) proofs. The boot now runs all the
+  way through device-manager's full fault-isolation cycle to
+  `state=Failed restarts_in_window=6` — i.e. aarch64 now reaches
+  `scripts/qemu-fault-isolation-test.sh`'s own PASS marker, which it could
+  never reach before. Note it needs more than the script's default 90s to
+  get there: a 150s run reached every Issue #28 proof with zero panics but
+  stopped short of the marker, while a 300s run reached it — the same QEMU
+  scheduling-capacity effect documented below, not a regression. Use
+  `QEMU_FAULT_TEST_TIMEOUT=300` on aarch64.
+
+  **Known remaining work, deliberately not swept:** roughly 20 OTHER
+  `untyped: CapId::new(0)` `Retype` sites remain in `kernel-arch-glue`
+  (`wire_service_endpoint`, `wire_notification`, the
+  compositor/mm/netstack/driver spawns, ...). They carry the IDENTICAL
+  latent bug and will fail the same way as the system grows.
+  `retype_one_from_any_untyped` is a drop-in replacement for every one of
+  them — mechanical, and strictly safer (it tries slot 0 first, so
+  behaviour is identical wherever the current code already succeeds). They
+  were left for a follow-up that can give all three architectures their
+  own full QEMU verification.
+
+- **aarch64, newly exposed by the fix above (2026-09-17), minor:** after
+  `root task (aarch64): real POWER_CONTROL syscall - shutdown`, the boot
+  emits `UNHANDLED EXCEPTION: esr.ec=0x0 elr=0x40240a38 far=0x0` instead
+  of the VM actually powering off — the aarch64 PSCI (`smc`) shutdown path
+  apparently not taking effect under this QEMU/AAVMF combination. This
+  happens strictly AFTER all real work and after the fault-isolation PASS
+  marker, so it blocks nothing; it was simply never reachable before
+  because the boot died earlier. Not investigated.
 - **QEMU scheduling capacity at scale (x86_64) — getting worse, not yet
   fixed, deliberately deferred (2026-09-15)**: with this many real
   subsystems now competing for one emulated core under TCG, a

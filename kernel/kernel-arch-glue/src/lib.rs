@@ -418,6 +418,72 @@ fn carve_from_any_untyped(state: &mut KernelState, align: u64, bytes: u64) -> Op
     None
 }
 
+/// Issues ONE real `SyscallOp::Retype` for `count` objects of
+/// `target_type`, trying every untyped CAPABILITY the caller holds in
+/// turn instead of hardcoding capability slot 0.
+///
+/// **This is the capability-level twin of `carve_from_any_untyped` above,
+/// and it closes the exact same class of bug at the exact same place that
+/// one already fixed for RAW carves** — found for real via QEMU + live
+/// gdb on aarch64 (2026-09-17), as the root cause of the long-open
+/// `security_broker_intermediary_demo_start` boot crash.
+///
+/// `carve_from_any_untyped` fixed the raw-carve sites, but every
+/// `SyscallOp::Retype` in this file still passed `untyped: CapId::new(0)`
+/// — pinning EVERY retyped kernel object (Endpoints, Notifications,
+/// SharedRegions) for the whole boot to the ONE untyped region behind
+/// capability slot 0. `KernelState::from_boot_info` (kernel-core/src/
+/// state.rs, Step 3a) seeds the Root Task with one `UntypedMemory`
+/// capability PER usable firmware memory fragment, at consecutive slots,
+/// so slot 0 is merely the FIRST fragment of a fragmented UEFI memory
+/// map, not the bulk of RAM. Once that one fragment's forward-only
+/// watermark filled up, every later `Retype` failed with
+/// `MmError::OutOfMemory` while the other regions sat untouched.
+///
+/// On aarch64 that tipped over exactly at
+/// `security_broker_intermediary_demo_start`'s own FIRST `Retype`
+/// (live-gdb confirmed: `do_retype` reached `u.retype(..)` and took the
+/// error path, having passed both `resolve` and `untyped_mut`), which
+/// made that function `return None` — and THAT, not any aarch64 codegen
+/// or MMU problem, is what left `G_SBI_SHARED_PHYS` at its `usize::MAX`
+/// sentinel for the next `write_shared_sbi_message` to dereference,
+/// producing the misleading `ptr::write_volatile requires that the
+/// pointer argument is aligned and non-null` panic. x86_64 was never
+/// immune — its own slot-0 fragment simply happened to still have room.
+///
+/// Probing is side-effect free on failure, which is why "just try each
+/// one" is safe here: a slot holding a non-untyped capability fails in
+/// `do_retype`'s own `resolve` before anything is allocated, and an
+/// exhausted region fails in `UntypedMemory::retype` — the reservation
+/// step itself — so nothing is reserved, created, or leaked by an
+/// attempt that does not succeed.
+fn retype_one_from_any_untyped(
+    state: &mut KernelState,
+    hal: &HalInterface,
+    caller: ThreadId,
+    target_type: kernel_mm::KernelObjectType,
+    count: u32,
+) -> Option<CapId> {
+    // `untyped_count` is the number of untyped OBJECTS; the Root Task's
+    // own untyped capabilities are seeded one-per-object, so this bounds
+    // the candidate slots without assuming slot i names region i.
+    for slot in 0..state.untyped_count.max(1) {
+        if let Ok(SyscallReturn::NewCaps { cap, .. }) = state.dispatch(
+            caller,
+            hal.now_ns(),
+            SyscallOp::Retype {
+                untyped: CapId::new(slot),
+                target_type,
+                count,
+            },
+            hal,
+        ) {
+            return Some(cap);
+        }
+    }
+    None
+}
+
 /// Where the final binary's user (layer-3) Root Task image lives: its
 /// `.user_text` and `.user_stack` regions, each as a `(vma, lma, len)`
 /// triple (linked for a virtual address, loaded at a physical address
@@ -8648,6 +8714,30 @@ static mut G_SBI_TID: Option<ThreadId> = None;
 /// Single-core; written once, read only afterward.
 static mut G_SBI_SHARED_PHYS: usize = usize::MAX;
 
+/// `true` iff `security_broker_intermediary_demo_start` actually got far
+/// enough to publish the shared page, i.e. `G_SBI_SHARED_PHYS` is no
+/// longer its `usize::MAX` sentinel.
+///
+/// **Why this guard exists at all** (a real, multi-session debugging
+/// cost, not defensive habit): when `security_broker_intermediary_demo_
+/// start` returned `None`, `sys::SBI_DEMO_START`'s own handler dutifully
+/// returned `usize::MAX`, but Root Task's `.user_text` boot sequence
+/// issued `SBI_CAP_GRANT` unconditionally right afterwards anyway — so
+/// the sentinel got dereferenced as a `*mut u64` and the boot died with
+/// `unsafe precondition(s) violated: ptr::write_volatile requires that
+/// the pointer argument is aligned and non-null`. That message points at
+/// the IPC marshaling code, kilometres away from the actual fault (an
+/// exhausted untyped region during `Retype` — see
+/// `retype_one_from_any_untyped`), and cost several sessions chasing
+/// aarch64 codegen/MMU theories that were never involved. The real
+/// fix is that helper; this guard exists so that if a `*_demo_start`
+/// EVER fails again for some new reason, the boot degrades to an honest,
+/// logged "demo did not run" instead of a misdirecting kernel panic.
+fn sbi_shared_page_ready() -> bool {
+    // SAFETY: single-core; plain read of a scalar static.
+    unsafe { core::ptr::addr_of!(G_SBI_SHARED_PHYS).read() != usize::MAX }
+}
+
 /// See `write_shared_fs_message`'s own doc comment — identical shape,
 /// different backing global.
 ///
@@ -8740,29 +8830,28 @@ pub const SBI_TARGET_MM_SERVICE: u32 = 1;
 /// (`spawn_security_broker`'s own return value) — this is exactly why
 /// `root_task::Service::SecurityBrokerIntermediary` boots LAST.
 ///
-/// **Real, open bug found via QEMU (2026-09-12), aarch64-only, NOT yet
-/// root-caused**: on a real aarch64 boot, right after `spawn_security_
-/// broker_aarch64`'s own log line prints (that spawn itself succeeds),
-/// the very next step — THIS function's own call to `spawn_process_from_
-/// elf` for the intermediary ELF, or the `TrapOutcome::SwitchTo` right
-/// after it returns (`sys::SBI_DEMO_START`'s own match arm, `kernel/
-/// kernel/src/main.rs`) — crashes with `unsafe precondition(s) violated:
-/// ptr::write_volatile requires that the pointer argument is aligned and
-/// non-null`. x86_64 and riscv64 both run this exact same shared
-/// function without incident (riscv64 never reaches it at all, blocked
-/// earlier by the already-tracked Compositor spawn fault; x86_64 reaches
-/// it and completes cleanly, real `minted a REAL capability...` log
-/// lines confirmed on a real boot the same session this was found). A 4x
-/// stack-size bump on the intermediary's own spawn (`SBI_STACK_LEN`,
-/// mirroring `spawn_security_broker_aarch64`'s own `SB_STACK_LEN`
-/// precedent for an unrelated, already-fixed x86_64 stack overflow) was
-/// tried and ruled out — identical crash, same spot, on a second real
-/// boot. Not chased further this session: an unaligned/null raw pointer
-/// write deep in either ELF-loading or aarch64's own context-switch path
-/// needs real instruction-level tracing (the SAME class of tooling gap
-/// this project's own riscv64 Compositor spawn fault has been blocked on
-/// across many sessions — see `.claude/IMPLEMENTATION-PLAN.md` Sessions
-/// 25/27/36/37) to safely root-cause rather than guess at blindly.
+/// **Previously a real, open, aarch64-only boot crash (found 2026-09-12)
+/// — ROOT-CAUSED AND FIXED 2026-09-17 via live gdb on real QEMU.** For
+/// the record, because every one of the original suspicions was wrong:
+/// the symptom was `unsafe precondition(s) violated: ptr::write_volatile
+/// requires that the pointer argument is aligned and non-null`, firing
+/// right after `spawn_security_broker_aarch64`'s own log line, and it was
+/// variously blamed on this function's `spawn_process_from_elf` call, the
+/// `TrapOutcome::SwitchTo` after it, aarch64 codegen, aarch64
+/// exception-level/MMU setup, and stack size (a 4x `SBI_STACK_LEN` bump
+/// was tried and correctly ruled out). None of those were involved, and
+/// the bug was not aarch64-specific at all.
+///
+/// The real cause was capability slot 0's untyped region running out of
+/// room, so this function's own FIRST `SyscallOp::Retype` failed and it
+/// `return None`ed before ever publishing `G_SBI_SHARED_PHYS` — leaving
+/// that `usize::MAX` sentinel for the next `write_shared_sbi_message` to
+/// dereference, which is what actually produced the misleading pointer
+/// panic, kilometres from the real fault. See
+/// `retype_one_from_any_untyped`'s own doc comment for the full story and
+/// the fix; `sbi_shared_page_ready` now stops any future `*_demo_start`
+/// failure from presenting this way again. x86_64 was never immune — its
+/// own slot-0 fragment simply still had room.
 pub fn security_broker_intermediary_demo_start(
     hal: &HalInterface,
     caller: ThreadId,
@@ -8773,30 +8862,22 @@ pub fn security_broker_intermediary_demo_start(
     let k = kstate();
 
     // slot 0: this process's own Endpoint.
-    let ep_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: kernel_mm::KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
+    //
+    // `retype_one_from_any_untyped`, NOT a hardcoded `CapId::new(0)`:
+    // this exact call was the real root cause of the aarch64 boot crash
+    // this function's own doc comment documents — see that helper's own
+    // doc comment for the full, gdb-confirmed story.
+    let Some(ep_cap) = retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1) else {
+        klog!("security_broker_intermediary_demo_start: Retype failed (no untyped region has room) - demo skipped\r\n");
+        return None;
     };
 
     const SBI_STACK_VMA: usize = 0xC042_0000;
-    // `// TODO(bug)`: a real, open, aarch64-only crash right after this
-    // spawn — see this function's own module-level "known issues" doc
-    // comment (added 2026-09-12) for the full, honest record. A 4x stack
-    // bump (mirroring `spawn_security_broker_aarch64`'s own `SB_STACK_
-    // LEN` precedent for an unrelated, already-fixed x86_64 stack
-    // overflow) was tried and DID NOT fix it — same crash, same spot,
-    // confirmed via a second real QEMU boot — so stack size is ruled
-    // out, not the answer; kept at the original size rather than
-    // carrying an unexplained, unhelpful bump.
+    // Kept at the shared 64 KiB every other subsystem process uses. The
+    // aarch64 crash that once made this constant suspect was NOT a stack
+    // problem (a 4x bump was tried and correctly ruled out at the time);
+    // it was untyped exhaustion during `Retype`, fixed 2026-09-17 — see
+    // this function's own doc comment and `retype_one_from_any_untyped`.
     const SBI_STACK_LEN: usize = 4096 * 16;
     let (sbi_tid, sbi_cs, _stack_phys) =
         spawn_process_from_elf(hal, k, sbi_elf, expected_machine, SBI_STACK_VMA, SBI_STACK_LEN)?;
@@ -8815,18 +8896,10 @@ pub fn security_broker_intermediary_demo_start(
     // (a fresh `Retype`, then granted in) — see this function's own doc
     // comment on why a plain Endpoint stands in for a real `MintSpec`
     // resource here.
-    let resource_cap = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: kernel_mm::KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
+    let Some(resource_cap) = retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1)
+    else {
+        klog!("security_broker_intermediary_demo_start: Retype failed (slot 2 demo resource)\r\n");
+        return None;
     };
     // `REVOKE` is required, not optional: `SecurityRequest::CapRevoke`'s
     // own demo (`sys::SBI_CAP_REVOKE`) has the intermediary issue a real
@@ -8867,18 +8940,11 @@ pub fn security_broker_intermediary_demo_start(
     // security-broker's own client code can hardcode `register_
     // resource_slot("camera", 3)` without depending on the SECOND
     // target's own conditional slot count.
-    let resource_cap_sb_self = match k.dispatch(
-        caller,
-        hal.now_ns(),
-        SyscallOp::Retype {
-            untyped: CapId::new(0),
-            target_type: kernel_mm::KernelObjectType::Endpoint,
-            count: 1,
-        },
-        hal,
-    ) {
-        Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-        _ => return None,
+    let Some(resource_cap_sb_self) =
+        retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1)
+    else {
+        klog!("security_broker_intermediary_demo_start: Retype failed (slot 3 self-check resource)\r\n");
+        return None;
     };
     grant_cap_into(
         k,
@@ -8904,18 +8970,11 @@ pub fn security_broker_intermediary_demo_start(
         // slot 4: mm-service's own TCB.
         mint_tcb_cap_into(k, sbi_cs, mm_tid)?;
         // slot 5: a second demo resource, same shape as slot 2's.
-        let resource_cap_2 = match k.dispatch(
-            caller,
-            hal.now_ns(),
-            SyscallOp::Retype {
-                untyped: CapId::new(0),
-                target_type: kernel_mm::KernelObjectType::Endpoint,
-                count: 1,
-            },
-            hal,
-        ) {
-            Ok(SyscallReturn::NewCaps { cap, .. }) => cap,
-            _ => return None,
+        let Some(resource_cap_2) =
+            retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1)
+        else {
+            klog!("security_broker_intermediary_demo_start: Retype failed (slot 5 second-target resource)\r\n");
+            return None;
         };
         grant_cap_into(
             k,
@@ -9012,10 +9071,15 @@ pub fn sbi_cap_grant_call(
     cap: u32,
     rights: u32,
 ) -> Option<IpcSwitch> {
+    if !sbi_shared_page_ready() {
+        klog!("sbi_cap_grant_call: intermediary demo never started - skipping (see sbi_shared_page_ready)\r\n");
+        return None;
+    }
     let req = ipc_protocol::SecurityRequest::CapGrant { target_service, cap, rights };
     let msg = ipc_protocol::codec::encode_security_request(&req);
     // SAFETY: `security_broker_intermediary_demo_start` has already run
-    // (this opcode is only ever issued after `SBI_DEMO_START` returns).
+    // (this opcode is only ever issued after `SBI_DEMO_START` returns),
+    // and `sbi_shared_page_ready` just confirmed it published the page.
     unsafe { write_shared_sbi_message(&msg) };
     sbi_ipc_call(hal, caller, ep_cap)
 }
@@ -9025,6 +9089,11 @@ pub fn sbi_cap_grant_call(
 /// (`SecurityResponse::Granted::dst`) on success, `usize::MAX` on any
 /// `Error`/decode failure — same sentinel convention as `fs_open_result`.
 pub fn sbi_cap_grant_result() -> usize {
+    // Same sentinel guard as `sbi_cap_grant_call` — `read_shared_sbi_
+    // message` would `read_volatile` through `usize::MAX` otherwise.
+    if !sbi_shared_page_ready() {
+        return usize::MAX;
+    }
     // SAFETY: same contract as `sbi_cap_grant_call`.
     let msg = unsafe { read_shared_sbi_message() };
     match ipc_protocol::codec::decode_security_response(&msg) {
@@ -9037,9 +9106,14 @@ pub fn sbi_cap_grant_result() -> usize {
 /// CapRevoke` and issues it as a REAL `Call` to the intermediary — same
 /// shape as `sbi_cap_grant_call`.
 pub fn sbi_cap_revoke_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, cap: u32) -> Option<IpcSwitch> {
+    if !sbi_shared_page_ready() {
+        klog!("sbi_cap_revoke_call: intermediary demo never started - skipping (see sbi_shared_page_ready)\r\n");
+        return None;
+    }
     let req = ipc_protocol::SecurityRequest::CapRevoke { cap };
     let msg = ipc_protocol::codec::encode_security_request(&req);
-    // SAFETY: `security_broker_intermediary_demo_start` has already run.
+    // SAFETY: `security_broker_intermediary_demo_start` has already run,
+    // and `sbi_shared_page_ready` just confirmed it published the page.
     unsafe { write_shared_sbi_message(&msg) };
     sbi_ipc_call(hal, caller, ep_cap)
 }
@@ -9048,6 +9122,10 @@ pub fn sbi_cap_revoke_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, ca
 /// the number of slots freed (`SecurityResponse::Revoked::freed`) on
 /// success, `usize::MAX` on any `Error`/decode failure.
 pub fn sbi_cap_revoke_result() -> usize {
+    // Same sentinel guard as `sbi_cap_grant_result`.
+    if !sbi_shared_page_ready() {
+        return usize::MAX;
+    }
     // SAFETY: same contract as `sbi_cap_grant_result`.
     let msg = unsafe { read_shared_sbi_message() };
     match ipc_protocol::codec::decode_security_response(&msg) {
