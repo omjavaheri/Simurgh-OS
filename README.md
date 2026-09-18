@@ -1020,24 +1020,67 @@ riscv64) unless noted:**
   apparently not taking effect under this QEMU/AAVMF combination. This
   happens strictly AFTER all real work and after the fault-isolation PASS
   marker, so it blocks nothing; it was simply never reachable before
-  because the boot died earlier. Not investigated.
-- **aarch64 fault isolation only covers UNDEFINED INSTRUCTION faults, not
-  data aborts — real, pre-existing, found 2026-09-18** while verifying the
-  new `sys::THREAD_EXIT_POLL` syscall. `hal-arm64`'s own `el0_sync`
-  handler routes ONLY `ESR_EC_UNKNOWN_AARCH64` (`ec = 0x00`) to the
-  registered `FaultHandler`; every other exception class from EL0 falls
-  through to the terminal `UNHANDLED EXCEPTION:` print. The §5.2
-  fault-isolation demo passes because its injected fault is an undefined
-  instruction (`ec = 0x0`) — but a real EL0 **data abort** (`ec = 0x24`)
-  is NOT isolated: it kills the boot instead of killing only the
-  offending process. Observed live as
-  `UNHANDLED EXCEPTION: esr.ec=0x24 elr=0x80000744 far=0xd9200000`, after
-  the fault-isolation PASS marker. The equivalent fault on riscv64 IS
-  isolated correctly (`FAULT: thread 17 ... cause=0xd stval=0xd9200000 -
-  terminating IT, rest of the system continues`), which is what makes the
-  aarch64 gap unambiguous rather than a guess. Not caused by, and not
-  fixed by, the syscall work that exposed it — recorded here rather than
-  fixed opportunistically.
+  because the boot died earlier. Not investigated. **Re-confirmed
+  2026-09-18** (as `esr.ec=0x0 elr=0x40242244`, plus the
+  `tcr_el1=…`/`mmfr0.parange=…` line) by the data-abort fix in the entry
+  below, which restored the boot's path to `POWER_CONTROL` again. Worth
+  recording for whoever does investigate it: `elr` is a **kernel** (EL1)
+  address, and the `tcr_el1`/`mmfr0` line is printed only by
+  `common_sync_el1_entry` — so this arrives on the "Current EL, SPx"
+  vector, NOT the EL0 path, and is therefore outside per-process fault
+  isolation by design rather than by omission.
+- **aarch64 fault isolation covered ONLY undefined-instruction faults,
+  not data aborts — found 2026-09-18, FIXED and QEMU-verified the same
+  day.** Found while verifying the new `sys::THREAD_EXIT_POLL` syscall.
+  `hal-arm64`'s EL0 synchronous handler (`common_sync_entry`, the
+  `sync_el0_entry` vector) routed ONLY `ec = 0x00` ("Unknown reason", the
+  class `udf #0` traps as) to the registered `FaultHandler`; EVERY other
+  exception class from EL0 fell through to the terminal
+  `UNHANDLED EXCEPTION:` print. The §5.2 fault-isolation demo passed
+  only because its injected fault happens to BE an undefined instruction
+  — a real EL0 **data abort** (`ec = 0x24`) was NOT isolated and killed
+  the whole boot. Reproduced on a real aarch64 AAVMF/UEFI QEMU boot
+  before the fix: after the fault-isolation PASS marker, the boot died on
+  `UNHANDLED EXCEPTION: esr.ec=0x24 elr=0x800025c4 far=0xd8e00000`,
+  `full esr_el1=0x92000046` (EC 0x24, DFSC 0x06 translation fault, WnR
+  set — a genuine U-mode *write* to an unmapped VA), and never reached
+  its own `POWER_CONTROL` shutdown. riscv64's equivalent path already
+  isolated the SAME real fault correctly, which is what made this an
+  aarch64-specific gap rather than a project-wide design limit.
+
+  **Fix**: `common_sync_entry`'s fault branch now adopts hal-riscv64's
+  own rule verbatim — *any* synchronous exception that is neither the
+  syscall instruction nor an interrupt, taken while a user thread was
+  running, goes to the `FaultHandler` — instead of testing one EC value.
+  An EC allow-list was deliberately NOT used: it would need revisiting
+  for every class EL0 can produce (0x20 instruction abort, 0x24 data
+  abort, 0x22/0x26 PC/SP misalignment, 0x0E illegal execution state,
+  0x2C FP exception, 0x3C `brk`, …) and forgetting one degrades silently
+  back into exactly this bug. `FaultHandler`'s own contract needed no
+  change: it is a per-arch `fn(usize, usize, usize) -> TrapOutcome`
+  alias (not a `hal-core` trait), and both `simurgh_fault_aarch64` and
+  `kernel_arch_glue::p2_fault` are already cause-code agnostic, so
+  nothing above the HAL was touched.
+
+  Routing a KERNEL-mode fault into a path meant only for recoverable
+  user-mode faults would be a far worse bug than the one being fixed, so
+  the new branch is scoped to EL0 twice over: structurally (it is only
+  reachable from the "Lower EL, AArch64 / Synchronous" vector slot — a
+  synchronous EL1 fault takes the "Current EL, SPx" slot into
+  `common_sync_el1_entry`, whose dump-and-halt behavior is untouched),
+  and explicitly via a `SPSR_EL1.M[4:0] == EL0t` check, the direct
+  analogue of riscv64's own `SSTATUS.SPP == 0` guard.
+
+  **QEMU-verified on a real aarch64 AAVMF/UEFI boot, both halves:** the
+  same data aborts that previously killed the boot are now isolated per
+  process — `FAULT: thread 18 took a fatal U-mode exception (cause=0x24
+  …) - terminating IT, rest of the system continues`, likewise thread 17
+  — and the boot now runs PAST them to `root task (aarch64): real
+  POWER_CONTROL syscall - shutdown`, which it had never reached before.
+  Zero regression to what already worked: the pre-existing
+  undefined-instruction demo still runs its full six-restart supervision
+  cycle under device-manager to `state=Failed restarts_in_window=6`, and
+  `scripts/qemu-fault-isolation-test.sh aarch64` still PASSES.
 - **A real unmapped-VA access around `0xD920_0000` / `0xD8E0_0000` —
   pre-existing, found 2026-09-18, not investigated.** The addresses
   belong to the security-broker ↔ store / policy-engine shared-page edges

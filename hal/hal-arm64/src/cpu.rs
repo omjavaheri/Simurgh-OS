@@ -1102,22 +1102,25 @@ pub fn set_tick_handler(handler: TickHandler) {
     }
 }
 
-/// `ESR_EL1.EC` = 0x00, "Unknown reason" per the ARM Architecture
-/// Reference Manual — the class every genuinely undefined A64 encoding
-/// traps as, including `udf #0` (Permanently Undefined): this project's
-/// aarch64 fault-injection demo choice (03-Kernel-Subsystems-Layer.md
-/// §5.2), analogous to hal-riscv64's `.word 0` / hal-x86_64's `ud2`.
-/// The ONLY exception class this mechanism currently handles — a real
-/// kernel would extend this to every EC that can legitimately occur
-/// from EL0 (e.g. Data/Instruction Abort, EC 0x24/0x20), a tracked
-/// follow-up once a concrete need arises (same scope decision
-/// hal-x86_64's own `FAULT_VECTOR_UD` doc comment makes).
-const ESR_EC_UNKNOWN_AARCH64: u64 = 0x00;
+/// `SPSR_EL1.M[4:0]`, the saved "mode" field: the Exception level — and
+/// the execution state (AArch64 vs AArch32) — the exception was taken
+/// FROM. Masked out of `spsr` to scope per-process fault isolation to
+/// genuine user-mode faults; see the fault branch in `common_sync_entry`.
+const SPSR_M_MASK: u64 = 0x1F;
+
+/// `SPSR_EL1.M[4:0] == 0b00000` — "EL0t": AArch64 EL0 using `SP_EL0`,
+/// the one and only state this project ever executes user code in
+/// (`enter_user`/`resume_user` below always build exactly this `SPSR`).
+/// Any other value means the exception came from EL1 (`0b0101` = EL1h)
+/// or from AArch32 (bit 4 set), neither of which may EVER be routed into
+/// per-process fault isolation — see the fault branch's own comment.
+const SPSR_M_EL0T: u64 = 0x00;
 
 /// Signature of the handler the microkernel registers for a fatal EL0
 /// exception that is not a `svc`: raw `(ec, elr, far)` — the exception
-/// class, the resume PC, and the fault address (0 for `ESR_EC_UNKNOWN_
-/// AARCH64`, which carries no fault-address ISS field) — mirrors
+/// class, the resume PC, and the fault address (`FAR_EL1`, meaningful
+/// for the abort/alignment classes and simply 0 for classes such as EC
+/// 0x00 that carry no fault-address ISS field) — mirrors
 /// hal-riscv64's `FaultHandler`'s `(cause_code, sepc, stval)` shape and
 /// hal-x86_64's `FaultHandler`'s `(vector, rip, _reserved)` shape.
 /// Always expected to return `TrapOutcome::Terminate` in practice (the
@@ -1160,10 +1163,12 @@ extern "C" fn common_sync_entry(_frame: *mut SyncFrame) {}
 
 /// Called from `sync_el0_entry` with a pointer to the saved `SyncFrame`.
 /// Reads `ESR_EL1.EC` to identify the exception; routes a `svc` (EC =
-/// `ESR_EC_SVC_AARCH64`) to the registered `SyscallHandler` and advances
-/// `ELR_EL1` past it; anything else (this milestone registers no fault/
-/// tick handler yet — same scope decision hal-x86_64's own U-mode+
-/// syscall milestone made) dumps and halts.
+/// `ESR_EC_SVC_AARCH64`) to the registered `SyscallHandler`; routes
+/// every OTHER synchronous exception taken from EL0 — any exception
+/// class, not just undefined instructions — to the registered
+/// `FaultHandler` for per-process fault isolation. Only an exception
+/// that was not taken from EL0, or one for which no handler is
+/// registered at all, dumps and halts.
 #[cfg(target_os = "none")]
 #[no_mangle]
 extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
@@ -1309,7 +1314,57 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
         return;
     }
 
-    if ec == ESR_EC_UNKNOWN_AARCH64 {
+    // EVERY remaining synchronous exception taken from EL0 is a candidate
+    // for per-process fault isolation (03-Kernel-Subsystems-Layer.md
+    // §2.1/§5.2) — not just EC 0x00 ("Unknown reason", the class `udf #0`
+    // traps as and the one this project's own §5.2 fault-injection demo
+    // happens to use). **Real bug found via QEMU (2026-09-18)**: this
+    // branch used to test `ec == 0x00` and nothing else, so a genuine EL0
+    // **Data Abort** (EC 0x24 — e.g. the real unmapped-VA store around
+    // `0xD920_0000` that a U-mode thread takes on the security-broker
+    // shared-page edge) fell straight through to `trap_diag` +
+    // `halt_on_unexpected_exception` and killed the WHOLE BOOT
+    // (`UNHANDLED EXCEPTION: esr.ec=0x24 ...`) instead of killing only
+    // the offending process. The isolation guarantee was therefore real
+    // for exactly one fault class and silently absent for every other —
+    // while hal-riscv64's equivalent branch already isolated the SAME
+    // real fault correctly (`cause=0xd`, a load page fault), which is
+    // what made this an aarch64-specific gap rather than a design limit.
+    //
+    // The condition now MATCHES hal-riscv64's own rule exactly ("any
+    // synchronous exception that is neither the syscall instruction nor
+    // an interrupt, taken while a U-mode thread was running"), rather
+    // than enumerating ECs: an allow-list would have to be revisited for
+    // every class EL0 can produce (0x20 Instruction Abort, 0x24 Data
+    // Abort, 0x22/0x26 PC/SP misalignment, 0x0E Illegal Execution State,
+    // 0x2C FP exception, 0x3C `brk`, …), and forgetting one degrades
+    // silently back into exactly this bug. Reaching this line already
+    // implies `ec != ESR_EC_SVC_AARCH64`: the `svc` branch above either
+    // returns or halts.
+    //
+    // Scoping to EL0 is what keeps this SAFE, and it holds twice over —
+    // misrouting a KERNEL fault into per-process isolation would be far
+    // worse than the bug being fixed, silently "recovering" from a real
+    // EL1 kernel bug by killing some thread instead:
+    //   1. Structurally: `common_sync_entry` is only ever reached from
+    //      `sync_el0_entry`, the "Lower EL, AArch64 / Synchronous" slot
+    //      of `arm64_vector_table`. A synchronous EL1 fault takes the
+    //      "Current EL, SPx" slot instead (`sync_exception_entry` ->
+    //      `common_sync_el1_entry`), whose dump-and-halt behavior this
+    //      change does not touch at all.
+    //   2. Explicitly, belt-and-braces: `SPSR_EL1.M[4:0] == EL0t`
+    //      confirms the exception really was taken from AArch64 EL0 —
+    //      the direct analogue of hal-riscv64's own `SSTATUS.SPP == 0`
+    //      test, which guards its identical fault branch. `spsr` here is
+    //      the value captured at the very top of this function, before
+    //      any handler could run and before any nested IRQ could clobber
+    //      `SPSR_EL1` (see this function's own top-of-body comment), so
+    //      it is the genuine exception state.
+    // An EL1 fault, an AArch32 fault, or no registered `FaultHandler`
+    // (e.g. `kernel-stub`) all keep the original dump-and-halt path
+    // below, unchanged — exactly as on riscv64.
+    let from_el0 = (spsr & SPSR_M_MASK) == SPSR_M_EL0T;
+    if from_el0 {
         // SAFETY: `frame` is the on-stack register file `sync_el0_entry`
         // just saved; valid for this call, with no other live reference
         // (the `svc` branch above already returned by this point).
@@ -1321,11 +1376,13 @@ extern "C" fn common_sync_entry(frame: *mut SyncFrame) {
             match h(ec as usize, elr as usize, far as usize) {
                 TrapOutcome::Resume(ret) => {
                     // Not the expected outcome for a fatal exception (the
-                    // faulting instruction is still `udf`, so resuming at
-                    // the SAME `elr` would just re-fault forever), but the
-                    // type is shared with the syscall path, so this arm
-                    // must exist — same as hal-riscv64's/hal-x86_64's own
-                    // fault-handler `Resume` arms.
+                    // faulting instruction is untouched — for every class
+                    // routed here, `ELR_EL1` points AT it, not past it, so
+                    // resuming at the SAME `elr` would just re-fault
+                    // forever), but the type is shared with the syscall
+                    // path, so this arm must exist — same as
+                    // hal-riscv64's/hal-x86_64's own fault-handler
+                    // `Resume` arms.
                     f.regs[SyncFrame::X0] = ret as u64;
                     return;
                 }
