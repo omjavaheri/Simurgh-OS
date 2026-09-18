@@ -1452,6 +1452,87 @@ mod sys {
     /// policy`'s own `TODO(spec)` covers that gap honestly (shared with
     /// `MAP_PAGE`/`POWER_CONTROL` and every other MVP-phase opcode).
     pub const SCHED_SET_SYSTEM_POLICY: usize = 135;
+    /// `a0` = the raw `ThreadId` of a thread the CALLER spawned. Asks
+    /// whether that thread has terminated, and if so why — the general
+    /// process-supervision syscall (2026-09-18).
+    ///
+    /// Returns TWO registers (`TrapOutcome::Resume2`, as `IPC_RECV`
+    /// already does for its own two-value answer): `a0` = a status code,
+    /// `a1` = its companion payload. The codes are
+    /// `kernel_arch_glue`'s own `THREAD_EXIT_*` constants —
+    /// `THREAD_EXIT_RUNNING`(0, payload `0`: still alive, including
+    /// spawned-but-not-yet-started), `THREAD_EXIT_CLEAN`(1, payload =
+    /// the thread's self-reported exit code), `THREAD_EXIT_FAULTED`(2,
+    /// payload = the RAW architecture trap cause it died of, NOT
+    /// normalized across architectures), `THREAD_EXIT_UNKNOWN`(3,
+    /// payload `0`: dead, reason unrecorded — unreachable today, kept so
+    /// the encoding is total), and `THREAD_EXIT_DENIED`(`usize::MAX`,
+    /// payload `0`: no such thread, OR the caller is not its spawner —
+    /// deliberately one indistinguishable value for both, see that
+    /// constant's own doc comment).
+    ///
+    /// This is the real, GENERAL primitive behind `simurgh-init`'s own
+    /// post-launch crash-loop detection (that repo's README long flagged
+    /// its absence as the blocker for acting on
+    /// `ServiceUnit::restart_policy` after a successful launch). It
+    /// replaces nothing: device-manager's own `DM_WAIT_CRASH`/
+    /// `DM_POLL_CRASH`/`DM_RESPAWN_DRIVER` trio stays exactly as it is —
+    /// those are a bespoke, single-slot mechanism hardwired to one
+    /// watched demo driver (`kernel_arch_glue`'s `WATCHED_DRIVER_TID`/
+    /// `DM_TID` statics), load-bearing for the §5.2 fault-isolation
+    /// acceptance demo, and deliberately left untouched. Both are
+    /// populated from the same real fault in `p2_fault`.
+    ///
+    /// Two deliberate design decisions, both documented at length on
+    /// `kernel_core::SyscallOp::ThreadExitStatus` itself rather than
+    /// here:
+    /// - **It polls, it does not block.** A supervisor watches MANY
+    ///   children, so a syscall that parked it on ONE named thread would
+    ///   blind it to all the others (device-manager can block because it
+    ///   watches exactly one driver). The answer is STICKY — a
+    ///   terminated thread's reason is recorded once and never cleared —
+    ///   so polling cannot MISS an exit, however long the gap between
+    ///   two polls. Same `Wait`/`Poll` split as `NOTIF_WAIT`/
+    ///   `NOTIF_POLL`, landing on the `Poll` side for the same reason
+    ///   Compositor's own input loop does.
+    /// - **Only the spawner may ask.** Unlike `sys::PS_LIST_ENTRY`
+    ///   (unrestricted, but deliberately coarser — a bare `ThreadState`
+    ///   code and nothing more), this answer includes a raw fault cause,
+    ///   and a raw `ThreadId` is guessable in this MVP. Unrestricted, it
+    ///   would let any process sweep the whole TCB table and read every
+    ///   other process's crash details.
+    pub const THREAD_EXIT_POLL: usize = 136;
+    /// `a0` = `1` iff `simurgh-init`'s own real post-launch crash-
+    /// supervision self-check passed — a real `sys::THREAD_EXIT_POLL`
+    /// round trip about a process init genuinely spawned itself, plus a
+    /// real ACCESS-CONTROL check that a query about a thread init did NOT
+    /// spawn is refused. `a1` = the raw `THREAD_EXIT_*` status code that
+    /// query actually returned, so the serial log carries the real
+    /// observed value rather than only a pass/fail bit.
+    ///
+    /// A SEPARATE opcode from `sys::IN_REPORT` (which reports init's own
+    /// unrelated DAG-resolution / spawn / manifest-read results, and
+    /// whose `a0`/`a1` are both fully spoken for) — the same "one opcode
+    /// per distinct real proof" split `sys::DG_LC_REPORT` already made
+    /// from `sys::DG_REPORT`, for the same reason.
+    pub const IN_SUPERVISE_REPORT: usize = 137;
+}
+
+/// Human-readable name for one of `kernel_arch_glue`'s `THREAD_EXIT_*`
+/// wire status codes, for the serial log only (`sys::IN_SUPERVISE_REPORT`'s
+/// own handler). Architecture-independent and shared by all three
+/// handlers — the raw numbers are what cross the syscall boundary; this
+/// exists purely so a real boot log reads as prose instead of an
+/// unexplained integer.
+fn thread_exit_status_name(code: usize) -> &'static str {
+    match code {
+        kernel_arch_glue::THREAD_EXIT_RUNNING => "still running",
+        kernel_arch_glue::THREAD_EXIT_CLEAN => "exited cleanly",
+        kernel_arch_glue::THREAD_EXIT_FAULTED => "faulted",
+        kernel_arch_glue::THREAD_EXIT_UNKNOWN => "exited, reason unrecorded",
+        kernel_arch_glue::THREAD_EXIT_DENIED => "denied (no such thread, or caller is not its spawner)",
+        _ => "unrecognized status",
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -3547,6 +3628,32 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 None => usize::MAX,
             });
         }
+        sys::THREAD_EXIT_POLL => {
+            let hal = kernel_arch_glue::khal();
+            // Same `running()`-with-root-fallback shape every other
+            // caller-identifying opcode in this handler uses (see
+            // `sys::NOTIF_POLL` just above). The caller's identity is
+            // load-bearing here, not incidental: it IS the access check
+            // (`kernel_core::SyscallOp::ThreadExitStatus` answers only a
+            // thread's own spawner).
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let (status, payload) = kernel_arch_glue::p2_thread_exit_status(hal, caller, a0 as u32);
+            // Two registers, not one packed value: the payload can be a
+            // full-width architecture trap cause (this opcode's own doc
+            // comment).
+            return TrapOutcome::Resume2(status, payload);
+        }
+        sys::IN_SUPERVISE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode): real post-launch crash-supervision self-check {} - THREAD_EXIT_POLL on its own spawned process returned {}\r\n",
+                if a0 == 1 { "PASSED" } else { "FAILED" },
+                thread_exit_status_name(a1)
+            ));
+            return TrapOutcome::Resume(0);
+        }
         sys::SCHED_SET_SYSTEM_POLICY => {
             return TrapOutcome::Resume(
                 match kernel_arch_glue::set_system_scheduler_policy(a0, a1) {
@@ -4438,6 +4545,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 "device-manager (U-mode, isolated subsystem process, x86_64): state={name} restarts_in_window={a1}\r\n"
             ));
             if a0 == 3 {
+                // Additive cross-check of the GENERAL thread-exit query
+                // against this demo's own real crash (that function's own
+                // doc comment explains why this is the one point on a real
+                // boot where that is possible). Must run BEFORE
+                // `p2_dm_supervision_done`, purely for log ordering — it
+                // changes no state either way.
+                kernel_arch_glue::p2_verify_watched_driver_exit_query(kernel_arch_glue::khal());
                 kernel_arch_glue::p2_dm_supervision_done();
             }
             return TrapOutcome::Resume(0);
@@ -7497,6 +7611,25 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 None => usize::MAX,
             });
         }
+        sys::THREAD_EXIT_POLL => {
+            let hal = kernel_arch_glue::khal();
+            // See the x86_64 handler's own arm for why the caller's
+            // identity is load-bearing here (it IS the access check).
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let (status, payload) = kernel_arch_glue::p2_thread_exit_status(hal, caller, x0 as u32);
+            return TrapOutcome::Resume2(status, payload);
+        }
+        sys::IN_SUPERVISE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode): real post-launch crash-supervision self-check {} - THREAD_EXIT_POLL on its own spawned process returned {}\r\n",
+                if x0 == 1 { "PASSED" } else { "FAILED" },
+                thread_exit_status_name(x1)
+            ));
+            return TrapOutcome::Resume(0);
+        }
         sys::SCHED_SET_SYSTEM_POLICY => {
             return TrapOutcome::Resume(
                 match kernel_arch_glue::set_system_scheduler_policy(x0, x1) {
@@ -8173,6 +8306,8 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 "device-manager (U-mode, isolated subsystem process, aarch64): state={name} restarts_in_window={x1}\r\n"
             ));
             if x0 == 3 {
+                // See the x86_64 handler's own arm for the reasoning.
+                kernel_arch_glue::p2_verify_watched_driver_exit_query(kernel_arch_glue::khal());
                 kernel_arch_glue::p2_dm_supervision_done();
             }
             return TrapOutcome::Resume(0);
@@ -8922,6 +9057,11 @@ fn simurgh_syscall(
                 // via QEMU: `s_timer` fired ~12500 times in a tight
                 // re-arm loop with zero forward progress once
                 // device-manager's exemption outlived its purpose.
+                //
+                // See the x86_64 handler's own arm for the additive
+                // general-thread-exit cross-check below, which must run
+                // before `p2_dm_supervision_done` purely for log ordering.
+                kernel_arch_glue::p2_verify_watched_driver_exit_query(kernel_arch_glue::khal());
                 kernel_arch_glue::p2_dm_supervision_done();
             }
             return TrapOutcome::Resume(0);
@@ -9191,6 +9331,32 @@ fn simurgh_syscall(
                 Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
                 None => usize::MAX,
             });
+        }
+        sys::THREAD_EXIT_POLL => {
+            let hal = kernel_arch_glue::khal();
+            // Same `running()`-with-root-fallback shape every other
+            // caller-identifying opcode in this handler uses (see
+            // `sys::NOTIF_POLL` just above). The caller's identity is
+            // load-bearing here, not incidental: it IS the access check
+            // (`kernel_core::SyscallOp::ThreadExitStatus` answers only a
+            // thread's own spawner).
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let (status, payload) = kernel_arch_glue::p2_thread_exit_status(hal, caller, a0 as u32);
+            // Two registers, not one packed value: the payload can be a
+            // full-width architecture trap cause (this opcode's own doc
+            // comment).
+            return TrapOutcome::Resume2(status, payload);
+        }
+        sys::IN_SUPERVISE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode): real post-launch crash-supervision self-check {} - THREAD_EXIT_POLL on its own spawned process returned {}\r\n",
+                if a0 == 1 { "PASSED" } else { "FAILED" },
+                thread_exit_status_name(a1)
+            ));
+            return TrapOutcome::Resume(0);
         }
         sys::SCHED_SET_SYSTEM_POLICY => {
             return TrapOutcome::Resume(

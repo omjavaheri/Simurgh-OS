@@ -24,7 +24,7 @@
 
 use crate::config::MAX_THREADS;
 use crate::state::KernelState;
-use crate::tcb::ThreadState;
+use crate::tcb::{ThreadExit, ThreadState};
 use hal_core::HalInterface;
 use kernel_cap::ThreadId;
 use kernel_sched::MAX_PRIORITY;
@@ -255,13 +255,22 @@ impl KernelState {
     /// `account` first, purely to leave `kernel-sched`'s own state
     /// internally consistent — irrelevant to `tid` itself, which is being
     /// destroyed either way.
-    pub fn terminate_thread(&mut self, tid: ThreadId, now_ns: u64) -> TerminationOutcome {
+    /// `exit` records WHY `tid` died, for its spawner to read back later
+    /// via `SyscallOp::ThreadExitStatus` (`crate::tcb::ThreadExit`'s own
+    /// doc comment). It is a required argument rather than an assumed
+    /// `Faulted`: this same function is the generic termination path, and
+    /// a caller that knows the real reason must not be able to silently
+    /// drop it.
+    pub fn terminate_thread(
+        &mut self,
+        tid: ThreadId,
+        exit: ThreadExit,
+        now_ns: u64,
+    ) -> TerminationOutcome {
         if self.sched.running() == Some(tid) {
             self.sched.account(now_ns);
         }
-        if let Some(t) = self.tcb_mut(tid) {
-            t.state = ThreadState::Exited;
-        }
+        self.mark_exited(tid, exit);
         self.sched.remove(tid);
 
         match self.sched.pick_next(now_ns) {
@@ -337,13 +346,19 @@ impl KernelState {
     /// `incoming` must already be `Ready` (e.g. via `wake_blocked`) —
     /// this does not check or change its readiness, only commits it as
     /// `running`.
-    pub fn terminate_thread_and_handoff(&mut self, tid: ThreadId, incoming: ThreadId, now_ns: u64) {
+    /// `exit` carries the same meaning as [`KernelState::terminate_thread`]'s
+    /// own argument of that name.
+    pub fn terminate_thread_and_handoff(
+        &mut self,
+        tid: ThreadId,
+        exit: ThreadExit,
+        incoming: ThreadId,
+        now_ns: u64,
+    ) {
         if self.sched.running() == Some(tid) {
             self.sched.account(now_ns);
         }
-        if let Some(t) = self.tcb_mut(tid) {
-            t.state = ThreadState::Exited;
-        }
+        self.mark_exited(tid, exit);
         self.sched.remove(tid);
         let _ = self.sched.dispatch(incoming, now_ns);
     }
@@ -431,9 +446,13 @@ mod tests {
         // give `terminate_thread` a `running() == Some(root)` to charge.
         let _ = k.sched.dispatch(root, 0);
 
-        let outcome = k.terminate_thread(root, 1_000);
+        let outcome = k.terminate_thread(root, ThreadExit::Faulted { cause: 0xd }, 1_000);
         assert_eq!(outcome, TerminationOutcome::Idle);
         assert_eq!(k.tcb(root).unwrap().state, ThreadState::Exited);
+        // The REASON is recorded alongside the state, not just the fact of
+        // death - that pairing is what `SyscallOp::ThreadExitStatus` reads
+        // back, and `Tcb::exit`'s own documented invariant.
+        assert_eq!(k.tcb(root).unwrap().exit, Some(ThreadExit::Faulted { cause: 0xd }));
         assert!(k.sched.entity(root).is_none());
         assert_eq!(k.sched.running(), None);
     }
@@ -449,7 +468,7 @@ mod tests {
         let _ = k.sched.note_ready(other, 0);
         let _ = k.sched.dispatch(root, 0);
 
-        let outcome = k.terminate_thread(root, 1_000);
+        let outcome = k.terminate_thread(root, ThreadExit::Faulted { cause: 0xd }, 1_000);
         assert_eq!(outcome, TerminationOutcome::Switched { incoming: other });
         assert_eq!(k.tcb(root).unwrap().state, ThreadState::Exited);
         assert!(k.sched.entity(root).is_none());
@@ -513,7 +532,7 @@ mod tests {
         // A subsequent `terminate_thread` on `other` (standing in for
         // "whatever runs next picks it up") should now be able to select
         // the woken `root`.
-        let outcome = k.terminate_thread(other, 3_000);
+        let outcome = k.terminate_thread(other, ThreadExit::Clean { code: 0 }, 3_000);
         assert_eq!(outcome, TerminationOutcome::Switched { incoming: root });
     }
 
@@ -544,7 +563,7 @@ mod tests {
         // fairness comparison in ways this test does not need to pin down
         // exactly - the point of `terminate_thread_and_handoff` is that it
         // is never even asked.
-        k.terminate_thread_and_handoff(root, waiter, 1_000_001_000);
+        k.terminate_thread_and_handoff(root, ThreadExit::Faulted { cause: 0x2 }, waiter, 1_000_001_000);
         assert_eq!(k.tcb(root).unwrap().state, ThreadState::Exited);
         assert!(k.sched.entity(root).is_none());
         assert_eq!(k.sched.running(), Some(waiter));

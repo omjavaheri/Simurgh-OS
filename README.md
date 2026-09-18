@@ -334,6 +334,90 @@ riscv64) unless noted:**
   x86_64 (`1`), aarch64 (`0`), and riscv64 (`0`), all real, honest numbers
   for what each machine type actually exposes, not a guess. Previously this
   discovery ran at boot but had no observable log line anywhere.
+- **Real general process-exit supervision (`sys::THREAD_EXIT_POLL`,
+  2026-09-18)**, QEMU-verified against a REAL crash on all three
+  architectures: the kernel had per-process fault isolation
+  (03 §5.2) but no GENERAL way for a process to learn that a process IT
+  spawned had died. The only mechanism was device-manager's own bespoke,
+  single-slot one — `kernel-arch-glue`'s `WATCHED_DRIVER_TID`/`DM_TID`
+  statics plus the `DM_WAIT_CRASH`/`DM_POLL_CRASH`/`DM_RESPAWN_DRIVER`
+  opcodes, hardwired to exactly one demo driver and reusable by nobody.
+  `kernel_core::SyscallOp` had no exit-notification variant keyed by an
+  arbitrary spawned `ThreadId` at all, which is what blocked
+  `simurgh-init` from acting on `ServiceUnit::restart_policy` after a
+  unit had successfully started (that repo's README named this exact
+  gap). One new general syscall closes it. **It replaces nothing** —
+  device-manager's trio is untouched and still drives the §5.2
+  fault-isolation demo; both are populated from the same real fault in
+  `p2_fault`.
+
+  `a0` = the raw `ThreadId` of a thread the CALLER spawned. Answers in
+  TWO registers (`TrapOutcome::Resume2`, the same shape `sys::IPC_RECV`
+  uses — the payload can be a full-width architecture trap cause with no
+  spare bits to pack a tag into): `a0` = status, `a1` = payload.
+  `THREAD_EXIT_RUNNING`(0) still alive · `THREAD_EXIT_CLEAN`(1, payload =
+  self-reported exit code) · `THREAD_EXIT_FAULTED`(2, payload = the RAW
+  architecture trap cause, deliberately NOT normalized across
+  architectures) · `THREAD_EXIT_UNKNOWN`(3) dead, reason unrecorded ·
+  `THREAD_EXIT_DENIED`(`usize::MAX`) refused.
+
+  Two deliberate design decisions, both documented at length on
+  `kernel_core::SyscallOp::ThreadExitStatus`:
+  - **It polls; it does not block.** device-manager can block because it
+    supervises exactly ONE driver. A real supervisor (`simurgh-init`)
+    watches MANY units, and a syscall that parked it on one named thread
+    would blind it to every other unit crashing meanwhile — the "wait on
+    any of N" primitive that would be needed instead does not exist and
+    is already a recorded gap (`wire_notification`). The project solves
+    that same gap the same way elsewhere (`sys::NOTIF_POLL` in
+    Compositor's input loop). Polling is lossless here because the answer
+    is STICKY: a terminated thread's reason is recorded once
+    (`Tcb::exit`) and never cleared, so an exit occurring between two
+    polls cannot be missed. A blocking `WaitThreadExit` companion is
+    recorded as explicit future work, not built speculatively — it needs
+    a per-TCB waiter list plus a wake-and-poke at every termination site,
+    which is exactly the stale-return-register bug class
+    `SyscallReturn::DeliveredValue` documents.
+  - **Only a thread's own SPAWNER may ask.** `Tcb` gained a `spawner`
+    field, recorded automatically at TCB allocation from whoever is
+    running (correct for every real spawn path with no call-site change:
+    boot-time spawns run as the Root Task, `SPAWN_KNOWN_ELF` as init,
+    `SPAWN_FROM_BUFFER` as native-loader, `DM_RESPAWN_DRIVER` as
+    device-manager). A raw `ThreadId` is guessable in this MVP
+    (`SyscallOp::Reply` records that accepted gap), and the answer
+    includes a raw fault cause — unrestricted, any process could sweep
+    the whole TCB table and read every other process's crash details.
+    `sys::PS_LIST_ENTRY` stays the unrestricted but deliberately COARSER
+    introspection path (a bare state code, no exit reason). "No such
+    thread" and "not yours" are distinct kernel errors but ONE
+    indistinguishable wire value, so a refusal leaks nothing.
+
+  Termination now records WHY, not just that: `KernelState::mark_exited`
+  is the single place both `ThreadState::Exited` and
+  `Tcb::exit: Option<ThreadExit>` are written, and `terminate_thread` /
+  `terminate_thread_and_handoff` take the reason as a required argument
+  so a caller that knows it cannot silently drop it. First recorded
+  reason wins — a real fault cause is never overwritten by a later, less
+  specific termination.
+
+  **Real QEMU verification against a real crash, all three
+  architectures.** An additive, read-only cross-check runs at the exact
+  moment device-manager reports `Failed` (the §5.2 PASS point) — the one
+  instant on a real boot where a genuinely-crashed process exists AND the
+  running thread is its real spawner. It changes no control flow. Real
+  observed results: x86_64 `supervisor tid#10 queried its own crashed
+  child tid#31 -> status=2 payload=0x6`, aarch64 `tid#11 ... tid#26 ->
+  status=2 payload=0x0`, riscv64 `tid#10 ... tid#25 -> status=2
+  payload=0x2` — in each case status 2 = faulted and the payload is
+  exactly the raw trap cause that architecture's own `FAULT:` line
+  reported for that same thread. All three still reach
+  `state=Failed restarts_in_window=6`; x86_64 and riscv64 still reach a
+  clean `POWER_CONTROL` shutdown. 9 new `kernel-core` unit tests cover the
+  primitive directly (live child, real fault cause read back, sticky and
+  idempotent answers, clean-vs-fault, non-spawner refused, the Root Task
+  refused because nothing spawned it, out-of-range/empty slots,
+  spawner attribution, first-reason-wins), and the existing 200 000
+  iteration syscall fuzzer now generates the new operation too.
 - **Real per-process introspection (`sys::PS_LIST_ENTRY`, 2026-09-12)**:
   `simurgh-shell`'s own `ps` command long flagged itself as "not a live
   process table — no kernel syscall exposes real per-process
@@ -937,6 +1021,36 @@ riscv64) unless noted:**
   happens strictly AFTER all real work and after the fault-isolation PASS
   marker, so it blocks nothing; it was simply never reachable before
   because the boot died earlier. Not investigated.
+- **aarch64 fault isolation only covers UNDEFINED INSTRUCTION faults, not
+  data aborts — real, pre-existing, found 2026-09-18** while verifying the
+  new `sys::THREAD_EXIT_POLL` syscall. `hal-arm64`'s own `el0_sync`
+  handler routes ONLY `ESR_EC_UNKNOWN_AARCH64` (`ec = 0x00`) to the
+  registered `FaultHandler`; every other exception class from EL0 falls
+  through to the terminal `UNHANDLED EXCEPTION:` print. The §5.2
+  fault-isolation demo passes because its injected fault is an undefined
+  instruction (`ec = 0x0`) — but a real EL0 **data abort** (`ec = 0x24`)
+  is NOT isolated: it kills the boot instead of killing only the
+  offending process. Observed live as
+  `UNHANDLED EXCEPTION: esr.ec=0x24 elr=0x80000744 far=0xd9200000`, after
+  the fault-isolation PASS marker. The equivalent fault on riscv64 IS
+  isolated correctly (`FAULT: thread 17 ... cause=0xd stval=0xd9200000 -
+  terminating IT, rest of the system continues`), which is what makes the
+  aarch64 gap unambiguous rather than a guess. Not caused by, and not
+  fixed by, the syscall work that exposed it — recorded here rather than
+  fixed opportunistically.
+- **A real unmapped-VA access around `0xD920_0000` / `0xD8E0_0000` —
+  pre-existing, found 2026-09-18, not investigated.** The addresses
+  belong to the security-broker ↔ store / policy-engine shared-page edges
+  (`STORE_VA` / `POLICY_ENGINE_VA` / `SB_SHARED_VA` in
+  `kernel/kernel/src/main.rs`). On riscv64 two threads take real load/store
+  page faults there (`cause=0xd`/`cause=0xf`) and are correctly isolated,
+  the boot continuing to a clean `POWER_CONTROL` shutdown; on aarch64 the
+  same address surfaces via the unhandled-data-abort gap above. These
+  threads were previously starved by the documented QEMU
+  scheduling-capacity limit and simply never ran far enough to reach the
+  faulting access, so this is newly OBSERVED, not newly introduced —
+  nothing in the `sys::THREAD_EXIT_POLL` work touches those edges or any
+  mapping.
 - **QEMU scheduling capacity at scale (x86_64) — LARGELY SUPERSEDED
   (2026-09-17); read the correction first.** The most alarming claim in
   this entry — that `device-manager` was never once observed reaching its

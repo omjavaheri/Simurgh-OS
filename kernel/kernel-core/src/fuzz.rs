@@ -241,12 +241,12 @@ fn random_message(rng: &mut Rng) -> SmallMessage {
 /// register_irq` ignores its `handler` argument entirely).
 fn fuzz_irq_handler(_irq: hal_core::interrupt::IrqId) {}
 
-/// One pseudo-random `SyscallOp`, uniformly over all thirteen variants,
+/// One pseudo-random `SyscallOp`, uniformly over all fourteen variants,
 /// with every field independently adversarial (see the field-level
 /// helpers above) — exactly the shape an untrusted layer-3 process
 /// controls.
 fn random_op(rng: &mut Rng, root: ThreadId) -> SyscallOp {
-    match rng.next_range(13) {
+    match rng.next_range(14) {
         0 => SyscallOp::Send {
             endpoint: random_cap_id(rng),
             msg: random_message(rng),
@@ -311,10 +311,22 @@ fn random_op(rng: &mut Rng, root: ThreadId) -> SyscallOp {
         11 => SyscallOp::Poll {
             notification: random_cap_id(rng),
         },
-        _ => SyscallOp::IrqBind {
+        12 => SyscallOp::IrqBind {
             mmio: random_cap_id(rng),
             notification: random_cap_id(rng),
             handler: fuzz_irq_handler,
+        },
+        // `random_thread_id` deliberately includes out-of-range and
+        // wildly out-of-range indices as well as the real root thread —
+        // exactly the adversarial input `do_thread_exit_status`'s own
+        // range/occupancy check (`NoSuchThread`) and ownership check
+        // (`NotSpawner`) exist to survive. The root thread is the
+        // interesting in-range case: it is real, so it gets past the
+        // first check and must then be refused by the second (nothing
+        // spawned it, so its `spawner` is `None` and can never equal any
+        // caller).
+        _ => SyscallOp::ThreadExitStatus {
+            thread: random_thread_id(rng, root),
         },
     }
 }

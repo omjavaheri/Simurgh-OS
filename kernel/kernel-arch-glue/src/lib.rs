@@ -2041,12 +2041,29 @@ pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u
             );
             let now = hal.now_ns();
             k.wake_blocked(dm_tid, now);
-            k.terminate_thread_and_handoff(tid, dm_tid, now);
+            k.terminate_thread_and_handoff(
+                tid,
+                kernel_core::ThreadExit::Faulted { cause: cause_code as u64 },
+                dm_tid,
+                now,
+            );
             return k.user_context_bytes(dm_tid).map(|c| c.as_ptr());
         }
     }
 
-    match k.terminate_thread(tid, hal.now_ns()) {
+    // The raw `cause_code` is recorded on the dying thread's own TCB here,
+    // for its SPAWNER to read back later via `SyscallOp::ThreadExitStatus`
+    // (`p2_thread_exit_status` below) — the general counterpart of the
+    // single-slot `PENDING_CRASH` static above, which only ever serves
+    // device-manager's one watched driver. Both are populated on the same
+    // real fault; neither replaces the other yet (device-manager's own
+    // blocking wait is load-bearing for the §5.2 fault-isolation demo and
+    // is deliberately left untouched).
+    match k.terminate_thread(
+        tid,
+        kernel_core::ThreadExit::Faulted { cause: cause_code as u64 },
+        hal.now_ns(),
+    ) {
         kernel_core::TerminationOutcome::Switched { incoming } => {
             k.user_context_bytes(incoming).map(|c| c.as_ptr())
         }
@@ -8180,6 +8197,142 @@ pub fn ps_list_entry(idx: usize) -> Option<(u32, u8)> {
     Some((idx as u32, thread_state_wire_code(tcb.state)))
 }
 
+// ---------------------------------------------------------------------------
+// General thread-exit supervision (`sys::THREAD_EXIT_POLL`, 2026-09-18).
+//
+// The architecture-erased half of the real `kernel_core::SyscallOp::
+// ThreadExitStatus` primitive — see that operation's own doc comment for
+// the whole design (why it polls rather than blocks, and why only a
+// thread's own spawner may ask). Everything here is wire format: flatten
+// `SyscallReturn::ThreadStatus`'s three-way answer into the two plain
+// registers a U-mode caller gets back, and keep `kernel-core` free of any
+// knowledge of that encoding.
+//
+// The status codes are a small, closed set rather than bit-packed into one
+// register the way `sys::PS_LIST_ENTRY`'s own `(tid << 8) | state_code`
+// is: the payload here is a FULL 64-bit architecture trap cause with no
+// spare bits to shift it past, so the answer genuinely needs two
+// registers (`TrapOutcome::Resume2`, which every architecture already has
+// for exactly this "one value does not fit" case — see `IPC_RECV`).
+// ---------------------------------------------------------------------------
+
+/// The queried thread is alive (any non-`Exited` state, including spawned-
+/// but-not-yet-started). Payload register is `0`.
+pub const THREAD_EXIT_RUNNING: usize = 0;
+/// The queried thread terminated voluntarily; the payload register holds
+/// its self-reported exit code (`0` = success by convention).
+pub const THREAD_EXIT_CLEAN: usize = 1;
+/// The queried thread was killed by a fatal exception; the payload
+/// register holds the RAW, architecture-specific trap cause code (NOT
+/// normalized across architectures — `kernel_core::ThreadExit::Faulted`'s
+/// own doc comment).
+pub const THREAD_EXIT_FAULTED: usize = 2;
+/// The queried thread terminated but no reason was recorded
+/// (`kernel_core::ThreadExit::Unknown` — unreachable today, kept so this
+/// encoding is total). Payload register is `0`.
+pub const THREAD_EXIT_UNKNOWN: usize = 3;
+/// The query was refused: the target names no live TCB, or the caller is
+/// not the target's spawner. Deliberately ONE wire value for both
+/// kernel-side errors — the distinction is useful inside the kernel (and
+/// logged there) but telling an unauthorized caller WHICH of the two it
+/// hit would leak exactly the "does this thread exist" fact the spawner
+/// check exists to withhold. `usize::MAX` matches the established error
+/// sentinel of every other real query opcode in this project
+/// (`sys::SPAWN_KNOWN_ELF`, `sys::PS_LIST_ENTRY`, `sys::SERIAL_TRY_READ`).
+pub const THREAD_EXIT_DENIED: usize = usize::MAX;
+
+/// Purely ADDITIVE, real, on-boot cross-check of the general thread-exit
+/// primitive against a real, genuinely-crashed process — called once from
+/// each architecture's own `sys::DM_REPORT` handler at the exact moment
+/// device-manager reports `Failed` (the §5.2 fault-isolation demo's own
+/// PASS point), just before `p2_dm_supervision_done`.
+///
+/// Why here specifically: at that instant the system contains a process
+/// that REALLY faulted (`WATCHED_DRIVER_TID`, killed by `p2_fault` on a
+/// genuine U-mode exception) whose REAL spawner is the thread that is
+/// running right now (device-manager, which respawned it via
+/// `sys::DM_RESPAWN_DRIVER`). So this is the one place on a real boot
+/// where the general query can be exercised end to end against a real
+/// fault AND a legitimately-authorized caller, rather than only against
+/// a live process (which is all `simurgh-init`'s own supervision
+/// self-check can reach — every target it is allowed to spawn parks
+/// forever instead of dying).
+///
+/// Changes NO control flow and mutates NO state: one read-only `dispatch`
+/// and one log line. The bespoke `DM_WAIT_CRASH`/`DM_POLL_CRASH` path the
+/// demo actually runs on is untouched and remains the mechanism under
+/// test by that demo; this only observes, alongside it.
+pub fn p2_verify_watched_driver_exit_query(hal: &HalInterface) {
+    // SAFETY: single-core; written by `p2_watch_driver` / read here.
+    let watched = unsafe { core::ptr::addr_of!(WATCHED_DRIVER_TID).read() };
+    let Some(driver_tid) = watched else {
+        return;
+    };
+    let k = kstate();
+    let Some(caller) = k.sched.running() else {
+        return;
+    };
+    let (status, payload) = p2_thread_exit_status(hal, caller, driver_tid.as_u32());
+    klog!(
+        "THREAD_EXIT_POLL cross-check: supervisor tid#{} queried its own crashed child tid#{} -> status={} payload={:#x}\r\n",
+        caller.as_u32(),
+        driver_tid.as_u32(),
+        status,
+        payload
+    );
+}
+
+/// `sys::THREAD_EXIT_POLL` from any U-mode process: has the thread `caller`
+/// spawned as raw id `target` terminated, and if so why?
+///
+/// Returns `(status, payload)` for the architecture caller to place in its
+/// own two return registers (`TrapOutcome::Resume2`) — `status` is one of
+/// the `THREAD_EXIT_*` constants above, `payload` its documented
+/// companion value.
+///
+/// Never blocks, never switches, and never mutates kernel state: the whole
+/// operation is one `dispatch` into a read-only `kernel-core` query, which
+/// is what makes it safe for a supervisor to call in a hot loop over all
+/// of its children.
+pub fn p2_thread_exit_status(hal: &HalInterface, caller: ThreadId, target: u32) -> (usize, usize) {
+    let k = kstate();
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::ThreadExitStatus { thread: ThreadId::new(target) },
+        hal,
+    ) {
+        Ok(SyscallReturn::ThreadStatus { exit: None }) => (THREAD_EXIT_RUNNING, 0),
+        Ok(SyscallReturn::ThreadStatus { exit: Some(exit) }) => match exit {
+            kernel_core::ThreadExit::Clean { code } => (THREAD_EXIT_CLEAN, code as usize),
+            kernel_core::ThreadExit::Faulted { cause } => (THREAD_EXIT_FAULTED, cause as usize),
+            kernel_core::ThreadExit::Unknown => (THREAD_EXIT_UNKNOWN, 0),
+        },
+        Ok(other) => {
+            // Unreachable: `dispatch` answers this operation with
+            // `ThreadStatus` or an error, nothing else. Logged rather than
+            // silently folded into `DENIED` so a future dispatch change
+            // that broke this pairing would be visible on a real boot.
+            klog!(
+                "THREAD_EXIT_POLL: tid#{} asked about tid#{} and got an unexpected {:?}\r\n",
+                caller.as_u32(),
+                target,
+                other
+            );
+            (THREAD_EXIT_DENIED, 0)
+        }
+        Err(e) => {
+            klog!(
+                "THREAD_EXIT_POLL: tid#{} denied a query about tid#{} ({:?})\r\n",
+                caller.as_u32(),
+                target,
+                e
+            );
+            (THREAD_EXIT_DENIED, 0)
+        }
+    }
+}
+
 /// Installs a new SYSTEM-WIDE scheduling policy on behalf of layer-4
 /// Profile Policy — the kernel side of `kernel/src/main.rs`'s own
 /// `sys::SCHED_SET_SYSTEM_POLICY` (2026-09-18).
@@ -8612,9 +8765,11 @@ extern "C" fn thread2_main() -> ! {
     // forever as a phantom `Ready` entity that a later `pick_next` (e.g.
     // the §8.3 benchmark below) could select, switching into a thread that
     // can only spin — hanging the kernel.
-    if let Some(t) = k.tcb_mut(me) {
-        t.state = kernel_core::ThreadState::Exited;
-    }
+    // `mark_exited`, not a bare `t.state = Exited`: it records the REASON
+    // too (`Tcb::exit`'s own documented invariant), so this thread's exit
+    // is reportable through `SyscallOp::ThreadExitStatus` like any other.
+    // A deliberate, orderly finish — `Clean { code: 0 }`, not a fault.
+    k.mark_exited(me, kernel_core::ThreadExit::Clean { code: 0 });
     k.sched.remove(me);
     k.yield_to(me, root, hal);
     park();
@@ -8679,9 +8834,9 @@ extern "C" fn bench_server_main() -> ! {
         }
 
         if i + 1 == IPC_BENCH_ITERATIONS {
-            if let Some(t) = k.tcb_mut(me) {
-                t.state = kernel_core::ThreadState::Exited;
-            }
+            // Same reasoning as `thread2_main`'s own retire step: record
+            // the reason, not just the fact.
+            k.mark_exited(me, kernel_core::ThreadExit::Clean { code: 0 });
             k.sched.remove(me);
             k.yield_to(me, from, hal);
             break;

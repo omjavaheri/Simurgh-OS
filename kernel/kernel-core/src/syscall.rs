@@ -175,6 +175,92 @@ pub enum SyscallOp {
         /// invert the crate dependency direction).
         handler: hal_core::interrupt::IrqHandler,
     },
+    /// Asks whether `thread` has terminated, and if so WHY — the general
+    /// process-supervision primitive (03-Kernel-Subsystems-Layer.md §5.2:
+    /// per-process fault isolation is only useful if something above can
+    /// react to one process dying; 04-System-Services-Policy-Layer.md §2:
+    /// `simurgh-init`'s `ServiceUnit::restart_policy`, which cannot mean
+    /// anything at all without this).
+    ///
+    /// Answers with `SyscallReturn::ThreadStatus { exit }`: `None` while
+    /// `thread` is still alive in any state, `Some(reason)` once it has
+    /// terminated (`crate::tcb::ThreadExit`).
+    ///
+    /// # Why non-blocking (poll), not a blocking wait
+    ///
+    /// The closest existing precedent in this project is device-manager's
+    /// own real crash supervision, which BLOCKS (`kernel_arch_glue::
+    /// p2_dm_wait_crash` -> `KernelState::block_thread`, woken by a
+    /// direct hand-off from `p2_fault`). That shape is right for
+    /// device-manager and wrong as a general primitive, for one concrete
+    /// reason: device-manager supervises exactly ONE driver, so blocking
+    /// on that one thread costs it nothing. A real supervisor —
+    /// `simurgh-init`, this operation's first caller — supervises MANY
+    /// units at once. A syscall that blocks on ONE named thread would
+    /// make init unable to notice ANY of its other units crashing while
+    /// it waits, turning a supervisor into a single-child babysitter.
+    /// Closing that properly needs a "wait on any of N" primitive, which
+    /// this kernel does not have and which `kernel_arch_glue::
+    /// wire_notification`'s own doc comment already records as a known,
+    /// separate gap — and which the project already works around
+    /// elsewhere in exactly this way, by polling (`sys::NOTIF_POLL` in
+    /// Compositor's own additive input loop, rather than a blocking
+    /// `Wait` that would stall its main `Recv`).
+    ///
+    /// So this follows the established `Wait`/`Poll` split deliberately
+    /// and lands on the `Poll` side: a supervisor sweeps its children
+    /// once per loop iteration, cheaply, without ever parking on any
+    /// single one of them. The answer is STICKY (a terminated thread's
+    /// `exit` is recorded once and never cleared — `crate::tcb::Tcb::
+    /// exit`), so unlike a notification's drained signal word this cannot
+    /// miss an exit that happened between two polls, however long the
+    /// gap: exactly the property that makes polling a correct answer
+    /// here rather than a lossy shortcut.
+    ///
+    /// TODO(spec): a genuinely blocking companion (`WaitThreadExit`, the
+    /// `Wait` to this `Poll`) is real future work, deliberately NOT built
+    /// speculatively alongside this one. It is not free: it needs a
+    /// per-TCB waiter list plus a wake-and-poke at every termination
+    /// site, and that poke is the exact bug class `SyscallReturn::
+    /// DeliveredValue`'s own doc comment documents at length (a woken
+    /// thread resuming with a stale return register). Nothing needs it
+    /// yet — device-manager already has its own blocking path, and init
+    /// specifically must NOT block — so building it now would be new,
+    /// unexercised kernel surface, which this repo's own `CLAUDE.md`
+    /// rules out ("grow it only when genuinely needed — never
+    /// speculatively").
+    ///
+    /// # Access control: the spawner only
+    ///
+    /// `thread` is a raw `ThreadId`, not a capability — the same MVP
+    /// simplification `Reply { to, .. }` already documents, including its
+    /// accepted consequence that a `ThreadId` can simply be GUESSED. That
+    /// makes an ownership check mandatory here rather than optional: the
+    /// answer includes a raw fault cause, so an unchecked version would
+    /// let any process sweep `0..MAX_THREADS` and read every other
+    /// process's crash details. Only `thread`'s own recorded spawner
+    /// (`crate::tcb::Tcb::spawner`) may ask; anyone else gets
+    /// `SyscallError::NotSpawner`, and a `thread` naming an out-of-range
+    /// or empty TCB slot gets `SyscallError::NoSuchThread` —
+    /// deliberately a DIFFERENT error, since "not yours" and "does not
+    /// exist" are both honest answers a caller can act on, and neither
+    /// reveals anything about a thread the caller does not own.
+    ///
+    /// Chosen over the alternatives on capability-consistency grounds:
+    /// "any thread may query any thread" is strictly more permissive than
+    /// this kernel's model anywhere else, and "a designated system
+    /// supervisor may query anything" would hardcode exactly the kind of
+    /// privileged role the capability model exists to avoid. The spawner
+    /// is the one party that provably already holds the `ThreadId`
+    /// legitimately (the spawn returned it) and the one with a real
+    /// reason to supervise. `sys::PS_LIST_ENTRY` remains the
+    /// unrestricted, deliberately COARSER introspection path for
+    /// `simurgh-shell`'s `ps` (a bare `ThreadState` code, no exit reason
+    /// — see that opcode's own doc comment).
+    ThreadExitStatus {
+        /// The thread to ask about. Must have been spawned by the caller.
+        thread: ThreadId,
+    },
 }
 
 /// The result of a syscall. `kernel-arch-glue` translates this into a
@@ -264,6 +350,23 @@ pub enum SyscallReturn {
         /// The message.
         msg: SmallMessage,
     },
+    /// `ThreadExitStatus`'s answer about the queried thread: `None` while
+    /// it is still alive (any non-`Exited` `ThreadState`, including
+    /// `Inactive` — spawned but not yet started counts as alive),
+    /// `Some(reason)` once it has terminated.
+    ///
+    /// A dedicated variant rather than an encoded `Value(u64)`: the
+    /// answer is genuinely three-way (alive / exited cleanly with a code
+    /// / faulted with a raw cause) and the fault cause is a full 64-bit
+    /// architecture value with no spare bits to steal for a tag. The
+    /// architecture layer flattens it into two registers on the way out
+    /// (`kernel_arch_glue::p2_thread_exit_status`) — that is a wire-format
+    /// concern, and doing it here would bake a wire format into
+    /// `kernel-core`.
+    ThreadStatus {
+        /// Why the thread died, or `None` if it has not.
+        exit: Option<crate::tcb::ThreadExit>,
+    },
     /// `Yield` (or a blocking op) — the caller should context-switch to
     /// `next` (or idle if `None`).
     Reschedule {
@@ -314,6 +417,19 @@ pub enum SyscallError {
     /// contiguity for real and fails with this error instead. The whole
     /// batch is rolled back — nothing is left half-created.
     RetypeNotContiguous,
+    /// `ThreadExitStatus { thread }` named a `ThreadId` that is either
+    /// out of range (`>= config::MAX_THREADS`) or an empty TCB slot —
+    /// there is no such thread to report on. Deliberately distinct from
+    /// [`SyscallError::NotSpawner`]: both are honest answers the caller
+    /// can act on, and neither discloses anything about a thread the
+    /// caller does not own (see that operation's own doc comment).
+    NoSuchThread,
+    /// `ThreadExitStatus { thread }` named a live, real thread that the
+    /// caller did not spawn. A thread's exit reason is readable by its
+    /// OWN spawner only — `SyscallOp::ThreadExitStatus`'s own doc comment
+    /// has the full reasoning for that choice and the alternatives it was
+    /// chosen over.
+    NotSpawner,
     /// The requested operation is not implemented in this MVP.
     Unsupported,
 }
@@ -459,7 +575,63 @@ impl KernelState {
                 notification,
                 handler,
             } => self.do_irq_bind(caller, mmio, notification, handler, hal),
+            SyscallOp::ThreadExitStatus { thread } => self.do_thread_exit_status(caller, thread),
         }
+    }
+
+    /// `SyscallOp::ThreadExitStatus` — never blocks, never mutates any
+    /// kernel state at all (the only read-only operation in `dispatch`
+    /// besides `Poll`'s own drain, which does consume bits; this one is
+    /// genuinely idempotent, which is what makes it safe to call in a
+    /// supervisor's hot loop).
+    ///
+    /// Checks, in this order:
+    /// 1. the caller itself must be a live thread (`NoCaller`) — every
+    ///    other operation in this crate starts the same way;
+    /// 2. `thread` must name a real, occupied TCB slot (`NoSuchThread`);
+    /// 3. `thread`'s recorded spawner must be the caller (`NotSpawner`).
+    ///
+    /// Step 3 must come last and must be checked against the TARGET's
+    /// `spawner` field, never against anything the caller supplies —
+    /// that field is written once at spawn time by `alloc_tcb` and is not
+    /// reachable from user space, which is the entire basis of the check.
+    ///
+    /// A caller asking about ITSELF is rejected by step 3 like anyone
+    /// else (a thread is not its own spawner), which is correct rather
+    /// than merely convenient: a running thread trivially knows it has
+    /// not exited, and a thread that HAS exited is not running to ask.
+    fn do_thread_exit_status(
+        &self,
+        caller: ThreadId,
+        thread: ThreadId,
+    ) -> Result<SyscallReturn, SyscallError> {
+        // Step 1: the caller must exist. Uses `tcb`, not `resolve` — this
+        // operation takes no capability argument at all (see its own doc
+        // comment on why `thread` is a raw `ThreadId` in this MVP).
+        let _ = self.tcb(caller).ok_or(SyscallError::NoCaller)?;
+
+        // Step 2: `tcb` already returns `None` both for an out-of-range
+        // index and for an empty slot, so this one check covers both
+        // halves of `NoSuchThread`'s documented meaning.
+        let target = self.tcb(thread).ok_or(SyscallError::NoSuchThread)?;
+
+        // Step 3: ownership.
+        if target.spawner != Some(caller) {
+            return Err(SyscallError::NotSpawner);
+        }
+
+        // `state`, not `exit.is_some()`, is the authority on aliveness;
+        // `exit` supplies the reason. They are written together by
+        // `mark_exited`, so the mismatch arm below is unreachable today —
+        // it reports `Unknown` rather than lying "still running" about a
+        // thread whose `ThreadState` says it is dead (see `ThreadExit::
+        // Unknown`'s own doc comment).
+        let exit = if target.state == crate::tcb::ThreadState::Exited {
+            Some(target.exit.unwrap_or(crate::tcb::ThreadExit::Unknown))
+        } else {
+            None
+        };
+        Ok(SyscallReturn::ThreadStatus { exit })
     }
 
     /// The object kind stored at `cap` in `caller`'s space (helper for
@@ -2567,5 +2739,213 @@ mod tests {
         };
         assert_eq!(freed, 2); // ep_cap itself + the same-space grant
         assert!(k.cap_space(sibling_cs).unwrap().lookup(dst).is_none());
+    }
+
+    // --- SyscallOp::ThreadExitStatus: the general process-supervision
+    // primitive (2026-09-18). See that operation's own doc comment for the
+    // design (why non-blocking, why spawner-only). These tests drive it
+    // through the REAL `dispatch` entry point, not `do_thread_exit_status`
+    // directly, so the dispatch wiring is covered too. ------------------
+
+    /// Allocates a TCB attributed to `spawner` and admits it as a running
+    /// thread would be — the shape every real spawn produces.
+    fn spawn_child(k: &mut KernelState, spawner: ThreadId) -> ThreadId {
+        let cs = k.root_cap_space;
+        let as_ = k.root_addr_space;
+        let child = k.alloc_tcb_spawned_by(cs, as_, Some(spawner)).unwrap();
+        if let Some(t) = k.tcb_mut(child) {
+            t.state = crate::tcb::ThreadState::Runnable;
+        }
+        child
+    }
+
+    #[test]
+    fn thread_exit_status_reports_a_live_child_as_still_running() {
+        let mut k = kernel();
+        let parent = k.root_thread;
+        let child = spawn_child(&mut k, parent);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
+
+        let r = k
+            .dispatch(parent, 0, SyscallOp::ThreadExitStatus { thread: child }, &hal)
+            .unwrap();
+        assert_eq!(r, SyscallReturn::ThreadStatus { exit: None });
+    }
+
+    #[test]
+    fn thread_exit_status_reports_a_real_fault_cause_to_the_spawner() {
+        // The REAL end-to-end shape of the fault-isolation path this
+        // primitive exists to expose: the child is terminated by exactly
+        // the same `terminate_thread` call `kernel_arch_glue::p2_fault`
+        // makes on a genuine U-mode exception, and the spawner then reads
+        // back the real raw trap cause it was killed with.
+        let mut k = kernel();
+        let parent = k.root_thread;
+        let child = spawn_child(&mut k, parent);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
+
+        let _ = k.terminate_thread(child, crate::tcb::ThreadExit::Faulted { cause: 0xc }, 1_000);
+
+        let r = k
+            .dispatch(parent, 2_000, SyscallOp::ThreadExitStatus { thread: child }, &hal)
+            .unwrap();
+        assert_eq!(
+            r,
+            SyscallReturn::ThreadStatus { exit: Some(crate::tcb::ThreadExit::Faulted { cause: 0xc }) }
+        );
+
+        // Sticky and idempotent: asking twice gives the same answer, which
+        // is what makes polling (rather than a blocking wait) a correct
+        // supervision strategy — an exit cannot be consumed or missed.
+        let again = k
+            .dispatch(parent, 3_000, SyscallOp::ThreadExitStatus { thread: child }, &hal)
+            .unwrap();
+        assert_eq!(again, r);
+    }
+
+    #[test]
+    fn thread_exit_status_distinguishes_a_clean_exit_from_a_fault() {
+        // The distinction `RestartPolicy::OnFailure` vs. `Always` needs:
+        // a clean, zero-code exit must NOT look like a failure.
+        let mut k = kernel();
+        let parent = k.root_thread;
+        let clean = spawn_child(&mut k, parent);
+        let failed = spawn_child(&mut k, parent);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
+
+        k.mark_exited(clean, crate::tcb::ThreadExit::Clean { code: 0 });
+        k.mark_exited(failed, crate::tcb::ThreadExit::Clean { code: 7 });
+
+        let read_back = |k: &mut KernelState, t: ThreadId| {
+            match k.dispatch(parent, 0, SyscallOp::ThreadExitStatus { thread: t }, &hal).unwrap() {
+                SyscallReturn::ThreadStatus { exit } => exit.unwrap(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert!(!read_back(&mut k, clean).is_failure());
+        assert!(read_back(&mut k, failed).is_failure());
+    }
+
+    #[test]
+    fn thread_exit_status_refuses_a_thread_the_caller_did_not_spawn() {
+        // The access-control decision this operation documents: a raw
+        // `ThreadId` is guessable in this MVP, so an unchecked version
+        // would let any process read every other process's fault causes.
+        let mut k = kernel();
+        let parent = k.root_thread;
+        let child = spawn_child(&mut k, parent);
+        // A second, unrelated thread that did NOT spawn `child`.
+        let stranger = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        if let Some(t) = k.tcb_mut(stranger) {
+            t.state = crate::tcb::ThreadState::Runnable;
+        }
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
+
+        k.mark_exited(child, crate::tcb::ThreadExit::Faulted { cause: 0xc });
+
+        // The stranger is refused even though `child` really did exit and
+        // really does have a recorded cause.
+        assert_eq!(
+            k.dispatch(stranger, 0, SyscallOp::ThreadExitStatus { thread: child }, &hal),
+            Err(SyscallError::NotSpawner)
+        );
+        // ...while the real spawner still gets the real answer.
+        assert!(matches!(
+            k.dispatch(parent, 0, SyscallOp::ThreadExitStatus { thread: child }, &hal),
+            Ok(SyscallReturn::ThreadStatus { exit: Some(_) })
+        ));
+    }
+
+    #[test]
+    fn thread_exit_status_refuses_the_root_task_which_nothing_spawned() {
+        // `Tcb::spawner` is `None` for the Root Task, so no caller can
+        // ever match it — a thread with no spawner is queryable by nobody,
+        // not by everybody. Worth pinning: the opposite bug (treating
+        // `None` as "matches anyone") would be a silent, total bypass of
+        // the whole check.
+        let mut k = kernel();
+        let root = k.root_thread;
+        let child = spawn_child(&mut k, root);
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
+
+        assert_eq!(k.tcb(root).unwrap().spawner, None);
+        assert_eq!(
+            k.dispatch(child, 0, SyscallOp::ThreadExitStatus { thread: root }, &hal),
+            Err(SyscallError::NotSpawner)
+        );
+    }
+
+    #[test]
+    fn thread_exit_status_rejects_an_out_of_range_or_empty_thread_slot() {
+        let mut k = kernel();
+        let parent = k.root_thread;
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
+
+        // Wildly out of range, and just past the table's end.
+        for raw in [u32::MAX, crate::config::MAX_THREADS as u32] {
+            assert_eq!(
+                k.dispatch(
+                    parent,
+                    0,
+                    SyscallOp::ThreadExitStatus { thread: ThreadId::new(raw) },
+                    &hal
+                ),
+                Err(SyscallError::NoSuchThread)
+            );
+        }
+        // In range, but an empty slot: `MAX_THREADS - 1` is never
+        // allocated by `from_boot_info` (which takes slot 0 for the Root
+        // Task and nothing else).
+        assert_eq!(
+            k.dispatch(
+                parent,
+                0,
+                SyscallOp::ThreadExitStatus {
+                    thread: ThreadId::new(crate::config::MAX_THREADS as u32 - 1)
+                },
+                &hal
+            ),
+            Err(SyscallError::NoSuchThread)
+        );
+    }
+
+    #[test]
+    fn alloc_tcb_attributes_a_new_thread_to_the_running_one() {
+        // The implicit-capture contract `alloc_tcb` documents, which is
+        // what makes every real spawn path in the project attribute
+        // parentage correctly with no call-site change: whoever is running
+        // when a TCB is allocated becomes its spawner.
+        let mut k = kernel();
+        let root = k.root_thread;
+        // Nothing running yet -> no spawner.
+        let orphan = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        assert_eq!(k.tcb(orphan).unwrap().spawner, None);
+
+        let _ = k.sched.dispatch(root, 0);
+        let child = k.alloc_tcb(k.root_cap_space, k.root_addr_space).unwrap();
+        assert_eq!(k.tcb(child).unwrap().spawner, Some(root));
+    }
+
+    #[test]
+    fn mark_exited_keeps_the_first_recorded_reason() {
+        // A real recorded fault cause must not be overwritten by a later,
+        // less specific termination call — that would lose exactly the
+        // information the supervisor is waiting to read.
+        let mut k = kernel();
+        let root = k.root_thread;
+        let child = spawn_child(&mut k, root);
+
+        k.mark_exited(child, crate::tcb::ThreadExit::Faulted { cause: 0xc });
+        k.mark_exited(child, crate::tcb::ThreadExit::Clean { code: 0 });
+        assert_eq!(
+            k.tcb(child).unwrap().exit,
+            Some(crate::tcb::ThreadExit::Faulted { cause: 0xc })
+        );
     }
 }

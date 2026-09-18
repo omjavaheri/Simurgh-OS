@@ -49,7 +49,7 @@ pub use preempt::{PreemptStep, TerminationOutcome};
 pub use run::ScheduleOutcome;
 pub use state::{KernelInitError, KernelState};
 pub use syscall::{SyscallError, SyscallOp, SyscallReturn};
-pub use tcb::{ThreadState, Tcb};
+pub use tcb::{ThreadExit, ThreadState, Tcb};
 /// Re-exported because `KernelState::sched` is public and its own API
 /// (`admit`, `set_system_scheduler_policy`) both takes and returns this
 /// type — so any crate driving the scheduler through `KernelState` needs

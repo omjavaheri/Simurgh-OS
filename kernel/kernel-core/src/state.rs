@@ -216,11 +216,70 @@ impl KernelState {
 
     /// Allocates an `Inactive` TCB bound to `cap_space` / `addr_space`,
     /// returning its `ThreadId`.
+    ///
+    /// The new thread's [`Tcb::spawner`] is recorded as whichever thread
+    /// is running RIGHT NOW (`self.sched.running()`). That is exactly the
+    /// correct attribution for every real spawn path in this project, and
+    /// it needs no call-site change anywhere: a boot-time spawn runs
+    /// while the Root Task is the running thread, `sys::SPAWN_KNOWN_ELF`
+    /// runs inside `simurgh-init`'s own trap, `sys::SPAWN_FROM_BUFFER`
+    /// inside `native-loader`'s, and `sys::DM_RESPAWN_DRIVER` inside
+    /// device-manager's — in each case the running thread genuinely IS
+    /// the parent. `None` before anything runs (the Root Task's own TCB,
+    /// allocated by `from_boot_info`) and in unit tests that allocate
+    /// TCBs directly.
+    ///
+    /// A caller that knows better than `running()` — a kernel thread
+    /// allocating a TCB on some other thread's behalf, which nothing in
+    /// this project does today — must use
+    /// [`KernelState::alloc_tcb_spawned_by`] and say so explicitly,
+    /// rather than relying on this implicit capture.
     pub fn alloc_tcb(&mut self, cap_space: CapSpaceId, addr_space: PageTableId) -> Option<ThreadId> {
+        let spawner = self.sched.running();
+        self.alloc_tcb_spawned_by(cap_space, addr_space, spawner)
+    }
+
+    /// Like [`KernelState::alloc_tcb`], but attributing the new thread to
+    /// an EXPLICIT `spawner` instead of the currently-running thread. See
+    /// [`Tcb::spawner`]'s own doc comment for what that attribution
+    /// authorizes (`SyscallOp::ThreadExitStatus`'s access control).
+    pub fn alloc_tcb_spawned_by(
+        &mut self,
+        cap_space: CapSpaceId,
+        addr_space: PageTableId,
+        spawner: Option<ThreadId>,
+    ) -> Option<ThreadId> {
         let i = self.tcbs.iter().position(|s| s.is_none())?;
         let id = ThreadId::new(i as u32);
-        self.tcbs[i] = Some(Tcb::new_inactive(id, cap_space, addr_space));
+        self.tcbs[i] = Some(Tcb::new_inactive_spawned_by(id, cap_space, addr_space, spawner));
         Some(id)
+    }
+
+    /// Marks `tid` `ThreadState::Exited` AND records WHY
+    /// ([`crate::tcb::ThreadExit`]) in one step — the single place either
+    /// is written, so the "`exit.is_some()` iff `state == Exited`"
+    /// invariant [`Tcb::exit`] documents cannot be broken by a
+    /// termination path that forgets half of it.
+    ///
+    /// Does NOT touch the scheduler: callers that are genuinely
+    /// terminating a thread go through `terminate_thread` /
+    /// `terminate_thread_and_handoff` (which call this and then remove
+    /// `tid` from `kernel-sched`), while the in-kernel demo threads that
+    /// retire themselves manage their own `sched.remove` already.
+    ///
+    /// The FIRST reason wins: a thread that is already `Exited` keeps the
+    /// reason it died of. Termination happens once; a second call would
+    /// only ever be a bookkeeping mistake, and silently overwriting a
+    /// real recorded fault cause with a later, less specific one would
+    /// lose exactly the information a supervisor is waiting for.
+    pub fn mark_exited(&mut self, tid: ThreadId, exit: crate::tcb::ThreadExit) {
+        if let Some(t) = self.tcb_mut(tid) {
+            if t.state == crate::tcb::ThreadState::Exited && t.exit.is_some() {
+                return;
+            }
+            t.state = crate::tcb::ThreadState::Exited;
+            t.exit = Some(exit);
+        }
     }
 
     /// Allocates an `Endpoint` object, returning its id.
