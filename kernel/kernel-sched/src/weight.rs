@@ -104,7 +104,36 @@ pub fn base_priority_weight_fp(priority: u8) -> u64 {
 ///
 /// Returns a value `>= 1` (never a zero divisor).
 pub fn effective_weight_fp(base_fp: u64, wait_time_ms: u64, numa_local: bool) -> u64 {
-    let capped_wait = wait_time_ms.min(AGING_CAP_MS);
+    effective_weight_fp_capped(base_fp, wait_time_ms, numa_local, AGING_CAP_MS)
+}
+
+/// [`effective_weight_fp`] with the aging cap supplied by the caller
+/// instead of being fixed at the [`AGING_CAP_MS`] compile-time constant.
+///
+/// Added 2026-09-18 for the real layer-4 profile → scheduler edge:
+/// 04-System-Services-Policy-Layer-v2.md §7.3 makes `aging_cap_ms` the ONE
+/// knob the `RealTime` profile actually turns ("کوچک‌تر یا صفر"), and
+/// `simurgh-profile-policy`'s own `RealTime` default is `Some(0)`. With the
+/// cap hard-wired to 50ms, that profile's whole stated effect was
+/// unreachable from outside this crate, so `Scheduler` now holds the cap as
+/// runtime state and `Scheduler::account` calls THIS function with it.
+///
+/// `cap_ms == 0` is a real, meaningful value, not a sentinel: it disables
+/// the aging term entirely (`min(wait, 0) == 0` ⇒ `aging_mul_fp ==
+/// WEIGHT_ONE`), so a thread's `vruntime` accrues purely on base priority
+/// and NUMA locality, and a long-waiting low-priority thread can never age
+/// its way past a high-priority one. That is exactly the low-jitter,
+/// priority-is-final behaviour §7.3 asks `RealTime` for.
+///
+/// [`effective_weight_fp`] is kept as the `AGING_CAP_MS` wrapper so every
+/// existing caller and test is unaffected.
+pub fn effective_weight_fp_capped(
+    base_fp: u64,
+    wait_time_ms: u64,
+    numa_local: bool,
+    cap_ms: u64,
+) -> u64 {
+    let capped_wait = wait_time_ms.min(cap_ms);
     // (1 + aging_factor * wait)  in fixed point.
     let aging_mul_fp = WEIGHT_ONE + AGING_FACTOR_FP * capped_wait;
     let numa_fp = if numa_local {
@@ -164,6 +193,41 @@ mod tests {
         assert!(w25 > w0);
         assert!(w50 > w25);
         assert_eq!(w50, w_over, "aging is capped at AGING_CAP_MS");
+    }
+
+    #[test]
+    fn a_zero_aging_cap_disables_aging_entirely() {
+        // RealTime's own configured cap (04-v2 §7.3). Waiting must then buy
+        // a thread NOTHING: base priority (and NUMA) become final.
+        let base = base_priority_weight_fp(10);
+        let w_no_wait = effective_weight_fp_capped(base, 0, false, 0);
+        let w_long_wait = effective_weight_fp_capped(base, 10_000, false, 0);
+        assert_eq!(w_no_wait, w_long_wait);
+        assert_eq!(w_no_wait, base, "a zero cap leaves base weight untouched");
+    }
+
+    #[test]
+    fn a_custom_aging_cap_binds_where_the_default_would_not() {
+        let base = base_priority_weight_fp(10);
+        // Waiting 30ms: the 50ms default does not clamp it, a 10ms cap does.
+        let w_default_cap = effective_weight_fp_capped(base, 30, false, AGING_CAP_MS);
+        let w_tight_cap = effective_weight_fp_capped(base, 30, false, 10);
+        assert!(w_tight_cap < w_default_cap);
+        // ...and the tight cap must agree with simply waiting only 10ms.
+        assert_eq!(w_tight_cap, effective_weight_fp_capped(base, 10, false, 10));
+    }
+
+    #[test]
+    fn the_capped_form_matches_the_wrapper_at_the_default_cap() {
+        let base = base_priority_weight_fp(17);
+        for wait in [0, 1, 25, 50, 51, 10_000] {
+            for numa in [false, true] {
+                assert_eq!(
+                    effective_weight_fp(base, wait, numa),
+                    effective_weight_fp_capped(base, wait, numa, AGING_CAP_MS),
+                );
+            }
+        }
     }
 
     #[test]

@@ -808,6 +808,20 @@ impl KernelState {
             .unwrap_or(CapId::new(u32::MAX));
 
         // Step 4: schedule the Root Task.
+        //
+        // Deliberately PINNED `Interactive` via plain `admit`, not
+        // `admit_following_system_default` (2026-09-18): the Root Task is
+        // the one thread a user's profile choice must never be able to
+        // deprioritise. It owns every `klog!` report, drives the boot
+        // self-checks, and services the syscalls — including
+        // `sys::SCHED_SET_SYSTEM_POLICY` itself — that a profile switch
+        // travels through. Letting a switch to `Throughput` drop it into
+        // chain-group vruntime fairness alongside every spawned subsystem
+        // would make the very mechanism that installed the policy compete
+        // for the CPU on equal terms, and a bad policy would then be hard
+        // to observe or undo. `SchedEntity::follows_system_default_mode`'s
+        // own doc comment covers the general per-thread-override rule this
+        // is the most important instance of.
         self.sched
             .admit(root_tid, SchedulerMode::Interactive, kernel_sched::MAX_PRIORITY, None)
             .map_err(|_| KernelInitError::CapacityExhausted)?;

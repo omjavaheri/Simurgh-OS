@@ -46,6 +46,6 @@ pub use chain_group::{ChainGroup, ChainGroupError};
 pub use mode::SchedulerMode;
 pub use sched::{RunState, SchedEntity, Scheduler, SchedError};
 pub use weight::{
-    base_priority_weight_fp, effective_weight_fp, vruntime_next, AGING_CAP_MS, AGING_FACTOR_FP,
-    MAX_PRIORITY, NUMA_LOCALITY_BONUS_FP, WEIGHT_ONE,
+    base_priority_weight_fp, effective_weight_fp, effective_weight_fp_capped, vruntime_next,
+    AGING_CAP_MS, AGING_FACTOR_FP, MAX_PRIORITY, NUMA_LOCALITY_BONUS_FP, WEIGHT_ONE,
 };

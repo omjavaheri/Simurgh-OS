@@ -8180,6 +8180,50 @@ pub fn ps_list_entry(idx: usize) -> Option<(u32, u8)> {
     Some((idx as u32, thread_state_wire_code(tcb.state)))
 }
 
+/// Installs a new SYSTEM-WIDE scheduling policy on behalf of layer-4
+/// Profile Policy — the kernel side of `kernel/src/main.rs`'s own
+/// `sys::SCHED_SET_SYSTEM_POLICY` (2026-09-18).
+///
+/// `mode_code` is a `kernel_sched::SchedulerMode::wire_code` value
+/// (`0` = `Interactive`, `1` = `Throughput`); `aging_cap_ms` is
+/// 02-Microkernel-Layer.md §4.3's `aging_cap_ms`, where `0` is a real
+/// value (aging off — `simurgh-profile-policy`'s own `RealTime` default,
+/// 04-System-Services-Policy-Layer-v2.md §7.3), not "unset".
+///
+/// Returns `Some(threads_re_moded)` on success — the count
+/// `Scheduler::set_system_scheduler_policy` reports, so the caller can
+/// log real evidence the switch took effect — or `None` if `mode_code` is
+/// not a mode this kernel knows, in which case NOTHING is changed (not
+/// even `aging_cap_ms`: a request this kernel only half-understands is
+/// rejected whole rather than partially applied).
+///
+/// Scope is deliberately system-wide, not per-caller: a "profile" is a
+/// whole-machine setting (04-...-v2.md §7), so this changes
+/// `Scheduler`'s own default mode and re-modes every already-admitted
+/// thread that follows it. Threads that pinned a mode at admit time —
+/// notably the Root Task (`kernel_core::KernelState::init`'s own Step 4
+/// comment) — are untouched, per 02-Microkernel-Layer.md §4.4.
+///
+/// `aging_cap_ms` is clamped to `u32`'s range by its own parameter type
+/// upstream; a caller passing a nonsense-but-in-range huge value simply
+/// gets an aging cap no real wait time will ever reach, which is
+/// behaviourally identical to the cap being very large — not a fault
+/// worth rejecting.
+///
+/// TODO(spec): not capability-gated yet. Every syscall opcode in this MVP
+/// phase shares that gap (`sys::MAP_PAGE`'s and `sys::POWER_CONTROL`'s own
+/// doc comments say the same), and a genuinely privileged
+/// profile-policy-only gate needs the `simurgh-security-broker` capability
+/// edge that does not reach the kernel yet. Flagged for Omid rather than
+/// silently treated as done: as it stands ANY U-mode process that knows
+/// the opcode can retune system scheduling, which is not the intended
+/// end state for a capability-based OS.
+pub fn set_system_scheduler_policy(mode_code: usize, aging_cap_ms: usize) -> Option<usize> {
+    let mode = kernel_core::SchedulerMode::from_wire_code(u8::try_from(mode_code).ok()?)?;
+    let k = kstate();
+    Some(k.sched.set_system_scheduler_policy(mode, aging_cap_ms as u64))
+}
+
 
 /// The in-kernel milestone demo (02-Microkernel-Layer.md §8.1 / §8.2 /
 /// §8.5): retype an `Endpoint`, exercise capability revocation, retype

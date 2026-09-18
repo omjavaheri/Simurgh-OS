@@ -28,7 +28,9 @@
 
 use crate::chain_group::{ChainGroup, ChainGroupError};
 use crate::mode::SchedulerMode;
-use crate::weight::{base_priority_weight_fp, effective_weight_fp, vruntime_next, MAX_PRIORITY};
+use crate::weight::{
+    base_priority_weight_fp, effective_weight_fp_capped, vruntime_next, AGING_CAP_MS, MAX_PRIORITY,
+};
 use kernel_cap::{ChainGroupId, ThreadId};
 
 /// Runnability state of a scheduling entity.
@@ -96,10 +98,29 @@ pub struct SchedEntity {
     /// affinity (input to `numa_locality_bonus`). Set by the kernel from
     /// HAL NUMA topology; defaults to `false` (no bonus).
     numa_local: bool,
+    /// Whether this thread's [`SchedEntity::mode`] tracks the scheduler's
+    /// system default (`Scheduler::system_default_mode`) rather than being
+    /// a mode the admitting code named explicitly.
+    ///
+    /// `true` for anything admitted via
+    /// `Scheduler::admit_following_system_default` (the ordinary path for
+    /// a spawned user-space process), `false` for plain `Scheduler::admit`.
+    /// Only `true` entities are re-moded by
+    /// `Scheduler::set_system_scheduler_policy`, which is what keeps
+    /// 02-Microkernel-Layer.md §4.4's per-thread override real: a thread
+    /// that genuinely needs one specific discipline says so at admit time
+    /// and no profile switch can take it away.
+    follows_system_default_mode: bool,
 }
 
 impl SchedEntity {
-    fn new(thread: ThreadId, mode: SchedulerMode, priority: u8, group: Option<ChainGroupId>) -> Self {
+    fn new(
+        thread: ThreadId,
+        mode: SchedulerMode,
+        priority: u8,
+        group: Option<ChainGroupId>,
+        follows_system_default_mode: bool,
+    ) -> Self {
         let p = priority.min(MAX_PRIORITY);
         Self {
             thread,
@@ -113,7 +134,14 @@ impl SchedEntity {
             became_ready_ns: 0,
             last_wait_ms: 0,
             numa_local: false,
+            follows_system_default_mode,
         }
+    }
+
+    /// Whether this thread follows the system default mode (see the field's
+    /// own doc comment) rather than a mode pinned at admit time.
+    pub const fn follows_system_default_mode(&self) -> bool {
+        self.follows_system_default_mode
     }
 }
 
@@ -128,6 +156,28 @@ pub struct Scheduler<const NT: usize, const NCG: usize> {
     /// Interactive-mode time quantum in ns (§4: ~1–4 ms). `kernel-core`
     /// arms the HAL timer with this.
     quantum_ns: u64,
+    /// The discipline a thread admitted via
+    /// [`Scheduler::admit_following_system_default`] gets, and which
+    /// [`Scheduler::set_system_scheduler_policy`] retargets across every
+    /// such already-admitted thread.
+    ///
+    /// This is the one genuinely system-wide scheduling knob layer-4
+    /// Profile Policy owns. It starts at `Interactive` — the mode every
+    /// production admit site hard-coded before this existed, so a kernel
+    /// nobody ever calls `set_system_scheduler_policy` on schedules
+    /// exactly as it always did.
+    system_default_mode: SchedulerMode,
+    /// The aging cap (`crate::weight`'s `aging_cap_ms`) in effect
+    /// system-wide, in milliseconds. Starts at [`AGING_CAP_MS`]
+    /// (02-Microkernel-Layer.md §4.3's own stated 50ms starting value) and
+    /// is retargeted by [`Scheduler::set_system_scheduler_policy`].
+    ///
+    /// Unlike `system_default_mode` this has no per-thread override to
+    /// respect — §4.3 states the formula's constants once, for the whole
+    /// scheduler, and 04-System-Services-Policy-Layer-v2.md §7.3 likewise
+    /// treats `aging_cap_ms` as a property of the active profile set, not
+    /// of one thread. `0` is a real value (aging off), not "unset".
+    system_aging_cap_ms: u64,
 }
 
 impl<const NT: usize, const NCG: usize> Scheduler<NT, NCG> {
@@ -139,12 +189,68 @@ impl<const NT: usize, const NCG: usize> Scheduler<NT, NCG> {
             running: None,
             running_since_ns: 0,
             quantum_ns,
+            system_default_mode: SchedulerMode::Interactive,
+            system_aging_cap_ms: AGING_CAP_MS,
         }
     }
 
     /// The interactive time quantum in nanoseconds.
     pub const fn quantum_ns(&self) -> u64 {
         self.quantum_ns
+    }
+
+    // ---- system-wide scheduling policy (layer-4 Profile Policy) ------
+
+    /// The mode newly `admit_following_system_default`ed threads get.
+    pub const fn system_default_mode(&self) -> SchedulerMode {
+        self.system_default_mode
+    }
+
+    /// The system-wide aging cap in ms currently charged by `account`.
+    pub const fn system_aging_cap_ms(&self) -> u64 {
+        self.system_aging_cap_ms
+    }
+
+    /// Installs a new system-wide scheduling policy — the kernel side of
+    /// `simurgh-profile-policy`'s real profile switch
+    /// (`kernel/src/main.rs`'s own `sys::SCHED_SET_SYSTEM_POLICY`).
+    ///
+    /// Two effects, both immediate:
+    ///   1. `mode` becomes the default for every FUTURE
+    ///      `admit_following_system_default`, and is applied right now to
+    ///      every already-admitted thread whose
+    ///      `SchedEntity::follows_system_default_mode` is `true`;
+    ///   2. `aging_cap_ms` becomes the cap `account` charges `vruntime`
+    ///      against, for every thread in either mode.
+    ///
+    /// Returns how many already-admitted threads had their mode actually
+    /// CHANGED (not merely visited) — the caller logs it, which is what
+    /// makes a profile switch observable on a real serial console rather
+    /// than an invisible field write.
+    ///
+    /// Threads admitted via plain `admit` keep their explicitly-named
+    /// mode (§4.4's per-thread override). `vruntime` is deliberately left
+    /// untouched: it is a monotonically non-decreasing fairness account
+    /// (this module's own stated invariant), and a mode switch is not a
+    /// reason to forgive or invent runtime a thread did or did not have.
+    /// A thread moving `Interactive` → `Throughput` therefore enters the
+    /// throughput ordering already carrying its real history, which is
+    /// the fair outcome.
+    pub fn set_system_scheduler_policy(
+        &mut self,
+        mode: SchedulerMode,
+        aging_cap_ms: u64,
+    ) -> usize {
+        self.system_default_mode = mode;
+        self.system_aging_cap_ms = aging_cap_ms;
+        let mut changed = 0;
+        for e in self.entities.iter_mut().flatten() {
+            if e.follows_system_default_mode && e.mode != mode {
+                e.mode = mode;
+                changed += 1;
+            }
+        }
+        changed
     }
 
     /// The currently running thread, if any.
@@ -170,6 +276,12 @@ impl<const NT: usize, const NCG: usize> Scheduler<NT, NCG> {
     /// Registers a thread with the scheduler in `Blocked` state (call
     /// `note_ready` to make it runnable). The `ThreadId` doubles as the
     /// table index, so it must be `< NT`.
+    ///
+    /// `mode` is PINNED: naming it here opts the thread out of
+    /// [`Scheduler::set_system_scheduler_policy`]'s re-moding sweep
+    /// (02-Microkernel-Layer.md §4.4's per-thread override). Use
+    /// [`Scheduler::admit_following_system_default`] for an ordinary
+    /// thread that should simply follow the active profile.
     pub fn admit(
         &mut self,
         thread: ThreadId,
@@ -181,7 +293,30 @@ impl<const NT: usize, const NCG: usize> Scheduler<NT, NCG> {
         if idx >= NT {
             return Err(SchedError::TableFull);
         }
-        self.entities[idx] = Some(SchedEntity::new(thread, mode, priority, group));
+        self.entities[idx] = Some(SchedEntity::new(thread, mode, priority, group, false));
+        Ok(())
+    }
+
+    /// [`Scheduler::admit`] with the mode taken from — and thereafter
+    /// tracking — [`Scheduler::system_default_mode`].
+    ///
+    /// This is the right admit path for an ordinary thread: a spawned
+    /// layer-3 subsystem or a user-space process has no opinion of its own
+    /// about scheduling discipline, so it should follow whatever profile
+    /// the user has actually selected. A later profile switch re-modes it
+    /// in place.
+    pub fn admit_following_system_default(
+        &mut self,
+        thread: ThreadId,
+        priority: u8,
+        group: Option<ChainGroupId>,
+    ) -> Result<(), SchedError> {
+        let idx = thread.as_usize();
+        if idx >= NT {
+            return Err(SchedError::TableFull);
+        }
+        let mode = self.system_default_mode;
+        self.entities[idx] = Some(SchedEntity::new(thread, mode, priority, group, true));
         Ok(())
     }
 
@@ -306,13 +441,20 @@ impl<const NT: usize, const NCG: usize> Scheduler<NT, NCG> {
     pub fn account(&mut self, now_ns: u64) {
         let Some(cur) = self.running else { return };
         let since = self.running_since_ns;
+        // Read before the `slot_mut` borrow below takes `self` mutably.
+        let cap_ms = self.system_aging_cap_ms;
         let (inc, group, still_running) = {
             let Some(e) = self.slot_mut(cur) else {
                 self.running = None;
                 return;
             };
             let ran = now_ns.saturating_sub(since);
-            let w = effective_weight_fp(e.base_weight_fp, e.last_wait_ms, e.numa_local);
+            let w = effective_weight_fp_capped(
+                e.base_weight_fp,
+                e.last_wait_ms,
+                e.numa_local,
+                cap_ms,
+            );
             let newv = vruntime_next(e.vruntime, ran, w);
             let inc = newv - e.vruntime;
             e.vruntime = newv;
@@ -463,6 +605,133 @@ mod tests {
         assert_eq!(s.entity(t(0)).unwrap().effective_priority, 25);
         s.restore_priority(t(0)).unwrap();
         assert_eq!(s.entity(t(0)).unwrap().effective_priority, 5);
+    }
+
+    // ---- system-wide scheduling policy (layer-4 profile switch) ------
+
+    #[test]
+    fn a_fresh_scheduler_defaults_to_interactive_and_the_doc_aging_cap() {
+        // No regression for a kernel nobody ever sets a policy on: this is
+        // exactly what every production admit site hard-coded before.
+        let s = sched();
+        assert_eq!(s.system_default_mode(), SchedulerMode::Interactive);
+        assert_eq!(s.system_aging_cap_ms(), crate::weight::AGING_CAP_MS);
+    }
+
+    #[test]
+    fn admit_following_system_default_picks_up_the_current_default() {
+        let mut s = sched();
+        s.admit_following_system_default(t(0), 10, None).unwrap();
+        assert_eq!(s.entity(t(0)).unwrap().mode, SchedulerMode::Interactive);
+
+        s.set_system_scheduler_policy(SchedulerMode::Throughput, 50);
+        // A thread admitted AFTER the switch is born in the new mode.
+        s.admit_following_system_default(t(1), 10, None).unwrap();
+        assert_eq!(s.entity(t(1)).unwrap().mode, SchedulerMode::Throughput);
+    }
+
+    #[test]
+    fn a_profile_switch_re_modes_already_admitted_following_threads() {
+        // The whole point: a switch must change how threads that ALREADY
+        // exist get scheduled, not just future ones.
+        let mut s = sched();
+        s.admit_following_system_default(t(0), 10, None).unwrap();
+        s.admit_following_system_default(t(1), 10, None).unwrap();
+        assert_eq!(s.set_system_scheduler_policy(SchedulerMode::Throughput, 50), 2);
+        assert_eq!(s.entity(t(0)).unwrap().mode, SchedulerMode::Throughput);
+        assert_eq!(s.entity(t(1)).unwrap().mode, SchedulerMode::Throughput);
+        // Switching back is symmetric.
+        assert_eq!(s.set_system_scheduler_policy(SchedulerMode::Interactive, 50), 2);
+        assert_eq!(s.entity(t(0)).unwrap().mode, SchedulerMode::Interactive);
+    }
+
+    #[test]
+    fn a_profile_switch_never_touches_an_explicitly_pinned_thread() {
+        // 02-Microkernel-Layer.md §4.4's per-thread override, kept real.
+        let mut s = sched();
+        s.admit(t(0), SchedulerMode::Interactive, 10, None).unwrap();
+        s.admit_following_system_default(t(1), 10, None).unwrap();
+        assert!(!s.entity(t(0)).unwrap().follows_system_default_mode());
+        assert!(s.entity(t(1)).unwrap().follows_system_default_mode());
+
+        assert_eq!(s.set_system_scheduler_policy(SchedulerMode::Throughput, 50), 1);
+        assert_eq!(
+            s.entity(t(0)).unwrap().mode,
+            SchedulerMode::Interactive,
+            "a pinned thread must survive a profile switch"
+        );
+        assert_eq!(s.entity(t(1)).unwrap().mode, SchedulerMode::Throughput);
+    }
+
+    #[test]
+    fn re_moding_reports_only_threads_whose_mode_actually_changed() {
+        let mut s = sched();
+        s.admit_following_system_default(t(0), 10, None).unwrap();
+        // Already Interactive: an Interactive switch changes nothing.
+        assert_eq!(s.set_system_scheduler_policy(SchedulerMode::Interactive, 50), 0);
+        assert_eq!(s.set_system_scheduler_policy(SchedulerMode::Throughput, 50), 1);
+        // Idempotent: a repeated switch to the same mode is also a no-op.
+        assert_eq!(s.set_system_scheduler_policy(SchedulerMode::Throughput, 50), 0);
+    }
+
+    #[test]
+    fn a_profile_switch_really_changes_which_thread_pick_next_chooses() {
+        // The real, end-to-end behavioural proof this whole edge exists
+        // for: two threads, identical except priority. Under Interactive,
+        // priority decides and the high-priority one wins every time.
+        // Under Throughput, priority is not part of the ordering key at
+        // all — lowest vruntime wins — so the thread that has run LESS is
+        // picked even though it is the lower-priority one.
+        let mut s = sched();
+        let (lo_prio, hi_prio) = (t(0), t(1));
+        s.admit_following_system_default(lo_prio, 0, None).unwrap();
+        s.admit_following_system_default(hi_prio, MAX_PRIORITY, None).unwrap();
+        s.note_ready(lo_prio, 0).unwrap();
+        s.note_ready(hi_prio, 0).unwrap();
+
+        // Interactive: priority wins outright.
+        assert_eq!(s.pick_next(0), Some(hi_prio));
+
+        // Burn real runtime on the high-priority thread so it owes the
+        // most vruntime, then let the profile switch land.
+        s.dispatch(hi_prio, 0).unwrap();
+        s.account(20_000_000); // ran 20 ms
+        s.note_ready(hi_prio, 20_000_000).unwrap();
+        // Still Interactive, so priority STILL wins despite that debt.
+        assert_eq!(s.pick_next(20_000_000), Some(hi_prio));
+
+        s.set_system_scheduler_policy(SchedulerMode::Throughput, crate::weight::AGING_CAP_MS);
+        // Now fairness wins and the starved low-priority thread runs.
+        assert_eq!(
+            s.pick_next(20_000_000),
+            Some(lo_prio),
+            "Throughput mode must order by vruntime, not priority"
+        );
+    }
+
+    #[test]
+    fn the_system_aging_cap_really_changes_how_vruntime_is_charged() {
+        // Proof the RealTime profile's `aging_cap_ms = 0` reaches real
+        // accounting: the same thread, the same run slice, the same wait
+        // time, charged under two different caps must differ.
+        fn vruntime_after_a_slice_with_cap(cap_ms: u64) -> u64 {
+            let mut s = sched();
+            s.admit_following_system_default(t(0), 10, None).unwrap();
+            s.set_system_scheduler_policy(SchedulerMode::Interactive, cap_ms);
+            // Become ready at 0, dispatch at 40ms ⇒ last_wait_ms = 40.
+            s.note_ready(t(0), 0).unwrap();
+            s.dispatch(t(0), 40_000_000).unwrap();
+            s.account(41_000_000); // ran 1 ms
+            s.entity(t(0)).unwrap().vruntime
+        }
+
+        let with_aging = vruntime_after_a_slice_with_cap(crate::weight::AGING_CAP_MS);
+        let without_aging = vruntime_after_a_slice_with_cap(0);
+        assert!(
+            without_aging > with_aging,
+            "a zero cap removes the aging weight bonus, so the same slice \
+             must cost MORE vruntime ({without_aging} vs {with_aging})"
+        );
     }
 
     #[test]

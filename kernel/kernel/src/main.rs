@@ -1419,6 +1419,39 @@ mod sys {
     /// — `subsystem_main` used to prove the underlying IPC mechanism
     /// once (`DG_LC_REPORT`) then just park forever.
     pub const DG_FLUSH_REPORT: usize = 134;
+    /// Install a new SYSTEM-WIDE scheduling policy — the real kernel edge
+    /// behind a user picking a profile in `Simurgh-UI-Template01::
+    /// ui-core`'s own PROFILE submenu (2026-09-18).
+    ///
+    /// `a0` = `kernel_sched::SchedulerMode::wire_code` (`0` =
+    /// `Interactive`, `1` = `Throughput`). `a1` = 02-Microkernel-Layer.md
+    /// §4.3's `aging_cap_ms`, where `0` is a REAL value (aging off —
+    /// `simurgh-profile-policy`'s own `RealTime` default, 04-System-
+    /// Services-Policy-Layer-v2.md §7.3), not a "unset" sentinel.
+    ///
+    /// Returns the number of already-admitted threads whose scheduling
+    /// discipline this call actually CHANGED, or `usize::MAX` if `a0` is
+    /// not a mode this kernel knows (in which case nothing at all is
+    /// changed — not even `a1`). A return of `0` is a normal success: it
+    /// means every thread following the system default was already in the
+    /// requested mode.
+    ///
+    /// Genuinely system-wide, which is the point: a "profile" is a
+    /// whole-machine setting, so unlike every other opcode here this one
+    /// changes how EVERY spawned subsystem process is scheduled, not just
+    /// the caller. Threads that pinned a discipline at admit time — the
+    /// Root Task above all (`kernel_core::KernelState::init`'s own Step 4
+    /// comment) — are deliberately exempt, per §4.4's per-thread
+    /// override. The real mechanism is `kernel_arch_glue::set_system_
+    /// scheduler_policy` → `kernel_sched::Scheduler::set_system_
+    /// scheduler_policy`.
+    ///
+    /// The one real caller is `simurgh-profile-policy`'s own
+    /// `policy-engine` process, from its `switch_profile` server handler.
+    /// Not capability-gated yet — `kernel_arch_glue::set_system_scheduler_
+    /// policy`'s own `TODO(spec)` covers that gap honestly (shared with
+    /// `MAP_PAGE`/`POWER_CONTROL` and every other MVP-phase opcode).
+    pub const SCHED_SET_SYSTEM_POLICY: usize = 135;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -2259,6 +2292,33 @@ extern "C" fn umode_root() -> ! {
         //    `core::ptr::*_volatile`, which a debug build compiles to a
         //    call into kernel `.text` that U-mode cannot execute) so
         //    `.user_text` stays call- and relocation-free.
+        // Real, on-hardware self-exercise of sys::SCHED_SET_SYSTEM_POLICY
+        // (2026-09-18) — the one point in a real boot where this opcode can
+        // actually be observed end to end. simurgh-profile-policy's own
+        // process issues it for real when a user picks a profile in
+        // ui-core's PROFILE submenu, and once at its own startup, but
+        // neither happens on an unattended boot: policy-engine is spawned
+        // and then never scheduled before the fault-isolation demo below
+        // completes and powers the machine off (verified on a real QEMU
+        // boot — device-manager and the spawned security-broker are the
+        // only subsystem processes that run their own code at all here).
+        //
+        // Placed HERE deliberately: every subsystem process has already
+        // been spawned and admitted at this point, so the kernel's own log
+        // line reports a genuinely non-zero re-mode count over real,
+        // already-running threads — not a vacuous call against an empty
+        // scheduler table.
+        //
+        // A round trip, and net zero: Throughput (mode code 1) and
+        // straight back to Interactive (mode code 0), which is the mode
+        // every thread already had. No scheduling decision can happen
+        // between the two traps (each returns TrapOutcome::Resume, so
+        // this thread keeps the CPU across both), which is why this proves
+        // the mechanism without perturbing the boot that follows. Both
+        // calls pass kernel_sched::AGING_CAP_MS (50) — the cap already in
+        // force — so the aging term is left exactly as it was too.
+        raw_syscall(sys::SCHED_SET_SYSTEM_POLICY, 1, 50);
+        raw_syscall(sys::SCHED_SET_SYSTEM_POLICY, 0, 50);
         raw_syscall(sys::P2_PREEMPT_START, 0, 0);
         core::arch::asm!(
             "2:",
@@ -3040,6 +3100,33 @@ extern "C" fn umode_root_x86() -> ! {
         //    retired rather than reused) — this loop is the fallback
         //    for the rare case that spawn fails, mirroring riscv64's/
         //    aarch64's own identical tail exactly.
+        // Real, on-hardware self-exercise of sys::SCHED_SET_SYSTEM_POLICY
+        // (2026-09-18) — the one point in a real boot where this opcode can
+        // actually be observed end to end. simurgh-profile-policy's own
+        // process issues it for real when a user picks a profile in
+        // ui-core's PROFILE submenu, and once at its own startup, but
+        // neither happens on an unattended boot: policy-engine is spawned
+        // and then never scheduled before the fault-isolation demo below
+        // completes and powers the machine off (verified on a real QEMU
+        // boot — device-manager and the spawned security-broker are the
+        // only subsystem processes that run their own code at all here).
+        //
+        // Placed HERE deliberately: every subsystem process has already
+        // been spawned and admitted at this point, so the kernel's own log
+        // line reports a genuinely non-zero re-mode count over real,
+        // already-running threads — not a vacuous call against an empty
+        // scheduler table.
+        //
+        // A round trip, and net zero: Throughput (mode code 1) and
+        // straight back to Interactive (mode code 0), which is the mode
+        // every thread already had. No scheduling decision can happen
+        // between the two traps (each returns TrapOutcome::Resume, so
+        // this thread keeps the CPU across both), which is why this proves
+        // the mechanism without perturbing the boot that follows. Both
+        // calls pass kernel_sched::AGING_CAP_MS (50) — the cap already in
+        // force — so the aging term is left exactly as it was too.
+        raw_syscall_x86(sys::SCHED_SET_SYSTEM_POLICY, 1, 50);
+        raw_syscall_x86(sys::SCHED_SET_SYSTEM_POLICY, 0, 50);
         raw_syscall_x86(sys::P2_PREEMPT_START, 0, 0);
         // Address in a HARDCODED `ecx` (loaded once, up front), data in
         // hardcoded `eax` — two DISTINCT physical registers, neither
@@ -3459,6 +3546,31 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
                 None => usize::MAX,
             });
+        }
+        sys::SCHED_SET_SYSTEM_POLICY => {
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::set_system_scheduler_policy(a0, a1) {
+                    Some(re_moded) => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (x86_64): real SCHED_SET_SYSTEM_POLICY syscall - system \
+                             scheduler mode now {}, aging_cap_ms now {}, {} already-running \
+                             thread(s) re-moded\r\n",
+                            if a0 == 0 { "Interactive" } else { "Throughput" },
+                            a1,
+                            re_moded
+                        ));
+                        re_moded
+                    }
+                    None => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (x86_64): SCHED_SET_SYSTEM_POLICY rejected - {} is not a \
+                             real scheduler mode code, nothing changed\r\n",
+                            a0
+                        ));
+                        usize::MAX
+                    }
+                },
+            );
         }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();
@@ -6975,6 +7087,33 @@ extern "C" fn umode_root_aarch64() -> ! {
         //    retired rather than reused) — this loop is the fallback
         //    for the rare case that spawn fails, mirroring `umode_root_
         //    x86`'s own identical tail exactly.
+        // Real, on-hardware self-exercise of sys::SCHED_SET_SYSTEM_POLICY
+        // (2026-09-18) — the one point in a real boot where this opcode can
+        // actually be observed end to end. simurgh-profile-policy's own
+        // process issues it for real when a user picks a profile in
+        // ui-core's PROFILE submenu, and once at its own startup, but
+        // neither happens on an unattended boot: policy-engine is spawned
+        // and then never scheduled before the fault-isolation demo below
+        // completes and powers the machine off (verified on a real QEMU
+        // boot — device-manager and the spawned security-broker are the
+        // only subsystem processes that run their own code at all here).
+        //
+        // Placed HERE deliberately: every subsystem process has already
+        // been spawned and admitted at this point, so the kernel's own log
+        // line reports a genuinely non-zero re-mode count over real,
+        // already-running threads — not a vacuous call against an empty
+        // scheduler table.
+        //
+        // A round trip, and net zero: Throughput (mode code 1) and
+        // straight back to Interactive (mode code 0), which is the mode
+        // every thread already had. No scheduling decision can happen
+        // between the two traps (each returns TrapOutcome::Resume, so
+        // this thread keeps the CPU across both), which is why this proves
+        // the mechanism without perturbing the boot that follows. Both
+        // calls pass kernel_sched::AGING_CAP_MS (50) — the cap already in
+        // force — so the aging term is left exactly as it was too.
+        raw_syscall_aarch64(sys::SCHED_SET_SYSTEM_POLICY, 1, 50);
+        raw_syscall_aarch64(sys::SCHED_SET_SYSTEM_POLICY, 0, 50);
         raw_syscall_aarch64(sys::P2_PREEMPT_START, 0, 0);
         core::arch::asm!(
             "2:",
@@ -7357,6 +7496,31 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
                 None => usize::MAX,
             });
+        }
+        sys::SCHED_SET_SYSTEM_POLICY => {
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::set_system_scheduler_policy(x0, x1) {
+                    Some(re_moded) => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (aarch64): real SCHED_SET_SYSTEM_POLICY syscall - system \
+                             scheduler mode now {}, aging_cap_ms now {}, {} already-running \
+                             thread(s) re-moded\r\n",
+                            if x0 == 0 { "Interactive" } else { "Throughput" },
+                            x1,
+                            re_moded
+                        ));
+                        re_moded
+                    }
+                    None => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (aarch64): SCHED_SET_SYSTEM_POLICY rejected - {} is not a \
+                             real scheduler mode code, nothing changed\r\n",
+                            x0
+                        ));
+                        usize::MAX
+                    }
+                },
+            );
         }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();
@@ -9027,6 +9191,31 @@ fn simurgh_syscall(
                 Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
                 None => usize::MAX,
             });
+        }
+        sys::SCHED_SET_SYSTEM_POLICY => {
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::set_system_scheduler_policy(a0, a1) {
+                    Some(re_moded) => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (riscv64): real SCHED_SET_SYSTEM_POLICY syscall - system \
+                             scheduler mode now {}, aging_cap_ms now {}, {} already-running \
+                             thread(s) re-moded\r\n",
+                            if a0 == 0 { "Interactive" } else { "Throughput" },
+                            a1,
+                            re_moded
+                        ));
+                        re_moded
+                    }
+                    None => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (riscv64): SCHED_SET_SYSTEM_POLICY rejected - {} is not a \
+                             real scheduler mode code, nothing changed\r\n",
+                            a0
+                        ));
+                        usize::MAX
+                    }
+                },
+            );
         }
         sys::IPC_REPLY => {
             let hal = kernel_arch_glue::khal();

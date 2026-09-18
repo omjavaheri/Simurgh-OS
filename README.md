@@ -179,6 +179,28 @@ riscv64) unless noted:**
   instruction; a preemptive, timer-driven scheduler runs multiple processes
   concurrently in separate, MMU-isolated address spaces, including zero-copy
   sharing of a single physical frame across two spaces.
+- **Real, system-wide scheduler-mode switching driven by layer-4 Profile
+  Policy** (`sys::SCHED_SET_SYSTEM_POLICY`, opcode 135): `kernel-sched` has
+  always had both disciplines of 02 §4 (`Interactive`: priority + aging,
+  latency-first; `Throughput`: chain-group `vruntime` fairness), but every
+  production admit site used to hard-code `Interactive`, so `Throughput` was
+  reachable only from unit tests and a user's profile choice changed no real
+  scheduling behaviour. `Scheduler` now carries a system default mode plus a
+  runtime `aging_cap_ms`, and this syscall retargets both: it re-modes every
+  already-running thread that follows the default, and applies to threads
+  spawned afterwards. 02 §4.4's per-thread override is preserved — a thread
+  admitted through plain `Scheduler::admit` pins its own mode and is never
+  swept, which is how the Root Task deliberately stays `Interactive` no
+  matter what profile is active (it serves this very syscall). The one real
+  caller is `simurgh-profile-policy`'s `policy-engine` process, from its
+  `switch_profile` handler. QEMU-verified on all three architectures: the
+  Root Task performs a `Throughput` → `Interactive` round trip just before
+  arming preemption and the kernel logs **8 already-running threads re-moded
+  each way**, with `policy-engine`'s own startup assertion (`General` ⇒
+  `Interactive`, cap 50) showing up separately as a correct 0-thread no-op.
+  Not capability-gated yet — the same MVP-phase gap `MAP_PAGE` and
+  `POWER_CONTROL` carry, flagged in `kernel_arch_glue::
+  set_system_scheduler_policy`'s own `TODO(spec)`.
 - **Layer 3 subsystems:** `device-manager`, `fs-native`,
   `driver-virtio-blk`, `driver-virtio-net`, `driver-i8042`, `driver-mouse`,
   `driver-nvme`, `netstack`, `compositor`, `mm-service`,

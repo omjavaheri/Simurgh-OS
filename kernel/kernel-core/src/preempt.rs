@@ -27,7 +27,12 @@ use crate::state::KernelState;
 use crate::tcb::ThreadState;
 use hal_core::HalInterface;
 use kernel_cap::ThreadId;
-use kernel_sched::{SchedulerMode, MAX_PRIORITY};
+use kernel_sched::MAX_PRIORITY;
+// `SchedulerMode` is no longer named by this module's own production code
+// (`init_user_thread` follows the system default now) — only by the tests
+// below, which pin a mode explicitly.
+#[cfg(test)]
+use kernel_sched::SchedulerMode;
 
 /// What one `preempt_tick` resolved to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,10 +206,18 @@ impl KernelState {
 
     /// Turns a freshly-`Retype`d / `alloc`ed TCB into a runnable U-mode
     /// thread: seeds its `user_context` (entry, stack, address-space root)
-    /// via the HAL, marks it `Runnable`, and admits it to the scheduler
-    /// (Interactive, `MAX_PRIORITY`). Re-admitting an already-admitted
-    /// thread (e.g. the Root Task) is a no-op — its `note_ready` still
-    /// refreshes it.
+    /// via the HAL, marks it `Runnable`, and admits it to the scheduler at
+    /// `MAX_PRIORITY`, in whatever mode the ACTIVE PROFILE currently calls
+    /// for (`Scheduler::admit_following_system_default`). Re-admitting an
+    /// already-admitted thread (e.g. the Root Task) is a no-op — its
+    /// `note_ready` still refreshes it.
+    ///
+    /// The mode is deliberately not pinned here (2026-09-18): this is the
+    /// admit path every spawned layer-3 subsystem process takes, and those
+    /// are exactly the threads a user's profile choice is meant to govern.
+    /// Hard-coding `SchedulerMode::Interactive` here — as this did before —
+    /// was what made `simurgh-profile-policy`'s `Server`/`AI` profiles
+    /// unable to produce any real scheduling difference at all.
     ///
     /// `root_frame` is the physical address of the thread's page-table
     /// root (`0` = keep the active one).
@@ -223,7 +236,7 @@ impl KernelState {
         }
         let _ = self
             .sched
-            .admit(tid, SchedulerMode::Interactive, MAX_PRIORITY, None);
+            .admit_following_system_default(tid, MAX_PRIORITY, None);
         let _ = self.sched.note_ready(tid, hal.now_ns());
     }
 

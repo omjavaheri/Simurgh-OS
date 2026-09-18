@@ -50,6 +50,13 @@ pub use run::ScheduleOutcome;
 pub use state::{KernelInitError, KernelState};
 pub use syscall::{SyscallError, SyscallOp, SyscallReturn};
 pub use tcb::{ThreadState, Tcb};
+/// Re-exported because `KernelState::sched` is public and its own API
+/// (`admit`, `set_system_scheduler_policy`) both takes and returns this
+/// type — so any crate driving the scheduler through `KernelState` needs
+/// to name it, without `kernel-sched` having to become a direct dependency
+/// of every such crate (`kernel-arch-glue`'s own
+/// `set_system_scheduler_policy` is the motivating caller).
+pub use kernel_sched::SchedulerMode;
 
 /// The concrete `CpuContext` width this kernel is built with. All three
 /// architecture crates fix their own `*_CONTEXT_BYTES` to 160

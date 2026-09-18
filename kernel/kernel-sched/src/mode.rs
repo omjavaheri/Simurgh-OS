@@ -11,6 +11,18 @@
 //! sets it from a thread-creation argument that, higher up, comes from
 //! layer-4 Profile Policy; the scheduler branches on it in `pick_next` and
 //! in how it charges `vruntime`.
+//!
+//! How layer-4 Profile Policy actually reaches this enum (2026-09-18):
+//! §4.4's "per-thread, not global" wording constrains where the mode is
+//! STORED and applied (one `SchedulerMode` per `SchedEntity`, which is
+//! still exactly true), not where its DEFAULT comes from. `Scheduler`
+//! carries a system default mode that every thread admitted via
+//! `Scheduler::admit_following_system_default` follows, and
+//! `simurgh-profile-policy` sets that default over the real
+//! `sys::SCHED_SET_SYSTEM_POLICY` syscall when a user switches profile.
+//! A thread admitted through plain `Scheduler::admit` names its mode
+//! explicitly and is left alone by such a switch — so the per-thread
+//! override §4.4 requires genuinely still exists.
 //! ============================================================================
 
 /// Scheduling discipline applied to one thread.
@@ -49,5 +61,53 @@ impl SchedulerMode {
             Self::Interactive => 0,
             Self::Throughput => 1,
         }
+    }
+
+    /// This mode's stable syscall-ABI code, as carried in `a0` of
+    /// `kernel/src/main.rs`'s own `sys::SCHED_SET_SYSTEM_POLICY`.
+    ///
+    /// Deliberately NOT the enum's own declaration order via `as usize`:
+    /// a cross-repo ABI a separate git repo (`simurgh-profile-policy`,
+    /// which mirrors this enum by hand in its own `scheduler.rs`) encodes
+    /// against must not silently change meaning if a variant is ever
+    /// reordered or inserted. Same reasoning `kernel_arch_glue::
+    /// thread_state_wire_code` already applies to `ThreadState`.
+    pub const fn wire_code(self) -> u8 {
+        match self {
+            Self::Interactive => 0,
+            Self::Throughput => 1,
+        }
+    }
+
+    /// Inverse of [`Self::wire_code`]. `None` for any code this kernel does
+    /// not know — an out-of-range value from a user-space caller is a
+    /// normal, expected input to reject, not a kernel bug.
+    pub const fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Interactive),
+            1 => Some(Self::Throughput),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_codes_round_trip_both_modes() {
+        for mode in [SchedulerMode::Interactive, SchedulerMode::Throughput] {
+            assert_eq!(SchedulerMode::from_wire_code(mode.wire_code()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn an_unknown_wire_code_is_rejected_rather_than_defaulted() {
+        // A user-space caller passing garbage must NOT silently land on
+        // `Interactive` — `set_system_scheduler_policy` needs to be able to
+        // tell "asked for interactive" apart from "asked for nonsense".
+        assert_eq!(SchedulerMode::from_wire_code(2), None);
+        assert_eq!(SchedulerMode::from_wire_code(u8::MAX), None);
     }
 }

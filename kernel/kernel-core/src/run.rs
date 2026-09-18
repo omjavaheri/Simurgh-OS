@@ -27,7 +27,7 @@ use crate::state::KernelState;
 use crate::tcb::ThreadState;
 use hal_core::{HalInterface, VirtAddr};
 use kernel_cap::ThreadId;
-use kernel_sched::{RunState, SchedulerMode};
+use kernel_sched::RunState;
 
 /// What one `schedule_step` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +123,9 @@ impl KernelState {
 
     /// Makes a freshly-`Retype`d TCB runnable: seeds its saved context to
     /// begin executing `entry` (a `-> !` function) on `stack_top`, admits
-    /// it to the scheduler (Interactive mode, mid priority), and marks it
+    /// it to the scheduler at mid priority in whatever mode the active
+    /// profile currently calls for
+    /// (`Scheduler::admit_following_system_default`), and marks it
     /// `Ready` / `Runnable`.
     ///
     /// Used by the in-kernel Root Task to bring up a second thread
@@ -141,7 +143,7 @@ impl KernelState {
             tcb.entry = VirtAddr::new(entry);
             tcb.state = ThreadState::Runnable;
         }
-        let _ = self.sched.admit(tid, SchedulerMode::Interactive, 20, None);
+        let _ = self.sched.admit_following_system_default(tid, 20, None);
         let _ = self.sched.note_ready(tid, hal.now_ns());
     }
 
