@@ -41,6 +41,12 @@ use alloc::collections::BTreeMap;
 /// architecture gating lives inside the file, not at this level).
 pub mod subsystem_entry;
 
+/// The real display output path — turning a committed frame into pixels
+/// on the firmware-programmed framebuffer. See that module's own doc
+/// comment; everything in it that can be decided without touching the
+/// mapping is pure, host-tested logic.
+pub mod scanout;
+
 /// Errors from the surface table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositorError {

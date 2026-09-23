@@ -49,6 +49,9 @@
 //! are completely safe here.
 //! ============================================================================
 
+use crate::scanout::{
+    Scanout, DESKTOP_BACKGROUND, SCANOUT_ACK_OFFSET, SCANOUT_INFO_MAGIC, SCANOUT_STATUS_OFFSET,
+};
 use crate::Compositor;
 use ipc_protocol::codec::{decode_display_request, encode_display_response};
 use ipc_protocol::display::DisplayErrorCode;
@@ -336,6 +339,20 @@ fn copy_frame_to_confirm(len: u32) {
     }
 }
 
+/// VA the scanout info page is mapped at — must stay numerically equal
+/// to `kernel_arch_glue::COMPOSITOR_SCANOUT_INFO_VA`. ALWAYS mapped,
+/// even on a machine with no display: a zero-filled page is how the
+/// kernel says "no framebuffer was granted", and reading a mapped page
+/// is how this process finds that out without an architecture check it
+/// is not allowed to make (no `cfg(target_arch)` above the HAL).
+const SCANOUT_INFO_VA: usize = 0xD900_0000;
+
+/// VA the granted framebuffer itself is mapped at — must stay
+/// numerically equal to `kernel_arch_glue::COMPOSITOR_SCANOUT_VA`.
+/// Mapped ONLY when a real framebuffer exists; nothing here dereferences
+/// it unless the info page above said so.
+const SCANOUT_VA: usize = 0xD910_0000;
+
 /// VA `driver-i8042`'s own shared message page is mapped at in THIS
 /// process's own address space — must stay numerically equal to
 /// `kernel_arch_glue::COMPOSITOR_I8042_VA`. A DIFFERENT physical region
@@ -437,6 +454,81 @@ fn read_mouse_message() -> Option<MouseEvent> {
     })
 }
 
+/// This process's display output, and the running proof of what it has
+/// actually put on screen.
+///
+/// `scanout` is `None` on every machine that granted no framebuffer
+/// (riscv64, or UEFI firmware with no directly-writable mode) — and on
+/// that path every method here is a no-op, so the whole pre-scanout
+/// behaviour of this file is preserved exactly, with no architecture
+/// check anywhere (none is permitted above the HAL).
+struct Output {
+    scanout: Option<Scanout>,
+    /// How many frames this process has genuinely written to the
+    /// framebuffer. Mirrored into the info page for the kernel to read
+    /// back and report in the boot log — the same "kernel peeks a
+    /// shared region directly" proof the confirm region already
+    /// provides for `CommitBuffer` itself.
+    blits: u64,
+    /// The size of the last frame that actually reached the screen,
+    /// AFTER clipping — not the size requested, which is the number
+    /// worth knowing when a client and the firmware mode disagree.
+    last_size: (u32, u32),
+}
+
+impl Output {
+    /// No display. The state every machine starts in, and the one a
+    /// machine with no framebuffer stays in forever.
+    const fn headless() -> Self {
+        Self { scanout: None, blits: 0, last_size: (0, 0) }
+    }
+
+    /// Puts a committed frame on the screen and records that it
+    /// happened. A no-op when no framebuffer was granted.
+    fn present(&mut self, src_va: usize, width: u32, height: u32) {
+        let Some(scanout) = self.scanout else {
+            return;
+        };
+        // SAFETY: `src_va` is `FB_VA`, the shared frame region the
+        // kernel maps for this process before it is first scheduled,
+        // and the caller has already rejected any `width * height * 4`
+        // exceeding `FRAME_MAX` (the region's own mapped length).
+        let plan = unsafe { scanout.blit(src_va, width, height) };
+        if plan.is_empty() {
+            return;
+        }
+        self.blits += 1;
+        self.last_size = (plan.copy_width, plan.copy_height);
+        self.write_status();
+    }
+
+    /// Mirrors `blits`/`last_size` into the scanout info page, where the
+    /// kernel reads them from its own identity map.
+    fn write_status(&self) {
+        if self.scanout.is_none() {
+            return;
+        }
+        let base = (SCANOUT_INFO_VA + SCANOUT_STATUS_OFFSET) as *mut u64;
+        // SAFETY: the info page is mapped `U=1 R+W` for this process by
+        // `kernel_arch_glue::compositor_demo_start` before it is first
+        // scheduled, and this writes 16 bytes at offset 32 plus one
+        // word at offset 48, all well inside that 4 KiB page. Volatile
+        // because the kernel reads the same physical bytes through its
+        // own mapping, at a moment this process cannot observe.
+        unsafe {
+            core::ptr::write_volatile(base, self.blits);
+            core::ptr::write_volatile(
+                base.add(1),
+                self.last_size.0 as u64 | ((self.last_size.1 as u64) << 32),
+            );
+            core::ptr::write_volatile(
+                (SCANOUT_INFO_VA + SCANOUT_ACK_OFFSET) as *mut u64,
+                SCANOUT_INFO_MAGIC,
+            );
+        }
+    }
+}
+
 /// Handles one REAL `DisplayRequest`, driving a REAL `Compositor` surface
 /// table. `CommitBuffer`'s own `buffer_cap` (the WIRE protocol's own
 /// "client capability slot" field) is intentionally never resolved here
@@ -450,6 +542,7 @@ fn handle_request(
     comp: &mut Compositor,
     pending_key_event: &mut Option<KeyEvent>,
     pending_mouse_event: &mut Option<MouseEvent>,
+    output: &mut Output,
     req: DisplayRequest,
 ) -> DisplayResponse {
     match req {
@@ -471,6 +564,11 @@ fn handle_request(
             match comp.commit_buffer(surface.0, width, height) {
                 Ok(()) => {
                     copy_frame_to_confirm(len);
+                    // The real scanout hop — strictly AFTER the confirm
+                    // copy, so the pre-existing `compositor_commit_
+                    // verify` proof is byte-for-byte unaffected by it,
+                    // and a no-op on a machine with no framebuffer.
+                    output.present(FB_VA, width, height);
                     DisplayResponse::Committed
                 }
                 Err(_) => DisplayResponse::Error {
@@ -511,12 +609,28 @@ fn handle_request(
         // standard default any software compositor reports absent a
         // real monitor to negotiate EDID/refresh timing with (no such
         // hardware exists in this headless/file-output MVP, §5.4.2).
-        DisplayRequest::QueryOutputs => DisplayResponse::OutputTopology {
-            output_count: 1,
-            primary_width: 800,
-            primary_height: 600,
-            primary_refresh_mhz: 60_000,
-        },
+        //
+        // Once a REAL framebuffer is granted, this reports the mode
+        // firmware actually programmed instead of the fixed pair — a
+        // client that sizes its frame from this answer then renders
+        // exactly the output's own resolution and needs neither
+        // centering nor clipping (`scanout::BlitPlan`'s own policy).
+        // Without one, the fixed 800x600 stands: it is the resolution
+        // every frame in this codebase is rendered at and `FRAME_MAX`
+        // is sized for, and reporting a made-up alternative would be
+        // worse than reporting the real convention.
+        DisplayRequest::QueryOutputs => {
+            let (primary_width, primary_height) = match output.scanout {
+                Some(scanout) => (scanout.info().width, scanout.info().height),
+                None => (800, 600),
+            };
+            DisplayResponse::OutputTopology {
+                output_count: 1,
+                primary_width,
+                primary_height,
+                primary_refresh_mhz: 60_000,
+            }
+        }
         // Real, per this file's own `read_i8042_message`/`KeyEvent` —
         // drains (not peeks) `pending_key_event`, matching `driver-
         // virtio-net`'s own `PollFrame` precedent this variant's own
@@ -622,6 +736,34 @@ pub extern "C" fn subsystem_main() -> ! {
     // — same "real consumer is a later stage" reasoning.
     let mut last_mouse_event: Option<MouseEvent> = None;
 
+    // Acquire the display, if this machine granted one. Done once, here,
+    // before the first `Recv`: the mapping is established by
+    // `kernel_arch_glue::compositor_demo_start` before this process is
+    // ever scheduled, so there is nothing to wait for, and doing it up
+    // front keeps the serving loop below free of any per-request
+    // display setup.
+    //
+    // SAFETY: `SCANOUT_INFO_VA` is always mapped for this process
+    // (zero-filled when no framebuffer exists, which decodes to
+    // `None`), and `SCANOUT_VA` is mapped whenever that page says a
+    // framebuffer was granted — both per those constants' own doc
+    // comments.
+    let mut output = Output::headless();
+    output.scanout = unsafe { Scanout::from_info_page(SCANOUT_INFO_VA, SCANOUT_VA) };
+    if let Some(scanout) = output.scanout {
+        // Take ownership of every pixel: what is on screen at this
+        // moment is leftover UEFI console text, which would otherwise
+        // stay there for the rest of the boot underneath any committed
+        // frame. See `scanout::DESKTOP_BACKGROUND`'s own doc comment
+        // for why this specific colour.
+        scanout.fill(DESKTOP_BACKGROUND);
+        // Publish a first status the kernel can read back even before
+        // any client has committed anything — "the Compositor reached
+        // its display" and "the Compositor drew a frame" are different
+        // facts, and the boot log should be able to tell them apart.
+        output.write_status();
+    }
+
     // Same stack-slot-reuse miscompilation `fs_native::subsystem_entry::
     // subsystem_main`'s own identical loop hits (full investigation in
     // that function's own doc comment) — the same defense-in-depth every
@@ -689,7 +831,7 @@ pub extern "C" fn subsystem_main() -> ! {
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, COMPOSITOR_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();
         let resp = match decode_display_request(&req_msg) {
-            Ok(req) => handle_request(&mut comp, &mut last_key_event, &mut last_mouse_event, req),
+            Ok(req) => handle_request(&mut comp, &mut last_key_event, &mut last_mouse_event, &mut output, req),
             Err(_) => DisplayResponse::Error {
                 code: DisplayErrorCode::Unsupported,
             },
@@ -712,7 +854,7 @@ mod tests {
         let mut comp = Compositor::new();
         let mut pending_key = None;
         let mut pending_mouse = None;
-        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::QueryOutputs);
+        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::QueryOutputs);
         assert_eq!(
             resp,
             DisplayResponse::OutputTopology {
@@ -729,7 +871,7 @@ mod tests {
         let mut comp = Compositor::new();
         let mut pending_key = None;
         let mut pending_mouse = None;
-        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::SubscribeInput);
+        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::SubscribeInput);
         assert_eq!(
             resp,
             DisplayResponse::Error {
@@ -749,12 +891,28 @@ mod tests {
         let mut pending_key = Some(KeyEvent { keycode: 0x48, pressed: true, extended: true });
         let mut pending_mouse = None;
 
-        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::PollInputEvent);
+        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::PollInputEvent);
         assert_eq!(resp, DisplayResponse::InputEvent { keycode: 0x48, pressed: true, extended: true });
         assert!(pending_key.is_none(), "PollInputEvent must drain, not peek");
 
-        let resp2 = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::PollInputEvent);
+        let resp2 = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::PollInputEvent);
         assert_eq!(resp2, DisplayResponse::NoInputPending);
+    }
+
+    /// On a machine that granted no framebuffer, every display-output
+    /// call must be a pure no-op that never dereferences a scanout VA —
+    /// this is what keeps the pre-scanout behaviour of this file
+    /// bit-for-bit intact on riscv64 and on any machine with no usable
+    /// GOP mode. Safe to call on the host precisely because it returns
+    /// before touching any address.
+    #[test]
+    fn a_headless_output_never_touches_the_scanout() {
+        let mut output = Output::headless();
+        assert!(output.scanout.is_none());
+        output.present(FB_VA, 800, 600);
+        output.write_status();
+        assert_eq!(output.blits, 0);
+        assert_eq!(output.last_size, (0, 0));
     }
 
     #[test]
@@ -777,14 +935,14 @@ mod tests {
         let mut pending_key = None;
         let mut pending_mouse = Some(MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false });
 
-        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::PollMouseEvent);
+        let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::PollMouseEvent);
         assert_eq!(
             resp,
             DisplayResponse::MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false }
         );
         assert!(pending_mouse.is_none(), "PollMouseEvent must drain, not peek");
 
-        let resp2 = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, DisplayRequest::PollMouseEvent);
+        let resp2 = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::PollMouseEvent);
         assert_eq!(resp2, DisplayResponse::NoMouseEventPending);
     }
 }
