@@ -1163,6 +1163,143 @@ riscv64) unless noted:**
   faulting access, so this is newly OBSERVED, not newly introduced —
   nothing in the `sys::THREAD_EXIT_POLL` work touches those edges or any
   mapping.
+- **Layer-4 processes spawned but never running — ROOT-CAUSED AND FIXED
+  (2026-09-18).** After the Ring-0 deadlock fix below, a real x86_64 boot
+  reached a clean shutdown in ~13 seconds — but almost nothing ran in it.
+  Of every layer-4 process spawned (`store`, `ui-core`, `init`, `shell`,
+  `account-manager`, `backup-manager`, `native-loader`, `file-manager`,
+  `policy-engine`, ...), only `device-manager` and the spawned
+  `security-broker` ever executed their own code; everything else was
+  spawned with a real ELF and real capabilities and then stayed silent.
+
+  **The cause was boot SEQUENCING, not scheduler fairness.** A temporary
+  in-kernel trace of every real switch decision settled it: `pick_next`
+  was distributing turns correctly across every spawned thread, and
+  `p2_fault`'s "direct, not generic fairness" hand-off — the prime
+  suspect — consumed only FIVE ticks (~10 ms) end to end for the whole
+  six-cycle crash/respawn demo. Neither was at fault. What actually
+  happened is that `device-manager`'s own `subsystem_main` issues a real
+  `POWER_CONTROL` shutdown as its closing act, so the §5.2
+  fault-isolation demo does not merely run alongside the system, **it
+  ends the boot** — and the faulty driver was spawned `Ready` alongside
+  everything else, so `pick_next` reached it on its ordinary turn about
+  TWELVE ticks (~24 ms) into the preemption phase. The machine powered
+  itself off at roughly tick 60 of a 400-tick budget, about 15% of the
+  window the demo was already designed to provide. The layer-4 processes
+  were never starved of turns; they were starved of TIME. Under TCG one
+  IPC round trip costs ~1.3 ms on average (this same boot's §8.3
+  benchmark line) — most of a single 2 ms quantum — so one or two turns
+  each buys nothing observable.
+
+  **The fix, part 1 — a single-purpose gate** in `kernel-arch-glue`:
+  `p2_gate_fault_demo` holds the FIRST faulty-driver instance out of
+  `pick_next` (`note_blocked`, TCB and scheduler entity fully intact)
+  until `p2_tick` reaches `P2_FAULT_DEMO_START_TICK` (1000), then
+  releases it with one `note_ready`. The fault-isolation mechanism itself
+  is untouched: every RESPAWN still uses the existing direct hand-off,
+  the driver still faults on its own first instruction, and
+  `device-manager` still runs the full six-restart budget to
+  `state=Failed restarts_in_window=6`. Only the demo's START time moves.
+  The quantum is deliberately NOT widened to compensate —
+  02-Microkernel-Layer.md §4 states the interactive quantum as ~1–4 ms
+  and 2 ms sits inside that; more turns is the same total CPU without
+  departing from the spec. `P2_TICK_BUDGET` was raised 400 → 2000 as pure
+  margin, since reaching it cancels the timer and would strand
+  `device-manager`'s closing shutdown.
+
+  **The fix, part 2 — x86_64 `#PF` isolation, which part 1 turned out to
+  depend on.** The gate alone was reproducible at 300 ticks but genuinely
+  flaky at 600 and 1000 (about half of boots died). Giving layer-4 code
+  real run time exposed latent faults the old ~12-tick window never
+  reached — a null dereference in a subsystem thread (`error_code=0x5`,
+  `cr2=0x0`) and an unmapped access at `cr2=0xD810_0000` — and EITHER one
+  halted the whole machine, because `hal-x86_64` routed only `#UD` to its
+  registered `FaultHandler` and let `#PF` fall through to
+  `common_interrupt_entry`'s halt-forever arm. That is a direct breach of
+  the per-process isolation 03-Kernel-Subsystems-Layer.md §2.1/§5.2
+  requires, and the exact mirror of the aarch64 `ec=0x24` gap fixed in
+  `e8e1c83`. `#PF` now has its own gate (`isr_pagefault_trampoline` →
+  `common_pagefault_entry`), identical to the `#UD` path except for one
+  leading `add rsp, 8` that discards the CPU-pushed error code; `cr2` is
+  passed as the handler's third argument (matching riscv64's `stval`),
+  and a Ring-0 `#PF` stays fatal. The `#UD` gate is untouched.
+
+  **Measured, on real QEMU boots of all three architectures.** Before:
+  on every architecture, nothing but `device-manager` and the spawned
+  `security-broker` ran its own code. After:
+  - **x86_64** — six consecutive boots across two bases (three on
+    `69aa1fe`, three on `e8e1c83`): all six reached
+    `state=Failed restarts_in_window=6` and a clean `POWER_CONTROL`
+    shutdown with zero unhandled exceptions, and in five of the six two
+    real page faults were isolated mid-boot with the system carrying on.
+    New self-check / report lines, present in every run and all
+    appearing BEFORE the demo: `security-broker` (3 real service calls),
+    `native-loader` (2-3 real round trips — `request_capability`,
+    `Loader::spawn`, de-framework `DisplayClient` to Compositor),
+    `simurgh-shell` (its prompt), `file-manager` (its
+    fs-native self-check round trip), and `init` (its 5-unit self-check
+    with a real on-demand spawn, and its `THREAD_EXIT_POLL`
+    crash-supervision self-check, which PASSES).
+  - **aarch64** — two consecutive boots: PASS marker and `POWER_CONTROL`
+    reached; `init`'s own self-check now runs. (Verified on an image
+    whose embedded in-repo subsystem ELFs were debug-stripped for test
+    only — see the load-address entry below; the code is byte-identical.)
+  - **riscv64** — two consecutive boots: PASS marker and clean shutdown;
+    `init`'s self-check now runs, and `native-loader`, `account-manager`
+    and `store` now execute their own code for the first time on this
+    architecture — reaching the already-recorded unmapped shared-page
+    writes at `0xD8E0_0000` / `0xD900_0000` / `0xD920_0040`, which are
+    isolated exactly as §5.2 promises.
+
+  **What is still NOT running, and why — none of it a scheduling
+  defect.** `store`, `ui-core`, `account-manager` and `policy-engine` DO
+  receive real scheduling turns on x86_64 (the trace showed `pick_next`
+  selecting them) but do not yet reach a report line inside the window.
+  `backup-manager` and `diagnostics-manager` cannot run at all by
+  construction: `p2_preempt_start` deliberately marks both `Exited` and
+  removes them from the scheduler, a standing workaround for the
+  stale-saved-context bug class documented there. Two real bugs were also
+  surfaced (not caused) by this work, both recorded rather than fixed:
+  `simurgh-init` enters a runaway `SPAWN_KNOWN_ELF` loop once its
+  self-check completes — the copies it spawns re-issue the call and are
+  denied — which is now self-limiting because each copy's null-pointer
+  `#PF` is isolated (its own repo); and `file-manager`'s `Write` step
+  intermittently receives a stale `FsResponse::Opened` reply
+  (`step=72057594037928193` = label `0x0100_0000_0000_0001`: Filesystem
+  namespace, opcode 1), while on other boots `Write` succeeds and the
+  later `copy` step fails (`step=7`). Identical builds giving different
+  results points to a timing race on the fs-native multi-client reply
+  path `852c2b6` addressed — plausibly between `init` and `file-manager`,
+  both fs-native clients that had never actually run concurrently before
+  this gate.
+
+  **Desktop mode — how to turn this off.** The mechanism is
+  `kernel_arch_glue::p2_gate_fault_demo` plus the constant
+  `P2_FAULT_DEMO_START_TICK` (and its static `GATED_FAULT_DRIVER_TID`),
+  deliberately NOT entangled with `p2_fault`'s hand-off, `DM_TID`'s
+  preemption exemption or `P2_TICK_BUDGET`. Setting
+  `P2_FAULT_DEMO_START_TICK` to `0` means "never release": the demo never
+  starts, `device-manager` never reaches its closing `POWER_CONTROL`, and
+  the machine keeps running — what an interactive desktop boot
+  (Compositor + `ui-core` + i8042/mouse + `account-manager`) needs.
+  Turning the automated demo off is that one constant and nothing else.
+
+- **aarch64 kernel image no longer loads under UEFI — a fixed-address
+  ceiling, not RAM (found 2026-09-18).** The aarch64 kernel is linked at
+  fixed physical addresses from `0x4020_0000`, and `uefi-bootloader`
+  requests exactly those pages. `AllocatePages` fails ("kernel image
+  corrupted") whenever the image's end crosses roughly `0x4400_0000`: a
+  passing build ended at `0x43F0_6000`, and failing builds ended at
+  `0x4401_7610` and `0x4401_CAC8`. It fails identically with `-m 1024M`,
+  and on both `e8e1c83` and `69aa1fe`, so **no RAM value fixes it** and
+  no single commit caused it — the image had only ~1 MB of headroom, and
+  the embedded-ELF payload (segment #3) swings by more than that between
+  builds. The real lever is size: the embedded subsystem ELFs are
+  unstripped debug builds, and `llvm-objcopy --strip-debug` on just the
+  nine in-repo aarch64 ones reclaimed 27,078,656 bytes (29.5 MB → 2.5 MB),
+  after which the image loads and boots to a clean PASS. Stripping the
+  embedded ELFs at build time (or relinking the aarch64 kernel above the
+  firmware's reservation) is the open fix; not done here.
 - **QEMU scheduling capacity at scale (x86_64) — LARGELY SUPERSEDED
   (2026-09-17); read the correction first.** The most alarming claim in
   this entry — that `device-manager` was never once observed reaching its

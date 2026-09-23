@@ -4523,7 +4523,17 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 DRIVER_NVME_ELF,
                 elf_loader::machine::EM_X86_64,
             );
-            let _ = spawn_faulty_driver_x86(kernel_arch_glue::khal());
+            // Spawned here as always (its capability wiring, its
+            // `p2_watch_driver` registration and its own log line are
+            // unchanged), but held out of `pick_next` until the general
+            // scheduler has had its designed share of the boot window —
+            // see `kernel_arch_glue::p2_gate_fault_demo`'s own doc comment
+            // for the real, QEMU-measured starvation this closes. Without
+            // it this driver got its ordinary turn ~12 ticks in, faulted,
+            // and device-manager's closing `POWER_CONTROL` powered the
+            // machine off before any other layer-4 process had run long
+            // enough to produce a single line of its own output.
+            kernel_arch_glue::p2_gate_fault_demo(spawn_faulty_driver_x86(kernel_arch_glue::khal()));
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
@@ -8284,7 +8294,10 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             let _ = spawn_store_aarch64(kernel_arch_glue::khal());
             let _ = spawn_native_loader_aarch64(kernel_arch_glue::khal());
             let _ = spawn_policy_engine_aarch64(kernel_arch_glue::khal());
-            let _ = spawn_faulty_driver_aarch64(kernel_arch_glue::khal());
+            // Gated exactly as in `simurgh_syscall_x86`'s own
+            // `P2_PREEMPT_START` arm — see it, and `kernel_arch_glue::
+            // p2_gate_fault_demo`'s own doc comment, for the rationale.
+            kernel_arch_glue::p2_gate_fault_demo(spawn_faulty_driver_aarch64(kernel_arch_glue::khal()));
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
@@ -9029,7 +9042,10 @@ fn simurgh_syscall(
             let _ = spawn_store(kernel_arch_glue::khal());
             let _ = spawn_native_loader(kernel_arch_glue::khal());
             let _ = spawn_policy_engine(kernel_arch_glue::khal());
-            let _ = spawn_faulty_driver(kernel_arch_glue::khal());
+            // Gated exactly as in `simurgh_syscall_x86`'s own
+            // `P2_PREEMPT_START` arm — see it, and `kernel_arch_glue::
+            // p2_gate_fault_demo`'s own doc comment, for the rationale.
+            kernel_arch_glue::p2_gate_fault_demo(spawn_faulty_driver(kernel_arch_glue::khal()));
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),

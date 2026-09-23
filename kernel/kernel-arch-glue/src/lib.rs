@@ -223,6 +223,19 @@ static mut PENDING_CRASH: Option<(usize, usize, usize)> = None;
 /// blocked".
 static mut DM_TID: Option<ThreadId> = None;
 
+/// The FIRST faulty-driver instance, spawned by `P2_PREEMPT_START` but
+/// deliberately held back from `pick_next` until `p2_tick` has run
+/// [`P2_FAULT_DEMO_START_TICK`] rounds of ordinary fair scheduling — see
+/// [`p2_gate_fault_demo`] for the real, QEMU-measured starvation this
+/// closes, and `p2_tick`'s own gate-release branch for the release.
+///
+/// Only the FIRST instance is gated. Every RESPAWN
+/// (`DM_RESPAWN_DRIVER` → `p2_dm_handoff_to_driver`) still runs
+/// immediately via the existing direct hand-off, so the §5.2
+/// crash/restart cycle itself is completely untouched: once it starts it
+/// runs to `state=Failed restarts_in_window=6` exactly as before.
+static mut GATED_FAULT_DRIVER_TID: Option<ThreadId> = None;
+
 /// Per-thread quantum for the preemption demo. 2 ms at QEMU virt's
 /// 10 MHz timebase is 20 000 ticks — long enough that each process's
 /// counting loop makes visible progress, short enough that the whole
@@ -266,7 +279,113 @@ const P2_QUANTUM_NS: u64 = 2_000_000;
 /// — `MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) rather
 /// than a minimal bump, since more layer-4/5 services will keep growing
 /// this same competing set.
-const P2_TICK_BUDGET: u32 = 400;
+///
+/// **Raised again to 1000 (2026-09-18), as pure headroom behind
+/// [`P2_FAULT_DEMO_START_TICK`]** — not because the demo needs 1000
+/// ticks. Reaching this budget CANCELS the timer permanently (see this
+/// module's `p2_tick`), after which whichever thread happens to hold the
+/// CPU keeps it forever; if that thread is not device-manager, the boot
+/// can never reach device-manager's own closing `POWER_CONTROL`
+/// shutdown. With the fault-isolation demo now starting at tick
+/// [`P2_FAULT_DEMO_START_TICK`], the shutdown lands around tick 1015 on a
+/// real x86_64 boot — the old 400 would not even have been reached. This
+/// is margin, and costs nothing: on every real boot the machine powers
+/// off long before the budget is hit, so this branch stays exactly as
+/// unreached as it already was.
+const P2_TICK_BUDGET: u32 = 2000;
+
+/// The tick at which `p2_tick` releases the gated first faulty-driver
+/// instance (`GATED_FAULT_DRIVER_TID`) and so lets the §5.2
+/// fault-isolation demo begin.
+///
+/// **The real, QEMU-measured problem this exists to fix (2026-09-18).**
+/// device-manager's `subsystem_main` issues a real `POWER_CONTROL`
+/// shutdown as its own final act, immediately after reporting
+/// `state=Failed` — so the fault-isolation demo does not merely run
+/// alongside the general scheduler, it ENDS THE BOOT. Before this gate
+/// the first faulty driver was spawned `Ready` alongside every other
+/// layer-4 process, so `pick_next` reached it on its ordinary turn about
+/// TWELVE ticks (~24 ms) into the preemption phase. A real x86_64 trace
+/// of every switch decision showed the whole boot powering off at around
+/// tick 60 of a 400-tick budget — roughly 15% of the window the demo was
+/// already designed to give the system.
+///
+/// The general scheduler itself was never at fault, and neither was
+/// `p2_fault`'s direct hand-off. The same trace showed `pick_next`
+/// distributing turns correctly across every spawned layer-4 thread, and
+/// the entire six-cycle crash/respawn hand-off consuming only FIVE ticks
+/// (~10 ms) end to end. What the layer-4 processes lacked was simply
+/// TIME: under TCG one IPC round trip costs ~1.3 ms on average (this
+/// boot's own §8.3 benchmark line), i.e. most of a single 2 ms quantum,
+/// so one or two turns each buys them nothing observable. In the ~40
+/// ticks that happened to remain after device-manager reached `Failed`,
+/// real output — security-broker serving real calls, native-loader's
+/// real `request_capability` round trip, simurgh-shell's own prompt —
+/// started appearing, which is exactly the evidence that more ordinary
+/// scheduling time is all that was ever missing.
+///
+/// Hence a tick count rather than a per-thread "everyone ran once"
+/// guarantee: the measurement above shows a thread's FIRST turn produces
+/// nothing at all, so "ran once" would be a guarantee of the wrong
+/// thing.
+///
+/// The quantum itself is deliberately NOT raised to compensate.
+/// 02-Microkernel-Layer.md §4 states the interactive quantum as ~1–4 ms
+/// and [`P2_QUANTUM_NS`] sits inside that range; widening it to fit a
+/// TCG IPC round trip would be a silent departure from the spec. Giving
+/// the same scheduler more turns is the same total CPU with none of that
+/// cost.
+///
+/// **Why 1000, and what had to be fixed first.** Raising this constant
+/// alone was NOT enough, and the way it failed is worth recording. With
+/// the gate at 300 the boot was reproducible (four clean runs), but at
+/// 600 and 1000 it became genuinely flaky — of two consecutive 600-tick
+/// boots one powered off cleanly having never reached `simurgh-init` at
+/// all, while the other reached `init`'s full self-check and then died
+/// outright. The cause was not scheduling: letting the layer-4 processes
+/// finally run their own code for a meaningful stretch simply exposed
+/// latent faults that the old ~12-tick window never reached. One was a
+/// plain null dereference in a subsystem thread (`error_code=0x5`,
+/// `cr2=0x0`); another a real unmapped-VA access at `cr2=0xD810_0000`.
+///
+/// Either one killed the ENTIRE MACHINE, because `hal-x86_64` routed
+/// only `#UD` to its registered `FaultHandler` and let `#PF` fall
+/// through to `common_interrupt_entry`'s halt-forever arm — the exact
+/// mirror of the aarch64 `ec=0x24` gap fixed in `e8e1c83`. That is a
+/// direct breach of the per-process isolation
+/// 03-Kernel-Subsystems-Layer.md §2.1/§5.2 requires, and it was the real
+/// blocker: with it open, ANY increase in how long layer-4 code runs
+/// traded the §5.2 acceptance marker for more output, which is not a
+/// trade worth making. It is fixed alongside this constant
+/// (`hal_x86_64::cpu::common_pagefault_entry`), so a U-mode page fault
+/// now terminates just that thread.
+///
+/// With `#PF` isolated, 1000 is reproducible: three consecutive real
+/// boots all reached `state=Failed restarts_in_window=6` and a clean
+/// `POWER_CONTROL` shutdown, and in two of them real page faults were
+/// genuinely isolated mid-boot (`init`'s own runaway `SPAWN_KNOWN_ELF`
+/// copies dereferencing null) with the system carrying on exactly as
+/// §5.2 promises — the runaway now self-limits, because each copy dies
+/// instead of taking the machine down with it. `simurgh-init`'s respawn
+/// loop is still a real bug in its own separate repo; it is simply no
+/// longer fatal here.
+///
+/// 1000 is deliberately not pushed higher. It already reaches every
+/// layer-4 process currently capable of reporting, and this is a boot
+/// demo, not a soak test.
+///
+/// **Desktop mode.** `0` means "never release": the gated driver stays
+/// `Blocked` for the life of the boot, the §5.2 demo never starts, and
+/// device-manager therefore never reaches its own closing
+/// `POWER_CONTROL`. That is exactly what an interactive desktop boot
+/// needs — Compositor, ui-core, the i8042/mouse drivers and
+/// account-manager keep running instead of the machine powering itself
+/// off — and it is why this gate is a single-purpose mechanism with its
+/// own name and its own static, deliberately NOT entangled with
+/// `p2_fault`'s hand-off, `DM_TID`'s preemption exemption, or
+/// `P2_TICK_BUDGET`. Switching the automated demo off later is this one
+/// constant and nothing else.
+const P2_FAULT_DEMO_START_TICK: u32 = 1000;
 /// Byte offsets into the shared frame each process bumps in its counting
 /// loop — distinct words (the frame is ONE physical page aliased into
 /// both spaces), clear of the `0`/`4` area the §8.4 round-trip used.
@@ -1873,6 +1992,42 @@ pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
     let ticks = unsafe { core::ptr::addr_of!(P2_TICKS).read() } + 1;
     unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(ticks) };
 
+    // Gate release: the general scheduler has now had its designed share
+    // of the boot window, so let the §5.2 fault-isolation demo — which
+    // ends the boot, via device-manager's own closing `POWER_CONTROL` —
+    // finally start. See `P2_FAULT_DEMO_START_TICK`'s own doc comment for
+    // the real QEMU measurements this ordering is derived from, and
+    // `p2_gate_fault_demo` for why a `note_ready` is all that is needed.
+    //
+    // Released BEFORE this tick's own `preempt_tick` below, deliberately:
+    // the driver's `vruntime` is still 0, so it is immediately the
+    // lowest-vruntime `Ready` candidate and this very tick's `pick_next`
+    // switches into it. Waiting for the NEXT tick would work too, but
+    // would make the release's own timing depend on the table's tie-break
+    // rather than on this constant.
+    //
+    // Exactly once (`replace(None)`, not a read): re-readying the driver
+    // on every later tick would fight `p2_fault`'s own `terminate_thread`,
+    // which has by then removed this very `ThreadId` from the scheduler.
+    //
+    // `P2_FAULT_DEMO_START_TICK == 0` (desktop mode — see that constant's
+    // own doc comment) needs no special case here: `ticks` is
+    // pre-incremented above and so is never 0, which is precisely why 0
+    // is the "never release" sentinel rather than an arbitrary flag.
+    if ticks == P2_FAULT_DEMO_START_TICK {
+        // SAFETY: single-core; written once by `p2_gate_fault_demo`,
+        // consumed exactly here.
+        if let Some(tid) = unsafe { core::ptr::addr_of_mut!(GATED_FAULT_DRIVER_TID).replace(None) } {
+            let k = kstate();
+            let _ = k.sched.note_ready(tid, hal.now_ns());
+            klog!(
+                "fault-isolation demo (03 5.2): tick {} reached - releasing faulty-driver tid {} into the scheduler\r\n",
+                ticks,
+                tid.as_u32()
+            );
+        }
+    }
+
     if ticks >= P2_TICK_BUDGET {
         hal.cancel_timer();
         let phys = unsafe { core::ptr::addr_of!(P2_SHARED_PHYS).read() };
@@ -2075,6 +2230,46 @@ pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u
             None
         }
     }
+}
+
+/// Holds the FIRST faulty-driver instance back from `pick_next` until
+/// the general scheduler has had [`P2_FAULT_DEMO_START_TICK`] real
+/// rounds — see that constant's own doc comment for the QEMU
+/// measurements behind it, and `GATED_FAULT_DRIVER_TID` for the scope.
+///
+/// Called by each architecture's `P2_PREEMPT_START` arm with whatever
+/// `spawn_faulty_driver*` returned, immediately after that spawn and
+/// before `p2_preempt_start` arms the timer. `None` (the spawn failed)
+/// is a no-op: there is then no demo to gate, and the boot proceeds
+/// exactly as it would have.
+///
+/// `note_blocked`, not `sched.remove`: the driver's TCB and scheduler
+/// entity must both stay fully intact, since the gate release is just a
+/// `note_ready` on this same entity. It is not running (it has never run
+/// — it was seeded by `init_user_thread` moments ago and the CPU is
+/// still inside root's own `P2_PREEMPT_START` trap), so `note_blocked`
+/// cannot disturb `sched.running()` here. Its `vruntime` stays 0, which
+/// is what makes the release immediate in practice: the moment it goes
+/// `Ready` it is the lowest-vruntime candidate in the table, so the very
+/// next `pick_next` selects it.
+///
+/// This does NOT weaken fault isolation in any way. The driver still
+/// faults on its own first instruction, `p2_fault` still hands off
+/// directly to `DM_TID`, and device-manager still runs the full
+/// six-cycle restart budget to `state=Failed restarts_in_window=6`. The
+/// only thing that changes is WHEN that sequence starts.
+pub fn p2_gate_fault_demo(tid: Option<ThreadId>) {
+    let Some(tid) = tid else { return };
+    let k = kstate();
+    let _ = k.sched.note_blocked(tid);
+    // SAFETY: single-core; only written here, read (and cleared) by
+    // `p2_tick`'s own gate-release branch.
+    unsafe { core::ptr::addr_of_mut!(GATED_FAULT_DRIVER_TID).write(Some(tid)) };
+    klog!(
+        "fault-isolation demo (03 5.2): faulty-driver tid {} held out of pick_next until tick {}, so every spawned layer-4 process gets real scheduling time first\r\n",
+        tid.as_u32(),
+        P2_FAULT_DEMO_START_TICK
+    );
 }
 
 /// Records `tid` as the "faulty driver" instance `p2_fault` should treat
