@@ -482,6 +482,75 @@ riscv64) unless noted:**
   scheduling-capacity limit this project's other real edges have hit at
   this system's current scale.
 
+- **Real display scanout — committed frames now reach an actual screen
+  (2026-09-23, x86_64 verified; aarch64 shares the code path).** Until
+  now `DisplayProtocol::CommitBuffer` ended in RAM: nothing in the
+  system had ever asked the firmware where the display is, no capability
+  named it, and a QEMU window showed UEFI text and then nothing. The
+  path is end-to-end now, and it is capability-gated at every hop:
+  1. `uefi-bootloader` (new stage 5b) locates the UEFI Graphics Output
+     Protocol before `ExitBootServices` — the only moment in the whole
+     boot when a display mode can be chosen, since GOP is a boot service
+     and no GPU driver exists (drivers are layer 3, by design). It picks
+     the closest directly-writable 32-bit mode to 800x600, then reads
+     back the mode that is ACTUALLY active rather than the one
+     requested, and appends a 48-byte record (base, size, width, height,
+     stride in PIXELS, bpp, pixel order) after the handoff block's RSDP,
+     introduced by a versioned magic. Because that block is zero-filled
+     up front, a kernel built against this layout but booted by an older
+     bootloader reads zero and correctly concludes "no framebuffer".
+  2. `hal-x86_64`/`hal-arm64` parse the record into
+     `hal_manifest::raw::FramebufferInfoRaw`, a new singleton field of
+     the hardware manifest beside `timer` — unconditionally, in full,
+     per 01 §2's discovery-vs-policy split. riscv64 has no UEFI and
+     reports `ZERO`.
+  3. `kernel-core`'s `populate_from_boot_info` gains Step 3h: it mints
+     an `MmioRegion` capability over the scanout, exactly as Steps 3c-3g
+     do for virtio/NVMe BAR windows, because that is what it is —
+     device-owned physical memory that must never enter the untyped
+     pool. The window is sized to `stride * height * 4`, not to the
+     larger size firmware reports for the whole BAR.
+  4. `kernel-arch-glue` maps it into ONE address space, the
+     Compositor's, alongside a small info page carrying the geometry
+     (always mapped, zeroed when there is no display — which is how a
+     process learns it is headless without a `cfg(target_arch)` it is
+     not allowed to have). Nothing else in the system can reach the
+     screen, so "the Compositor owns the display" is enforced rather
+     than assumed.
+  5. `compositor::scanout` clears the output to ui-core's own desktop
+     background on acquire (taking ownership of the screen means owning
+     the stale UEFI text on it), then blits every committed frame:
+     centered if smaller than the output, clipped if larger, never
+     scaled, with every row offset going through the real stride.
+
+  **Verified on real QEMU, by pixels, not by log lines.** An HMP
+  `screendump` taken late in an ordinary x86_64 demo boot is 800x600 —
+  the mode the bootloader selected — and every one of its 480,000 pixels
+  was written by the Compositor: 479,996 of desktop-background
+  `0x2C1A3D`, plus exactly the four pixels of the Root Task's 2x2
+  bootstrap test frame at (399,299)-(400,300), the centre, carrying
+  `COMPOSITOR_DEMO_FRAME`'s own bytes in BGRX order. That is the full
+  chain — Root Task → real IPC → Compositor → framebuffer → emulated
+  display — with `compositor_commit_verify` still reporting `MATCH`
+  unchanged. The serial log reports the real mode
+  (`framebuffer: 800x600 stride=800 base=0x80000000`) and a separate
+  `compositor_scanout_verify` line read back out of the info page
+  through the kernel's own identity map, which distinguishes "no
+  framebuffer granted" from "granted but the Compositor never got
+  scheduled".
+
+  **What is NOT on screen yet is the ui-core desktop**, and that is a
+  scheduling matter, not a display one: `ui-core` is spawned and wired
+  but does not get a turn to commit its frame (see the
+  scheduling-capacity notes elsewhere in this section). The moment it
+  does, its frame reaches the screen through this same path with no
+  further work. Capture it with
+  `.\simurgh-run.ps1 -Arch x86_64 -Window -Screenshot` (the workspace
+  script, outside this repo); timing matters, because the UEFI
+  bootloader spends most of the run printing to the firmware console and
+  the desktop only exists in the last few seconds before the demo boot
+  powers itself off.
+
 - **Compositor's second real client (`native-loader`, 2026-09-16,
   x86_64 only)**: `simurgh-native-sdk`'s own `de-framework::display::
   DisplayClient` trait had a confirmed wire mirror but no real transport
