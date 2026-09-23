@@ -158,6 +158,38 @@ pub struct KernelState {
     /// yet). `CapId::new(u32::MAX)` if none was found or the cap space
     /// was full, same sentinel as `root_mmio_blk_cap`.
     pub root_mmio_nvme_cap: CapId,
+    /// The capability, in the Root Task's own cap space, naming the
+    /// firmware-programmed display framebuffer
+    /// (`populate_from_boot_info`'s Step 3h) — an `MmioRegion`, exactly
+    /// like every BAR window above, because that is what it is: physical
+    /// pages owned by the display device and firmware, never part of
+    /// general-purpose RAM and never legal to hand out as
+    /// `UntypedMemory`. `CapId::new(u32::MAX)` if this machine reported
+    /// no usable framebuffer (riscv64 always; any UEFI machine whose
+    /// firmware offered no directly-writable 32-bit GOP mode) or the cap
+    /// space was full — the same sentinel as `root_mmio_blk_cap`, and
+    /// the same "absent hardware is not a boot failure" rule.
+    ///
+    /// Exactly one process is ever granted a derivation of this: the
+    /// Compositor (`kernel_arch_glue::compositor_demo_start`). Nothing
+    /// else in the system may write to the scanout, which is what makes
+    /// "the Compositor owns the screen" an enforced property rather than
+    /// a convention.
+    pub root_mmio_framebuffer_cap: CapId,
+    /// The framebuffer's own geometry, copied out of the boot manifest
+    /// (`BootInfo::hardware_manifest.framebuffer`) so later boot code
+    /// does not need the whole `BootInfo` kept alive to answer "how wide
+    /// is a row". `FramebufferInfoRaw::ZERO` when
+    /// `root_mmio_framebuffer_cap` is the sentinel — the two always
+    /// agree, and both are set together in Step 3h.
+    ///
+    /// The `MmioRegion` above carries base/size and nothing else (that
+    /// is all a BAR needs); a framebuffer additionally needs
+    /// width/height/stride/pixel-format, and dropping them here keeps
+    /// `MmioRegionDescriptor` a faithful description of an MMIO window
+    /// rather than growing display-specific fields every driver would
+    /// then carry for nothing.
+    pub framebuffer: hal_manifest::raw::FramebufferInfoRaw,
     /// How many `UntypedMemory` objects the boot path created.
     pub untyped_count: u32,
 
@@ -528,6 +560,8 @@ impl KernelState {
         root_mmio_i8042_cap: CapId::new(u32::MAX),
         root_mmio_mouse_cap: CapId::new(u32::MAX),
         root_mmio_nvme_cap: CapId::new(u32::MAX),
+        root_mmio_framebuffer_cap: CapId::new(u32::MAX),
+        framebuffer: hal_manifest::raw::FramebufferInfoRaw::ZERO,
         untyped_count: 0,
         map_pool_base: 0,
         map_pool_len: 0,
@@ -866,6 +900,60 @@ impl KernelState {
             })
             .unwrap_or(CapId::new(u32::MAX));
 
+        // Step 3h: mint an `MmioRegion` capability for the firmware-
+        // programmed display framebuffer, if this machine has one.
+        //
+        // Unlike Steps 3c-3g this does NOT search
+        // `peripheral_devices()`: the framebuffer is a singleton field
+        // of the manifest (`hal_manifest::raw::FramebufferInfoRaw`),
+        // because its geometry — width/height/stride/pixel format —
+        // has nowhere to live in a `PeripheralDeviceRaw`. The
+        // capability itself is still an ordinary `MmioRegion`, seeded
+        // the same direct way, because the memory behind it behaves
+        // exactly like a BAR: device-owned physical pages that must
+        // never enter the untyped pool.
+        //
+        // `is_present()` is what gates this (not `phys_base != 0`):
+        // a half-populated record would otherwise mint a capability
+        // over a region nothing can safely write — see that method's
+        // own doc comment. `irq: 0` and `config_space_base: 0`: the
+        // scanout raises no interrupt and has no PCI config space of
+        // its own that any consumer here walks.
+        let fb_raw = boot.hardware_manifest.framebuffer;
+        let root_mmio_framebuffer_cap = if fb_raw.is_present() {
+            self.alloc_mmio_region_direct(MmioRegionDescriptor {
+                phys_base: fb_raw.phys_base,
+                // The mapped window is the geometry's own minimum, not
+                // the (often much larger) size firmware reports for the
+                // whole BAR — nothing may write past the last row.
+                size: fb_raw.min_size_bytes(),
+                irq: 0,
+                config_space_base: 0,
+            })
+            .and_then(|mmio_id| {
+                let cap = Capability::full(ObjectRef::new(
+                    KernelObjectKind::MmioRegion,
+                    ObjectId::new(mmio_id.as_u32()),
+                ));
+                self.cap_space_mut(root_cs)
+                    .expect("root cap space exists")
+                    .insert_root(cap)
+                    .ok()
+            })
+            .unwrap_or(CapId::new(u32::MAX))
+        } else {
+            CapId::new(u32::MAX)
+        };
+        // Geometry travels beside the capability, and only when the
+        // capability itself was really minted — a recorded geometry with
+        // no capability to back it would invite a consumer to compute
+        // offsets into memory it has no right to touch.
+        self.framebuffer = if root_mmio_framebuffer_cap == CapId::new(u32::MAX) {
+            hal_manifest::raw::FramebufferInfoRaw::ZERO
+        } else {
+            fb_raw
+        };
+
         // Step 4: schedule the Root Task.
         //
         // Deliberately PINNED `Interactive` via plain `admit`, not
@@ -901,6 +989,7 @@ impl KernelState {
         self.root_mmio_i8042_cap = root_mmio_i8042_cap;
         self.root_mmio_mouse_cap = root_mmio_mouse_cap;
         self.root_mmio_nvme_cap = root_mmio_nvme_cap;
+        self.root_mmio_framebuffer_cap = root_mmio_framebuffer_cap;
         self.untyped_count = untyped_made;
         Ok(())
     }
@@ -1115,5 +1204,64 @@ mod tests {
             KernelState::from_boot_info(&boot),
             Err(KernelInitError::BadBootInfo)
         ));
+    }
+
+    /// A machine with no display (riscv64, or UEFI firmware with no
+    /// usable 32-bit mode) must boot exactly as before: no capability,
+    /// no geometry, no failure.
+    #[test]
+    fn a_machine_without_a_framebuffer_mints_no_framebuffer_capability() {
+        let boot = boot_with_ram(64);
+        let st = KernelState::from_boot_info(&boot).unwrap();
+        assert_eq!(st.root_mmio_framebuffer_cap, CapId::new(u32::MAX));
+        assert!(!st.framebuffer.is_present());
+    }
+
+    /// A real framebuffer becomes a real `MmioRegion` capability over
+    /// exactly the geometry's own minimum window — never the larger
+    /// `size_bytes` firmware reports for the whole BAR, since nothing
+    /// may write past the last row.
+    #[test]
+    fn a_real_framebuffer_becomes_an_mmio_capability_sized_to_its_geometry() {
+        let mut boot = boot_with_ram(64);
+        boot.hardware_manifest.framebuffer = hal_manifest::raw::FramebufferInfoRaw::new(
+            0xFD00_0000,
+            16 * 1024 * 1024, // firmware reports the whole 16 MiB BAR
+            800,
+            600,
+            1024, // padded stride
+            32,
+            hal_manifest::raw::PixelFormatRaw::Bgrx8,
+        );
+        let st = KernelState::from_boot_info(&boot).unwrap();
+
+        let cap = st.root_mmio_framebuffer_cap;
+        assert_ne!(cap, CapId::new(u32::MAX));
+        let id = st.cap_space(st.root_cap_space).unwrap().lookup(cap).unwrap().object.id;
+        let region = st.mmio_region(MmioRegionId::new(id.as_u32())).unwrap();
+        assert_eq!(region.phys_base, 0xFD00_0000);
+        assert_eq!(region.size, 1024 * 600 * 4);
+        assert_eq!(st.framebuffer.width, 800);
+        assert_eq!(st.framebuffer.stride_pixels, 1024);
+    }
+
+    /// A corrupt/half-populated record must be refused outright rather
+    /// than turned into a capability over memory nothing can safely
+    /// write — the whole reason Step 3h gates on `is_present()`.
+    #[test]
+    fn a_corrupt_framebuffer_record_mints_nothing() {
+        let mut boot = boot_with_ram(64);
+        boot.hardware_manifest.framebuffer = hal_manifest::raw::FramebufferInfoRaw::new(
+            0xFD00_0000,
+            800 * 600 * 4,
+            800,
+            600,
+            640, // stride narrower than the visible width
+            32,
+            hal_manifest::raw::PixelFormatRaw::Bgrx8,
+        );
+        let st = KernelState::from_boot_info(&boot).unwrap();
+        assert_eq!(st.root_mmio_framebuffer_cap, CapId::new(u32::MAX));
+        assert!(!st.framebuffer.is_present());
     }
 }
