@@ -29,6 +29,14 @@ kernel-cap  = { path = "../kernel-cap" }
 kernel-mm   = { path = "../kernel-mm" }
 kernel-ipc  = { path = "../kernel-ipc" }
 hal-core    = { path = "../../hal/hal-core" }
+# The raw hardware-manifest types, for the ONE boot-data shape this crate
+# has to interpret rather than just pass along: the framebuffer's pixel
+# format, when handing the display to the Compositor
+# (`map_compositor_scanout`). Layer-1 data types only — no architecture
+# crate name, so this crate's own "no `hal-<arch>` dependency" rule is
+# untouched. `default-features = false` keeps it to the fixed-size raw
+# form (no `alloc`), matching kernel-core's own dependency on it.
+hal-manifest = { path = "../../hal/hal-manifest", default-features = false }
 # `spawn_process_from_elf`'s loader (subsystems-as-processes packaging) —
 # architecture-independent pure logic, no violation of this crate's own
 # "no architecture crate name" rule above.

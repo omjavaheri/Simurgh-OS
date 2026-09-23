@@ -3908,6 +3908,237 @@ const COMPOSITOR_FB_VA: usize = 0xD850_0000;
 /// again.
 const COMPOSITOR_CONFIRM_VA: usize = 0xD8A0_0000;
 
+/// VA Compositor's own process maps the scanout INFO page at — must stay
+/// numerically equal to `compositor::subsystem_entry::SCANOUT_INFO_VA`.
+///
+/// ALWAYS mapped, on every architecture, even when this machine has no
+/// display at all: a zero-filled page is how the kernel tells the
+/// Compositor "no framebuffer was granted", and a process that must read
+/// a page to learn that is a process with no `cfg(target_arch)` in it —
+/// which is the rule above the HAL.
+const COMPOSITOR_SCANOUT_INFO_VA: usize = 0xD900_0000;
+
+/// VA Compositor's own process maps the real framebuffer at — must stay
+/// numerically equal to `compositor::subsystem_entry::SCANOUT_VA`.
+/// Mapped ONLY when a real framebuffer exists. Placed clear of every
+/// other region in this address space (`COMPOSITOR_MOUSE_VA`, the last
+/// one below it, ends long before `0xD900_0000`) with room for
+/// `COMPOSITOR_SCANOUT_MAX_BYTES` above it.
+const COMPOSITOR_SCANOUT_VA: usize = 0xD910_0000;
+
+/// Largest framebuffer this VA window will map: 8 MiB, which covers
+/// every mode up to ~1440x1080 at 32bpp (and comfortably the 800x600
+/// and 1024x768 modes OVMF actually offers). A firmware mode larger than
+/// this is refused with a log line rather than partially mapped — half a
+/// screen is not a display, and silently mapping the first 8 MiB of a
+/// bigger mode would put the Compositor's rows at the wrong addresses.
+const COMPOSITOR_SCANOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Magic word introducing the scanout info page — must stay numerically
+/// equal to `compositor::scanout::SCANOUT_INFO_MAGIC` (ASCII `"SIMGSC"`
+/// + a 16-bit layout version). See that constant's own doc comment for
+/// why a magic (rather than a bare field) is what makes an
+/// unrecognized/absent page decode to "headless" instead of to a
+/// misread base address.
+const SCANOUT_INFO_MAGIC: u64 = 0x5349_4D47_5343_0001;
+
+/// Byte offset of the fields the COMPOSITOR writes back into the info
+/// page (blit count, then the last blitted size packed as
+/// `width | height << 32`) — must stay numerically equal to
+/// `compositor::scanout::SCANOUT_STATUS_OFFSET`.
+const SCANOUT_STATUS_OFFSET: usize = 32;
+
+/// Byte offset of the Compositor's acknowledgement echo — must stay
+/// numerically equal to `compositor::scanout::SCANOUT_ACK_OFFSET`.
+const SCANOUT_ACK_OFFSET: usize = 48;
+
+/// Physical address of the scanout info page, kept so
+/// `compositor_scanout_report` can peek the Compositor's own written-back
+/// status through the kernel's identity map — the same "kernel reads the
+/// shared region directly and compares" verification style
+/// `G_COMPOSITOR_CONFIRM_PHYS` already uses for committed frame bytes.
+/// `usize::MAX` until `compositor_demo_start` has run.
+static mut G_COMPOSITOR_SCANOUT_INFO_PHYS: usize = usize::MAX;
+
+/// Maps the display for the Compositor process, and only for it.
+///
+/// Two mappings, one always and one conditional:
+///   - the 4 KiB INFO page (always): carved from untyped RAM, zeroed,
+///     and filled with the real geometry when a framebuffer exists.
+///     Zeroes mean "headless", which is the correct answer on riscv64
+///     and on any machine whose firmware offered no writable mode.
+///   - the framebuffer itself (only when one exists): the physical
+///     pages named by `KernelState::root_mmio_framebuffer_cap`, mapped
+///     `U=1 R+W` at `COMPOSITOR_SCANOUT_VA`.
+///
+/// The framebuffer capability is deliberately NOT granted into the
+/// Compositor's own cap space, for the same two reasons
+/// `spawn_nvme_driver` never grants a BAR capability to its driver: the
+/// kernel walks the mapping itself at boot (trusted bootstrap, no `Map`
+/// ceremony), and this process's capability slots are numbered by grant
+/// ORDER — slot 0 is the display Endpoint, slots 1-4 belong to the
+/// i8042/mouse edges (`compositor::subsystem_entry`'s own `*_CAP`
+/// constants), so an extra grant here would silently renumber them all.
+/// The authority is still real and still checked: this function refuses
+/// to map anything unless `root_mmio_framebuffer_cap` resolves to an
+/// actual `MmioRegion` object.
+///
+/// Returns `None` only when the INFO page itself could not be carved or
+/// mapped — a genuine allocation failure. A machine with no display is
+/// `Some(())` with a zeroed page, because that is not an error.
+fn map_compositor_scanout(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    caller: ThreadId,
+    comp_root_pt: usize,
+) -> Option<()> {
+    let info_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core. The
+    // zeroing is what makes "no framebuffer" the default answer rather
+    // than whatever this frame previously held.
+    unsafe { core::ptr::write_bytes(info_phys as *mut u8, 0, 4096) };
+
+    // Resolve the framebuffer capability, if this machine has one, and
+    // work out how much of it to map. Every early return below leaves
+    // the info page zeroed, i.e. headless — and still maps it.
+    let mapped_bytes = 'resolve: {
+        let fb_cap = k.root_mmio_framebuffer_cap;
+        if fb_cap == CapId::new(u32::MAX) {
+            klog!("compositor scanout: no framebuffer was handed over at boot - Compositor stays headless\r\n");
+            break 'resolve 0usize;
+        }
+        let src_cs = k.tcb(caller)?.cap_space;
+        let Some(entry) = k.cap_space(src_cs).and_then(|cs| cs.lookup(fb_cap)) else {
+            klog!("compositor scanout: the framebuffer capability does not resolve - staying headless\r\n");
+            break 'resolve 0usize;
+        };
+        let mmio_id = kernel_cap::MmioRegionId::new(entry.object.id.as_u32());
+        let Some(mmio) = k.mmio_region(mmio_id).copied() else {
+            klog!("compositor scanout: the framebuffer MmioRegion object is missing - staying headless\r\n");
+            break 'resolve 0usize;
+        };
+        let fb = k.framebuffer;
+
+        // `map_range` demands page alignment on all three of vaddr,
+        // paddr and len. A GOP framebuffer base is page-aligned on every
+        // real firmware, but refusing loudly beats a `u32::MAX` return
+        // nobody can explain later.
+        if mmio.phys_base & 0xFFF != 0 {
+            klog!("compositor scanout: framebuffer base {:#x} is not page-aligned - staying headless\r\n", mmio.phys_base);
+            break 'resolve 0usize;
+        }
+        // Round the needed window UP to a page. Rounding up can reach at
+        // most 4095 bytes past the last row, still inside the display
+        // device's own BAR, and nothing ever writes there: the
+        // Compositor bounds every write by the geometry, never by the
+        // mapping's length.
+        let needed = (mmio.size as usize + 0xFFF) & !0xFFF;
+        if needed == 0 || needed > COMPOSITOR_SCANOUT_MAX_BYTES {
+            klog!("compositor scanout: mode needs {} bytes, past this VA window's {} - staying headless\r\n", needed, COMPOSITOR_SCANOUT_MAX_BYTES);
+            break 'resolve 0usize;
+        }
+
+        // Eight pool frames: an 8 MiB range crosses at most four 2 MiB
+        // boundaries (five PT-level tables) plus one PD-level table,
+        // leaving two frames of margin — same sizing reasoning as the
+        // frame-buffer mapping above.
+        let pool = carve_from_any_untyped(k, 4096, 4096 * 8)?;
+        // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+        // `map_range` needs the pool pre-zeroed.
+        unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 8) };
+        if hal.map_range(comp_root_pt, COMPOSITOR_SCANOUT_VA, mmio.phys_base as usize, needed, 1 | 2 | 8, pool, 8) == u32::MAX {
+            klog!("compositor scanout: map_range error (framebuffer) - staying headless\r\n");
+            break 'resolve 0usize;
+        }
+        klog!(
+            "compositor scanout: framebuffer {}x{} stride={} bpp={} base={:#x} mapped {} bytes into Compositor at {:#x} (device memory, NOT untyped RAM)\r\n",
+            fb.width, fb.height, fb.stride_pixels, fb.bits_per_pixel, mmio.phys_base, needed, COMPOSITOR_SCANOUT_VA
+        );
+        needed
+    };
+
+    // Fill in the info page: the real geometry when the mapping above
+    // succeeded, otherwise nothing at all (the page stays zeroed, which
+    // `compositor::scanout::ScanoutInfo::from_bytes` decodes as "no
+    // display").
+    if mapped_bytes != 0 {
+        let fb = k.framebuffer;
+        let format = match fb.format {
+            hal_manifest::raw::PixelFormatRaw::Bgrx8 => 1u32,
+            hal_manifest::raw::PixelFormatRaw::Rgbx8 => 2u32,
+            hal_manifest::raw::PixelFormatRaw::Unknown => 0u32,
+        };
+        // SAFETY: `info_phys` is a freshly carved, identity-addressable
+        // 4 KiB frame this function owns; all writes are within its
+        // first 32 bytes.
+        unsafe {
+            let base = info_phys as *mut u8;
+            core::ptr::write_unaligned(base as *mut u64, SCANOUT_INFO_MAGIC);
+            core::ptr::write_unaligned(base.add(8) as *mut u32, fb.width);
+            core::ptr::write_unaligned(base.add(12) as *mut u32, fb.height);
+            core::ptr::write_unaligned(base.add(16) as *mut u32, fb.stride_pixels);
+            core::ptr::write_unaligned(base.add(20) as *mut u32, format);
+            core::ptr::write_unaligned(base.add(24) as *mut u64, mapped_bytes as u64);
+        }
+    }
+
+    let info_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(info_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(comp_root_pt, COMPOSITOR_SCANOUT_INFO_VA, info_phys, 4096, 1 | 2 | 8, info_pool, 2) == u32::MAX {
+        klog!("compositor scanout: map_range error (info page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before the
+    // Compositor can run and before any `compositor_scanout_report`.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_SCANOUT_INFO_PHYS).write(info_phys) };
+    Some(())
+}
+
+/// Reports what the Compositor has ACTUALLY put on screen, read straight
+/// out of the scanout info page's status fields through the kernel's own
+/// identity map — not from anything the Compositor told us over IPC.
+///
+/// Three distinguishable outcomes, which is the whole point of the
+/// separate acknowledgement word: no framebuffer was granted at all;
+/// one was, but the Compositor has not reached it (this project's known
+/// scheduling-capacity characteristic makes that a real possibility, not
+/// a hypothetical); or it has, with a real blit count.
+fn compositor_scanout_report() {
+    // SAFETY: single-core; written once by `map_compositor_scanout`
+    // before the Compositor could run.
+    let info_phys = unsafe { core::ptr::addr_of!(G_COMPOSITOR_SCANOUT_INFO_PHYS).read() };
+    if info_phys == usize::MAX {
+        return;
+    }
+    // SAFETY: `info_phys` is the identity-addressable frame this module
+    // carved and mapped; these reads stay within its first 56 bytes.
+    let (magic, blits, last, ack) = unsafe {
+        let base = info_phys as *const u8;
+        (
+            core::ptr::read_unaligned(base as *const u64),
+            core::ptr::read_unaligned(base.add(SCANOUT_STATUS_OFFSET) as *const u64),
+            core::ptr::read_unaligned(base.add(SCANOUT_STATUS_OFFSET + 8) as *const u64),
+            core::ptr::read_unaligned(base.add(SCANOUT_ACK_OFFSET) as *const u64),
+        )
+    };
+    if magic != SCANOUT_INFO_MAGIC {
+        klog!("compositor_scanout_verify: no framebuffer granted - frames stay in RAM (headless, as before)\r\n");
+        return;
+    }
+    if ack != SCANOUT_INFO_MAGIC {
+        klog!("compositor_scanout_verify: framebuffer granted, but Compositor has not acquired it yet\r\n");
+        return;
+    }
+    klog!(
+        "compositor_scanout_verify: Compositor acquired the real framebuffer and blitted {} frame(s), last {}x{} -> PIXELS ON SCREEN\r\n",
+        blits,
+        last as u32,
+        (last >> 32) as u32
+    );
+}
+
 /// Page count for the frame buffer AND confirm `SharedRegion`s — enough
 /// for a real 800x600 BGRA8 desktop frame (800 * 600 * 4 = 1,920,000
 /// bytes; 470 pages = 1,925,120 bytes, the smallest page count that
@@ -4100,6 +4331,14 @@ pub fn compositor_demo_start(
     // returns).
     unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_CONFIRM_PHYS).write(confirm_phys) };
 
+    // The real display, if this machine has one — the FOURTH and FIFTH
+    // mappings (info page, framebuffer). Additive: every mapping above
+    // is untouched, and a machine with no display still gets the info
+    // page, zeroed. See `map_compositor_scanout`'s own doc comment.
+    if map_compositor_scanout(k, hal, caller, comp_root_pt).is_none() {
+        klog!("compositor_demo_start: scanout setup failed - continuing headless\r\n");
+    }
+
     // Switch straight to Compositor — same race-avoidance rationale as
     // `fs_demo_start`'s own tail comment.
     let _ = k.sched.note_ready(caller, hal.now_ns());
@@ -4285,6 +4524,12 @@ pub fn compositor_commit_verify() -> usize {
         "compositor_commit_verify: real CommitBuffer round-trip, frame bytes read back through Compositor's own confirm region (03 2.4/5.4.2) -> {}\r\n",
         if committed && confirmed { "MATCH, zero-copy through the SharedRegion capability" } else { "MISMATCH" }
     );
+    // Additive second half of the same proof: the line above says the
+    // frame reached the Compositor, this one says whether it reached
+    // the SCREEN. Reported here rather than from a new opcode so this
+    // needs no change in `kernel/kernel/src/main.rs`'s own boot
+    // sequence, and never affects the verdict returned below.
+    compositor_scanout_report();
     (committed && confirmed) as usize
 }
 
