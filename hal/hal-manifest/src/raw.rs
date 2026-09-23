@@ -584,6 +584,157 @@ impl PowerDomainRaw {
 }
 
 // ============================================================================
+// Framebuffer raw type (section 3.6 — display scanout output)
+//
+// The one piece of display hardware state that must survive the
+// firmware -> HAL -> microkernel handoff: the linear framebuffer UEFI's
+// Graphics Output Protocol already programmed and left scanning out
+// before `ExitBootServices()`. Nothing in this system can re-program a
+// display mode afterwards (there is no GPU driver, by design — drivers
+// are layer 3, user space), so the mode firmware left active IS the
+// mode, permanently, and its geometry is boot data exactly like the
+// timer frequency or the interrupt controller's base address.
+//
+// Kept as a singleton field of `HardwareManifestRaw` (like `timer` and
+// `interrupt_controller`), NOT as a `PeripheralDeviceRaw` entry:
+// a peripheral entry carries only `mmio_base`/`mmio_size`/`irq`, with
+// nowhere to put width/height/stride/pixel format — and those four are
+// exactly what makes a framebuffer usable at all.
+// ============================================================================
+
+/// Byte order of one 32-bit pixel in the firmware-programmed
+/// framebuffer, as reported by UEFI GOP's own `PixelFormat`.
+///
+/// Variants and their effect on a writer:
+///   - `Unknown` (0): no framebuffer was handed over, OR firmware
+///     reported a format this project cannot write directly (GOP's
+///     `PixelBitMask`/`PixelBltOnly`). Consumers MUST treat this the
+///     same as "no framebuffer" and skip scanout entirely rather than
+///     guessing a layout — writing the wrong byte order into a live
+///     scanout buffer produces a wrong-coloured desktop with no error
+///     anywhere, which is worse than no desktop.
+///   - `Bgrx8` (1): GOP `PixelBlueGreenRedReserved8BitPerColor`. One
+///     pixel is `[B, G, R, X]` little-endian — byte-identical to the
+///     packed BGRA8 this project's own Compositor/ui-core already
+///     render into, so a scanout blit is a straight `memcpy` per row.
+///   - `Rgbx8` (2): GOP `PixelRedGreenBlueReserved8BitPerColor`. One
+///     pixel is `[R, G, B, X]`; a writer must swap the R and B bytes of
+///     every pixel on the way out.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormatRaw {
+    Unknown = 0,
+    Bgrx8 = 1,
+    Rgbx8 = 2,
+}
+
+/// The firmware-programmed linear framebuffer (section 3.6), or all
+/// zeroes when none exists (riscv64 has no UEFI GOP at all; a UEFI
+/// system whose firmware exposes no usable 32-bit mode reports the same
+/// "absent" shape).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferInfoRaw {
+    /// Physical address of the first pixel. This memory is owned by
+    /// firmware/the display device — it is NOT general-purpose RAM and
+    /// must never be handed out as `UntypedMemory`, exactly like an
+    /// MMIO BAR window (`PeripheralDeviceRaw::mmio_base`).
+    pub phys_base: u64,
+
+    /// Size of the scanout window in bytes, as reported by GOP
+    /// (`FrameBufferSize`) — at least `stride_pixels * height * 4`, and
+    /// often larger (firmware may reserve the whole BAR).
+    pub size_bytes: u64,
+
+    /// Visible width, in pixels.
+    pub width: u32,
+    /// Visible height, in pixels.
+    pub height: u32,
+
+    /// Distance between the first pixel of consecutive rows, in PIXELS
+    /// (GOP's `PixelsPerScanLine`), not bytes. Frequently larger than
+    /// `width` — firmware is free to pad rows for alignment, and a
+    /// writer that assumes `stride_pixels == width` produces a sheared
+    /// image on exactly those machines.
+    pub stride_pixels: u32,
+
+    /// Bits per pixel. Always 32 for every format this project accepts
+    /// (see `PixelFormatRaw`); recorded explicitly rather than implied
+    /// so a future 16-/24-bit mode is a visible data change here, not a
+    /// silent miscomputation of every row offset.
+    pub bits_per_pixel: u32,
+
+    /// Pixel byte order — see `PixelFormatRaw`.
+    pub format: PixelFormatRaw,
+
+    _reserved0: u32,
+}
+
+impl FramebufferInfoRaw {
+    /// The "no framebuffer on this machine" value — what riscv64 (no
+    /// UEFI), and any UEFI machine whose firmware offered no usable
+    /// 32-bit mode, reports.
+    pub const ZERO: Self = Self {
+        phys_base: 0,
+        size_bytes: 0,
+        width: 0,
+        height: 0,
+        stride_pixels: 0,
+        bits_per_pixel: 0,
+        format: PixelFormatRaw::Unknown,
+        _reserved0: 0,
+    };
+
+    pub fn new(
+        phys_base: u64,
+        size_bytes: u64,
+        width: u32,
+        height: u32,
+        stride_pixels: u32,
+        bits_per_pixel: u32,
+        format: PixelFormatRaw,
+    ) -> Self {
+        Self {
+            phys_base,
+            size_bytes,
+            width,
+            height,
+            stride_pixels,
+            bits_per_pixel,
+            format,
+            _reserved0: 0,
+        }
+    }
+
+    /// Whether this describes a framebuffer that can actually be
+    /// written to. Every consumer gates on this rather than on
+    /// `phys_base != 0` alone: a partially-populated record (a base
+    /// address but a zero stride, say) would otherwise be treated as
+    /// real and produce writes past the end of the scanout window.
+    ///
+    /// `stride_pixels >= width` is part of the check because every
+    /// row-offset computation in this system assumes it; a record
+    /// violating it is corrupt by definition, not merely unusual.
+    pub fn is_present(&self) -> bool {
+        self.phys_base != 0
+            && self.width != 0
+            && self.height != 0
+            && self.stride_pixels >= self.width
+            && self.bits_per_pixel == 32
+            && !matches!(self.format, PixelFormatRaw::Unknown)
+            && self.size_bytes >= self.min_size_bytes()
+    }
+
+    /// The smallest byte length that can hold `height` rows of
+    /// `stride_pixels` 32-bit pixels — the amount a scanout writer
+    /// actually needs mapped, which is what the kernel maps rather than
+    /// the (often much larger) `size_bytes` the firmware reports.
+    pub fn min_size_bytes(&self) -> u64 {
+        self.stride_pixels as u64 * self.height as u64 * 4
+    }
+}
+
+// ============================================================================
 // Top-level raw manifest (section 9 — exact structure from the spec)
 // ============================================================================
 
@@ -604,6 +755,15 @@ pub struct HardwareManifestRaw {
 
     pub interrupt_controller: InterruptControllerInfoRaw,
     pub timer: TimerInfoRaw,
+
+    /// The firmware-programmed display framebuffer, or
+    /// `FramebufferInfoRaw::ZERO` when this machine has none — see that
+    /// type's own doc comment for why this is a singleton field beside
+    /// `timer`/`interrupt_controller` rather than a peripheral entry.
+    /// Populated by each `hal-<arch>` crate's own discovery exactly
+    /// like every other field here: always, in full, regardless of
+    /// install profile (section 2's Discovery + Policy split).
+    pub framebuffer: FramebufferInfoRaw,
 
     pub power_domain_count: u32,
     pub power_domains: [PowerDomainRaw; MAX_POWER_DOMAINS],
@@ -649,6 +809,7 @@ impl HardwareManifestRaw {
             peripheral_devices: [PeripheralDeviceRaw::ZERO; MAX_PERIPHERAL_DEVICES],
             interrupt_controller: InterruptControllerInfoRaw::ZERO,
             timer: TimerInfoRaw::ZERO,
+            framebuffer: FramebufferInfoRaw::ZERO,
             power_domain_count: 0,
             power_domains: [PowerDomainRaw::ZERO; MAX_POWER_DOMAINS],
             truncated_memory_regions: 0,
@@ -796,6 +957,10 @@ const _: () = {
     // _pad0(3) + has_thermal_sensor(1) + _pad1(3) = 16
     // The struct should remain 16 bytes: two u32s (8) + two bools (2) + two 3-byte pads (6) = 16
     assert!(core::mem::size_of::<PowerDomainRaw>() == 16);
+    // FramebufferInfoRaw:
+    // phys_base(8) + size_bytes(8) + width(4) + height(4) +
+    // stride_pixels(4) + bits_per_pixel(4) + format(4) + _reserved0(4) = 40
+    assert!(core::mem::size_of::<FramebufferInfoRaw>() == 40);
 };
 
 #[cfg(test)]
@@ -895,5 +1060,54 @@ mod tests {
             assert!(full.push_peripheral_device(PeripheralDeviceRaw::ZERO).is_ok());
         }
         assert!(full.push_peripheral_device(PeripheralDeviceRaw::ZERO).is_err());
+    }
+
+    /// A zeroed manifest must report "no framebuffer" — this is what
+    /// riscv64 (no UEFI GOP at all) hands the microkernel, and every
+    /// scanout consumer gates on it.
+    #[test]
+    fn zeroed_manifest_reports_no_framebuffer() {
+        let m = HardwareManifestRaw::zeroed();
+        assert!(!m.framebuffer.is_present());
+        assert_eq!(m.framebuffer.format, PixelFormatRaw::Unknown);
+    }
+
+    #[test]
+    fn a_real_800x600_bgrx8_framebuffer_is_present() {
+        let fb = FramebufferInfoRaw::new(0xFD00_0000, 800 * 600 * 4, 800, 600, 800, 32, PixelFormatRaw::Bgrx8);
+        assert!(fb.is_present());
+        assert_eq!(fb.min_size_bytes(), 800 * 600 * 4);
+    }
+
+    /// A padded row stride (firmware aligning rows) is legal and must
+    /// raise the minimum mapping size accordingly — the exact case a
+    /// `stride == width` assumption would shear.
+    #[test]
+    fn padded_stride_raises_the_minimum_size() {
+        let fb = FramebufferInfoRaw::new(0xFD00_0000, 1024 * 600 * 4, 800, 600, 1024, 32, PixelFormatRaw::Bgrx8);
+        assert!(fb.is_present());
+        assert_eq!(fb.min_size_bytes(), 1024 * 600 * 4);
+    }
+
+    /// Each individually-corrupt record must fail `is_present`, so a
+    /// half-populated handoff can never be mistaken for a real
+    /// framebuffer and written through.
+    #[test]
+    fn partially_populated_framebuffer_records_are_rejected() {
+        // Stride narrower than the visible width.
+        let sheared = FramebufferInfoRaw::new(0xFD00_0000, 800 * 600 * 4, 800, 600, 640, 32, PixelFormatRaw::Bgrx8);
+        assert!(!sheared.is_present());
+        // A format this project cannot write byte-for-byte.
+        let unknown = FramebufferInfoRaw::new(0xFD00_0000, 800 * 600 * 4, 800, 600, 800, 32, PixelFormatRaw::Unknown);
+        assert!(!unknown.is_present());
+        // A non-32-bit mode.
+        let bpp16 = FramebufferInfoRaw::new(0xFD00_0000, 800 * 600 * 2, 800, 600, 800, 16, PixelFormatRaw::Bgrx8);
+        assert!(!bpp16.is_present());
+        // A window smaller than the geometry it claims.
+        let short = FramebufferInfoRaw::new(0xFD00_0000, 4096, 800, 600, 800, 32, PixelFormatRaw::Bgrx8);
+        assert!(!short.is_present());
+        // No base address.
+        let based = FramebufferInfoRaw::new(0, 800 * 600 * 4, 800, 600, 800, 32, PixelFormatRaw::Bgrx8);
+        assert!(!based.is_present());
     }
 }

@@ -41,9 +41,10 @@ mod dynamic {
     //! Only compiled with `feature = "alloc"` — see module-level docs.
 
     use crate::raw::{
-        ComputeDeviceRaw, ComputeKindRaw, HardwareManifestRaw, InterruptControllerInfoRaw,
-        InterruptControllerKindRaw, MemoryRegionKindRaw, MemoryRegionRaw, PeripheralDeviceRaw,
-        PeripheralKindRaw, PowerDomainRaw, TimerInfoRaw, TimerKindRaw, VendorIdRaw,
+        ComputeDeviceRaw, ComputeKindRaw, FramebufferInfoRaw, HardwareManifestRaw,
+        InterruptControllerInfoRaw, InterruptControllerKindRaw, MemoryRegionKindRaw,
+        MemoryRegionRaw, PeripheralDeviceRaw, PeripheralKindRaw, PixelFormatRaw, PowerDomainRaw,
+        TimerInfoRaw, TimerKindRaw, VendorIdRaw,
     };
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -389,6 +390,66 @@ mod dynamic {
     }
 
     // ------------------------------------------------------------------
+    // Framebuffer (dynamic)
+    // ------------------------------------------------------------------
+    /// The firmware-programmed scanout buffer, `None` when this machine
+    /// has none (riscv64, or a UEFI machine with no usable 32-bit GOP
+    /// mode). `Option` rather than a "present" flag: an upper layer
+    /// that forgets to check cannot accidentally read a zeroed record
+    /// as if it were a real display.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FramebufferInfo {
+        pub phys_base: u64,
+        pub size_bytes: u64,
+        pub width: u32,
+        pub height: u32,
+        /// In PIXELS, not bytes — see `FramebufferInfoRaw::stride_pixels`.
+        pub stride_pixels: u32,
+        pub bits_per_pixel: u32,
+        pub format: PixelFormat,
+    }
+
+    /// Dynamic mirror of `raw::PixelFormatRaw` — see that type's own doc
+    /// comment for what each variant means to a writer. The raw
+    /// `Unknown` variant has no counterpart here on purpose: it means
+    /// "no usable framebuffer", which this side expresses as
+    /// `Option::None` instead.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PixelFormat {
+        Bgrx8,
+        Rgbx8,
+    }
+
+    impl FramebufferInfo {
+        /// Converts a raw record, returning `None` for anything that is
+        /// not a complete, writable framebuffer (`FramebufferInfoRaw::
+        /// is_present`'s own rules).
+        pub fn from_raw(raw: &FramebufferInfoRaw) -> Option<Self> {
+            if !raw.is_present() {
+                return None;
+            }
+            let format = match raw.format {
+                PixelFormatRaw::Bgrx8 => PixelFormat::Bgrx8,
+                PixelFormatRaw::Rgbx8 => PixelFormat::Rgbx8,
+                // Unreachable once `is_present()` has passed (it rejects
+                // `Unknown`), but matched explicitly rather than via a
+                // catch-all so adding a raw variant is a compile error
+                // here instead of a silent misinterpretation.
+                PixelFormatRaw::Unknown => return None,
+            };
+            Some(Self {
+                phys_base: raw.phys_base,
+                size_bytes: raw.size_bytes,
+                width: raw.width,
+                height: raw.height,
+                stride_pixels: raw.stride_pixels,
+                bits_per_pixel: raw.bits_per_pixel,
+                format,
+            })
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Top-level dynamic manifest — matches 01-HAL-Layer.md section 4's
     // `HardwareManifest` struct shape (cpu, memory_regions,
     // compute_devices, interrupt_controller, timer, power_domains).
@@ -411,6 +472,9 @@ mod dynamic {
         pub interrupt_controller: InterruptControllerInfo,
         pub timer: TimerInfo,
         pub power_domains: Vec<PowerDomain>,
+        /// The firmware-programmed scanout buffer, or `None` on a
+        /// machine with none — see `FramebufferInfo`.
+        pub framebuffer: Option<FramebufferInfo>,
     }
 
     impl<Cap> HardwareManifest<Cap> {
@@ -460,6 +524,7 @@ mod dynamic {
                 interrupt_controller: raw.interrupt_controller.into(),
                 timer: raw.timer.into(),
                 power_domains,
+                framebuffer: FramebufferInfo::from_raw(&raw.framebuffer),
             }
         }
 
@@ -557,6 +622,30 @@ mod tests {
         assert_eq!(blk.mmio_size, 0x1000);
         assert_eq!(blk.irq, 1);
         assert!(blk.capability_token.is_none());
+    }
+
+    /// The sample manifest has no framebuffer, so the dynamic side must
+    /// say `None` rather than a zeroed record — the whole reason the
+    /// dynamic field is an `Option`.
+    #[test]
+    fn a_manifest_without_a_framebuffer_converts_to_none() {
+        let raw = sample_raw();
+        let dyn_manifest: HardwareManifest<u64> = HardwareManifest::from_raw(&raw);
+        assert!(dyn_manifest.framebuffer.is_none());
+    }
+
+    #[test]
+    fn a_real_framebuffer_survives_the_dynamic_conversion() {
+        let mut raw = sample_raw();
+        raw.framebuffer =
+            FramebufferInfoRaw::new(0xFD00_0000, 1024 * 600 * 4, 800, 600, 1024, 32, PixelFormatRaw::Bgrx8);
+        let dyn_manifest: HardwareManifest<u64> = HardwareManifest::from_raw(&raw);
+        let fb = dyn_manifest.framebuffer.expect("a present framebuffer must convert");
+        assert_eq!(fb.width, 800);
+        assert_eq!(fb.height, 600);
+        assert_eq!(fb.stride_pixels, 1024);
+        assert_eq!(fb.phys_base, 0xFD00_0000);
+        assert_eq!(fb.format, PixelFormat::Bgrx8);
     }
 
     #[test]
