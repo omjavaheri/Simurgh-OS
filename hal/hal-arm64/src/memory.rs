@@ -26,7 +26,10 @@ use core::mem::size_of;
 
 use hal_core::error::HalError;
 use hal_core::memory::{MapPermissions, MemoryBootstrap, MemoryRegion, PhysAddr, VirtAddr};
-use hal_manifest::raw::{HardwareManifestRaw, InterruptControllerInfoRaw, MemoryRegionRaw, TimerInfoRaw};
+use hal_manifest::raw::{
+    FramebufferInfoRaw, HardwareManifestRaw, InterruptControllerInfoRaw, MemoryRegionRaw,
+    PixelFormatRaw, TimerInfoRaw,
+};
 
 use crate::compute::ComputeDiscovery;
 use crate::cpu::Cpu;
@@ -306,6 +309,49 @@ unsafe fn locate_acpi_rsdp(uefi_memory_map: *const u8, header: &UefiMemoryMapHea
     unsafe { core::ptr::read_unaligned(uefi_memory_map.add(trailer_offset as usize) as *const u64) }
 }
 
+/// Must stay numerically equal to `uefi-bootloader`'s own
+/// `FB_HANDOFF_MAGIC` and to hal-x86_64/memory.rs's constant of the same
+/// name — this architecture boots through the SAME bootloader binary's
+/// aarch64 build, so it reads the identical handoff-block trailer. See
+/// hal-x86_64's own copy for the full rationale (why an exact-match
+/// magic is what makes the extension additive in both directions).
+const FB_HANDOFF_MAGIC: u64 = 0x5349_4D47_4642_0001;
+
+/// Decodes the 48-byte framebuffer record — a deliberate mirror of
+/// hal-x86_64/memory.rs's `decode_framebuffer_trailer` (see that
+/// function's doc comment), duplicated per architecture exactly the way
+/// `locate_acpi_rsdp` and `UefiMemoryMapHeader` already are in this
+/// codebase, rather than introducing a shared crate for one byte layout
+/// that only these two callers parse.
+fn decode_framebuffer_trailer(bytes: &[u8; 48]) -> FramebufferInfoRaw {
+    let u64_at = |o: usize| u64::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3], bytes[o + 4], bytes[o + 5], bytes[o + 6], bytes[o + 7]]);
+    let u32_at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+
+    if u64_at(0) != FB_HANDOFF_MAGIC {
+        return FramebufferInfoRaw::ZERO;
+    }
+    let format = match u32_at(40) {
+        1 => PixelFormatRaw::Bgrx8,
+        2 => PixelFormatRaw::Rgbx8,
+        _ => PixelFormatRaw::Unknown,
+    };
+    FramebufferInfoRaw::new(u64_at(8), u64_at(16), u32_at(24), u32_at(28), u32_at(32), u32_at(36), format)
+}
+
+/// # Safety
+/// Same contract as hal-x86_64/memory.rs's `locate_framebuffer`.
+unsafe fn locate_framebuffer(uefi_memory_map: *const u8, header: &UefiMemoryMapHeader) -> FramebufferInfoRaw {
+    let fb_offset = size_of::<UefiMemoryMapHeader>() as u64 + header.map_size + 8;
+    let mut bytes = [0u8; 48];
+    // SAFETY: forwarded from this function's own contract — the record
+    // sits immediately after the RSDP u64 inside the same
+    // bootloader-allocated block.
+    unsafe {
+        core::ptr::copy_nonoverlapping(uefi_memory_map.add(fb_offset as usize), bytes.as_mut_ptr(), 48);
+    }
+    decode_framebuffer_trailer(&bytes)
+}
+
 // ============================================================================
 // Page table setup — ARM64 uses a 4-level translation table walk
 // (matching this project's 4KB granule choice, the same base page size
@@ -473,6 +519,9 @@ pub struct Memory {
     dropped_region_count: usize,
     iommu_present: bool,
     gicd_base: u64,
+    /// See hal-x86_64's `Memory::framebuffer` field doc comment — same
+    /// record, same handoff block, same bootloader.
+    framebuffer: FramebufferInfoRaw,
 }
 
 impl Memory {
@@ -509,6 +558,9 @@ impl Memory {
         }
 
         let rsdp_phys = unsafe { locate_acpi_rsdp(uefi_memory_map, &header) };
+        // SAFETY: same boot-protocol contract as `locate_acpi_rsdp` —
+        // one fixed-size record further into the same blob.
+        let framebuffer = unsafe { locate_framebuffer(uefi_memory_map, &header) };
         // SAFETY: forwarded per acpi_discover's own contract.
         let acpi_result = unsafe { acpi_discover(rsdp_phys) };
 
@@ -524,7 +576,13 @@ impl Memory {
             dropped_region_count,
             iommu_present: acpi_result.smmu_present,
             gicd_base: acpi_result.gicd_base.unwrap_or(QEMU_VIRT_DEFAULT_GICD_BASE),
+            framebuffer,
         }
+    }
+
+    /// See hal-x86_64's `Memory::framebuffer` accessor.
+    pub fn framebuffer(&self) -> FramebufferInfoRaw {
+        self.framebuffer
     }
 
     /// See this struct's `dropped_region_count` field doc comment.
@@ -707,6 +765,10 @@ pub fn built_hardware_manifest(
         timer.supports_tickless(),
     );
 
+    // Same unconditional fold-in as hal-x86_64's own identical line:
+    // discovery is always complete, policy is layer 4's business.
+    manifest.framebuffer = memory.framebuffer();
+
     cpu.mark_iommu_capable(memory.iommu_present());
     manifest.cpu_feature_flags = cpu.feature_flags().bits();
 
@@ -723,6 +785,32 @@ mod tests {
             classify_uefi_type(UefiMemoryType::ConventionalMemory as u32),
             hal_manifest::raw::MemoryRegionKindRaw::Usable
         );
+    }
+
+    /// The aarch64 half of the same byte contract hal-x86_64 tests —
+    /// both architectures boot through the same bootloader binary, so a
+    /// drift in either decoder must fail here too, not only on x86_64.
+    #[test]
+    fn framebuffer_trailer_decodes_the_shared_byte_layout() {
+        let mut b = [0u8; 48];
+        b[0..8].copy_from_slice(&FB_HANDOFF_MAGIC.to_le_bytes());
+        b[8..16].copy_from_slice(&0x8000_0000u64.to_le_bytes());
+        b[16..24].copy_from_slice(&(800u64 * 600 * 4).to_le_bytes());
+        b[24..28].copy_from_slice(&800u32.to_le_bytes());
+        b[28..32].copy_from_slice(&600u32.to_le_bytes());
+        b[32..36].copy_from_slice(&800u32.to_le_bytes());
+        b[36..40].copy_from_slice(&32u32.to_le_bytes());
+        b[40..44].copy_from_slice(&1u32.to_le_bytes());
+
+        let fb = decode_framebuffer_trailer(&b);
+        assert!(fb.is_present());
+        assert_eq!(fb.phys_base, 0x8000_0000);
+        assert_eq!(fb.width, 800);
+        assert_eq!(fb.height, 600);
+        assert_eq!(fb.format, PixelFormatRaw::Bgrx8);
+
+        // No/older bootloader: zero-filled trailer reads as absent.
+        assert!(!decode_framebuffer_trailer(&[0u8; 48]).is_present());
     }
 
     #[test]

@@ -22,7 +22,10 @@ use core::mem::size_of;
 use hal_core::cpu::CpuFeatureFlags;
 use hal_core::error::HalError;
 use hal_core::memory::{MapPermissions, MemoryBootstrap, MemoryRegion, MemoryRegionKind, PhysAddr, VirtAddr};
-use hal_manifest::raw::{HardwareManifestRaw, InterruptControllerInfoRaw, MemoryRegionRaw, TimerInfoRaw};
+use hal_manifest::raw::{
+    FramebufferInfoRaw, HardwareManifestRaw, InterruptControllerInfoRaw, MemoryRegionRaw,
+    PixelFormatRaw, TimerInfoRaw,
+};
 
 use crate::compute::ComputeDiscovery;
 use crate::cpu::Cpu;
@@ -628,6 +631,14 @@ pub struct Memory {
     /// Real ACPI MCFG table parsing (this field + `acpi_mcfg_ecam_
     /// base`) replaced the hardcoded guess for exactly this reason.
     rsdp_phys: u64,
+
+    /// The firmware-programmed framebuffer the bootloader recorded in
+    /// the handoff block (`locate_framebuffer`), or
+    /// `FramebufferInfoRaw::ZERO` when this machine has none. Parsed
+    /// here — beside the RSDP, from the same blob, at boot — rather than
+    /// discovered later, because the Graphics Output Protocol that knows
+    /// this no longer exists by the time any of this code runs.
+    framebuffer: FramebufferInfoRaw,
 }
 
 impl Memory {
@@ -683,6 +694,9 @@ impl Memory {
         // through a small accessor that the bootloader stub's contract
         // guarantees is valid at this point in boot.
         let rsdp_phys = unsafe { locate_acpi_rsdp(uefi_memory_map, &header) };
+        // SAFETY: same boot-protocol contract as `locate_acpi_rsdp` just
+        // above — one fixed-size record further into the same blob.
+        let framebuffer = unsafe { locate_framebuffer(uefi_memory_map, &header) };
         // SAFETY: `rsdp_phys` is either 0 (checked inside
         // acpi_dmar_present) or a value obtained per this same boot
         // protocol's guarantees.
@@ -704,6 +718,7 @@ impl Memory {
             dropped_region_count,
             iommu_present,
             rsdp_phys,
+            framebuffer,
         }
     }
 
@@ -724,6 +739,13 @@ impl Memory {
     pub fn rsdp_phys(&self) -> u64 {
         self.rsdp_phys
     }
+
+    /// The firmware-programmed framebuffer this crate parsed out of the
+    /// handoff block at boot — `FramebufferInfoRaw::ZERO` if none. See
+    /// this struct's own `framebuffer` field doc comment.
+    pub fn framebuffer(&self) -> FramebufferInfoRaw {
+        self.framebuffer
+    }
 }
 
 /// Reads the ACPI RSDP physical address the bootloader stub stashed
@@ -742,6 +764,81 @@ unsafe fn locate_acpi_rsdp(uefi_memory_map: *const u8, header: &UefiMemoryMapHea
     // 8-byte RSDP address immediately follows the descriptor array by
     // this project's boot protocol definition.
     unsafe { core::ptr::read_unaligned(uefi_memory_map.add(trailer_offset as usize) as *const u64) }
+}
+
+/// Magic word introducing the framebuffer record the bootloader appends
+/// after the RSDP address — must stay numerically equal to
+/// `uefi-bootloader/src/main.rs`'s own `FB_HANDOFF_MAGIC` (ASCII
+/// `"SIMGFB"` + a 16-bit layout version). Hand-mirrored rather than
+/// shared: that crate builds for a different target entirely, and the
+/// contract between the two is a byte layout, not a Rust type — the
+/// same convention `UefiMemoryMapHeader` itself already follows.
+///
+/// Requiring an EXACT match (not just a prefix) is what makes the
+/// extension safe both ways: an older bootloader leaves this area
+/// zero-filled, and a future layout change bumps the low 16 bits, so
+/// either mismatch lands in the same well-defined "no framebuffer"
+/// outcome instead of a misread record.
+const FB_HANDOFF_MAGIC: u64 = 0x5349_4D47_4642_0001;
+
+/// Decodes the framebuffer record from its 48 raw bytes — the pure,
+/// pointer-free half of `locate_framebuffer`, split out so the byte
+/// layout this project's two crates must agree on is covered by
+/// ordinary host unit tests (`cargo test -p hal-x86_64`) instead of only
+/// by a QEMU boot.
+///
+/// Returns `FramebufferInfoRaw::ZERO` on a magic mismatch (no/older
+/// bootloader), and otherwise whatever the bootloader recorded — the
+/// coherence of the fields themselves is then judged, once, by
+/// `FramebufferInfoRaw::is_present`.
+fn decode_framebuffer_trailer(bytes: &[u8; 48]) -> FramebufferInfoRaw {
+    let u64_at = |o: usize| u64::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3], bytes[o + 4], bytes[o + 5], bytes[o + 6], bytes[o + 7]]);
+    let u32_at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+
+    if u64_at(0) != FB_HANDOFF_MAGIC {
+        return FramebufferInfoRaw::ZERO;
+    }
+    let format = match u32_at(40) {
+        1 => PixelFormatRaw::Bgrx8,
+        2 => PixelFormatRaw::Rgbx8,
+        // Any other value is a bootloader this build does not
+        // understand: treat the mode as unwritable rather than guessing
+        // a channel order (`PixelFormatRaw`'s own doc comment).
+        _ => PixelFormatRaw::Unknown,
+    };
+    FramebufferInfoRaw::new(
+        u64_at(8),
+        u64_at(16),
+        u32_at(24),
+        u32_at(28),
+        u32_at(32),
+        u32_at(36),
+        format,
+    )
+}
+
+/// Reads the framebuffer record the bootloader stashed immediately after
+/// the RSDP address (this project's own boot-protocol extension, per
+/// `FB_HANDOFF_MAGIC`) — the same "trailer after the descriptor array"
+/// shape `locate_acpi_rsdp` above already established, one field
+/// further out.
+///
+/// # Safety
+/// Same contract as `Memory::from_uefi_memory_map`: `uefi_memory_map`
+/// and `header.map_size` must describe a valid handoff blob from this
+/// project's bootloader, which always allocates the block with room for
+/// this record (`HANDOFF_BUFFER_PAGES`) and zero-fills it up front.
+unsafe fn locate_framebuffer(uefi_memory_map: *const u8, header: &UefiMemoryMapHeader) -> FramebufferInfoRaw {
+    let fb_offset = size_of::<UefiMemoryMapHeader>() as u64 + header.map_size + 8;
+    let mut bytes = [0u8; 48];
+    // SAFETY: forwarded from this function's own safety contract — the
+    // 48-byte framebuffer record immediately follows the RSDP u64 by
+    // this project's boot protocol definition, inside the same
+    // bootloader-allocated block.
+    unsafe {
+        core::ptr::copy_nonoverlapping(uefi_memory_map.add(fb_offset as usize), bytes.as_mut_ptr(), 48);
+    }
+    decode_framebuffer_trailer(&bytes)
 }
 
 impl MemoryBootstrap for Memory {
@@ -896,6 +993,13 @@ pub fn built_hardware_manifest(
         timer.supports_tickless(),
     );
 
+    // The display scanout firmware left active (hal-manifest's
+    // `FramebufferInfoRaw`). Folded in exactly like every other
+    // discovery result above — unconditionally, in full: whether any
+    // process may map it is layer-4 policy, not a discovery-time
+    // decision (01-HAL-Layer.md section 2).
+    manifest.framebuffer = memory.framebuffer();
+
     // Fold IOMMU presence into the CPU feature flags too, per cpu.rs's
     // `mark_iommu_capable` doc comment on why CPUID alone cannot report
     // this bit.
@@ -950,6 +1054,53 @@ mod tests {
         let flags = permissions_to_flags(MapPermissions::DEVICE_MMIO);
         assert_ne!(flags & pte_flags::CACHE_DISABLE, 0);
         assert_ne!(flags & pte_flags::WRITE_THROUGH, 0);
+    }
+
+    /// Builds the exact 48 bytes `uefi-bootloader`'s own
+    /// `exit_boot_services_and_jump` writes, so this test fails if
+    /// either side's field order or offset drifts.
+    fn framebuffer_trailer_bytes(magic: u64, format: u32) -> [u8; 48] {
+        let mut b = [0u8; 48];
+        b[0..8].copy_from_slice(&magic.to_le_bytes());
+        b[8..16].copy_from_slice(&0xFD00_0000u64.to_le_bytes()); // base
+        b[16..24].copy_from_slice(&(1024u64 * 600 * 4).to_le_bytes()); // size
+        b[24..28].copy_from_slice(&800u32.to_le_bytes()); // width
+        b[28..32].copy_from_slice(&600u32.to_le_bytes()); // height
+        b[32..36].copy_from_slice(&1024u32.to_le_bytes()); // stride (padded!)
+        b[36..40].copy_from_slice(&32u32.to_le_bytes()); // bpp
+        b[40..44].copy_from_slice(&format.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn framebuffer_trailer_decodes_every_field_at_its_agreed_offset() {
+        let fb = decode_framebuffer_trailer(&framebuffer_trailer_bytes(FB_HANDOFF_MAGIC, 1));
+        assert!(fb.is_present());
+        assert_eq!(fb.phys_base, 0xFD00_0000);
+        assert_eq!(fb.width, 800);
+        assert_eq!(fb.height, 600);
+        assert_eq!(fb.stride_pixels, 1024);
+        assert_eq!(fb.bits_per_pixel, 32);
+        assert_eq!(fb.format, PixelFormatRaw::Bgrx8);
+    }
+
+    /// The additive-extension guarantee: an older bootloader leaves this
+    /// area zero-filled, and a future layout bumps the magic's low 16
+    /// bits. Both must land in "no framebuffer", never in a misread
+    /// record pointed at arbitrary physical memory.
+    #[test]
+    fn a_missing_or_newer_framebuffer_trailer_reads_as_absent() {
+        assert!(!decode_framebuffer_trailer(&[0u8; 48]).is_present());
+        let newer = decode_framebuffer_trailer(&framebuffer_trailer_bytes(FB_HANDOFF_MAGIC + 1, 1));
+        assert!(!newer.is_present());
+        assert_eq!(newer.phys_base, 0);
+    }
+
+    #[test]
+    fn an_unrecognized_pixel_format_code_is_not_guessed_at() {
+        let fb = decode_framebuffer_trailer(&framebuffer_trailer_bytes(FB_HANDOFF_MAGIC, 7));
+        assert_eq!(fb.format, PixelFormatRaw::Unknown);
+        assert!(!fb.is_present());
     }
 
     #[test]
