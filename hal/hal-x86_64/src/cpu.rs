@@ -1292,6 +1292,31 @@ impl CpuAbstraction<{ crate::X86_64_CONTEXT_BYTES }> for Cpu {
             IDT[FAULT_VECTOR_UD as usize] = IdtEntry::gate(addr);
         }
 
+        // The page-fault gate: `#PF` (vector 14), same override pattern
+        // as the `#UD` gate just above but pointing at the separate
+        // `isr_pagefault_trampoline` — `#PF` pushes an error code and
+        // `#UD` does not, so they cannot share one entry point (see that
+        // trampoline's own comment). Stays DPL 0 for the same reason
+        // `#UD` does: it is CPU-generated, never raised via `int nn`, so
+        // the IDT's DPL check never applies.
+        //
+        // Without this, a U-mode page fault fell through to the generic
+        // `isr_stub_14` and halted the core forever, making one
+        // process's null dereference fatal to the whole system — see
+        // `common_pagefault_entry`'s own doc comment for the real QEMU
+        // boots that exposed it.
+        //
+        // SAFETY: `IDT` is written here, on the bootstrap core, before
+        // `load_idt` is called and before interrupts are enabled — no
+        // concurrent access is possible.
+        unsafe {
+            unsafe extern "C" {
+                static isr_pagefault_trampoline: u8;
+            }
+            let addr = &isr_pagefault_trampoline as *const u8 as u64;
+            IDT[FAULT_VECTOR_PF as usize] = IdtEntry::gate(addr);
+        }
+
         // The timer gate: `interrupt::TIMER_VECTOR` (32), same override
         // pattern as the syscall/fault gates above — points at the
         // DEDICATED `isr_timer_trampoline` instead of the generic
@@ -1975,6 +2000,11 @@ pub unsafe fn poke_saved_a0_a1(ctx: *mut u8, a0: usize, a1: usize) {
 /// every exception vector that can legitimately occur from Ring 3 (e.g.
 /// `#PF`/`#GP`), a tracked follow-up once a concrete need arises.
 const FAULT_VECTOR_UD: u8 = 6;
+/// `#PF`, the page-fault vector (Intel SDM Vol. 3A Table 6-1). Routed to
+/// the registered [`FaultHandler`] via its own dedicated gate exactly
+/// like [`FAULT_VECTOR_UD`] — see `common_pagefault_entry`'s own doc
+/// comment for why it did not used to be, and what that cost.
+const FAULT_VECTOR_PF: u8 = 14;
 
 /// Signature of the handler `common_fault_entry` calls for a Ring-3
 /// `#UD`: `(vector, rip, _reserved)` — mirrors hal-riscv64's
@@ -2045,11 +2075,174 @@ core::arch::global_asm!(
     "#
 );
 
+// The `#PF` (vector 14) trampoline. Byte-for-byte the `#UD` one above
+// apart from its FIRST instruction, and deliberately a separate symbol
+// rather than a shared one: `#UD` pushes no error code while `#PF`
+// does, so their entry stack layouts differ by exactly one qword, and
+// everything after that single `add rsp, 8` — the 15 pushes, the
+// `SyscallFrame` layout `common_*_entry` reads, the restore tail — is
+// then identical.
+//
+// `add rsp, 8` DISCARDS the CPU-pushed error code. That is a considered
+// choice, not an oversight: the error code's page-present / read-vs-
+// write / user-vs-supervisor bits are diagnostic only, while `cr2` (the
+// faulting virtual address, read in Rust below) is the value that
+// actually identifies the fault, and passing `cr2` as the handler's
+// third argument makes this architecture agree with hal-riscv64, where
+// that argument is `stval` — also the faulting address. Discarding it in
+// asm needs no scratch register and no static, which keeps this
+// prologue a single instruction that cannot clobber anything.
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .global isr_pagefault_trampoline
+    isr_pagefault_trampoline:
+        add rsp, 8
+
+        push r15
+        push r14
+        push r13
+        push r12
+        push r11
+        push r10
+        push r9
+        push r8
+        push rbp
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push rbx
+        push rax
+
+        mov rdi, rsp
+        call common_pagefault_entry
+
+        mov rbx, [rsp + 8]
+        mov rcx, [rsp + 16]
+        mov rdx, [rsp + 24]
+        mov rsi, [rsp + 32]
+        mov rdi, [rsp + 40]
+        mov rbp, [rsp + 48]
+        mov r8,  [rsp + 56]
+        mov r9,  [rsp + 64]
+        mov r10, [rsp + 72]
+        mov r11, [rsp + 80]
+        mov r12, [rsp + 88]
+        mov r13, [rsp + 96]
+        mov r14, [rsp + 104]
+        mov r15, [rsp + 112]
+        mov rax, [rsp + 0]
+        add rsp, 120
+        iretq
+    "#
+);
+
 /// Host (`cargo test`) stub — same reason `common_syscall_entry` needs
 /// one (the `global_asm!` trampoline's `call` is never cfg-gated).
 #[cfg(not(target_os = "none"))]
 #[no_mangle]
 extern "C" fn common_fault_entry(_frame: *mut SyscallFrame) {}
+
+/// Called from `isr_pagefault_trampoline` — the `#PF` counterpart of
+/// `common_fault_entry` below, with the identical Ring-0 check and the
+/// identical `TrapOutcome` handling, differing only in the two values it
+/// reports to the registered [`FaultHandler`]: vector
+/// [`FAULT_VECTOR_PF`] instead of `#UD`, and `cr2` (the faulting virtual
+/// address) instead of a hardcoded `0`.
+///
+/// **Why this exists (2026-09-18).** Before it, `#PF` had no dedicated
+/// gate at all: it fell through to the generic `isr_stub_14` and so into
+/// `common_interrupt_entry`'s `vector < 32` arm, which prints a
+/// diagnostic and HALTS THE CORE FOREVER. That made any U-mode page
+/// fault — a null dereference in one layer-4 process, say — fatal to the
+/// entire system, which is precisely the opposite of the per-process
+/// fault isolation 03-Kernel-Subsystems-Layer.md §2.1/§5.2 requires and
+/// which `#UD` already got. It was found by real QEMU boots once the
+/// layer-4 processes were finally given enough scheduling time to run
+/// their own code (`kernel_arch_glue::P2_FAULT_DEMO_START_TICK`): a
+/// subsystem thread read through a null pointer (`error_code=0x5`,
+/// `cr2=0x0`) and killed a boot that was otherwise healthy, and a second
+/// real unmapped-VA access at `cr2=0xD810_0000` did the same. Both are
+/// now isolated exactly like any other fatal U-mode exception — that one
+/// thread is terminated, the rest of the system continues.
+///
+/// This is the x86_64 mirror of the aarch64 `ec=0x24` (EL0 data abort)
+/// routing gap fixed in `e8e1c83`; the two architectures had the
+/// identical hole for the identical reason (only the one exception the
+/// fault-isolation demo itself raises was ever wired up).
+///
+/// A Ring-0 `#PF` stays unconditionally fatal, same as a Ring-0 `#UD`:
+/// it is the kernel's own bug, it must not be blamed on whatever U-mode
+/// thread happens to be current, and `halt_on_unexpected_fault` with a
+/// real `cr2` in the log is a far better outcome than silently
+/// terminating an innocent process.
+#[cfg(not(target_os = "none"))]
+#[no_mangle]
+extern "C" fn common_pagefault_entry(_frame: *mut SyscallFrame) {}
+
+/// See the `cfg(not(target_os = "none"))` stub above for the full doc
+/// comment.
+#[cfg(target_os = "none")]
+#[no_mangle]
+extern "C" fn common_pagefault_entry(frame: *mut SyscallFrame) {
+    // SAFETY: `frame` points at the 160-byte block
+    // `isr_pagefault_trampoline` just pushed, this function's only
+    // caller.
+    let f = unsafe { &mut *frame };
+    if (f.cs & 3) != 3 {
+        // Ring-0 page fault: the kernel's own bug, never isolated.
+        halt_on_unexpected_fault();
+    }
+    let cr2: u64;
+    // SAFETY: reading `cr2` has no preconditions in a trap handler.
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: single-core; `FAULT_HANDLER` is only written by
+    // `set_fault_handler` during boot, before any drop to Ring 3.
+    let handler = unsafe { core::ptr::addr_of!(FAULT_HANDLER).read() };
+    if let Some(h) = handler {
+        match h(FAULT_VECTOR_PF as usize, f.rip as usize, cr2 as usize) {
+            TrapOutcome::Resume(ret) => {
+                // Not a meaningful outcome for a fatal fault (the
+                // faulting instruction would just re-fault), but the
+                // type is shared with the syscall path so the arm must
+                // exist — same as `common_fault_entry`'s own.
+                f.rax = ret as u64;
+                return;
+            }
+            TrapOutcome::Resume2(a0, a1) => {
+                f.rax = a0 as u64;
+                f.rsi = a1 as u64;
+                return;
+            }
+            TrapOutcome::SwitchTo { save, into } | TrapOutcome::SwitchToFast { save, into } => {
+                // Deliberately a FULL save/restore for both arms — a
+                // fault handler has no basis for assuming the IPC fast
+                // path's register-set narrowing is safe here, the same
+                // choice `common_fault_entry` documents at length.
+                // SAFETY: `save`/`into` are kernel-owned, 8-byte-aligned
+                // `HAL_USER_CONTEXT_BYTES` blobs; the resume point is
+                // `f.rip` unchanged (the faulting instruction never
+                // legitimately completes).
+                unsafe {
+                    save_syscall_frame_as_user_context(f, f.rip, save as *mut X8664UserContext);
+                    restore_user_and_iretq(into as *const X8664UserContext);
+                }
+            }
+            TrapOutcome::Terminate { into } => {
+                // The expected outcome: the faulting thread is dead, its
+                // trap frame abandoned, no save.
+                // SAFETY: `into` is a kernel-owned, 8-byte-aligned
+                // `HAL_USER_CONTEXT_BYTES` blob.
+                unsafe { restore_user_and_iretq(into as *const X8664UserContext) };
+            }
+        }
+    }
+    halt_on_unexpected_fault();
+}
 
 /// Called from `isr_fault_trampoline` with a pointer to the pushed
 /// `SyscallFrame`. A CPU exception (unlike a syscall) can be taken from
