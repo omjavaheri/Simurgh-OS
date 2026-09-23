@@ -20,6 +20,7 @@
 use core::panic::PanicInfo;
 use uefi::mem::memory_map::MemoryMap;
 use uefi::prelude::*;
+use uefi::proto::console::gop::{GraphicsOutput, Mode, PixelFormat};
 use uefi::table::cfg::ACPI2_GUID;
 
 /// This bootloader's own target architecture, as an `elf-loader::machine`
@@ -186,6 +187,170 @@ fn locate_acpi_rsdp() -> u64 {
 
     config_entries.unwrap_or(0)
 }
+// ============================================================================
+// Graphics Output Protocol — the display scanout handoff
+//
+// This is the ONLY place in the whole system that can choose a display
+// mode. GOP is a boot service: it stops existing the instant
+// `ExitBootServices()` returns, and nothing above the HAL may talk to
+// display hardware directly (drivers are layer 3, user space, and no GPU
+// driver exists). So whatever mode this function leaves active is the
+// mode for the rest of the boot, and its geometry has to travel to the
+// kernel inside the handoff block — see `FB_HANDOFF_MAGIC` for the byte
+// contract, and hal-manifest's `FramebufferInfoRaw` for where it lands.
+// ============================================================================
+
+/// The desktop resolution `Simurgh-UI-Template01::ui-core` renders at
+/// and `compositor`'s own `FRAME_MAX` is sized for. Preferred exactly
+/// when firmware offers it; otherwise the closest offered mode is taken
+/// and the REAL geometry is what gets recorded (the Compositor centers
+/// or clips against it — `compositor::scanout`'s own doc comment).
+const PREFERRED_WIDTH: usize = 800;
+const PREFERRED_HEIGHT: usize = 600;
+
+/// Everything this bootloader learned about the firmware-programmed
+/// framebuffer. Mirrors `hal_manifest::raw::FramebufferInfoRaw` field
+/// for field — deliberately a separate, hand-mirrored type rather than a
+/// dependency on `hal-manifest`: this crate builds for a completely
+/// different target (`x86_64-unknown-uefi`, with firmware's own ABI) and
+/// the handoff between them is a documented BYTE layout, not a shared
+/// Rust type.
+#[derive(Clone, Copy)]
+struct FramebufferHandoff {
+    base: u64,
+    size: u64,
+    width: u32,
+    height: u32,
+    stride_pixels: u32,
+    bits_per_pixel: u32,
+    /// `1` = BGRX8 (GOP `PixelFormat::Bgr`), `2` = RGBX8 (GOP
+    /// `PixelFormat::Rgb`). Never `0` in a value this function returns —
+    /// `0` only ever appears in the handoff block as the zero-filled
+    /// "no framebuffer" case, which is why absence is `None` here
+    /// instead of a zero variant.
+    format: u32,
+}
+
+/// How far a candidate mode is from the preferred desktop size. Plain
+/// Manhattan distance on (width, height): the point is only to make
+/// "exactly 800x600" score 0 and to pick something sane when firmware
+/// does not offer it, not to model perceived quality.
+fn mode_distance(width: usize, height: usize) -> usize {
+    width.abs_diff(PREFERRED_WIDTH) + height.abs_diff(PREFERRED_HEIGHT)
+}
+
+/// Locates the Graphics Output Protocol, switches it to the best
+/// available 32-bit mode, and reports the REAL geometry firmware ended
+/// up with.
+///
+/// Returns `None` — a fully supported outcome, not an error — when the
+/// machine has no GOP at all, or offers only modes this project cannot
+/// write into directly (`PixelFormat::Bitmask`/`BltOnly`: GOP `Blt` is a
+/// boot service that will not exist after `ExitBootServices`, so a
+/// BltOnly mode is genuinely unusable to us, and a Bitmask mode would
+/// need per-channel shift/mask arithmetic no consumer in this codebase
+/// implements). The boot then proceeds exactly as it did before this
+/// existed: the handoff block's framebuffer trailer stays zeroed and the
+/// Compositor keeps its frames in RAM.
+///
+/// Must be called BEFORE the final `GetMemoryMap()`/`ExitBootServices()`
+/// sequence: it opens a protocol and allocates internally, both of which
+/// would invalidate the map key.
+fn locate_gop_framebuffer() -> Option<FramebufferHandoff> {
+    let handle = uefi::boot::get_handle_for_protocol::<GraphicsOutput>().ok()?;
+    let mut gop = uefi::boot::open_protocol_exclusive::<GraphicsOutput>(handle).ok()?;
+
+    // `GraphicsOutput::modes` needs a `&BootServices` for its internal
+    // `query_mode` pool allocations — the one place this crate still
+    // needs the older table-based handle, since the `uefi::boot` free
+    // functions have no equivalent accessor.
+    let system_table = uefi::table::system_table_boot()?;
+
+    // Pick the best mode we can actually write to: exact 800x600 wins
+    // outright (distance 0); otherwise the closest offered size, with a
+    // smaller stride breaking ties (less padding wasted per row).
+    let mut best: Option<(usize, usize, Mode)> = None;
+    for mode in gop.modes(system_table.boot_services()) {
+        let info = mode.info();
+        if !matches!(info.pixel_format(), PixelFormat::Rgb | PixelFormat::Bgr) {
+            continue;
+        }
+        let (w, h) = info.resolution();
+        let candidate = (mode_distance(w, h), info.stride());
+        let better = match &best {
+            None => true,
+            Some((d, s, _)) => (candidate.0, candidate.1) < (*d, *s),
+        };
+        if better {
+            best = Some((candidate.0, candidate.1, mode));
+        }
+    }
+
+    if let Some((distance, _, mode)) = best {
+        let (w, h) = mode.info().resolution();
+        uefi::println!("    [OK] Selected GOP mode {}x{} (distance from {}x{}: {})", w, h, PREFERRED_WIDTH, PREFERRED_HEIGHT, distance);
+        // A failed `set_mode` is not fatal: whatever mode firmware
+        // already had active is still a real, scanning-out framebuffer,
+        // and the geometry read back below is the truth either way.
+        if gop.set_mode(&mode).is_err() {
+            uefi::println!("    [!!] set_mode failed; keeping the firmware's current mode");
+        }
+    }
+
+    // Read back the mode that is ACTUALLY active now — never the
+    // requested one. A firmware that silently ignored `set_mode`, or
+    // rounded the request, must not make the kernel write rows at the
+    // wrong stride.
+    let info = gop.current_mode_info();
+    let format = match info.pixel_format() {
+        PixelFormat::Bgr => 1,
+        PixelFormat::Rgb => 2,
+        // `frame_buffer()` below panics on a BltOnly mode, and a Bitmask
+        // mode has no layout any consumer here can honor — bail out with
+        // the same "no framebuffer" answer as a machine with no GOP.
+        PixelFormat::Bitmask | PixelFormat::BltOnly => {
+            uefi::println!("    [!!] active GOP mode has no directly-writable pixel layout; no framebuffer handed over");
+            return None;
+        }
+    };
+    let (width, height) = info.resolution();
+    let stride_pixels = info.stride();
+
+    let mut frame_buffer = gop.frame_buffer();
+    let base = frame_buffer.as_mut_ptr() as u64;
+    let size = frame_buffer.size() as u64;
+
+    Some(FramebufferHandoff {
+        base,
+        size,
+        width: width as u32,
+        height: height as u32,
+        stride_pixels: stride_pixels as u32,
+        bits_per_pixel: 32,
+        format,
+    })
+}
+
+/// Magic word introducing the framebuffer record this bootloader
+/// appends after the handoff block's RSDP address — ASCII `"SIMGFB"`
+/// plus a 16-bit layout version (`0x0001`).
+///
+/// The whole point of a magic here (rather than just another bare u64
+/// like the RSDP) is that this field is an ADDITIVE extension to a byte
+/// contract that already shipped: `build_handoff_block` zero-fills the
+/// whole buffer, so a kernel built against this layout but booted by an
+/// older bootloader reads `0` here and correctly concludes "no
+/// framebuffer" instead of interpreting whatever follows as pixels.
+/// Bump the low 16 bits whenever a field below is added, resized or
+/// reordered — `hal_x86_64::memory::locate_framebuffer` requires an
+/// exact match and treats anything else as absent.
+const FB_HANDOFF_MAGIC: u64 = 0x5349_4D47_4642_0001;
+
+/// Byte size of the framebuffer record written after the RSDP:
+/// magic(8) + base(8) + size(8) + width(4) + height(4) +
+/// stride_pixels(4) + bits_per_pixel(4) + format(4) + reserved(4) = 48.
+const FB_HANDOFF_SIZE: usize = 48;
+
 /// Fixed-size safety margin for the handoff block's memory-map region.
 /// The real descriptor count is only known right before
 /// `ExitBootServices()` (its own act of querying the map can itself
@@ -275,7 +440,7 @@ const HEADER_SIZE: usize = 16; // two u64 fields: map_size, descriptor_size
 /// kernel entry address per `load_kernel_segments`. This function does
 /// not return — it diverges into the kernel or, on an unrecoverable
 /// UEFI error, halts.
-unsafe fn exit_boot_services_and_jump(handoff_block_addr: u64,rsdp_addr: u64,entry_point: u64,) -> ! {
+unsafe fn exit_boot_services_and_jump(handoff_block_addr: u64,rsdp_addr: u64,framebuffer: Option<FramebufferHandoff>,entry_point: u64,) -> ! {
     uefi::println!("________________ Stage 8: exit boot services and jump ___________________");
     // First, exploratory memory_map() call: used only to learn the
     // real descriptor layout (size, stride) so we can size our own
@@ -313,7 +478,12 @@ unsafe fn exit_boot_services_and_jump(handoff_block_addr: u64,rsdp_addr: u64,ent
     // reports far more descriptors than this project's QEMU target
     // currently does.
     uefi::println!("  [..] Checking handoff buffer size...");
-    let total_needed = HEADER_SIZE as u64 + map_bytes_needed + 8; // +8 for the trailing RSDP u64
+    // +8 for the trailing RSDP u64, + the framebuffer record after it
+    // (always accounted for, even when no framebuffer was found: the
+    // zero-filled record is still part of the layout, and sizing the
+    // check on whether a display happens to exist would make the
+    // buffer-overflow guard itself machine-dependent).
+    let total_needed = HEADER_SIZE as u64 + map_bytes_needed + 8 + FB_HANDOFF_SIZE as u64;
     if total_needed > (HANDOFF_BUFFER_PAGES * 0x1000) as u64 {
         uefi::println!("    [!!] memory map too large for fixed handoff buffer");
         uefi::println!("    [!!] Needed: {} bytes, Available: {} bytes",total_needed, HANDOFF_BUFFER_PAGES * 0x1000);
@@ -384,6 +554,29 @@ unsafe fn exit_boot_services_and_jump(handoff_block_addr: u64,rsdp_addr: u64,ent
         let rsdp_offset = HEADER_SIZE as u64 + final_map_bytes;
         core::ptr::write_unaligned(base.add(rsdp_offset as usize) as *mut u64, rsdp_addr);
         uefi::println!("    [OK] RSDP address {:#x} written at offset {}", rsdp_addr, rsdp_offset);
+
+        // Framebuffer record, immediately after the RSDP — see
+        // `FB_HANDOFF_MAGIC`. Written only when a real, directly-
+        // writable framebuffer exists; otherwise the bytes stay as
+        // `build_handoff_block` zeroed them, which is precisely how the
+        // kernel spells "this machine has no display".
+        if let Some(fb) = framebuffer {
+            let fb_offset = rsdp_offset as usize + 8;
+            let fb_base = base.add(fb_offset);
+            core::ptr::write_unaligned(fb_base as *mut u64, FB_HANDOFF_MAGIC);
+            core::ptr::write_unaligned(fb_base.add(8) as *mut u64, fb.base);
+            core::ptr::write_unaligned(fb_base.add(16) as *mut u64, fb.size);
+            core::ptr::write_unaligned(fb_base.add(24) as *mut u32, fb.width);
+            core::ptr::write_unaligned(fb_base.add(28) as *mut u32, fb.height);
+            core::ptr::write_unaligned(fb_base.add(32) as *mut u32, fb.stride_pixels);
+            core::ptr::write_unaligned(fb_base.add(36) as *mut u32, fb.bits_per_pixel);
+            core::ptr::write_unaligned(fb_base.add(40) as *mut u32, fb.format);
+            core::ptr::write_unaligned(fb_base.add(44) as *mut u32, 0u32);
+            uefi::println!("    [OK] framebuffer: {}x{} stride={} bpp={} format={} base={:#x} size={:#x} written at offset {}",
+                fb.width, fb.height, fb.stride_pixels, fb.bits_per_pixel, fb.format, fb.base, fb.size, fb_offset);
+        } else {
+            uefi::println!("    [!!] framebuffer: none (no usable GOP mode) - the kernel will run headless");
+        }
     }
     uefi::println!("  [OK] Copying memory map to handoff block at {:#x}...", handoff_block_addr);
     uefi::println!("  [OK] Handoff block fully populated");
@@ -524,6 +717,27 @@ fn efi_main() -> Status {
         uefi::println!("    [!!] Continuing with limited ACPI support");
     }
     uefi::println!("");
+    // === STAGE 5b: Graphics Output Protocol ===
+    //
+    // Deliberately BEFORE the handoff block is allocated and long
+    // before the final memory map snapshot: opening a protocol and
+    // switching modes both allocate inside firmware, which would
+    // invalidate the ExitBootServices map key if done later.
+    uefi::println!("___________________ Stage 5b: Graphics Output Protocol __________________");
+    uefi::println!("");
+    uefi::println!("  [..] Locating GOP and selecting a display mode...");
+    let framebuffer = locate_gop_framebuffer();
+    match framebuffer {
+        Some(fb) => {
+            uefi::println!("    [OK] framebuffer: {}x{} stride={} base={:#x} size={:#x}", fb.width, fb.height, fb.stride_pixels, fb.base, fb.size);
+            uefi::println!("    [OK] pixel format: {}", if fb.format == 1 { "BGRX8" } else { "RGBX8" });
+        }
+        None => {
+            uefi::println!("    [!!] No usable Graphics Output Protocol mode found");
+            uefi::println!("    [!!] Continuing headless - the Compositor will keep frames in RAM");
+        }
+    }
+    uefi::println!("");
     // === STAGE 6: Handoff Block Construction ===
     uefi::println!("__________________ Stage 6: Handoff Block Construction ___________________");
     uefi::println!("");
@@ -589,7 +803,7 @@ fn efi_main() -> Status {
     // stable AllocatePages-backed buffer meant to outlive
     // ExitBootServices, per that function's own doc comment.
     unsafe {
-        exit_boot_services_and_jump(handoff_block_addr, rsdp_addr, entry_point);
+        exit_boot_services_and_jump(handoff_block_addr, rsdp_addr, framebuffer, entry_point);
     }
 
     // Per the `uefi` crate's `#[entry]` macro contract, returning from
