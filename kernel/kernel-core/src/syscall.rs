@@ -1367,15 +1367,30 @@ impl KernelState {
         };
         match outcome {
             RecvOutcome::Received { from, msg } => {
-                // The queued sender becomes runnable (unless it was a
-                // Call sender — in the full model it stays BlockedOnReply
-                // until this receiver replies; MVP wakes it).
-                if let Some(t) = self.tcb_mut(from) {
-                    if t.state != ThreadState::BlockedOnReply {
+                // The queued sender becomes runnable — unless it was a
+                // Call sender, which stays BlockedOnReply (TCB state AND
+                // scheduler) until this receiver's `Reply` wakes it.
+                //
+                // **Real bug found on the first interactive desktop boot
+                // (2026-09-24)**: the TCB half of that rule was honoured
+                // but `note_ready` ran unconditionally, so the scheduler
+                // could resume a Call sender whose request had only just
+                // been dequeued — its `Call` "returned" before any reply
+                // existed and it read its reply page as it stood, i.e. the
+                // PREVIOUS reply. On the desktop this showed as the
+                // TERMINAL window displaying the shell's reply to the
+                // previous key (Enter never ran the command), and the
+                // server's later `Reply` then failed `NotBlockedOnReply`.
+                let is_call_sender = self
+                    .tcb(from)
+                    .map(|t| t.state == ThreadState::BlockedOnReply)
+                    .unwrap_or(false);
+                if !is_call_sender {
+                    if let Some(t) = self.tcb_mut(from) {
                         t.state = ThreadState::Runnable;
                     }
+                    let _ = self.sched.note_ready(from, now_ns);
                 }
-                let _ = self.sched.note_ready(from, now_ns);
                 Ok(SyscallReturn::Message { from, msg })
             }
             RecvOutcome::ReceiverQueued => {
@@ -2478,6 +2493,11 @@ mod tests {
         // to `Runnable` by `do_recv`'s own "unless it was a Call sender"
         // check) — this is the exact condition `do_reply` requires next.
         assert_eq!(k.tcb(root).unwrap().state, ThreadState::BlockedOnReply);
+        // ...and the SCHEDULER must agree (2026-09-24 desktop-boot bug):
+        // `do_recv` used to `note_ready` the Call sender anyway, so
+        // `pick_next` could resume it before the reply existed and its
+        // `Call` returned with a stale reply page.
+        assert_ne!(k.sched.pick_next(0), Some(root), "a queued Call sender must not be runnable before its Reply");
 
         // `server` replies — this must succeed (the real bug made this
         // fail with `NotBlockedOnReply`).

@@ -2539,9 +2539,32 @@ pub fn p2_ipc_call(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32, labe
         // (`native-loader`/`account-manager`/`store`, each issuing a
         // blocking `Call` after their own `Signal`) — this is not a
         // theoretical case.
+        //
+        // **Second half, found on the first interactive desktop boot
+        // (2026-09-24)**: undoing the block made the `Call` RETURN before
+        // any reply existed whenever the server was not already waiting in
+        // `Recv` — the request stays queued, but the client resumed and
+        // read its reply page as it stood, i.e. the PREVIOUS reply. That is
+        // exactly `simurgh-file-manager`'s long-open "Write reply decodes
+        // as Opened" bug (fm-core's `G_LAST_REPLY_LABEL` doc comment), and
+        // it made the desktop's FILES window fail every listing. The caller
+        // now stays genuinely blocked and the CPU goes to whatever
+        // `pick_next` finds (the same shape `p2_wait_general` uses); the
+        // server's later `Recv` finds the queued request and its `Reply`
+        // wakes this caller through the normal direct hand-off. Only when
+        // NOTHING else is runnable does the old undo-and-resume fallback
+        // remain (there is then no one to run instead).
         Ok(SyscallReturn::Reschedule { next: None }) => {
-            let _ = k.sched.note_ready(caller, hal.now_ns());
-            let _ = k.sched.dispatch(caller, hal.now_ns());
+            let now = hal.now_ns();
+            if let Some(n) = k.sched.pick_next(now) {
+                if n != caller {
+                    let _ = k.sched.dispatch(n, now);
+                    let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+                    return Some(IpcSwitch { save, into, poke: None });
+                }
+            }
+            let _ = k.sched.note_ready(caller, now);
+            let _ = k.sched.dispatch(caller, now);
             None
         }
         Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
@@ -2681,9 +2704,27 @@ pub fn p2_ipc_recv_general(hal: &HalInterface, caller: ThreadId, endpoint_raw: u
         // (real-IPC plan Phase 2) is this opcode's actual real user
         // today — confirmed via a real QEMU crash that traced back to
         // exactly this gap.
+        //
+        // **Second half (2026-09-24, found with `p2_ipc_call`'s identical
+        // one on the first interactive desktop boot)**: undoing the block
+        // made an empty `Recv` RETURN at once with no message, so every
+        // server using this path busy-polled its endpoint instead of
+        // sleeping. The receiver now stays genuinely blocked and the CPU
+        // goes to whatever `pick_next` finds (the same shape
+        // `p2_wait_general` uses); the next `Call` on this endpoint wakes
+        // it through the normal direct delivery. Only when NOTHING else is
+        // runnable does the old undo-and-resume fallback remain.
         Ok(SyscallReturn::Reschedule { next: None }) => {
-            let _ = k.sched.note_ready(caller, hal.now_ns());
-            let _ = k.sched.dispatch(caller, hal.now_ns());
+            let now = hal.now_ns();
+            if let Some(n) = k.sched.pick_next(now) {
+                if n != caller {
+                    let _ = k.sched.dispatch(n, now);
+                    let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+                    return Some(IpcRecvOutcome::Switch(IpcSwitch { save, into, poke: None }));
+                }
+            }
+            let _ = k.sched.note_ready(caller, now);
+            let _ = k.sched.dispatch(caller, now);
             None
         }
         Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
