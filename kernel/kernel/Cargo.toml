@@ -32,6 +32,22 @@ path = "src/main.rs"
 # kernel-arch-glue, which ARE host-tested), so skip it under `cargo test`.
 test = false
 
+[features]
+# Interactive desktop boot (`cargo xbuild-microkernel-x86_64 --features
+# desktop`). A compile-time switch rather than a runtime flag so the
+# default image stays byte-for-byte the automated demo boot the QEMU test
+# scripts grep for (`state=Failed restarts_in_window=6`, then a real
+# POWER_CONTROL shutdown), and so nothing in the desktop image can take
+# the demo's shutdown path by accident. With it on, the Root Task skips
+# the pure benchmarks (VFS throughput, mm-service IPC fast-path bench,
+# kernel-bypass latency comparison), still spawns and wires every
+# service, driver and the framebuffer exactly as before, never spawns the
+# deliberately-faulting driver, and leaves the preemptive scheduler
+# running forever. x86_64 is the only architecture with keyboard/mouse
+# drivers today; on aarch64/riscv64 the feature still builds and simply
+# yields a boot that keeps scheduling instead of powering off.
+desktop = ["kernel-arch-glue/desktop"]
+
 [dependencies]
 hal-core         = { path = "../../hal/hal-core" }
 kernel-core      = { path = "../kernel-core" }

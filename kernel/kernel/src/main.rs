@@ -2825,7 +2825,9 @@ fn mm_demo_x86() {
             raw_syscall_x86(sys::REPORT, victim, zero!());
             // The REAL §8.3 IPC fast-path benchmark - see the riscv64
             // `mm_bench_riscv64`'s own doc comment for why this runs
-            // BEFORE unregistering below.
+            // BEFORE unregistering below. A pure measurement, so the
+            // `desktop` build skips it (mm-service stays spawned).
+            #[cfg(not(feature = "desktop"))]
             mm_bench_x86();
             raw_syscall_x86(sys::MM_UNREGISTER, 100, zero!());
             let unreg0 = raw_syscall_x86(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
@@ -2837,8 +2839,10 @@ fn mm_demo_x86() {
     }
 }
 
-/// See the riscv64 `mm_bench_riscv64`'s own doc comment.
+/// See the riscv64 `mm_bench_riscv64`'s own doc comment. (Not called by
+/// the `desktop` build — a pure benchmark.)
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(feature = "desktop", allow(dead_code))]
 #[inline(never)]
 #[link_section = ".user_text"]
 fn mm_bench_x86() {
@@ -2874,8 +2878,10 @@ fn mm_bench_x86() {
     }
 }
 
-/// See the riscv64 `net_bypass_demo_riscv64`'s own doc comment.
+/// See the riscv64 `net_bypass_demo_riscv64`'s own doc comment. (Not
+/// called by the `desktop` build — a latency comparison only.)
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(feature = "desktop", allow(dead_code))]
 #[inline(never)]
 #[link_section = ".user_text"]
 fn net_bypass_demo_x86() {
@@ -3058,34 +3064,42 @@ extern "C" fn umode_root_x86() -> ! {
         // `Reply` round trip through fs-native's own isolated process —
         // the read phase uses `FS_READ_RESULT_QUIET` so it doesn't spam
         // one MATCH/MISMATCH log line per iteration.
-        const FS_BENCH_ITERS: usize = 100;
-        let mut w_total_bytes: usize = 0;
-        let mut w_total_ns: usize = 0;
-        for _ in 0..FS_BENCH_ITERS {
-            let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
-            raw_syscall_x86(sys::FS_WRITE, fs_handle, zero!());
-            let written = raw_syscall_x86(sys::FS_WRITE_RESULT, zero!(), zero!());
-            let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
-            if written != usize::MAX {
-                w_total_bytes += written;
-                w_total_ns += t1.saturating_sub(t0);
+        //
+        // Skipped in the `desktop` build: a pure measurement (200 real
+        // round trips) that spawns and wires nothing the desktop needs —
+        // fs-native itself was already spawned by `FS_DEMO_START` above
+        // and stays up for file-manager/init.
+        #[cfg(not(feature = "desktop"))]
+        {
+            const FS_BENCH_ITERS: usize = 100;
+            let mut w_total_bytes: usize = 0;
+            let mut w_total_ns: usize = 0;
+            for _ in 0..FS_BENCH_ITERS {
+                let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                raw_syscall_x86(sys::FS_WRITE, fs_handle, zero!());
+                let written = raw_syscall_x86(sys::FS_WRITE_RESULT, zero!(), zero!());
+                let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                if written != usize::MAX {
+                    w_total_bytes += written;
+                    w_total_ns += t1.saturating_sub(t0);
+                }
             }
-        }
-        raw_syscall_x86(sys::FS_WRITE_THROUGHPUT_SUMMARY, w_total_bytes, w_total_ns);
+            raw_syscall_x86(sys::FS_WRITE_THROUGHPUT_SUMMARY, w_total_bytes, w_total_ns);
 
-        let mut r_total_bytes: usize = 0;
-        let mut r_total_ns: usize = 0;
-        for _ in 0..FS_BENCH_ITERS {
-            let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
-            raw_syscall_x86(sys::FS_READ, fs_handle, 4096);
-            let bytes_read = raw_syscall_x86(sys::FS_READ_RESULT_QUIET, zero!(), zero!());
-            let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
-            if bytes_read != usize::MAX {
-                r_total_bytes += bytes_read;
-                r_total_ns += t1.saturating_sub(t0);
+            let mut r_total_bytes: usize = 0;
+            let mut r_total_ns: usize = 0;
+            for _ in 0..FS_BENCH_ITERS {
+                let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                raw_syscall_x86(sys::FS_READ, fs_handle, 4096);
+                let bytes_read = raw_syscall_x86(sys::FS_READ_RESULT_QUIET, zero!(), zero!());
+                let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                if bytes_read != usize::MAX {
+                    r_total_bytes += bytes_read;
+                    r_total_ns += t1.saturating_sub(t0);
+                }
             }
+            raw_syscall_x86(sys::FS_READ_THROUGHPUT_SUMMARY, r_total_bytes, r_total_ns);
         }
-        raw_syscall_x86(sys::FS_READ_THROUGHPUT_SUMMARY, r_total_bytes, r_total_ns);
 
         raw_syscall_x86(sys::FS_CLOSE, fs_handle, zero!());
         let fs_closed = raw_syscall_x86(sys::FS_CLOSE_RESULT, zero!(), zero!());
@@ -3137,7 +3151,10 @@ extern "C" fn umode_root_x86() -> ! {
         // 7g. Kernel-bypass networking demo (03-Kernel-Subsystems-
         // Layer.md §2.3/§5.4.1) — see `net_bypass_demo_x86`'s own doc
         // comment. Runs LAST among the subsystem demos, same ordering
-        // reason as riscv64's own identical call site.
+        // reason as riscv64's own identical call site. A latency
+        // comparison only (nothing the desktop uses is spawned by it), so
+        // the `desktop` build skips it.
+        #[cfg(not(feature = "desktop"))]
         net_bypass_demo_x86();
 
         // 7h. security-broker-intermediary demo (Issue #28): spawns
@@ -3652,6 +3669,12 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 if a0 == 1 { "PASSED" } else { "FAILED" },
                 thread_exit_status_name(a1)
             ));
+            // Desktop build: simurgh-init's last act; it only spins from
+            // here (`kernel_arch_glue::desktop_park_caller`'s doc comment).
+            #[cfg(feature = "desktop")]
+            if let Some((save, into)) = kernel_arch_glue::desktop_park_caller() {
+                return TrapOutcome::SwitchTo { save, into };
+            }
             return TrapOutcome::Resume(0);
         }
         sys::SCHED_SET_SYSTEM_POLICY => {
@@ -4533,7 +4556,17 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // and device-manager's closing `POWER_CONTROL` powered the
             // machine off before any other layer-4 process had run long
             // enough to produce a single line of its own output.
+            //
+            // The `desktop` build does not spawn it at all: its only
+            // purpose is the §5.2 demo, whose last act is device-manager's
+            // POWER_CONTROL shutdown. device-manager itself is still
+            // spawned (above) and simply stays blocked in `DM_WAIT_CRASH`.
+            #[cfg(not(feature = "desktop"))]
             kernel_arch_glue::p2_gate_fault_demo(spawn_faulty_driver_x86(kernel_arch_glue::khal()));
+            #[cfg(feature = "desktop")]
+            kernel_arch_glue::log(format_args!(
+                "desktop mode: fault-isolation demo not started (no faulty driver, no automatic shutdown) - preemptive scheduler runs until SHUTDOWN is chosen in the UI\r\n"
+            ));
             return match kernel_arch_glue::p2_preempt_start() {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
@@ -4637,6 +4670,12 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 "native-loader (U-mode, x86_64): real de-framework DisplayClient round trip to Compositor (CreateSurface->CommitBuffer->QueryOutputs->DestroySurface) succeeded={}, failed_step={a1}\r\n",
                 a0 == 1
             ));
+            // Desktop build: native-loader's last act; it only spins from
+            // here (`kernel_arch_glue::desktop_park_caller`'s doc comment).
+            #[cfg(feature = "desktop")]
+            if let Some((save, into)) = kernel_arch_glue::desktop_park_caller() {
+                return TrapOutcome::SwitchTo { save, into };
+            }
             return TrapOutcome::Resume(0);
         }
         sys::DRV_NVME_PROBE_REPORT => {
@@ -5457,6 +5496,31 @@ fn wire_native_loader_to_compositor_x86(
         ));
         return;
     };
+    // `desktop` build: ui-core is the Compositor's ONLY client. The
+    // Compositor serves every client through ONE message page and ONE
+    // frame region (`wire_ui_core_to_compositor` maps the same physical
+    // pages into each client — see compositor's `subsystem_entry` module
+    // doc comment), so with a preemptive scheduler running for real, two
+    // clients mid-`Call` overwrite each other's request/reply: on a real
+    // desktop boot (2026-09-24) native-loader's one-shot display
+    // self-check running concurrently with ui-core's startup made
+    // ui-core's own `CommitBuffer` fail (`ok=false step=2`) and
+    // native-loader's fail too. native-loader gets private scratch pages
+    // at the same VAs instead of the live ones and no Compositor
+    // capability, so its self-check runs to a clean `succeeded=false`
+    // and can never touch ui-core's traffic. The demo build keeps the
+    // real edge (there, nothing else is drawing).
+    #[cfg(feature = "desktop")]
+    {
+        let _ = native_loader_cs;
+        let ok = kernel_arch_glue::map_private_scratch(hal, nl_root_pt, UI_CORE_COMPOSITOR_SHARED_VA, 1).is_some()
+            && kernel_arch_glue::map_private_scratch(hal, nl_root_pt, UI_CORE_COMPOSITOR_FB_VA, 1).is_some();
+        kernel_arch_glue::log(format_args!(
+            "desktop mode: native-loader NOT wired to Compositor (ui-core is its only client); private scratch pages mapped: {ok}\r\n"
+        ));
+        return;
+    }
+    #[cfg(not(feature = "desktop"))]
     match kernel_arch_glue::wire_ui_core_to_compositor(
         hal,
         native_loader_cs,

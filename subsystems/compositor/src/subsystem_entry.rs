@@ -75,17 +75,22 @@ use kernel_ipc::SmallMessage;
 const IPC_RECV: usize = 108;
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_REPLY`.
 const IPC_REPLY: usize = 44;
-/// Must stay numerically equal to `kernel/src/main.rs`'s plain, generic
-/// `sys::IPC_RECV` (43) — NOT `IPC_RECV` above (`= 108`), which is the
-/// SPECIAL `SBS_IPC_RECV` opcode this file's own module doc comment
-/// explains is needed only for the display Endpoint's own root-
-/// bootstrap-vs-general distinction. `I8042_ENDPOINT_CAP` has exactly
-/// one real caller
-/// (`driver-i8042`) from the moment it exists, so the plain, ordinary
-/// `Recv` opcode every other subsystem in this codebase already uses is
-/// correct here — no `G_COMPOSITOR_ROOT_ONLY_PHASE`-style special case
-/// needed for THIS endpoint.
-const IPC_RECV_GENERIC: usize = 43;
+/// The `Recv` opcode used to drain the INPUT drivers' endpoints — the
+/// same general `sys::SBS_IPC_RECV` (108) as [`IPC_RECV`].
+///
+/// Was the plain `sys::IPC_RECV` (43). That opcode is the Root-Task-era
+/// path (`kernel_arch_glue::p2_ipc_recv`): whenever the `Recv` has to
+/// BLOCK it switches straight into `root_thread` — a TCB that
+/// `p2_preempt_start` retires before any input driver even exists. It
+/// blocks here whenever this loop sees a driver's signal bit before that
+/// driver has issued its `Call` (the driver signals first, then calls,
+/// and can be preempted in between), which on a live interactive boot is
+/// routine, not rare. For Compositor, 108 dispatches through
+/// `kernel_arch_glue::compositor_native_recv`, whose root-only bootstrap
+/// phase is already over by the time either driver is spawned (it ends
+/// when ui-core is wired), so these endpoints get the correct general
+/// `pick_next` hand-off.
+const IPC_RECV_GENERIC: usize = 108;
 /// Must stay numerically equal to `kernel/src/main.rs`'s `sys::
 /// NOTIF_POLL`. Real-input-handling plan, Stage B/C: this file's own
 /// `subsystem_main` polls `I8042_SIGNAL_NOTIF_CAP` with this at the top
@@ -101,25 +106,41 @@ const NOTIF_POLL: usize = 125;
 /// subsystem's own `*_ENDPOINT_CAP` constant doc comment already gives).
 const COMPOSITOR_ENDPOINT_CAP: usize = 0;
 
+/// Slot 1 is NOT an input capability: `kernel_arch_glue::
+/// compositor_demo_start` grants the frame-buffer `SharedRegion` (the
+/// `FB_VA` region) into this cap space right after the display Endpoint,
+/// so it is the SECOND grant and every input capability sits one slot
+/// later than the input plans originally assumed.
+///
+/// **Real bug found on the first interactive desktop boot (2026-09-24)**:
+/// these constants used to be 1/2/3/4, i.e. they skipped that
+/// `SharedRegion`. Every `NOTIF_POLL` below then named an `Endpoint`
+/// (slots 2 and 4) and failed with `BadCap`, which `p2_poll` reports as
+/// "no bits" — so this loop never noticed a driver's signal, driver-i8042
+/// and driver-mouse stayed blocked in their first `Call` forever, and not
+/// one keystroke or mouse event ever reached ui-core. Confirmed by dumping
+/// this cap space on a live boot: slot 0 `Endpoint`, 1 `SharedRegion`,
+/// 2 `Endpoint`, 3 `Notification`, 4 `Endpoint`, 5 `Notification`.
+///
 /// This process's own capability slot for `driver-i8042`'s own service
-/// `Endpoint` — `kernel_arch_glue::spawn_i8042_driver`'s own SECOND
-/// grant into this process's cap space (slot 0 above was the first),
-/// via `wire_service_endpoint`. Real-input-handling plan, Stage B/C.
-const I8042_ENDPOINT_CAP: usize = 1;
+/// `Endpoint` — `kernel_arch_glue::spawn_i8042_driver`'s own grant (the
+/// THIRD grant overall), via `wire_service_endpoint`. Real-input-handling
+/// plan, Stage B/C.
+const I8042_ENDPOINT_CAP: usize = 2;
 /// This process's own capability slot for the `Notification` SHARED
-/// with `driver-i8042` (signal-before-call) — the THIRD grant
+/// with `driver-i8042` (signal-before-call) — the FOURTH grant
 /// (`kernel_arch_glue::wire_notification`).
-const I8042_SIGNAL_NOTIF_CAP: usize = 2;
+const I8042_SIGNAL_NOTIF_CAP: usize = 3;
 /// This process's own capability slot for `driver-mouse`'s own service
-/// `Endpoint` — `kernel_arch_glue::spawn_mouse_driver`'s own grant into
-/// this process's cap space (the FOURTH grant overall: slot 0 display,
-/// slot 1 i8042 endpoint, slot 2 i8042 signal notif, THIS at slot 3),
-/// via `wire_service_endpoint`. Mouse-input plan, Stage 1b.
-const MOUSE_ENDPOINT_CAP: usize = 3;
+/// `Endpoint` — `kernel_arch_glue::spawn_mouse_driver`'s own grant (the
+/// FIFTH grant overall: 0 display, 1 frame-buffer region, 2 i8042
+/// endpoint, 3 i8042 signal notif, THIS at 4), via
+/// `wire_service_endpoint`. Mouse-input plan, Stage 1b.
+const MOUSE_ENDPOINT_CAP: usize = 4;
 /// This process's own capability slot for the `Notification` SHARED
-/// with `driver-mouse` (signal-before-call) — the FIFTH grant
+/// with `driver-mouse` (signal-before-call) — the SIXTH grant
 /// (`kernel_arch_glue::wire_notification`).
-const MOUSE_SIGNAL_NOTIF_CAP: usize = 4;
+const MOUSE_SIGNAL_NOTIF_CAP: usize = 5;
 
 /// VA the shared message page is mapped at in THIS process's own address
 /// space — must stay numerically equal to `kernel_arch_glue::
@@ -358,7 +379,59 @@ const SCANOUT_VA: usize = 0xD910_0000;
 /// `kernel_arch_glue::COMPOSITOR_I8042_VA`. A DIFFERENT physical region
 /// from `SHARED_VA` (the display Endpoint's own message page) —
 /// distinct producer, distinct edge.
-const I8042_VA: usize = 0xD8B0_0000;
+///
+/// Was `0xD8B0_0000`, inside `CONFIRM_VA`'s 1.92 MB range — every real
+/// 800x600 commit then overwrote this page via `copy_frame_to_confirm`.
+/// See `kernel_arch_glue::COMPOSITOR_I8042_VA`'s own doc comment.
+const I8042_VA: usize = 0xD8C8_0000;
+
+/// How many decoded input events of each kind this process holds for its
+/// client. Big enough for a burst of fast typing (or QEMU `sendkey`
+/// scripting, which delivers make+break pairs back to back) between two
+/// of ui-core's own polls.
+const INPUT_QUEUE_LEN: usize = 64;
+
+/// A fixed-capacity FIFO of decoded input events, drained one per
+/// `PollInputEvent`/`PollMouseEvent` request.
+///
+/// Replaces the single `Option` slot each event kind used to have. With
+/// one slot, every event that arrived before ui-core's next poll
+/// overwrote the previous one: on a real interactive boot (2026-09-24)
+/// typing "alice" at normal speed produced an empty username field and
+/// only two of seven password characters. When full, the OLDEST event is
+/// dropped — for a bounded queue under sustained overload, keeping the
+/// most recent input is what a user sees as "responsive".
+struct EventQueue<T: Copy> {
+    buf: [Option<T>; INPUT_QUEUE_LEN],
+    head: usize,
+    len: usize,
+}
+
+impl<T: Copy> EventQueue<T> {
+    const fn new() -> Self {
+        Self { buf: [None; INPUT_QUEUE_LEN], head: 0, len: 0 }
+    }
+
+    fn push(&mut self, event: T) {
+        if self.len == INPUT_QUEUE_LEN {
+            // Drop the oldest (see the type's own doc comment).
+            self.head = (self.head + 1) % INPUT_QUEUE_LEN;
+            self.len -= 1;
+        }
+        self.buf[(self.head + self.len) % INPUT_QUEUE_LEN] = Some(event);
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let event = self.buf[self.head].take();
+        self.head = (self.head + 1) % INPUT_QUEUE_LEN;
+        self.len -= 1;
+        event
+    }
+}
 
 /// One decoded real key event — `keycode` is a raw Scan Code Set 1 make
 /// code (bit 7 cleared), `extended` is `true` iff a real `0xE0` prefix
@@ -540,8 +613,8 @@ impl Output {
 /// gap in what IS wired here.
 fn handle_request(
     comp: &mut Compositor,
-    pending_key_event: &mut Option<KeyEvent>,
-    pending_mouse_event: &mut Option<MouseEvent>,
+    pending_key_event: &mut EventQueue<KeyEvent>,
+    pending_mouse_event: &mut EventQueue<MouseEvent>,
     output: &mut Output,
     req: DisplayRequest,
 ) -> DisplayResponse {
@@ -635,7 +708,7 @@ fn handle_request(
         // drains (not peeks) `pending_key_event`, matching `driver-
         // virtio-net`'s own `PollFrame` precedent this variant's own
         // `ipc_protocol::display` doc comment cites.
-        DisplayRequest::PollInputEvent => match pending_key_event.take() {
+        DisplayRequest::PollInputEvent => match pending_key_event.pop() {
             Some(event) => DisplayResponse::InputEvent {
                 keycode: event.keycode,
                 pressed: event.pressed,
@@ -646,7 +719,7 @@ fn handle_request(
         // Real, mouse-shaped counterpart of `PollInputEvent` just above
         // — drains (not peeks) `pending_mouse_event`, same `driver-
         // virtio-net`-style "poll, not push" shape.
-        DisplayRequest::PollMouseEvent => match pending_mouse_event.take() {
+        DisplayRequest::PollMouseEvent => match pending_mouse_event.pop() {
             Some(event) => DisplayResponse::MouseEvent {
                 dx: event.dx,
                 dy: event.dy,
@@ -730,11 +803,11 @@ pub extern "C" fn subsystem_main() -> ! {
     // Drained by a real client's own `PollInputEvent` (`handle_request`'s
     // own arm) — at most one pending event at a time, matching `driver-
     // i8042`'s own one-event-per-`Call` shape.
-    let mut last_key_event: Option<KeyEvent> = None;
+    let mut last_key_event: EventQueue<KeyEvent> = EventQueue::new();
     // Same drain-on-real-poll shape as `last_key_event`, for `driver-
     // mouse` (mouse-input plan, Stage 1b). Not read anywhere yet either
     // — same "real consumer is a later stage" reasoning.
-    let mut last_mouse_event: Option<MouseEvent> = None;
+    let mut last_mouse_event: EventQueue<MouseEvent> = EventQueue::new();
 
     // Acquire the display, if this machine granted one. Done once, here,
     // before the first `Recv`: the mapping is established by
@@ -800,7 +873,7 @@ pub extern "C" fn subsystem_main() -> ! {
             // comment on this exact pattern.
             let (i8042_from, _label) = unsafe { raw_syscall2(IPC_RECV_GENERIC, I8042_ENDPOINT_CAP, zero!()) };
             if let Some(event) = read_i8042_message() {
-                last_key_event = Some(event);
+                last_key_event.push(event);
             }
             // SAFETY: `raw_syscall`'s own contract — wakes `driver-
             // i8042`'s own blocking `Call` so it can process its next
@@ -820,7 +893,7 @@ pub extern "C" fn subsystem_main() -> ! {
             // check above.
             let (mouse_from, _label) = unsafe { raw_syscall2(IPC_RECV_GENERIC, MOUSE_ENDPOINT_CAP, zero!()) };
             if let Some(event) = read_mouse_message() {
-                last_mouse_event = Some(event);
+                last_mouse_event.push(event);
             }
             // SAFETY: `raw_syscall`'s own contract — wakes `driver-
             // mouse`'s own blocking `Call`.
@@ -852,8 +925,8 @@ mod tests {
     #[test]
     fn query_outputs_reports_the_real_single_800x600_output() {
         let mut comp = Compositor::new();
-        let mut pending_key = None;
-        let mut pending_mouse = None;
+        let mut pending_key = EventQueue::new();
+        let mut pending_mouse = EventQueue::new();
         let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::QueryOutputs);
         assert_eq!(
             resp,
@@ -869,8 +942,8 @@ mod tests {
     #[test]
     fn subscribe_input_stays_unsupported_superseded_by_poll_input_event() {
         let mut comp = Compositor::new();
-        let mut pending_key = None;
-        let mut pending_mouse = None;
+        let mut pending_key = EventQueue::new();
+        let mut pending_mouse = EventQueue::new();
         let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::SubscribeInput);
         assert_eq!(
             resp,
@@ -888,12 +961,13 @@ mod tests {
         // `handle_request` hop into `DisplayResponse::InputEvent`
         // unchanged, not just that the field exists.
         let mut comp = Compositor::new();
-        let mut pending_key = Some(KeyEvent { keycode: 0x48, pressed: true, extended: true });
-        let mut pending_mouse = None;
+        let mut pending_key = EventQueue::new();
+        pending_key.push(KeyEvent { keycode: 0x48, pressed: true, extended: true });
+        let mut pending_mouse = EventQueue::new();
 
         let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::PollInputEvent);
         assert_eq!(resp, DisplayResponse::InputEvent { keycode: 0x48, pressed: true, extended: true });
-        assert!(pending_key.is_none(), "PollInputEvent must drain, not peek");
+        assert_eq!(pending_key.len, 0, "PollInputEvent must drain, not peek");
 
         let resp2 = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::PollInputEvent);
         assert_eq!(resp2, DisplayResponse::NoInputPending);
@@ -932,17 +1006,55 @@ mod tests {
     #[test]
     fn poll_mouse_event_drains_a_pending_event_then_reports_none() {
         let mut comp = Compositor::new();
-        let mut pending_key = None;
-        let mut pending_mouse = Some(MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false });
+        let mut pending_key = EventQueue::new();
+        let mut pending_mouse = EventQueue::new();
+        pending_mouse.push(MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false });
 
         let resp = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::PollMouseEvent);
         assert_eq!(
             resp,
             DisplayResponse::MouseEvent { dx: 5, dy: -3, left: true, right: false, middle: false }
         );
-        assert!(pending_mouse.is_none(), "PollMouseEvent must drain, not peek");
+        assert_eq!(pending_mouse.len, 0, "PollMouseEvent must drain, not peek");
 
         let resp2 = handle_request(&mut comp, &mut pending_key, &mut pending_mouse, &mut Output::headless(), DisplayRequest::PollMouseEvent);
         assert_eq!(resp2, DisplayResponse::NoMouseEventPending);
+    }
+
+    #[test]
+    fn keys_typed_faster_than_polled_all_arrive_in_order() {
+        // The real regression: five make/break pairs ("alice") queued
+        // before the client polls once must ALL come back, in order —
+        // the old one-slot queue returned only the last.
+        let mut comp = Compositor::new();
+        let mut keys = EventQueue::new();
+        let mut mouse = EventQueue::new();
+        let codes = [0x1e, 0x26, 0x17, 0x2e, 0x12];
+        for &c in &codes {
+            keys.push(KeyEvent { keycode: c, pressed: true, extended: false });
+            keys.push(KeyEvent { keycode: c, pressed: false, extended: false });
+        }
+        for &c in &codes {
+            for pressed in [true, false] {
+                let resp = handle_request(&mut comp, &mut keys, &mut mouse, &mut Output::headless(), DisplayRequest::PollInputEvent);
+                assert_eq!(resp, DisplayResponse::InputEvent { keycode: c, pressed, extended: false });
+            }
+        }
+        let resp = handle_request(&mut comp, &mut keys, &mut mouse, &mut Output::headless(), DisplayRequest::PollInputEvent);
+        assert_eq!(resp, DisplayResponse::NoInputPending);
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_oldest_event_not_the_newest() {
+        let mut q: EventQueue<u32> = EventQueue::new();
+        for i in 0..(INPUT_QUEUE_LEN as u32 + 3) {
+            q.push(i);
+        }
+        assert_eq!(q.pop(), Some(3));
+        let mut last = 3;
+        while let Some(v) = q.pop() {
+            last = v;
+        }
+        assert_eq!(last, INPUT_QUEUE_LEN as u32 + 2);
     }
 }

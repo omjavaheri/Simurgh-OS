@@ -23,6 +23,17 @@ repository.workspace = true
 [lib]
 crate-type = ["rlib"]
 
+[features]
+# Interactive desktop boot mode, selected at COMPILE time by the `kernel`
+# binary's own `desktop` feature (which is the only thing that should ever
+# enable this one — see `kernel/kernel/Cargo.toml`). With it on, the
+# preemptive scheduler runs for the life of the machine instead of the
+# fixed demo window: the §5.2 fault-isolation demo (whose last act is a
+# real POWER_CONTROL shutdown) never starts, the tick budget never cancels
+# the timer, and the demo-only counting process C is not spawned. Off (the
+# default), this crate behaves exactly as it always has.
+desktop = []
+
 [dependencies]
 kernel-core = { path = "../kernel-core" }
 kernel-cap  = { path = "../kernel-cap" }

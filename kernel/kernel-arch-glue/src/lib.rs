@@ -292,7 +292,18 @@ const P2_QUANTUM_NS: u64 = 2_000_000;
 /// is margin, and costs nothing: on every real boot the machine powers
 /// off long before the budget is hit, so this branch stays exactly as
 /// unreached as it already was.
+#[cfg(not(feature = "desktop"))]
 const P2_TICK_BUDGET: u32 = 2000;
+/// Desktop build: the budget is never reached. Cancelling the timer is
+/// the demo's way of freezing the machine on whichever thread holds the
+/// CPU so the smoke grep can finish; an interactive session must keep
+/// preempting for as long as the machine is on. `u32::MAX` rather than a
+/// separate flag because `p2_tick` saturates its counter one BELOW this
+/// value in the desktop build (at the 2 ms quantum that is ~99 days of
+/// uptime, after which the counter simply stops advancing), so the `>=`
+/// check can never fire — see `p2_tick`.
+#[cfg(feature = "desktop")]
+const P2_TICK_BUDGET: u32 = u32::MAX;
 
 /// The tick at which `p2_tick` releases the gated first faulty-driver
 /// instance (`GATED_FAULT_DRIVER_TID`) and so lets the §5.2
@@ -384,8 +395,17 @@ const P2_TICK_BUDGET: u32 = 2000;
 /// own name and its own static, deliberately NOT entangled with
 /// `p2_fault`'s hand-off, `DM_TID`'s preemption exemption, or
 /// `P2_TICK_BUDGET`. Switching the automated demo off later is this one
-/// constant and nothing else.
+/// constant and nothing else — selected by this crate's `desktop` Cargo
+/// feature (enabled only through the `kernel` binary's own `desktop`
+/// feature), so the default image keeps the demo's 1000 exactly.
+#[cfg(not(feature = "desktop"))]
 const P2_FAULT_DEMO_START_TICK: u32 = 1000;
+/// Desktop build: never release the gated driver — see the default
+/// definition's doc comment just above. (The desktop Root Task does not
+/// spawn the faulty driver at all, so there is normally nothing gated;
+/// `0` keeps the gate closed even if a future change spawns it again.)
+#[cfg(feature = "desktop")]
+const P2_FAULT_DEMO_START_TICK: u32 = 0;
 /// Byte offsets into the shared frame each process bumps in its counting
 /// loop — distinct words (the frame is ONE physical page aliased into
 /// both spaces), clear of the `0`/`4` area the §8.4 round-trip used.
@@ -526,6 +546,33 @@ pub fn build(
 /// `a80da44` did for a different, real exhaustion) would not have helped
 /// here, since the actual bottleneck was `UntypedId(0)`'s own size, not
 /// any fixed-capacity table.
+/// Maps `pages` fresh, zeroed, PRIVATE frames at `va` in the address space
+/// rooted at `root_pt` (`U=1 R+W`, trusted bootstrap — no capability is
+/// granted, nothing else maps these frames).
+///
+/// For a process whose code dereferences a fixed shared-page VA
+/// unconditionally but whose real peer edge is deliberately NOT wired in
+/// this boot mode: backing the VA with private memory lets that process
+/// run its own logic to a clean, honestly-reported failure (its `Call` on
+/// the missing capability errors out) instead of taking a page fault on
+/// its first store. Used by the `desktop` build for native-loader's
+/// display self-check — see `kernel/src/main.rs`'s
+/// `wire_native_loader_to_compositor_x86`.
+pub fn map_private_scratch(hal: &HalInterface, root_pt: usize, va: usize, pages: usize) -> Option<()> {
+    let k = kstate();
+    let len = pages * 4096;
+    let phys = carve_from_any_untyped(k, 4096, len as u64)?;
+    // SAFETY: freshly carved untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, len) };
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: as above — `map_range` needs its page-table pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(root_pt, va, phys, len, 1 | 2 | 8, pool, 2) == u32::MAX {
+        return None;
+    }
+    Some(())
+}
+
 fn carve_from_any_untyped(state: &mut KernelState, align: u64, bytes: u64) -> Option<usize> {
     for i in 0..state.untyped_count {
         if let Some(u) = state.untyped_mut(kernel_cap::UntypedId::new(i)) {
@@ -1687,7 +1734,15 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
             core::ptr::addr_of!(G_A_STACK_TOP).read(),
         )
     };
-    if subsys_entry != 0 {
+    // Desktop build: process C exists only to prove the generic spawn
+    // path joins a THREE-way preemption demo whose verdict is printed when
+    // the tick budget runs out — which it never does there. It would just
+    // be a second busy loop taking turns from ui-core, Compositor and the
+    // input drivers. Process A's fresh loop thread below is kept: it is
+    // the always-`Ready` thread `pick_next` falls back to while every
+    // interactive process is blocked waiting for input, i.e. the idle
+    // thread.
+    if subsys_entry != 0 && !cfg!(feature = "desktop") {
         const PROC_C_STACK_VMA: usize = 0xC030_0000;
         const PROC_C_STACK_LEN: usize = 4096 * 4;
         match spawn_process(
@@ -1745,6 +1800,20 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
     // `root_frame = 0`: keep whatever address space is already active
     // (root's own space A, unchanged — this fresh TCB shares it).
     state.init_user_thread(fresh_tid, a_loop_entry, a_stack_top, 0, hal);
+    // Desktop build: this loop is the idle thread (see the process-C
+    // comment above), so it must not compete as an equal with ui-core,
+    // Compositor and the input drivers. `init_user_thread` admits every
+    // thread at `MAX_PRIORITY` (weight 4.0); re-admitting this one at
+    // priority 0 (weight 1.0, the lowest `kernel_sched` has) makes its
+    // vruntime advance 4x faster, so it only runs when the interactive
+    // processes are blocked or have had their share. Measured on a real
+    // desktop boot (2026-09-24) before this: in 1000 ticks ui-core got 11
+    // while this loop got 145.
+    #[cfg(feature = "desktop")]
+    {
+        let _ = state.sched.admit_following_system_default(fresh_tid, 0, None);
+        let _ = state.sched.note_ready(fresh_tid, hal.now_ns());
+    }
     // SAFETY: single-core; only written here, read (and retired) by
     // `p2_tick`'s own "budget exceeded" branch — see `G_FRESH_A_TID`'s
     // own doc comment.
@@ -1989,7 +2058,15 @@ pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
         return None;
     }
 
-    let ticks = unsafe { core::ptr::addr_of!(P2_TICKS).read() } + 1;
+    let prev_ticks = unsafe { core::ptr::addr_of!(P2_TICKS).read() };
+    // Desktop build: the machine runs indefinitely, so the counter must
+    // neither overflow (a debug-build panic) nor ever reach
+    // `P2_TICK_BUDGET` (`u32::MAX` there) — see that constant's doc
+    // comment. The default build keeps the plain increment it always had.
+    #[cfg(feature = "desktop")]
+    let ticks = prev_ticks.saturating_add(1).min(P2_TICK_BUDGET - 1);
+    #[cfg(not(feature = "desktop"))]
+    let ticks = prev_ticks + 1;
     unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(ticks) };
 
     // Gate release: the general scheduler has now had its designed share
@@ -2230,6 +2307,37 @@ pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u
             None
         }
     }
+}
+
+/// Desktop build only: takes the CURRENT thread out of scheduling for
+/// good and hands the CPU to the next runnable thread. Returns the
+/// `(save, into)` pair for `TrapOutcome::SwitchTo`, or `None` (the caller
+/// just resumes) if nothing else is runnable.
+///
+/// For a process whose documented next action after its final boot
+/// report is `loop { spin_loop() }` (native-loader after
+/// `NL_DISPLAY_REPORT`, simurgh-init after `IN_SUPERVISE_REPORT`): parking
+/// it is observably identical — it never does anything again either way
+/// — but it no longer burns a full fair share of the CPU. Measured on a
+/// real desktop boot (2026-09-24): those two spinning tails alone took
+/// ~35% of all ticks while ui-core got ~1%. The TCB stays intact
+/// (`note_blocked`, not `remove`), matching every other retirement in
+/// this file.
+#[cfg(feature = "desktop")]
+pub fn desktop_park_caller() -> Option<(*mut u8, *const u8)> {
+    let hal = khal();
+    let k = kstate();
+    let caller = k.sched.running()?;
+    let _ = k.sched.note_blocked(caller);
+    let now = hal.now_ns();
+    let Some(next) = k.sched.pick_next(now) else {
+        let _ = k.sched.note_ready(caller, now);
+        let _ = k.sched.dispatch(caller, now);
+        return None;
+    };
+    let _ = k.sched.dispatch(next, now);
+    klog!("desktop mode: tid {} finished its boot self-check and only spins from here - parked (not scheduled again)\r\n", caller.as_u32());
+    k.user_ctx_switch_ptrs(caller, next)
 }
 
 /// Holds the FIRST faulty-driver instance back from `pick_next` until
@@ -7034,7 +7142,17 @@ pub const DRV_I8042_MSG_VA: usize = 0xD830_0000;
 /// address space" convention): Compositor already owns `SHARED_VA`/
 /// `FB_VA`/`CONFIRM_VA`, so this just needs to be clear of those, not
 /// numerically matched to anything.
-const COMPOSITOR_I8042_VA: usize = 0xD8B0_0000;
+///
+/// **Was `0xD8B0_0000` — inside the confirm region** (`COMPOSITOR_CONFIRM_
+/// VA` `0xD8A0_0000` + `COMPOSITOR_FB_LEN` 1.92 MB ends at `0xD8BD_6000`).
+/// That overlap was harmless while every committed frame was the Root
+/// Task's tiny demo frame, but `map_range` silently replaces an existing
+/// leaf, so this page REPLACED confirm-region page 256: the moment ui-core
+/// committed a real 800x600 frame, Compositor's own `copy_frame_to_confirm`
+/// overwrote driver-i8042's message page with pixel bytes. Moved just past
+/// the mouse page (`COMPOSITOR_MOUSE_VA`, one page at `0xD8C0_0000`) and
+/// below the scanout info page (`0xD900_0000`).
+const COMPOSITOR_I8042_VA: usize = 0xD8C8_0000;
 
 /// Physical base of the raw-scancode ring `SharedRegion` — `usize::MAX`
 /// until `spawn_i8042_driver` has run. Same single-core-boot-scratch
@@ -7504,8 +7622,7 @@ pub fn spawn_mouse_driver(
     // Slot 2 on both sides: the shared "tell Compositor" Notification.
     wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
 
-    klog!("spawn_mouse_driver: driver-mouse spawned and wired to Compositor (real IRQ12, slave-PIC dual-EOI cascade)\r\n");
-    let _ = ep_cap; // boot-log value only
+    klog!("spawn_mouse_driver: driver-mouse spawned and wired to Compositor (real IRQ12, slave-PIC dual-EOI cascade)\r\n");    let _ = ep_cap; // boot-log value only
 
     // NOT a context switch — same "linear boot sequence, scheduler picks
     // it up later" reasoning as `spawn_i8042_driver`'s own tail comment.
