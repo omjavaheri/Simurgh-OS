@@ -769,6 +769,16 @@ pub fn dispatch_vector(vector: u8) {
         let handler = controller.handlers.borrow()[idx];
         if let Some(handler) = handler {
             handler(IrqId::new(vector as u32));
+        } else {
+            // No handler bound (yet) for an 8259-routed line: it still
+            // needs its device-side read and its PIC EOI, or the line
+            // stays in service forever — see `pic::acknowledge_unbound`'s
+            // own doc comment for the real boot this broke.
+            // SAFETY: we are in interrupt context for exactly this vector.
+            #[cfg(target_os = "none")]
+            unsafe {
+                crate::pic::acknowledge_unbound(vector);
+            }
         }
     }
 

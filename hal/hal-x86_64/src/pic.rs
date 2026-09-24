@@ -400,6 +400,53 @@ pub unsafe fn send_eoi() {
 ///
 /// # Safety
 /// Same contract as [`send_eoi`], for a slave-PIC-sourced interrupt.
+/// Acknowledges a PIC-routed interrupt that arrived while NO handler was
+/// bound to its vector yet. Returns `true` if `vector` is one of this
+/// PIC pair's own sixteen vectors (and was acknowledged), `false`
+/// otherwise (nothing touched).
+///
+/// Why this exists (found on the first interactive desktop boot,
+/// 2026-09-24): the keyboard and mouse lines are unmasked at HAL bring-up,
+/// but their handlers are only bound much later, when the Root Task
+/// spawns `driver-i8042`/`driver-mouse`. The Root Task runs in Ring 3 with
+/// interrupts enabled the whole time in between, so a byte already
+/// sitting in the i8042 (firmware leftovers, or the first key/mouse event
+/// of the boot) is delivered to a vector with no handler. Before this, the
+/// dispatcher only wrote the LAPIC EOI — which an 8259-sourced interrupt
+/// does not use — so the 8259 kept that line IN SERVICE forever (masking
+/// it and every lower-priority line), and the unread byte kept the i8042's
+/// output buffer full so it never raised another edge anyway: on a real
+/// desktop boot no keystroke ever reached the kernel. Draining the data
+/// port for the two PS/2 lines and sending the real 8259 EOI leaves both
+/// devices and the PIC ready for the handler that gets bound later; the
+/// early byte itself is dropped, which is the right outcome for input
+/// nobody is listening to yet.
+///
+/// # Safety
+/// Must only be called from interrupt context for the interrupt currently
+/// being serviced (same contract as [`send_eoi`]/[`send_eoi_slave`]).
+pub unsafe fn acknowledge_unbound(vector: u8) -> bool {
+    let master = (PIC1_OFFSET..PIC1_OFFSET + 8).contains(&vector);
+    let slave = (PIC2_OFFSET..PIC2_OFFSET + 8).contains(&vector);
+    if !master && !slave {
+        return false;
+    }
+    let v = vector as u32;
+    // SAFETY: forwarded from this function's own contract. Reading the
+    // data port is the device-side ack for exactly these two lines.
+    unsafe {
+        if v == KEYBOARD_IRQ_VECTOR || v == MOUSE_IRQ_VECTOR {
+            let _ = inb(I8042_DATA_PORT);
+        }
+        if slave {
+            send_eoi_slave();
+        } else {
+            send_eoi();
+        }
+    }
+    true
+}
+
 pub unsafe fn send_eoi_slave() {
     const OCW2_EOI: u8 = 0x20;
     // SAFETY: forwarded from this function's own contract; order matters
