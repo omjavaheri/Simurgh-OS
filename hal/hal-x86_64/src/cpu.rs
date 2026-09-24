@@ -2748,9 +2748,107 @@ pub(crate) mod x86_64_paging {
         (((high as u64) << 32) | low as u64) & 0x000F_FFFF_FFFF_F000
     }
 
+    /// How many GiB of identity mapping the shared 2 MiB-leaf PD tables
+    /// below cover. 4 GiB spans every caller this project has (x86_64's
+    /// `kernel-arch-glue` asks for `kernel_image_phys_end / 1 GiB + 1`,
+    /// i.e. 1; the kernel's paging self-test asks for 3) with headroom,
+    /// for a fixed 32 KiB of `.bss` (4 kernel-only + 4 user-accessible
+    /// PD tables).
+    const SHARED_IDENTITY_GIB: usize = 4;
+
+    /// One 4 KiB-aligned page-table page.
+    #[repr(C, align(4096))]
+    struct PdTable([u64; 512]);
+
+    /// `[kernel-only, user-accessible][gib]` identity PD tables — see
+    /// `shared_identity_pd`. `static mut` under the same single-core,
+    /// boot-time-initialized discipline as `GDT`/`IDT`/`TSS` above.
+    static mut SHARED_IDENTITY_PDS: [[PdTable; SHARED_IDENTITY_GIB]; 2] = {
+        const EMPTY: PdTable = PdTable([0; 512]);
+        [[EMPTY; SHARED_IDENTITY_GIB], [EMPTY; SHARED_IDENTITY_GIB]]
+    };
+    /// Whether `SHARED_IDENTITY_PDS[variant]` has been filled yet.
+    static SHARED_IDENTITY_READY: [core::sync::atomic::AtomicBool; 2] = [
+        core::sync::atomic::AtomicBool::new(false),
+        core::sync::atomic::AtomicBool::new(false),
+    ];
+
+    /// Returns the physical address of the PD table that identity-maps
+    /// GiB `gib` with 512 2 MiB leaves (kernel-only, or `USER` too when
+    /// `user_accessible`), filling that variant's tables on first use.
+    ///
+    /// WHY 2 MiB leaves and not one 1 GiB PDPT leaf (this function's
+    /// reason to exist): a PDPTE with PS=1 is only a legal 1 GiB leaf
+    /// when CPUID.80000001H:EDX.Page1GB[bit 26] = 1 — otherwise the
+    /// Intel SDM (Vol. 3A §4.5, Table 4-15/"reserved bits") treats PS as
+    /// a reserved bit and the page walk takes a #PF with the RSVD error
+    /// bit set. QEMU's software emulator (TCG) walks such an entry as a
+    /// 1 GiB page regardless, which is why the former 1 GiB-leaf version
+    /// of `map_ram_identity` only ever ran under TCG. Under Windows
+    /// Hypervisor Platform (QEMU `-accel whpx`) the partition does not
+    /// offer Page1GB at all (QEMU: "host doesn't support requested
+    /// feature: CPUID[eax=80000001h].EDX.pdpe1gb"), so the very first
+    /// `mov cr3` to such a table made EVERY access fault — including
+    /// the CPU's own read of the IDT to deliver that #PF, then the #DF:
+    /// a silent triple fault right after "handing control to the Root
+    /// Task" (captured with `-action panic=pause` + `info registers`:
+    /// CR3 = the self-test's new table, CR2 = IDT base + 8 * 16, the
+    /// #DF gate itself). 2 MiB PD leaves (PS in a PDE) need no CPUID
+    /// feature in long mode — PAE paging always supports them — so they
+    /// work on every x86_64 CPU and hypervisor.
+    ///
+    /// Shared (not per-address-space): the identity range is identical
+    /// in every address space of a given variant and is never modified
+    /// after being filled — `map_range` refuses to descend through a
+    /// 2 MiB leaf, exactly as it refused a 1 GiB one — so one set of
+    /// tables serves every PML4, keeping `root_frame`'s 3-page contract
+    /// (and every caller's carve size) unchanged. Filled once per
+    /// variant: re-writing live entries would needlessly clear the A/D
+    /// bits the CPU sets in them.
+    fn shared_identity_pd(gib: usize, user_accessible: bool) -> u64 {
+        use core::sync::atomic::Ordering;
+        let variant = user_accessible as usize;
+        // SAFETY: single core (this module's standing precondition);
+        // the tables are `'static` `.bss` inside the kernel image, which
+        // every caller keeps identity-mapped (VA == PA), so the pointer
+        // written into a PDPT below is also the tables' physical address.
+        unsafe {
+            let tables = core::ptr::addr_of_mut!(SHARED_IDENTITY_PDS[variant]);
+            if !SHARED_IDENTITY_READY[variant].load(Ordering::Acquire) {
+                let mut leaf = PRESENT | WRITABLE | HUGE_PAGE;
+                if user_accessible {
+                    leaf |= USER;
+                }
+                for g in 0..SHARED_IDENTITY_GIB {
+                    let pd = core::ptr::addr_of_mut!((*tables)[g].0).cast::<u64>();
+                    for i in 0..512 {
+                        let pa = ((g as u64) << 30) | ((i as u64) << 21);
+                        pd.add(i).write_volatile(pa | leaf);
+                    }
+                }
+                SHARED_IDENTITY_READY[variant].store(true, Ordering::Release);
+            }
+            core::ptr::addr_of!((*tables)[gib]) as u64
+        }
+    }
+
+    /// CPUID.80000001H:EDX.Page1GB[bit 26] — whether a PDPTE may be a
+    /// 1 GiB leaf at all (see `shared_identity_pd`).
+    fn cpu_supports_1gib_pages() -> bool {
+        // SAFETY: CPUID is unprivileged and always present on x86_64;
+        // the extended leaf is only queried after confirming it exists.
+        unsafe {
+            let max_ext = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+            max_ext >= 0x8000_0001
+                && core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 26) != 0
+        }
+    }
+
     /// Zeroes `root_frame` (the PML4), `root_frame + 4096` (its
-    /// companion PDPT — see this module's doc comment), and installs
-    /// `bytes_gib` 1 GiB identity leaves (VA == PA) into the PDPT, with
+    /// companion PDPT — see this module's doc comment), and identity-
+    /// maps (VA == PA) the low `bytes_gib` GiB through it — with 2 MiB
+    /// leaves in shared PD tables for the first `SHARED_IDENTITY_GIB`
+    /// GiB (see `shared_identity_pd` for why not 1 GiB leaves), with
     /// PML4[0] pointing at that PDPT. R+W+X (x86_64 has no separate
     /// "readable" bit — `PRESENT` alone means readable) and, if
     /// `user_accessible`, the PDPT leaves are `USER` too (PML4[0] itself
@@ -2814,8 +2912,28 @@ pub(crate) mod x86_64_paging {
                 leaf_flags |= USER;
             }
             pml4.write_volatile((root_frame as u64 + 4096) | pml4_flags);
-            for gib in 0..bytes_gib.min(512) {
-                pdpt.add(gib).write_volatile(((gib as u64) << 30) | leaf_flags);
+            let gibs = bytes_gib.min(512);
+            // The first `SHARED_IDENTITY_GIB` GiB go through the shared,
+            // 2 MiB-leaf PD tables (see `shared_identity_pd`'s doc
+            // comment for the hardware rule a 1 GiB PDPT leaf breaks).
+            // PDPT[gib] is a TABLE pointer here (bit 7 clear), so
+            // `map_range`'s descent reaches the PD, finds a 2 MiB leaf
+            // and rejects the VA — the same "block already covers this"
+            // outcome the former 1 GiB leaf produced, so no caller
+            // observes a difference.
+            for gib in 0..gibs.min(SHARED_IDENTITY_GIB) {
+                let pd = shared_identity_pd(gib, user_accessible);
+                pdpt.add(gib).write_volatile(pd | PRESENT | WRITABLE | USER);
+            }
+            // Beyond the shared tables (never reached by this project's
+            // own callers today — they ask for 1 or 3 GiB): a 1 GiB leaf
+            // is only legal when the CPU says so; otherwise the range is
+            // left unmapped rather than installing an entry the walker
+            // would reject with a reserved-bit #PF.
+            if gibs > SHARED_IDENTITY_GIB && cpu_supports_1gib_pages() {
+                for gib in SHARED_IDENTITY_GIB..gibs {
+                    pdpt.add(gib).write_volatile(((gib as u64) << 30) | leaf_flags);
+                }
             }
 
             let xapic_base = xapic_mmio_base_masked();
