@@ -155,6 +155,25 @@ carries Windows-style paths — cosmetic only; `info line *$pc`, `bt`,
 loop over `next` + `info line *$pc` is what pinned the untyped-exhaustion
 bug below down to one exact source line.
 
+## Interactive desktop boot (`--features desktop`, x86_64)
+
+`cargo xbuild-microkernel-x86_64 --features desktop` (or the workspace's
+`simurgh-build-all.ps1 -Desktop` / `simurgh-run.ps1 -Desktop`) builds an
+image that boots straight into the real ui-core login screen and stays up:
+the Root Task skips the pure benchmarks but still spawns and wires every
+service, driver and the framebuffer; the fault-isolation demo (whose last
+act is a POWER_CONTROL shutdown) is not started; the preemptive timer never
+stops. Verified on QEMU (2026-09-24) with real PS/2 input through QEMU's
+monitor: `alice` / `hunter2` logs in via account-manager, MENU opens by mouse
+click, TERMINAL runs `help` in the real simurgh-shell, FILES lists `/` from
+fs-native. The default (demo) build is unchanged and still ends with
+`state=Failed restarts_in_window=6` + shutdown. Bugs found on the way and
+fixed for every build: 8259 EOI for PS/2 IRQs arriving before a handler is
+bound (hal-x86_64), the Compositor's i8042 page overlapping its confirm
+region, off-by-one input capability slots and a one-slot input queue, and
+a queued `Call` returning before its `Reply` (kernel-core `do_recv`) — the
+root cause of file-manager's old fs-native self-check failure.
+
 ## Current status (honest)
 
 The layer-2 MVP (`02-Microkernel-Layer.md §8`, all six acceptance criteria)
