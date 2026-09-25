@@ -202,7 +202,7 @@ machine, matching what SMBIOS/TPM/NIC binding means).
 
 7.1 What is hashed: ALL currently-valid strong identifiers. So, a naive
 recomputation changes the id when any one changes. To avoid that, the
-service keeps a persisted record (section 9) of the identifier set used to
+service keeps a persisted record (storage: section 10, code location: section 11) of the identifier set used to
 compute the id, and on each boot:
 
 7.2 Match rule (K of N):
