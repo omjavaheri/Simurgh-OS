@@ -12,6 +12,15 @@
 //! TCP/IP, smoltcp-inspired), §5.4 (ICMP echo MVP), §2.3/§5.4.1
 //! (kernel-bypass path — control plane in `ipc_protocol::net`).
 //!
+//! `stack` is the stateful half (Internet plan, phase 1): the TCP/IP
+//! machinery itself comes from the `smoltcp` crate (owner decision of
+//! 2026-09-25, `docs/internet-plan.md` TODO(spec) 1) - ARP cache with retry,
+//! IPv4 routing, ICMP echo both ways - wrapped behind the tiny `FrameIo`
+//! transport trait so it runs identically over the driver IPC in the process
+//! image and over a mock LAN in host tests. The pure builders/parsers below
+//! stay: the boot demo and the tests use them as an independent check of
+//! smoltcp's wire format.
+//!
 //! Position in the system: an isolated layer-3 process. Talks to the
 //! virtio-net driver (through the Device Manager) for the standard path;
 //! the bypass path hands a client direct ring access and then stays out of
@@ -42,6 +51,7 @@
 
 extern crate alloc;
 
+pub mod stack;
 pub mod subsystem_entry;
 
 use alloc::vec::Vec;

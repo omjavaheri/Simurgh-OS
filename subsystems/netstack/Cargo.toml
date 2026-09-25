@@ -36,3 +36,14 @@ ipc-protocol = { path = "../../ipc-protocol" }
 # dependency on it (driver-virtio-blk/driver-virtio-net's own
 # `subsystem_entry.rs`).
 kernel-ipc   = { path = "../../kernel/kernel-ipc" }
+
+# The TCP/IP protocol machinery: smoltcp (owner decision of 2026-09-25, see
+# docs/internet-plan.md TODO(spec) 1). `no_std`, heap-free (`alloc` feature
+# left OFF: every socket buffer is caller-supplied static storage), no
+# `log`/`defmt`. Only the protocols Netstack uses are compiled in; TCP is
+# added in Phase 3 (`socket-tcp`). smoltcp is architecture-neutral, so this
+# dependency adds nothing target-specific above the HAL.
+[dependencies.smoltcp]
+version = "0.12"
+default-features = false
+features = ["proto-ipv4", "medium-ethernet", "socket-icmp"]
