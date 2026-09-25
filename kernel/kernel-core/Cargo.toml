@@ -30,3 +30,4 @@ kernel-ipc   = { path = "../kernel-ipc" }
 kernel-sched = { path = "../kernel-sched" }
 hal-core     = { path = "../../hal/hal-core" }
 hal-manifest = { path = "../../hal/hal-manifest", default-features = false }
+machine-id-core = { path = "../../machine-id-core" }

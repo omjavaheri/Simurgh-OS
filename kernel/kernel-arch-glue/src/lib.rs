@@ -661,6 +661,7 @@ pub fn build(
         .map_err(|_| RunError::Init(KernelInitError::BadBootInfo))?;
 
     let state = KernelState::init_global(boot)?;
+    log_machine_id(state);
     let first_scheduled = state.sched.pick_next(hal.now_ns()).map(|t| t.as_u32());
 
     let report = BootReport {
@@ -677,6 +678,85 @@ pub fn build(
     Ok((report, state))
 }
 
+
+// ============================================================================
+// Machine id info page (docs/machine-id.md section 10/11)
+//
+// The machine id is derived once at boot (`KernelState::machine_id`). Its
+// ONLY consumer today is the desktop's USERS window, so the smallest
+// mechanism consistent with the existing design is used: a read-only,
+// kernel-owned 4 KiB page mapped into exactly one process (ui-core) at a
+// fixed VA — the same shape as the Compositor's scanout info page, and no
+// new syscall (the syscall surface is deliberately tiny and fuzzed).
+//
+// Page layout (all little-endian; every other byte is zero):
+//   0   u64   MACHINE_ID_INFO_MAGIC  ("SIMMID" + 16-bit layout version 1)
+//   8   [u8;16] machine id, RFC 4122 byte order (as in the text form)
+//   24  u32   flags: bit0 = weak (no strong board-level identifier),
+//                    bit1 = virtual (firmware strings name a hypervisor)
+//   28  u32   algorithm version (machine_id_core::ALGORITHM_VERSION)
+//   32  [u8;36] canonical lowercase "8-4-4-4-12" text form, no terminator
+//
+// TODO(spec): access control (TODO-5 in docs/machine-id.md). Today "who may
+// see the raw id" is decided by this function's caller in the kernel main,
+// not by a capability; the doc's MachineIdRaw/MachineIdInfo capabilities
+// (layer 4 issues them) are not built.
+// ============================================================================
+
+/// Magic word of the machine-id info page — ASCII `"SIMMID"` + version 1.
+/// A client must check it before trusting the page.
+pub const MACHINE_ID_INFO_MAGIC: u64 = 0x5349_4D4D_4944_0001;
+
+/// Logs the derived machine id over serial (docs/machine-id.md: only the
+/// derived id and its flags are printed, never the raw serials/UUID).
+fn log_machine_id(state: &KernelState) {
+    let m = &state.machine_id;
+    let text = machine_id_core::format_guid(&m.id);
+    // `format_guid` only emits ASCII hex digits and hyphens, so this never fails.
+    let text = core::str::from_utf8(&text).unwrap_or("?");
+    klog!(
+        "machine id: {} (weak={}, virtual={}, strong ids used={}, algorithm v{})\r\n",
+        text,
+        m.weak,
+        m.virtual_machine,
+        m.strong_mask.count_ones(),
+        machine_id_core::ALGORITHM_VERSION
+    );
+}
+
+/// Maps the machine-id info page READ-ONLY into the address space rooted at
+/// `root_pt` at `va` (which must be page-aligned and free there). Returns
+/// `None` only on a genuine allocation/mapping failure.
+pub fn map_machine_id_info(hal: &HalInterface, root_pt: usize, va: usize) -> Option<()> {
+    let k = kstate();
+    let m = k.machine_id;
+    let page = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core; the
+    // zeroing makes every byte outside the fields below well defined.
+    unsafe { core::ptr::write_bytes(page as *mut u8, 0, 4096) };
+    let flags = (m.weak as u32) | ((m.virtual_machine as u32) << 1);
+    let text = machine_id_core::format_guid(&m.id);
+    // SAFETY: `page` is the frame just carved; every write is within its
+    // first 68 bytes.
+    unsafe {
+        let base = page as *mut u8;
+        core::ptr::write_unaligned(base as *mut u64, MACHINE_ID_INFO_MAGIC);
+        core::ptr::copy_nonoverlapping(m.id.as_ptr(), base.add(8), 16);
+        core::ptr::write_unaligned(base.add(24) as *mut u32, flags);
+        core::ptr::write_unaligned(base.add(28) as *mut u32, machine_id_core::ALGORITHM_VERSION);
+        core::ptr::copy_nonoverlapping(text.as_ptr(), base.add(32), 36);
+    }
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    // perm bits R=1 | U=8: readable from user mode, NOT writable, not executable.
+    if hal.map_range(root_pt, va, page, 4096, 1 | 8, pool, 2) == u32::MAX {
+        klog!("map_machine_id_info: map_range error\r\n");
+        return None;
+    }
+    Some(())
+}
 /// Carves `bytes` (aligned to `align`) out of the first `UntypedMemory`
 /// region that has room, trying every region in order instead of only
 /// `UntypedId(0)`.

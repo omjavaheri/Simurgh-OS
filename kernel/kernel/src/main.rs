@@ -349,6 +349,14 @@ const UI_CORE_COMPOSITOR_SHARED_VA: usize = 0xD840_0000;
 #[cfg(target_arch = "x86_64")]
 const UI_CORE_COMPOSITOR_FB_VA: usize = 0xD850_0000;
 
+/// VA of the READ-ONLY machine-id info page in `ui-core`'s own address
+/// space (`spawn_ui_core_x86` -> `kernel_arch_glue::map_machine_id_info`);
+/// the ui-core client must use the same number. Free in that space (its
+/// other mappings are 0xD840/0xD850(+1.9 MiB)/0xD870/0xD880/0xD890/0xD8A0).
+/// Page layout: see `kernel_arch_glue::MACHINE_ID_INFO_MAGIC`'s section.
+#[cfg(target_arch = "x86_64")]
+const UI_CORE_MACHINE_ID_VA: usize = 0xD8B0_0000;
+
 /// `driver-i8042-bin`'s own separately-built ELF image (real-input-
 /// handling plan, Stage B) — x86_64-only: no i8042 device exists on
 /// aarch64/riscv64 (`hal_manifest::raw::PeripheralKindRaw::Input`'s own
@@ -5813,6 +5821,20 @@ fn spawn_ui_core_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadI
                 None => kernel_arch_glue::log(format_args!(
                     "root task (x86_64): ui-core<->Compositor wiring skipped (could not resolve ui-core's own address space)\r\n"
                 )),
+            }
+            // The machine id, read-only, for the USERS window: ui-core is the
+            // ONLY process this page is ever mapped into (docs/machine-id.md
+            // section 10, TODO-5 records the open access-control question).
+            if let Some(root_pt) = root_pt {
+                match kernel_arch_glue::map_machine_id_info(hal, root_pt, UI_CORE_MACHINE_ID_VA) {
+                    Some(()) => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): mapped the machine-id info page read-only into ui-core at {:#x}\r\n",
+                        UI_CORE_MACHINE_ID_VA
+                    )),
+                    None => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): machine-id info page NOT mapped into ui-core (out of resources)\r\n"
+                    )),
+                }
             }
             Some(tid)
         }

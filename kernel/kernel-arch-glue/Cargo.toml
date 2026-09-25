@@ -48,6 +48,7 @@ hal-core    = { path = "../../hal/hal-core" }
 # untouched. `default-features = false` keeps it to the fixed-size raw
 # form (no `alloc`), matching kernel-core's own dependency on it.
 hal-manifest = { path = "../../hal/hal-manifest", default-features = false }
+machine-id-core = { path = "../../machine-id-core" }
 # `spawn_process_from_elf`'s loader (subsystems-as-processes packaging) —
 # architecture-independent pure logic, no violation of this crate's own
 # "no architecture crate name" rule above.

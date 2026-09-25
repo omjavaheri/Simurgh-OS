@@ -190,6 +190,13 @@ pub struct KernelState {
     /// rather than growing display-specific fields every driver would
     /// then carry for nothing.
     pub framebuffer: hal_manifest::raw::FramebufferInfoRaw,
+    /// The machine id (docs/machine-id.md), derived once in
+    /// `populate_from_boot_info` from `BootInfo::hardware_manifest.
+    /// machine_identity`. Pure recompute: same hardware gives the same
+    /// value on every boot and after a reinstall. `weak` is set when no
+    /// board-level identifier was usable. Exposed read-only to exactly one
+    /// process (ui-core) via `kernel_arch_glue::map_machine_id_info`.
+    pub machine_id: machine_id_core::MachineId,
     /// How many `UntypedMemory` objects the boot path created.
     pub untyped_count: u32,
 
@@ -562,6 +569,7 @@ impl KernelState {
         root_mmio_nvme_cap: CapId::new(u32::MAX),
         root_mmio_framebuffer_cap: CapId::new(u32::MAX),
         framebuffer: hal_manifest::raw::FramebufferInfoRaw::ZERO,
+        machine_id: machine_id_core::MachineId { id: [0; 16], weak: true, virtual_machine: false, strong_mask: 0 },
         untyped_count: 0,
         map_pool_base: 0,
         map_pool_len: 0,
@@ -954,6 +962,11 @@ impl KernelState {
             fb_raw
         };
 
+        // Step 3i: derive the machine id from the raw board identifiers
+        // (pure function; no capability is minted here, see
+        // `KernelState::machine_id`).
+        self.machine_id = machine_id_core::compute(&boot.hardware_manifest.machine_identity);
+
         // Step 4: schedule the Root Task.
         //
         // Deliberately PINNED `Interactive` via plain `admit`, not
@@ -1215,6 +1228,30 @@ mod tests {
         let st = KernelState::from_boot_info(&boot).unwrap();
         assert_eq!(st.root_mmio_framebuffer_cap, CapId::new(u32::MAX));
         assert!(!st.framebuffer.is_present());
+    }
+
+    /// The machine id is derived at boot from the manifest's raw identity:
+    /// none -> weak; a real SMBIOS UUID -> strong, and stable across two
+    /// independent `from_boot_info` calls (the "same hardware, same id" rule).
+    #[test]
+    fn the_machine_id_is_derived_at_boot_and_is_stable() {
+        use hal_manifest::raw::{IdentitySourceRaw, MachineIdentityRaw, IDENTITY_PRESENT_UUID};
+        let boot = boot_with_ram(64);
+        let st = KernelState::from_boot_info(&boot).unwrap();
+        assert!(st.machine_id.weak);
+
+        let mut boot = boot_with_ram(64);
+        let mut id = MachineIdentityRaw::ZERO;
+        id.source = IdentitySourceRaw::Smbios as u8;
+        id.smbios_major = 3;
+        id.present = IDENTITY_PRESENT_UUID;
+        id.uuid = [0x5A; 16];
+        id.uuid[0] = 1;
+        boot.hardware_manifest.machine_identity = id;
+        let a = KernelState::from_boot_info(&boot).unwrap().machine_id;
+        let b = KernelState::from_boot_info(&boot).unwrap().machine_id;
+        assert!(!a.weak);
+        assert_eq!(a, b);
     }
 
     /// A real framebuffer becomes a real `MmioRegion` capability over
