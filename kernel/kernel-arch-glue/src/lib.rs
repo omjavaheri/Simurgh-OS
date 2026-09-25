@@ -759,6 +759,56 @@ pub fn map_machine_id_info(hal: &HalInterface, root_pt: usize, va: usize) -> Opt
     Some(())
 }
 
+
+// ============================================================================
+// Network status page (docs/internet-plan.md, "Network status page")
+//
+// ONE zeroed 4 KiB frame, carved lazily on first use, shared by two mappings:
+// READ-WRITE into the Netstack process (`NETSTACK_NETINFO_VA`, its service
+// thread publishes a seqlocked record there) and READ-ONLY into ui-core (the
+// tray/login-screen network icon). A machine without a NIC never starts
+// Netstack, so the page stays zero and ui-core reads "no adapter".
+// TODO(spec): like the machine-id page, access is decided by kernel code that
+// maps it into ui-core only, not by a capability.
+// ============================================================================
+
+/// VA of the network status page in the Netstack process (R+W) - must stay
+/// numerically equal to `netstack::subsystem_entry::NETINFO_VA`.
+const NETSTACK_NETINFO_VA: usize = 0xD8C0_0000;
+/// Physical address of the shared status frame (`usize::MAX` until carved).
+static mut G_NET_INFO_PHYS: usize = usize::MAX;
+
+/// The shared status frame, carved and zeroed on first call.
+fn net_info_frame(k: &mut KernelState) -> Option<usize> {
+    // SAFETY: single-core; only this function writes the static.
+    let cur = unsafe { core::ptr::addr_of!(G_NET_INFO_PHYS).read() };
+    if cur != usize::MAX {
+        return Some(cur);
+    }
+    let page = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe {
+        core::ptr::write_bytes(page as *mut u8, 0, 4096);
+        core::ptr::addr_of_mut!(G_NET_INFO_PHYS).write(page);
+    }
+    Some(page)
+}
+
+/// Maps the network status page READ-ONLY into the address space rooted at
+/// `root_pt` at `va` (ui-core). `None` only on an allocation/mapping failure.
+pub fn map_net_info(hal: &HalInterface, root_pt: usize, va: usize) -> Option<()> {
+    let k = kstate();
+    let page = net_info_frame(k)?;
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    // R | U: readable from user mode, not writable, not executable.
+    if hal.map_range(root_pt, va, page, 4096, 1 | 8, pool, 2) == u32::MAX {
+        klog!("map_net_info: map_range error\r\n");
+        return None;
+    }
+    Some(())
+}
 // ============================================================================
 // Device list info page (docs/machine-id.md section 13.3)
 //
@@ -9153,6 +9203,16 @@ pub fn spawn_netstack_service(
     // SAFETY: single-core; written exactly once here, before any
     // `netstack_status` call (reached only after this function returns).
     unsafe { core::ptr::addr_of_mut!(G_NETSTACK_STATUS_PHYS).write(status_phys) };
+
+    // Network status page (R+W here, R-only in ui-core).
+    let netinfo_phys = net_info_frame(k)?;
+    let netinfo_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(netinfo_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(ns_root_pt, NETSTACK_NETINFO_VA, netinfo_phys, 4096, 1 | 2 | 8, netinfo_pool, 2) == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (network status page)\r\n");
+        return None;
+    }
     // Desktop image: tell the boot thread to skip its ARP/ICMP demo. That demo
     // is a blocking, timing-sensitive exchange whose two halves can be split
     // by the scheduler once the desktop runs (root resumes mid-demo and the

@@ -358,6 +358,8 @@ const UI_CORE_COMPOSITOR_FB_VA: usize = 0xD850_0000;
 const UI_CORE_MACHINE_ID_VA: usize = 0xD8B0_0000;
 /// VA of the read-only device-list info page in ui-core (two pages, after the machine-id page).
 const UI_CORE_DEVICE_LIST_VA: usize = 0xD8B0_1000;
+/// VA of the read-only network status page in ui-core (right after the two device-list pages).
+const UI_CORE_NET_INFO_VA: usize = 0xD8B0_3000;
 
 /// `driver-i8042-bin`'s own separately-built ELF image (real-input-
 /// handling plan, Stage B) — x86_64-only: no i8042 device exists on
@@ -5884,6 +5886,15 @@ fn spawn_ui_core_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadI
                     )),
                 }
                 add_x86_device_info();
+                match kernel_arch_glue::map_net_info(hal, root_pt, UI_CORE_NET_INFO_VA) {
+                    Some(()) => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): mapped the network status page read-only into ui-core at {:#x}\r\n",
+                        UI_CORE_NET_INFO_VA
+                    )),
+                    None => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): network status page NOT mapped into ui-core (out of resources)\r\n"
+                    )),
+                }
                 match kernel_arch_glue::map_device_list_info(hal, root_pt, UI_CORE_DEVICE_LIST_VA) {
                     Some(()) => kernel_arch_glue::log(format_args!(
                         "root task (x86_64): mapped the device-list info page read-only into ui-core at {:#x}\r\n",

@@ -52,6 +52,7 @@
 extern crate alloc;
 
 pub mod stack;
+pub mod status;
 pub mod subsystem_entry;
 
 use alloc::vec::Vec;

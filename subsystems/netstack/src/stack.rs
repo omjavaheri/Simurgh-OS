@@ -42,6 +42,12 @@ use smoltcp::wire::{
 /// queue - see `docs/internet-plan.md`.
 pub const MAX_FRAME: usize = 700;
 
+/// First DHCP restart delay while the link is up but there is no lease
+/// (smoltcp also retransmits DISCOVER by itself); doubles up to the cap.
+pub const DHCP_RESTART_FIRST_NS: u64 = 8_000_000_000;
+/// Upper bound of the DHCP restart backoff.
+pub const DHCP_RESTART_MAX_NS: u64 = 60_000_000_000;
+
 /// How long an echo request may stay unanswered before `PingTimeout` fires.
 pub const PING_TIMEOUT_MS: i64 = 1_000;
 
@@ -399,6 +405,13 @@ pub struct NetStack<IO: FrameIo> {
     pending: [Option<NetEvent>; PENDING_EVENTS],
     /// Cached view of the current lease/config for the API (`ip()` etc.).
     config: Option<NetEvent>,
+    /// Physical link state as last reported by the driver (`set_link`).
+    link_up: bool,
+    /// The static configuration to restore when the link returns.
+    static_cfg: Option<([u8; 4], u8, [u8; 4], Option<[u8; 4]>)>,
+    /// DHCP restart schedule while the link is up but no lease exists.
+    dhcp_retry_at_ns: u64,
+    dhcp_backoff_ns: u64,
 }
 
 /// Converts the process clock (nanoseconds) to smoltcp's `Instant`.
@@ -466,8 +479,13 @@ impl<IO: FrameIo> NetStack<IO> {
             dns_cache_next: 0,
             pending: [None; PENDING_EVENTS],
             config: None,
+            link_up: true,
+            static_cfg: None,
+            dhcp_retry_at_ns: now_ns + DHCP_RESTART_FIRST_NS,
+            dhcp_backoff_ns: DHCP_RESTART_FIRST_NS,
         };
         if let AddrMode::Static { ip, prefix, gateway, dns } = mode {
+            stack.static_cfg = Some((ip, prefix, gateway, dns));
             stack.apply_config(ip, prefix, Some(gateway), dns, false);
         }
         stack
@@ -518,6 +536,88 @@ impl<IO: FrameIo> NetStack<IO> {
     /// interface has no address.
     pub fn config(&self) -> Option<NetEvent> {
         self.config
+    }
+
+    /// Reports the physical link state (from the driver). Link down drops the
+    /// address configuration, outstanding ping/DNS state and DHCP progress and
+    /// queues `LinkLost`; link up restarts DHCP at once (or restores a static
+    /// configuration). Repeated calls with the same value do nothing.
+    pub fn set_link(&mut self, up: bool, now_ns: u64) {
+        if up == self.link_up {
+            return;
+        }
+        self.link_up = up;
+        if !up {
+            self.ping = None;
+            self.dns_slots = [None; DNS_SLOTS];
+            if self.config.is_some() {
+                self.clear_config();
+            }
+            return;
+        }
+        self.dhcp_backoff_ns = DHCP_RESTART_FIRST_NS;
+        self.dhcp_retry_at_ns = now_ns + DHCP_RESTART_FIRST_NS;
+        match self.dhcp {
+            Some(h) => self.sockets.get_mut::<dhcpv4::Socket>(h).reset(),
+            None => {
+                if let Some((ip, prefix, gw, dns)) = self.static_cfg {
+                    self.apply_config(ip, prefix, Some(gw), dns, false);
+                }
+            }
+        }
+    }
+
+    /// Last reported link state.
+    pub fn link_up(&self) -> bool {
+        self.link_up
+    }
+
+    /// What the user should see: no link -> `Disconnected`; link but no
+    /// address -> `Connecting`; address -> `Connected`.
+    pub fn conn_state(&self) -> crate::status::ConnState {
+        use crate::status::ConnState;
+        if !self.link_up {
+            ConnState::Disconnected
+        } else if self.config.is_some() {
+            ConnState::Connected
+        } else {
+            ConnState::Connecting
+        }
+    }
+
+    /// The compact status record for the desktop (adapter is present by
+    /// definition: a stack only exists over a probed NIC).
+    pub fn snapshot(&self, mac: [u8; 6], kind: crate::status::AdapterKind) -> crate::status::NetStatus {
+        let (ip, gateway, dns) = match self.config {
+            Some(NetEvent::LinkConfigured { ip, prefix, gateway, dns, .. }) => (Some((ip, prefix)), gateway, dns),
+            _ => (None, None, None),
+        };
+        crate::status::NetStatus {
+            adapter: true,
+            link_up: self.link_up,
+            state: self.conn_state(),
+            kind,
+            ip,
+            gateway,
+            dns,
+            mac,
+        }
+    }
+
+    /// While the link is up but no lease exists, restarts DHCP on an
+    /// exponential schedule (8 s, 16 s, ... capped at 60 s).
+    fn dhcp_watchdog(&mut self, now_ns: u64) {
+        let Some(h) = self.dhcp else { return };
+        if self.config.is_some() {
+            self.dhcp_backoff_ns = DHCP_RESTART_FIRST_NS;
+            self.dhcp_retry_at_ns = now_ns + DHCP_RESTART_FIRST_NS;
+            return;
+        }
+        if now_ns >= self.dhcp_retry_at_ns {
+            self.sockets.get_mut::<dhcpv4::Socket>(h).reset();
+            self.dhcp_backoff_ns = (self.dhcp_backoff_ns * 2).min(DHCP_RESTART_MAX_NS);
+            self.dhcp_retry_at_ns = now_ns + self.dhcp_backoff_ns;
+        }
     }
 
     /// Access to the transport (host tests only in practice).
@@ -686,9 +786,19 @@ impl<IO: FrameIo> NetStack<IO> {
     /// report events through `on_event`. Returns `true` if any socket state
     /// changed (the caller may poll again at once instead of sleeping).
     pub fn poll(&mut self, now_ns: u64, on_event: &mut dyn FnMut(NetEvent)) -> bool {
+        if !self.link_up {
+            // No link: nothing to send or receive; only report queued events.
+            for slot in self.pending.iter_mut() {
+                if let Some(ev) = slot.take() {
+                    on_event(ev);
+                }
+            }
+            return false;
+        }
         let now = instant_from_ns(now_ns);
         let moved = matches!(self.iface.poll(now, &mut self.device, &mut self.sockets), PollResult::SocketStateChanged);
         self.poll_dhcp();
+        self.dhcp_watchdog(now_ns);
         self.collect_ping(now_ns);
         self.collect_dns(now_ns);
         // A lease acquired above may let queued datagrams/queries leave now.

@@ -356,7 +356,11 @@ fn handle_poll_frame(drv: &mut crate::VirtioNet) -> DriverResponse {
         return DriverResponse::Failed { code: DriverErrorCode::ProbeFailed };
     }
     // SAFETY: `drv.is_ready()` (checked above) means `probe` already
-    // mapped every region and set up both queues.
+    // mapped every region and set up both queues. The link byte is
+    // refreshed on every poll: Netstack polls continuously, so this cheap
+    // config read is the link-change detection.
+    unsafe { drv.refresh_link() };
+    // SAFETY: same contract.
     match unsafe { drv.poll_rx() } {
         Some(len) => DriverResponse::FrameReceived { len },
         None => DriverResponse::Failed { code: DriverErrorCode::NoData },

@@ -222,6 +222,15 @@ pub const VIRTIO_F_VERSION_1: u32 = 1 << (32 - 32);
 /// backend always does); when present, `do_probe` reads a real MAC from
 /// `virtio_net_config::mac` instead of using `FALLBACK_MAC`.
 pub const VIRTIO_NET_F_MAC: u32 = 1 << 5;
+/// `VIRTIO_NET_F_STATUS` (feature bit 16, word 0, spec 5.1.3): the device
+/// reports its link state in `virtio_net_config::status` (offset 6, bit 0 =
+/// `VIRTIO_NET_S_LINK_UP`). Negotiated when offered; without it the link is
+/// assumed up forever.
+pub const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
+/// `virtio_net_config::status` offset (after the 6-byte MAC).
+pub const CONFIG_STATUS_OFFSET: usize = 6;
+/// `VIRTIO_NET_S_LINK_UP`.
+pub const VIRTIO_NET_S_LINK_UP: u16 = 1;
 
 /// A locally-administered, clearly-synthetic MAC (`02:...` — the
 /// "locally administered, unicast" bit pattern, RFC-reserved for exactly
@@ -332,6 +341,12 @@ pub mod layout {
     /// uses in the other direction (`drv_blk_write_call`'s `DATA_OFFSET`
     /// write).
     pub const MAC_OFFSET: usize = 8;
+    /// RX region only: one byte, 1 once the driver has published a link
+    /// reading (0 = never). Netstack reads it straight from the shared page.
+    pub const LINK_VALID_OFFSET: usize = 14;
+    /// RX region only: one byte, 1 = link up, 0 = link down. Refreshed by
+    /// `do_probe` and on every `PollFrame` (`VirtioNet::refresh_link`).
+    pub const LINK_UP_OFFSET: usize = 15;
     /// The descriptor table (`QUEUE_SIZE` * 16 bytes).
     pub const DESC_OFFSET: usize = 16;
     /// The avail (driver) ring.
@@ -475,6 +490,8 @@ pub struct VirtioNet {
     tx_next_idx: u16,
     /// The negotiated device MAC (all-zero until `do_probe` runs).
     mac: [u8; 6],
+    /// Whether `VIRTIO_NET_F_STATUS` was negotiated (link state readable).
+    status_negotiated: bool,
     /// `Transport::Pci` only: the RX queue's own `queue_notify_off`
     /// (`pci_common::QUEUE_NOTIFY_OFF`'s own doc comment), read once
     /// during `probe` and cached. Always `0` (harmless — never read) for
@@ -507,6 +524,7 @@ impl VirtioNet {
             rx_next_idx: 0,
             tx_next_idx: 0,
             mac: [0; 6],
+            status_negotiated: false,
             rx_notify_off: 0,
             tx_notify_off: 0,
             msix_vector: VIRTIO_MSI_NO_VECTOR,
@@ -538,6 +556,7 @@ impl VirtioNet {
             rx_next_idx: 0,
             tx_next_idx: 0,
             mac: [0; 6],
+            status_negotiated: false,
             rx_notify_off: 0,
             tx_notify_off: 0,
             msix_vector,
@@ -896,8 +915,13 @@ impl VirtioNet {
             let dev_features_lo = self.read_device_feature(0);
             let dev_features_hi = self.read_device_feature(1);
             let mac_offered = dev_features_lo & VIRTIO_NET_F_MAC != 0;
+            let status_offered = dev_features_lo & VIRTIO_NET_F_STATUS != 0;
+            self.status_negotiated = status_offered;
 
-            self.write_driver_feature(0, if mac_offered { VIRTIO_NET_F_MAC } else { 0 });
+            self.write_driver_feature(
+                0,
+                (if mac_offered { VIRTIO_NET_F_MAC } else { 0 }) | (if status_offered { VIRTIO_NET_F_STATUS } else { 0 }),
+            );
             self.write_driver_feature(1, dev_features_hi & VIRTIO_F_VERSION_1);
 
             self.write_status(status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK);
@@ -962,6 +986,8 @@ impl VirtioNet {
         // verified by the caller `probe`); RX_QUEUE was just enabled
         // above.
         unsafe { self.post_rx_buffer() };
+        // SAFETY: same contract (probe finished, config space readable).
+        unsafe { self.refresh_link() };
 
         Ok(())
     }
@@ -1112,6 +1138,34 @@ impl VirtioNet {
         // SAFETY: `post_rx_buffer`'s own contract (`self.rx_base` mapped).
         unsafe { self.post_rx_buffer() };
         Some(total_len.saturating_sub(VIRTIO_NET_HDR_LEN as u32))
+    }
+
+    /// Current link state: the device's `status` config field when
+    /// `VIRTIO_NET_F_STATUS` was negotiated, else always up.
+    ///
+    /// # Safety
+    /// Same contract as `read_config_byte` (probe finished).
+    pub unsafe fn link_up(&self) -> bool {
+        if !self.status_negotiated {
+            return true;
+        }
+        // SAFETY: forwarded.
+        let lo = unsafe { self.read_config_byte(CONFIG_STATUS_OFFSET) } as u16;
+        lo & VIRTIO_NET_S_LINK_UP != 0
+    }
+
+    /// Publishes the current link state into the RX region header
+    /// (`layout::LINK_UP_OFFSET`) for Netstack to read.
+    ///
+    /// # Safety
+    /// `self.rx_base` mapped and probe finished.
+    pub unsafe fn refresh_link(&self) {
+        // SAFETY: forwarded; header bytes lie inside the mapped RX region.
+        unsafe {
+            let up = self.link_up();
+            ((self.rx_base + layout::LINK_UP_OFFSET) as *mut u8).write_volatile(up as u8);
+            ((self.rx_base + layout::LINK_VALID_OFFSET) as *mut u8).write_volatile(1);
+        }
     }
 
     /// Whether `probe` has completed successfully.

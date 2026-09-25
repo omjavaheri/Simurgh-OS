@@ -730,3 +730,92 @@ fn no_link_lost_event_before_the_first_lease() {
     let events = run_until(&mut stack, &mut now, 5_000, is_configured);
     assert!(!events.iter().any(|e| matches!(e, NetEvent::LinkLost)), "spurious LinkLost: {events:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Link state: cable/Wi-Fi drop and return, DHCP retry
+// ---------------------------------------------------------------------------
+
+use crate::status::{AdapterKind, ConnState};
+
+#[test]
+fn link_down_drops_the_lease_and_reports_disconnected() {
+    let (mut stack, mut now) = leased_stack();
+    assert_eq!(stack.conn_state(), ConnState::Connected);
+    stack.set_link(false, now * 1_000_000);
+    let events = run_until(&mut stack, &mut now, 5, |_| false);
+    assert!(events.contains(&NetEvent::LinkLost), "events: {events:?}");
+    assert_eq!(stack.conn_state(), ConnState::Disconnected);
+    assert_eq!(stack.config(), None);
+    let snap = stack.snapshot(OUR_MAC, AdapterKind::Ethernet);
+    assert_eq!((snap.adapter, snap.link_up, snap.state, snap.ip), (true, false, ConnState::Disconnected, None));
+}
+
+#[test]
+fn nothing_is_sent_while_the_link_is_down() {
+    let (mut stack, mut now) = leased_stack();
+    stack.set_link(false, now * 1_000_000);
+    let sent = stack.io().sent.len();
+    run_until(&mut stack, &mut now, 30_000, |_| false);
+    assert_eq!(stack.io().sent.len(), sent);
+}
+
+#[test]
+fn link_up_reruns_dhcp_and_connects_again() {
+    let (mut stack, mut now) = leased_stack();
+    let discovers = stack.io().dhcp_discovers;
+    stack.set_link(false, now * 1_000_000);
+    run_until(&mut stack, &mut now, 2_000, |_| false);
+    stack.set_link(true, now * 1_000_000);
+    assert_eq!(stack.conn_state(), ConnState::Connecting);
+    let events = run_until(&mut stack, &mut now, 5_000, is_configured);
+    assert!(events.iter().any(is_configured), "no new lease after link up");
+    assert_eq!(stack.conn_state(), ConnState::Connected);
+    assert!(stack.io().dhcp_discovers > discovers, "DHCP was not re-run");
+    let snap = stack.snapshot(OUR_MAC, AdapterKind::Ethernet);
+    assert_eq!((snap.ip, snap.gateway, snap.dns), (Some((OUR_IP, 24)), Some(GW_IP), Some(DNS_IP)));
+}
+
+#[test]
+fn link_up_with_a_silent_dhcp_server_keeps_retrying_with_backoff_then_connects() {
+    let mut stack = new_stack_with(AddrMode::Dhcp);
+    stack.io_mut().answer_dhcp = false;
+    let mut now = 0;
+    run_until(&mut stack, &mut now, 1_000, |_| false);
+    stack.set_link(false, now * 1_000_000);
+    stack.set_link(true, now * 1_000_000);
+    let before = stack.io().dhcp_discovers;
+    // Two minutes of silence: still Connecting, DISCOVER keeps going out.
+    run_until(&mut stack, &mut now, 120_000, |_| false);
+    assert_eq!(stack.conn_state(), ConnState::Connecting);
+    assert!(stack.io().dhcp_discovers >= before + 3, "only {} new DISCOVERs", stack.io().dhcp_discovers - before);
+    // The server comes back: the very next restart or retransmit connects.
+    stack.io_mut().answer_dhcp = true;
+    let events = run_until(&mut stack, &mut now, 70_000, is_configured);
+    assert!(events.iter().any(is_configured), "never connected after the server returned");
+    assert_eq!(stack.conn_state(), ConnState::Connected);
+}
+
+#[test]
+fn repeated_link_reports_are_idempotent() {
+    let (mut stack, mut now) = leased_stack();
+    let discovers = stack.io().dhcp_discovers;
+    stack.set_link(true, now * 1_000_000);
+    stack.set_link(true, now * 1_000_000);
+    run_until(&mut stack, &mut now, 100, |_| false);
+    assert_eq!(stack.io().dhcp_discovers, discovers);
+    assert_eq!(stack.conn_state(), ConnState::Connected);
+}
+
+#[test]
+fn static_configuration_is_restored_when_the_link_returns() {
+    let mut stack = new_stack();
+    let mut now = 0;
+    assert_eq!(stack.conn_state(), ConnState::Connected);
+    stack.set_link(false, 0);
+    assert_eq!(stack.conn_state(), ConnState::Disconnected);
+    stack.set_link(true, 1_000_000);
+    assert_eq!(stack.conn_state(), ConnState::Connected);
+    stack.ping(GW_IP, 1, now * 1_000_000).unwrap();
+    let events = run_until(&mut stack, &mut now, 500, is_reply);
+    assert!(events.iter().any(is_reply));
+}

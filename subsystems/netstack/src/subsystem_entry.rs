@@ -703,6 +703,54 @@ const PING_BURST_INTERVAL_NS: u64 = 1_000_000_000;
 /// ...then one heartbeat ping per interval, forever.
 const PING_HEARTBEAT_INTERVAL_NS: u64 = 30_000_000_000;
 
+
+/// VA of the network status page in THIS process (read/write): the kernel
+/// maps the same physical frame READ-ONLY into ui-core. Must stay numerically
+/// equal to `kernel_arch_glue::NETSTACK_NETINFO_VA`. Layout: `crate::status`.
+const NETINFO_VA: usize = 0xD8C0_0000;
+/// `driver_virtio_net::layout::LINK_VALID_OFFSET` / `LINK_UP_OFFSET` - must
+/// stay numerically equal.
+const LINK_VALID_OFFSET: usize = 14;
+const LINK_UP_OFFSET: usize = 15;
+
+/// Reads the driver's published link state: `None` until the driver has
+/// written a reading, then `Some(up)`.
+///
+/// # Safety
+/// `DRV_RX_VA` must be mapped (true from process entry onward).
+unsafe fn read_link() -> Option<bool> {
+    // SAFETY: forwarded.
+    unsafe {
+        if ((DRV_RX_VA + LINK_VALID_OFFSET) as *const u8).read_volatile() == 0 {
+            return None;
+        }
+        Some(((DRV_RX_VA + LINK_UP_OFFSET) as *const u8).read_volatile() != 0)
+    }
+}
+
+/// Publishes `s` on the status page under the seqlock protocol of
+/// `crate::status` and returns the new (even) sequence value.
+fn publish_status(s: &crate::status::NetStatus, prev_seq: u32) -> u32 {
+    let next = prev_seq.wrapping_add(2);
+    let mut buf = [0u8; crate::status::NET_STATUS_LEN];
+    crate::status::encode(s, next, &mut buf);
+    // SAFETY: `NETINFO_VA` is mapped `U=1 R+W` in this process's own address
+    // space by the kernel before this thread runs; all writes stay inside the
+    // first `NET_STATUS_LEN` bytes of that page.
+    unsafe {
+        let base = NETINFO_VA as *mut u8;
+        // Odd = writer inside.
+        (base.add(crate::status::off::SEQ) as *mut u32).write_volatile(prev_seq | 1);
+        for (i, b) in buf.iter().enumerate() {
+            if i < crate::status::off::SEQ || i >= crate::status::off::SEQ + 4 {
+                base.add(i).write_volatile(*b);
+            }
+        }
+        (base.add(crate::status::off::SEQ) as *mut u32).write_volatile(next);
+    }
+    next
+}
+
 /// Reads the kernel's monotonic clock.
 fn now_ns() -> u64 {
     // SAFETY: `raw_syscall`'s own contract; never blocks.
@@ -840,8 +888,27 @@ fn service_main() -> ! {
     let mut next_ping_ns = start;
     let mut next_dns_ns = start;
     let mut dns_busy = false;
+    // Status page: published at start ("connecting": an adapter exists, no
+    // address yet) and again whenever the snapshot changes.
+    let mut info_seq: u32 = 0;
+    let mut published = stack.snapshot(mac, crate::status::AdapterKind::Ethernet);
+    info_seq = publish_status(&published, info_seq);
     loop {
         let now = now_ns();
+        // Link tracking. While the link is down the stack does not poll the
+        // driver, so poke it here: the driver refreshes its link byte on every
+        // PollFrame (a frame arriving while down is discarded).
+        if !stack.link_up() {
+            // SAFETY: `call_driver`'s own contract.
+            let _ = unsafe { call_driver(&DriverRequest::PollFrame) };
+        }
+        // SAFETY: `DRV_RX_VA` is mapped from process entry onward.
+        if let Some(up) = unsafe { read_link() } {
+            if up != stack.link_up() {
+                nlog!("link {}", if up { "up: restarting DHCP" } else { "down: cable/Wi-Fi lost, will keep retrying" });
+                stack.set_link(up, now);
+            }
+        }
         // Only act while the interface has an address.
         if let Some(NetEvent::LinkConfigured { gateway, .. }) = stack.config() {
             if let Some(gw) = gateway {
@@ -877,10 +944,16 @@ fn service_main() -> ! {
                     next_ping_ns = 0;
                     next_dns_ns = 0;
                 }
+                NetEvent::LinkLost => dns_busy = false,
                 _ => {}
             }
             log_event(ev);
         });
+        let snap = stack.snapshot(mac, crate::status::AdapterKind::Ethernet);
+        if snap != published {
+            info_seq = publish_status(&snap, info_seq);
+            published = snap;
+        }
         let now = now_ns();
         let wait = stack.poll_delay_ms(now).map(|ms| ms * 1_000_000).unwrap_or(IDLE_POLL_NS).clamp(1_000_000, IDLE_POLL_NS);
         sleep_ns(wait);

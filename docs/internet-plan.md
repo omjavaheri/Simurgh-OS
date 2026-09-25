@@ -200,7 +200,7 @@ use the `smoltcp` crate (no_std) for TCP/IP instead of hand-writing it
 
 | Phase | Status | Evidence |
 |---|---|---|
-| 0 - `-Net` switch, desktop boots with virtio-net | done (2026-09-25) | `simurgh-run.ps1 -Desktop -Net` boots to ui-core; serial: `driver-virtio-net (U-mode, x86_64): real VirtioNet::probe() succeeded=true`, then `ui-core ... self_check ... ok=true` |
+| 0 - `-Net` switch, desktop boots with virtio-net | done (2026-09-25) | `simurgh-run.ps1 -Desktop` (now with the NIC by default, `-NoNet` opts out) boots to ui-core; serial: `driver-virtio-net (U-mode, x86_64): real VirtioNet::probe() succeeded=true`, then `ui-core ... self_check ... ok=true` |
 | 1 - persistent netstack on smoltcp: ARP, IPv4, ICMP | done on x86_64 (2026-09-25) | desktop image with `-Net`: `netstack: link up: 10.0.2.15/24 gateway 10.0.2.2`, then `netstack: ping reply from 10.0.2.2: seq=1..11 time=..ms`; 11 new host tests |
 | 2 - UDP, DHCP client, DNS resolver | done on x86_64 (2026-09-25) | desktop image with `-Net`: `netstack: link up (DHCP lease): address 10.0.2.15/24 gateway 10.0.2.2 dns 10.0.2.3`, `netstack: dns: example.com resolved to 104.20.23.154`, later lookups `(from cache)`; 18 more host tests (42 in netstack) |
 | 3+ | not started | - |
@@ -292,3 +292,91 @@ Phase 2 notes (2026-09-25):
   is one feature away; the real work is the IPC socket protocol and the
   capability model (TODO(spec) 4/5), the driver buffer size (700-byte frames,
   2-descriptor queues), and a NIC RX notification instead of polling.
+
+### Link state and the network status page (2026-09-25)
+
+Owner requirement: the network icon (desktop tray and login screen) shows the
+REAL state, an interrupted link shows as disconnected, and the system keeps
+retrying and reconnects on its own. Wi-Fi hardware support does not exist yet,
+so this is implemented and tested on the virtio-net link ("cable").
+
+Data flow: virtio config `status` -> driver -> Netstack -> status page -> ui-core.
+
+1. Driver (`driver-virtio-net`): negotiates `VIRTIO_NET_F_STATUS` (bit 16) when
+   offered and reads `virtio_net_config::status` bit 0 (`LINK_UP`). Without the
+   feature the link is assumed up. The reading is published in the RX region
+   header (`LINK_VALID_OFFSET` 14, `LINK_UP_OFFSET` 15) at probe and on every
+   `PollFrame`. No config-change interrupt is used: Netstack polls at least
+   every 10 ms, so a link change is seen within one poll (poll, not IRQ).
+2. Netstack: `NetStack::set_link(up, now)`. Link down drops the lease and
+   address, clears the outstanding ping and DNS slots, queues `LinkLost`, and
+   the stack stops transmitting/receiving. Link up restarts DHCP at once (or
+   restores a static configuration). While the link is up and no lease exists a
+   watchdog restarts DHCP on an exponential schedule (8 s, 16 s, ... capped at
+   60 s; smoltcp also retransmits DISCOVER itself). The service thread pokes the
+   driver with a `PollFrame` while the link is down, since the stack does not
+   poll it then. State: `conn_state()` = Disconnected (no link) / Connecting
+   (link, no address) / Connected. "No adapter" is the absence of the page.
+3. Status page: ONE 4 KiB frame carved on first use by the kernel
+   (`kernel_arch_glue::net_info_frame`), mapped read-write into the Netstack
+   process (`NETSTACK_NETINFO_VA` 0xD8C0_0000) and read-only (`R | U`) into
+   ui-core only at `UI_CORE_NET_INFO_VA` = `0xD8B0_3000` (right after the two
+   device-list pages). A machine without a NIC never starts Netstack, so the
+   page stays zero and ui-core reads "no adapter". x86_64 only for the ui-core
+   mapping (same as the machine-id/device-list pages).
+
+   Little-endian, 48 bytes used (`netstack::status`):
+
+   | Offset | Size | Field |
+   |---|---|---|
+   | 0 | u64 | magic `0x5349_4D4E_4554_0001` ("SIMNET" + layout 1); wrong magic = no adapter |
+   | 8 | u32 | seqlock counter: odd while Netstack writes, even when stable; `seq / 2` is the generation |
+   | 12 | u8 | flags: 1 adapter present, 2 link up, 4 IPv4 valid, 8 gateway valid, 16 DNS valid |
+   | 13 | u8 | state: 0 no adapter, 1 disconnected, 2 connecting, 3 connected |
+   | 14 | u8 | kind: 0 none, 1 Ethernet, 2 Wi-Fi |
+   | 15 | u8 | IPv4 prefix length |
+   | 16 / 20 / 24 | 4 bytes each | IPv4 address / gateway / DNS server |
+   | 28 | 6 bytes | MAC |
+
+   A reader copies the 48 bytes and drops the copy if `seq` is odd or changed.
+   ui-core reads it once per loop iteration (48 bytes and a compare) and only
+   redraws when the generation changes; while "connecting" the icon animates
+   (amber, arcs appear one by one).
+
+   TODO(spec): who may read this page is decided by kernel code that maps it
+   into ui-core only, not by a capability (same open question as machine-id
+   TODO-5). Wi-Fi: the record already has `kind = 2`; scanning, SSIDs, keys and
+   roaming need their own design.
+4. ui-core: `netinfo.rs` decodes the page; the tray icon and the login-screen
+   icon share one drawing (`tray::draw_icon`): no adapter = dim with a red
+   slash, disconnected = dim with a red exclamation mark, connecting = amber
+   animated, connected = normal. The flyout (click) shows state, address,
+   gateway, DNS and MAC; on the login screen it opens above the icon and has no
+   "Open Settings" row.
+5. `simurgh-run.ps1 -Desktop` and `simurgh-login-test.ps1` now attach the
+   virtio NIC by default (`-NoNet` opts out); the demo image keeps `-net none`.
+
+Evidence (x86_64, WHPX, desktop image, QEMU HMP `set_link n0 off|on` where
+`n0` is the `-netdev` id): boot shows connected `10.0.2.15/24` on the tray and
+the login icon (flyout: Ethernet, 10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3,
+MAC 52:54:00:12:34:56); after `set_link n0 off` both icons show disconnected
+within a few seconds (red exclamation, flyout "Network: disconnected"); after
+`set_link n0 on` DHCP runs again and both return to connected. Serial:
+
+```
+netstack: link up (DHCP lease): address 10.0.2.15/24 gateway 10.0.2.2 dns 10.0.2.3
+netstack: link down: cable/Wi-Fi lost, will keep retrying
+netstack: link down: DHCP lease lost, waiting for a new one
+netstack: link up: restarting DHCP
+netstack: link up (DHCP lease): address 10.0.2.15/24 gateway 10.0.2.2 dns 10.0.2.3
+```
+
+Without a NIC (`-net none`) the icon reads "no adapter". Host tests: 11
+netstack (status encode/decode, link down/up, silent DHCP with backoff,
+idempotence, static restore, no traffic while down) and 7 ui-core (page decode,
+state mapping, watcher, login icon states and flyout).
+
+Gaps: the "connecting" state was not caught in a screenshot (DHCP completes in
+about a second on QEMU user networking; it is covered by host tests); the
+driver reports the link by polling, not by the config-change interrupt;
+riscv64/aarch64 only compile; no Wi-Fi hardware.
