@@ -46,7 +46,24 @@ kernel-ipc   = { path = "../../kernel/kernel-ipc" }
 [dependencies.smoltcp]
 version = "0.12"
 default-features = false
-features = ["proto-ipv4", "proto-dhcpv4", "proto-dns", "medium-ethernet", "socket-icmp", "socket-udp", "socket-dhcpv4", "socket-dns"]
+features = [
+    "proto-ipv4", "proto-ipv6", "proto-dhcpv4", "proto-dns",
+    "proto-ipv4-fragmentation", "proto-ipv6-fragmentation",
+    "medium-ethernet",
+    "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns",
+    "socket-tcp-cubic", "socket-tcp-reno",
+    "multicast",
+    # Static sizing (no heap): 8 interface addresses (LAN v4, link-local, SLAAC,
+    # DHCPv6, loopbacks), 16 multicast groups (solicited-node per address), 16
+    # neighbours, 4 routes, 4 DNS servers/results, 8 out-of-order TCP segments,
+    # 2 IP reassembly buffers of 4 KiB.
+    "iface-max-addr-count-8", "iface-max-multicast-group-count-16",
+    "iface-neighbor-cache-count-16", "iface-max-route-count-4",
+    "dns-max-server-count-4", "dns-max-result-count-4",
+    "assembler-max-segment-count-8",
+    "reassembly-buffer-size-4096", "reassembly-buffer-count-2",
+    "fragmentation-buffer-size-4096",
+]
 
 [dev-dependencies]
 # Host tests assert the numeric constants `subsystem_entry` duplicates (region

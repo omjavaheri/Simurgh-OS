@@ -51,6 +51,9 @@
 
 extern crate alloc;
 
+pub mod ndp_wire;
+pub mod selftest;
+pub mod sockets;
 pub mod stack;
 pub mod status;
 pub mod subsystem_entry;

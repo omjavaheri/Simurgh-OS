@@ -26,11 +26,17 @@
 
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{dhcpv4, dns, icmp, udp};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
     Ipv4Address,
+};
+
+use crate::ndp_wire::{self, Ip6, Mac};
+use crate::sockets::{
+    SocketTable, ICMP_BUF, ICMP_PACKETS, ICMP_SOCKETS, TCP_RX_BUF, TCP_SOCKETS, TCP_TX_BUF, UDP_BUF, UDP_PACKETS,
+    UDP_SOCKETS,
 };
 
 /// Largest Ethernet frame the driver's buffers hold
@@ -51,8 +57,8 @@ pub const DHCP_RESTART_MAX_NS: u64 = 60_000_000_000;
 pub const PING_TIMEOUT_MS: i64 = 1_000;
 
 /// ICMP identifier every echo request from this stack carries. One
-/// requester per stack today; a real socket API (Phase 3) will hand out
-/// identifiers per socket.
+/// requester per stack today; the socket layer's raw-ICMP sockets use their
+/// own identifiers and cannot bind this one.
 pub const PING_IDENT: u16 = 0x5151;
 
 /// Payload every echo request carries (visible in packet captures).
@@ -73,25 +79,218 @@ pub trait FrameIo {
     fn recv_frame(&mut self, buf: &mut [u8]) -> Option<usize>;
     /// Transmits one frame (at most `MAX_FRAME` bytes). `false` when the
     /// driver refused it; the stack treats that as a lost packet and relies
-    /// on protocol retransmission (ARP retry, DHCP/DNS retry, ...).
+    /// on protocol retransmission (ARP retry, DHCP/DNS retry, TCP, ...).
     fn send_frame(&mut self, frame: &[u8]) -> bool;
+}
+
+/// A fixed ring of whole frames (no heap): the loopback queue and the
+/// control-plane tap.
+pub struct FrameQueue<const N: usize> {
+    data: [[u8; MAX_FRAME]; N],
+    lens: [u16; N],
+    head: usize,
+    count: usize,
+}
+
+impl<const N: usize> FrameQueue<N> {
+    /// An empty queue (all zero bytes, so it can live in `.bss`).
+    pub const fn new() -> Self {
+        Self { data: [[0; MAX_FRAME]; N], lens: [0; N], head: 0, count: 0 }
+    }
+
+    /// Appends a copy of `frame`; `false` (frame dropped) when full or too big.
+    pub fn push(&mut self, frame: &[u8]) -> bool {
+        if self.count == N || frame.len() > MAX_FRAME {
+            return false;
+        }
+        let i = (self.head + self.count) % N;
+        self.data[i][..frame.len()].copy_from_slice(frame);
+        self.lens[i] = frame.len() as u16;
+        self.count += 1;
+        true
+    }
+
+    /// Removes the oldest frame into `buf`, returning its length.
+    pub fn pop_into(&mut self, buf: &mut [u8]) -> Option<usize> {
+        if self.count == 0 {
+            return None;
+        }
+        let n = (self.lens[self.head] as usize).min(buf.len());
+        buf[..n].copy_from_slice(&self.data[self.head][..n]);
+        self.head = (self.head + 1) % N;
+        self.count -= 1;
+        Some(n)
+    }
+
+    /// Frames queued.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// `true` when nothing is queued.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+impl<const N: usize> Default for FrameQueue<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// IPv6 addresses the interface can hold besides the two loopbacks and the
+/// IPv4 address (8 interface slots in total).
+pub const V6_ADDRS: usize = 5;
+
+/// Most `iface.poll` rounds one `NetStack::poll` runs to settle loopback traffic.
+pub const LOOP_ROUNDS: usize = 16;
+
+/// Loopback frames waiting to be "received" (127.0.0.1, ::1, own addresses).
+pub const LOOP_QUEUE: usize = 16;
+
+/// How often the loopback neighbour entries are re-seeded (they expire after
+/// 60 s in smoltcp).
+pub const NEIGHBOR_SEED_INTERVAL_NS: u64 = 20_000_000_000;
+/// Control-plane frames (ND, DHCPv6) copied aside for the SLAAC/DHCPv6 state
+/// machines.
+pub const CTL_QUEUE: usize = 6;
+
+/// Ethernet address the loopback pseudo-neighbour answers with (locally
+/// administered, never on the wire).
+pub const LOOP_MAC: Mac = [0x02, 0x53, 0x4c, 0x4f, 0x4f, 0x50];
+
+/// The host's own addresses as the device layer needs them to decide what
+/// never leaves the machine.
+#[derive(Clone, Copy, Default)]
+pub struct LocalAddrs {
+    /// Our Ethernet address.
+    pub mac: Mac,
+    /// Configured IPv4 address of the LAN interface.
+    pub v4: Option<[u8; 4]>,
+    /// Configured IPv6 addresses.
+    pub v6: [Option<Ip6>; V6_ADDRS],
+}
+
+impl LocalAddrs {
+    fn is_local_v4(&self, a: &[u8]) -> bool {
+        a[0] == 127 || self.v4.map(|v| v[..] == *a).unwrap_or(false)
+    }
+
+    fn is_local_v6(&self, a: &[u8]) -> bool {
+        a == ndp_wire::LOOPBACK || self.v6.iter().flatten().any(|v| v[..] == *a)
+    }
+}
+
+/// What to do with a frame the stack wants to transmit.
+enum TxRoute {
+    /// Put it on the wire.
+    Wire,
+    /// Deliver it back to ourselves (destination is one of our addresses).
+    Loop,
+    /// A neighbour-discovery query about one of our own addresses: answer it
+    /// locally with this pre-built reply (length in the second field).
+    Answer([u8; ndp_wire::MAX_ND_FRAME], usize),
+}
+
+/// Decides whether `frame` (as smoltcp built it) is for the wire, for
+/// ourselves, or an ND query we must answer. Loopback needs no special
+/// interface in smoltcp 0.12: the single Ethernet interface resolves
+/// 127.0.0.1/::1 like any on-link neighbour (ARP/NS), the answer comes from
+/// here, and frames addressed to ourselves never touch the driver.
+fn route_tx(frame: &[u8], local: &LocalAddrs) -> TxRoute {
+    if frame.len() < 14 {
+        return TxRoute::Wire;
+    }
+    match [frame[12], frame[13]] {
+        // IPv4
+        [0x08, 0x00] if frame.len() >= 34 && frame[14] >> 4 == 4 => {
+            if local.is_local_v4(&frame[30..34]) || frame[26] == 127 {
+                TxRoute::Loop
+            } else {
+                TxRoute::Wire
+            }
+        }
+        // ARP request for one of our addresses: we are the neighbour.
+        [0x08, 0x06] if frame.len() >= 42 && frame[20..22] == [0, 1] && local.is_local_v4(&frame[38..42]) => {
+            let mut r = [0u8; ndp_wire::MAX_ND_FRAME];
+            r[0..6].copy_from_slice(&local.mac);
+            r[6..12].copy_from_slice(&LOOP_MAC);
+            r[12..14].copy_from_slice(&[0x08, 0x06]);
+            r[14..20].copy_from_slice(&[0, 1, 8, 0, 6, 4]);
+            r[20..22].copy_from_slice(&[0, 2]);
+            r[22..28].copy_from_slice(&LOOP_MAC);
+            r[28..32].copy_from_slice(&frame[38..42]);
+            r[32..38].copy_from_slice(&local.mac);
+            r[38..42].copy_from_slice(&frame[28..32]);
+            TxRoute::Answer(r, 42)
+        }
+        // IPv6
+        [0x86, 0xdd] if frame.len() >= 54 && frame[14] >> 4 == 6 => {
+            let (src, dst) = (&frame[22..38], &frame[38..54]);
+            // Neighbor solicitation for one of our own addresses.
+            if frame[20] == 58 && frame.len() >= 78 && frame[54] == ndp_wire::icmp6::NEIGHBOR_SOLICIT {
+                let target = &frame[62..78];
+                if local.is_local_v6(target) && src != ndp_wire::UNSPECIFIED {
+                    let mut t = [0u8; 16];
+                    t.copy_from_slice(target);
+                    let mut asker = [0u8; 16];
+                    asker.copy_from_slice(src);
+                    let mut r = [0u8; ndp_wire::MAX_ND_FRAME];
+                    let flags = ndp_wire::NaFlags { router: false, solicited: true, override_: true };
+                    if let Some(n) =
+                        ndp_wire::build_na(&mut r, &LOOP_MAC, &local.mac, &t, &asker, &t, flags, Some(&LOOP_MAC))
+                    {
+                        return TxRoute::Answer(r, n);
+                    }
+                }
+            }
+            if dst[0] != 0xff && local.is_local_v6(dst) || local.is_local_v6(src) && src == ndp_wire::LOOPBACK {
+                TxRoute::Loop
+            } else {
+                TxRoute::Wire
+            }
+        }
+        _ => TxRoute::Wire,
+    }
+}
+
+/// `true` for frames the SLAAC/DHCPv6 machines care about: ICMPv6 router/
+/// neighbour discovery messages and UDP to/from the DHCPv6 client port.
+fn is_control_frame(frame: &[u8]) -> bool {
+    if frame.len() < 14 + 40 + 4 || frame[12..14] != [0x86, 0xdd] {
+        return false;
+    }
+    match frame[20] {
+        58 => (133..=137).contains(&frame[54]),
+        _ => false,
+    }
 }
 
 /// smoltcp `Device` adapter over a `FrameIo`.
 ///
-/// `receive` pulls at most one frame from the transport into `rx` (one
-/// staging buffer, no queue: the driver's own RX queue is the queue) and
-/// `transmit` hands out a token that builds the frame on the stack and sends
-/// it when consumed.
+/// `receive` first drains the loopback queue, then pulls at most one frame
+/// from the transport into `rx` (one staging buffer: the driver's own RX
+/// queue is the queue), copying ND messages aside for the SLAAC machine.
+/// `transmit` hands out a token that builds the frame on the stack and routes
+/// it (`route_tx`) when consumed.
 pub struct FrameDevice<IO: FrameIo> {
     io: IO,
     rx: [u8; MAX_FRAME],
+    lo: &'static mut FrameQueue<LOOP_QUEUE>,
+    ctl: &'static mut FrameQueue<CTL_QUEUE>,
+    local: LocalAddrs,
 }
 
 impl<IO: FrameIo> FrameDevice<IO> {
     /// Wraps `io`.
-    pub fn new(io: IO) -> Self {
-        Self { io, rx: [0; MAX_FRAME] }
+    pub fn new(
+        io: IO,
+        mac: Mac,
+        lo: &'static mut FrameQueue<LOOP_QUEUE>,
+        ctl: &'static mut FrameQueue<CTL_QUEUE>,
+    ) -> Self {
+        Self { io, rx: [0; MAX_FRAME], lo, ctl, local: LocalAddrs { mac, ..LocalAddrs::default() } }
     }
 
     /// Access to the transport (tests inspect their mock through this).
@@ -102,6 +301,37 @@ impl<IO: FrameIo> FrameDevice<IO> {
     /// Mutable access to the transport.
     pub fn io_mut(&mut self) -> &mut IO {
         &mut self.io
+    }
+
+    /// Tells the device layer which addresses are ours.
+    pub fn set_local(&mut self, v4: Option<[u8; 4]>, v6: [Option<Ip6>; V6_ADDRS]) {
+        self.local.v4 = v4;
+        self.local.v6 = v6;
+    }
+
+    /// Loopback frames waiting to be received.
+    pub fn loop_pending(&self) -> usize {
+        self.lo.len()
+    }
+
+    /// Queues a frame to be received as if it had arrived from the wire.
+    pub fn inject_loopback(&mut self, frame: &[u8]) {
+        let _ = self.lo.push(frame);
+    }
+
+    /// Our Ethernet address.
+    pub fn mac(&self) -> Mac {
+        self.local.mac
+    }
+
+    /// Takes the oldest control-plane frame (ND message) into `buf`.
+    pub fn take_control(&mut self, buf: &mut [u8]) -> Option<usize> {
+        self.ctl.pop_into(buf)
+    }
+
+    /// Sends a frame built outside smoltcp (RS, DAD NS) straight to the wire.
+    pub fn send_raw(&mut self, frame: &[u8]) -> bool {
+        self.io.send_frame(frame)
     }
 }
 
@@ -119,6 +349,8 @@ impl RxToken for FrameRxToken<'_> {
 /// Permission to send exactly one frame.
 pub struct FrameTxToken<'a, IO: FrameIo> {
     io: &'a mut IO,
+    lo: &'a mut FrameQueue<LOOP_QUEUE>,
+    local: &'a LocalAddrs,
 }
 
 impl<IO: FrameIo> TxToken for FrameTxToken<'_, IO> {
@@ -129,8 +361,22 @@ impl<IO: FrameIo> TxToken for FrameTxToken<'_, IO> {
         let len = len.min(MAX_FRAME);
         let mut buf = [0u8; MAX_FRAME];
         let result = f(&mut buf[..len]);
-        // A refused frame is a lost packet; the protocols above retry.
-        let _ = self.io.send_frame(&buf[..len]);
+        // A refused or dropped frame is a lost packet; the protocols retry.
+        match route_tx(&buf[..len], self.local) {
+            TxRoute::Wire => {
+                let _ = self.io.send_frame(&buf[..len]);
+            }
+            TxRoute::Loop => {
+                // Deliver to ourselves: rewrite the Ethernet header so the
+                // interface accepts it as unicast for us.
+                buf[0..6].copy_from_slice(&self.local.mac);
+                buf[6..12].copy_from_slice(&LOOP_MAC);
+                let _ = self.lo.push(&buf[..len]);
+            }
+            TxRoute::Answer(reply, n) => {
+                let _ = self.lo.push(&reply[..n]);
+            }
+        }
         result
     }
 }
@@ -146,16 +392,29 @@ impl<IO: FrameIo> Device for FrameDevice<IO> {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let n = self.io.recv_frame(&mut self.rx)?;
+        let Self { io, rx, lo, ctl, local } = self;
+        let n = match lo.pop_into(&mut rx[..]) {
+            Some(n) => n,
+            None => {
+                let n = io.recv_frame(&mut rx[..])?;
+                let n = n.min(MAX_FRAME);
+                if is_control_frame(&rx[..n]) {
+                    // Full queue: the ND message is dropped; routers repeat
+                    // advertisements and the machines retransmit.
+                    let _ = ctl.push(&rx[..n]);
+                }
+                n
+            }
+        };
         if n == 0 {
             return None;
         }
-        let n = n.min(MAX_FRAME);
-        Some((FrameRxToken { frame: &self.rx[..n] }, FrameTxToken { io: &mut self.io }))
+        Some((FrameRxToken { frame: &rx[..n] }, FrameTxToken { io, lo, local }))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(FrameTxToken { io: &mut self.io })
+        let Self { io, lo, local, .. } = self;
+        Some(FrameTxToken { io, lo, local })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -172,9 +431,13 @@ impl<IO: FrameIo> Device for FrameDevice<IO> {
 // Storage
 // ---------------------------------------------------------------------------
 
-/// Number of smoltcp sockets the stack can hold: ICMP, UDP, DHCP, DNS (+2
-/// spare for the socket API of phase 3).
-const SOCKET_SLOTS: usize = 6;
+/// smoltcp sockets that are not part of the user socket table: ICMP echo (the
+/// stack's own ping), one generic UDP, DNS, DHCPv4, the DHCPv6 client's UDP
+/// socket, plus spares.
+const SYSTEM_SOCKETS: usize = 8;
+
+/// Number of smoltcp sockets the stack can hold.
+const SOCKET_SLOTS: usize = SYSTEM_SOCKETS + TCP_SOCKETS + UDP_SOCKETS + ICMP_SOCKETS;
 
 /// Concurrent DNS lookups (smoltcp query slots) and the owner-visible token
 /// space of `dns_resolve`.
@@ -191,13 +454,16 @@ const DNS_CACHE_SLOTS: usize = 4;
 /// instead of the server's value.
 pub const DNS_CACHE_TTL_NS: u64 = 300 * 1_000_000_000;
 
-/// Largest UDP payload the generic UDP socket buffers (one datagram at a
-/// time; fits the driver's 700-byte frames).
+/// Largest UDP payload the generic system UDP socket buffers (one datagram at
+/// a time; the user socket table has its own, larger, UDP sockets).
 pub const UDP_PAYLOAD_MAX: usize = 512;
 
-/// All memory the stack uses. No heap: sockets and their buffers are carved
-/// out of this one struct, which the caller places in a `static` (the process
-/// image) or leaks (host tests).
+/// DHCPv6 datagram buffer of the client's socket.
+pub const DHCP6_BUF: usize = 1024;
+
+/// Socket metadata and the small system-socket buffers. Modest in size (it is
+/// constructed by value in tests); the big payload buffers are in
+/// `StackBuffers`.
 pub struct StackStorage {
     sockets: [SocketStorage<'static>; SOCKET_SLOTS],
     icmp_rx_meta: [icmp::PacketMetadata; 4],
@@ -208,7 +474,15 @@ pub struct StackStorage {
     udp_rx_data: [u8; UDP_PAYLOAD_MAX],
     udp_tx_meta: [udp::PacketMetadata; 4],
     udp_tx_data: [u8; UDP_PAYLOAD_MAX],
+    dhcp6_rx_meta: [udp::PacketMetadata; 2],
+    dhcp6_rx_data: [u8; DHCP6_BUF],
+    dhcp6_tx_meta: [udp::PacketMetadata; 2],
+    dhcp6_tx_data: [u8; DHCP6_BUF],
     dns_queries: [Option<dns::DnsQuery>; DNS_SLOTS],
+    user_udp_rx_meta: [[udp::PacketMetadata; UDP_PACKETS]; UDP_SOCKETS],
+    user_udp_tx_meta: [[udp::PacketMetadata; UDP_PACKETS]; UDP_SOCKETS],
+    user_icmp_rx_meta: [[icmp::PacketMetadata; ICMP_PACKETS]; ICMP_SOCKETS],
+    user_icmp_tx_meta: [[icmp::PacketMetadata; ICMP_PACKETS]; ICMP_SOCKETS],
 }
 
 impl StackStorage {
@@ -224,7 +498,15 @@ impl StackStorage {
             udp_rx_data: [0; UDP_PAYLOAD_MAX],
             udp_tx_meta: [udp::PacketMetadata::EMPTY; 4],
             udp_tx_data: [0; UDP_PAYLOAD_MAX],
+            dhcp6_rx_meta: [udp::PacketMetadata::EMPTY; 2],
+            dhcp6_rx_data: [0; DHCP6_BUF],
+            dhcp6_tx_meta: [udp::PacketMetadata::EMPTY; 2],
+            dhcp6_tx_data: [0; DHCP6_BUF],
             dns_queries: [const { None }; DNS_SLOTS],
+            user_udp_rx_meta: [[udp::PacketMetadata::EMPTY; UDP_PACKETS]; UDP_SOCKETS],
+            user_udp_tx_meta: [[udp::PacketMetadata::EMPTY; UDP_PACKETS]; UDP_SOCKETS],
+            user_icmp_rx_meta: [[icmp::PacketMetadata::EMPTY; ICMP_PACKETS]; ICMP_SOCKETS],
+            user_icmp_tx_meta: [[icmp::PacketMetadata::EMPTY; ICMP_PACKETS]; ICMP_SOCKETS],
         }
     }
 }
@@ -234,6 +516,46 @@ impl Default for StackStorage {
         Self::new()
     }
 }
+
+/// The socket payload buffers and frame queues: ONLY zero bytes, so this
+/// whole block is `.bss` in the process image (it adds nothing to the ELF).
+/// About 1.9 MiB: 16 TCP sockets with 64 KiB receive and 32 KiB send buffers
+/// (1.5 MiB), 16 UDP sockets with 8 KiB each way, 4 raw-ICMP sockets, and the
+/// loopback/control frame queues.
+#[repr(C)]
+pub struct StackBuffers {
+    tcp_rx: [[u8; TCP_RX_BUF]; TCP_SOCKETS],
+    tcp_tx: [[u8; TCP_TX_BUF]; TCP_SOCKETS],
+    udp_rx: [[u8; UDP_BUF]; UDP_SOCKETS],
+    udp_tx: [[u8; UDP_BUF]; UDP_SOCKETS],
+    icmp_rx: [[u8; ICMP_BUF]; ICMP_SOCKETS],
+    icmp_tx: [[u8; ICMP_BUF]; ICMP_SOCKETS],
+    pub(crate) lo: FrameQueue<LOOP_QUEUE>,
+    pub(crate) ctl: FrameQueue<CTL_QUEUE>,
+}
+
+impl StackBuffers {
+    /// An all-zero buffer block.
+    pub const fn new() -> Self {
+        Self {
+            tcp_rx: [[0; TCP_RX_BUF]; TCP_SOCKETS],
+            tcp_tx: [[0; TCP_TX_BUF]; TCP_SOCKETS],
+            udp_rx: [[0; UDP_BUF]; UDP_SOCKETS],
+            udp_tx: [[0; UDP_BUF]; UDP_SOCKETS],
+            icmp_rx: [[0; ICMP_BUF]; ICMP_SOCKETS],
+            icmp_tx: [[0; ICMP_BUF]; ICMP_SOCKETS],
+            lo: FrameQueue::new(),
+            ctl: FrameQueue::new(),
+        }
+    }
+}
+
+impl Default for StackBuffers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Configuration and events
@@ -390,13 +712,15 @@ const PENDING_EVENTS: usize = 8;
 /// (it is what moves frames and runs protocol timers); everything else only
 /// queues work for the next `poll`.
 pub struct NetStack<IO: FrameIo> {
-    device: FrameDevice<IO>,
-    iface: Interface,
-    sockets: SocketSet<'static>,
+    pub(crate) device: FrameDevice<IO>,
+    pub(crate) iface: Interface,
+    pub(crate) sockets: SocketSet<'static>,
     icmp: SocketHandle,
     udp: SocketHandle,
     dns: SocketHandle,
     dhcp: Option<SocketHandle>,
+    /// UDP socket of the DHCPv6 client (port 546).
+    dhcp6: SocketHandle,
     ping: Option<OutstandingPing>,
     dns_slots: [Option<DnsSlot>; DNS_SLOTS],
     dns_cache: [Option<DnsCacheEntry>; DNS_CACHE_SLOTS],
@@ -411,6 +735,20 @@ pub struct NetStack<IO: FrameIo> {
     /// DHCP restart schedule while the link is up but no lease exists.
     dhcp_retry_at_ns: u64,
     dhcp_backoff_ns: u64,
+    /// The user socket table (`sockets.rs`).
+    pub(crate) table: SocketTable,
+    /// Clock of the last `poll` (the socket layer stamps deadlines with it).
+    pub(crate) now_ns: u64,
+    /// IPv4 address of the LAN interface (static or leased).
+    lan_v4: Option<([u8; 4], u8)>,
+    /// IPv6 addresses of the LAN interface (link-local, SLAAC, DHCPv6).
+    lan_v6: [Option<(Ip6, u8)>; V6_ADDRS],
+    /// When the loopback neighbour entries are next refreshed.
+    next_seed_ns: u64,
+    /// IPv4 DNS server (DHCP/static).
+    dns_v4: Option<[u8; 4]>,
+    /// IPv6 DNS servers (RDNSS/DHCPv6).
+    dns_v6: [Option<Ip6>; 3],
 }
 
 /// Converts the process clock (nanoseconds) to smoltcp's `Instant`.
@@ -424,7 +762,14 @@ fn v4(a: [u8; 4]) -> Ipv4Address {
 
 impl<IO: FrameIo> NetStack<IO> {
     /// Builds the stack over `io` with hardware address `mac`.
-    pub fn new(storage: &'static mut StackStorage, io: IO, mac: [u8; 6], mode: AddrMode, now_ns: u64) -> Self {
+    pub fn new(
+        storage: &'static mut StackStorage,
+        bufs: &'static mut StackBuffers,
+        io: IO,
+        mac: [u8; 6],
+        mode: AddrMode,
+        now_ns: u64,
+    ) -> Self {
         let StackStorage {
             sockets,
             icmp_rx_meta,
@@ -435,15 +780,25 @@ impl<IO: FrameIo> NetStack<IO> {
             udp_rx_data,
             udp_tx_meta,
             udp_tx_data,
+            dhcp6_rx_meta,
+            dhcp6_rx_data,
+            dhcp6_tx_meta,
+            dhcp6_tx_data,
             dns_queries,
+            user_udp_rx_meta,
+            user_udp_tx_meta,
+            user_icmp_rx_meta,
+            user_icmp_tx_meta,
         } = storage;
+        let StackBuffers { tcp_rx, tcp_tx, udp_rx, udp_tx, icmp_rx, icmp_tx, lo, ctl } = bufs;
 
-        let mut device = FrameDevice::new(io);
+        let mut device = FrameDevice::new(io, mac, lo, ctl);
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         // Not cryptographic: seeds smoltcp's source ports, DNS transaction ids
         // and DHCP xid/jitter. Mixing the MAC in keeps two VMs booted at the
         // same instant apart.
-        config.random_seed = now_ns ^ u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0x5A, 0xA5]);
+        let seed = now_ns ^ u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0x5A, 0xA5]);
+        config.random_seed = seed;
         let iface = Interface::new(config, &mut device, instant_from_ns(now_ns));
 
         let mut socket_set = SocketSet::new(&mut sockets[..]);
@@ -463,6 +818,35 @@ impl<IO: FrameIo> NetStack<IO> {
             AddrMode::Dhcp => Some(socket_set.add(dhcpv4::Socket::new())),
             AddrMode::Static { .. } => None,
         };
+        let dhcp6 = socket_set.add(udp::Socket::new(
+            udp::PacketBuffer::new(&mut dhcp6_rx_meta[..], &mut dhcp6_rx_data[..]),
+            udp::PacketBuffer::new(&mut dhcp6_tx_meta[..], &mut dhcp6_tx_data[..]),
+        ));
+
+        // The user socket pools: every smoltcp socket exists from the start
+        // (its buffers are static); the table only hands them out.
+        let mut tcp_h = [SocketHandle::default(); TCP_SOCKETS];
+        for (h, (rx, tx)) in tcp_h.iter_mut().zip(tcp_rx.iter_mut().zip(tcp_tx.iter_mut())) {
+            *h = socket_set.add(tcp::Socket::new(tcp::SocketBuffer::new(&mut rx[..]), tcp::SocketBuffer::new(&mut tx[..])));
+        }
+        let mut udp_h = [SocketHandle::default(); UDP_SOCKETS];
+        let udp_sets = user_udp_rx_meta.iter_mut().zip(user_udp_tx_meta.iter_mut());
+        let udp_bufs = udp_rx.iter_mut().zip(udp_tx.iter_mut());
+        for (h, ((rxm, txm), (rxd, txd))) in udp_h.iter_mut().zip(udp_sets.zip(udp_bufs)) {
+            *h = socket_set.add(udp::Socket::new(
+                udp::PacketBuffer::new(&mut rxm[..], &mut rxd[..]),
+                udp::PacketBuffer::new(&mut txm[..], &mut txd[..]),
+            ));
+        }
+        let mut icmp_h = [SocketHandle::default(); ICMP_SOCKETS];
+        let icmp_sets = user_icmp_rx_meta.iter_mut().zip(user_icmp_tx_meta.iter_mut());
+        let icmp_bufs = icmp_rx.iter_mut().zip(icmp_tx.iter_mut());
+        for (h, ((rxm, txm), (rxd, txd))) in icmp_h.iter_mut().zip(icmp_sets.zip(icmp_bufs)) {
+            *h = socket_set.add(icmp::Socket::new(
+                icmp::PacketBuffer::new(&mut rxm[..], &mut rxd[..]),
+                icmp::PacketBuffer::new(&mut txm[..], &mut txd[..]),
+            ));
+        }
 
         let mut stack = Self {
             device,
@@ -472,6 +856,7 @@ impl<IO: FrameIo> NetStack<IO> {
             udp,
             dns,
             dhcp,
+            dhcp6,
             ping: None,
             dns_slots: [None; DNS_SLOTS],
             dns_cache: [None; DNS_CACHE_SLOTS],
@@ -482,7 +867,15 @@ impl<IO: FrameIo> NetStack<IO> {
             static_cfg: None,
             dhcp_retry_at_ns: now_ns + DHCP_RESTART_FIRST_NS,
             dhcp_backoff_ns: DHCP_RESTART_FIRST_NS,
+            table: SocketTable::new(tcp_h, udp_h, icmp_h, seed),
+            now_ns,
+            lan_v4: None,
+            lan_v6: [None; V6_ADDRS],
+            next_seed_ns: 0,
+            dns_v4: None,
+            dns_v6: [None; 3],
         };
+        stack.rebuild_addrs();
         if let AddrMode::Static { ip, prefix, gateway, dns } = mode {
             stack.static_cfg = Some((ip, prefix, gateway, dns));
             stack.apply_config(ip, prefix, Some(gateway), dns, false);
@@ -497,13 +890,87 @@ impl<IO: FrameIo> NetStack<IO> {
         // A full queue drops the event: the owner is not polling at all then.
     }
 
-    /// Installs an address configuration (static or from a lease).
-    fn apply_config(&mut self, ip: [u8; 4], prefix: u8, gateway: Option<[u8; 4]>, dns: Option<[u8; 4]>, dhcp: bool) {
-        let addr = v4(ip);
+    /// Rebuilds the interface's address list from the configured state: the
+    /// LAN IPv4 address, the IPv6 addresses (link-local, SLAAC, DHCPv6), then
+    /// the loopback addresses 127.0.0.1/8 and ::1/128. Order matters for
+    /// smoltcp's IPv6 source selection: the loopback goes last so a global or
+    /// link-local address is the first candidate. Also tells the device layer
+    /// which addresses are ours (frames to them never leave the machine).
+    pub(crate) fn rebuild_addrs(&mut self) {
+        let v4 = self.lan_v4;
+        let v6 = self.lan_v6;
         self.iface.update_ip_addrs(|addrs| {
             addrs.clear();
-            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(addr), prefix));
+            if let Some((ip, prefix)) = v4 {
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])), prefix));
+            }
+            for (a, prefix) in v6.iter().flatten() {
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(*a)), *prefix));
+            }
+            let _ = addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8));
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(ndp_wire::LOOPBACK)), 128));
         });
+        let mut local6 = [None; V6_ADDRS];
+        for (dst, src) in local6.iter_mut().zip(v6.iter()) {
+            *dst = src.map(|(a, _)| a);
+        }
+        self.device.set_local(v4.map(|(ip, _)| ip), local6);
+        self.seed_local_neighbors();
+    }
+
+    /// Pre-fills smoltcp's neighbour cache with the pseudo-neighbour that
+    /// answers for our own addresses (127.0.0.1, ::1, the LAN and IPv6
+    /// addresses): an unsolicited ARP reply/neighbor advertisement per address,
+    /// looped into the receive path. smoltcp rate-limits neighbour discovery to
+    /// one request per second for the whole interface, so without this the first
+    /// connection to ::1 right after one to 127.0.0.1 (or to a real host) would
+    /// stall for up to a second. The cache flushes on every address change and
+    /// entries live 60 s, so this runs after each rebuild and every 20 s.
+    pub(crate) fn seed_local_neighbors(&mut self) {
+        let mac = self.device_mac();
+        let mut targets_v4 = [[127, 0, 0, 1], [0; 4]];
+        let mut n4 = 1;
+        if let Some((ip, _)) = self.lan_v4 {
+            targets_v4[1] = ip;
+            n4 = 2;
+        }
+        for ip in &targets_v4[..n4] {
+            let mut r = [0u8; 42];
+            r[0..6].copy_from_slice(&mac);
+            r[6..12].copy_from_slice(&LOOP_MAC);
+            r[12..14].copy_from_slice(&[0x08, 0x06]);
+            r[14..20].copy_from_slice(&[0, 1, 8, 0, 6, 4]);
+            r[20..22].copy_from_slice(&[0, 2]);
+            r[22..28].copy_from_slice(&LOOP_MAC);
+            r[28..32].copy_from_slice(ip);
+            r[32..38].copy_from_slice(&mac);
+            r[38..42].copy_from_slice(ip);
+            self.device.inject_loopback(&r);
+        }
+        let mut addrs6 = [ndp_wire::LOOPBACK; V6_ADDRS + 1];
+        let mut n6 = 1;
+        for (a, _) in self.lan_v6.iter().flatten() {
+            addrs6[n6] = *a;
+            n6 += 1;
+        }
+        for a in &addrs6[..n6] {
+            let mut r = [0u8; ndp_wire::MAX_ND_FRAME];
+            let flags = ndp_wire::NaFlags { router: false, solicited: false, override_: true };
+            if let Some(len) = ndp_wire::build_na(&mut r, &LOOP_MAC, &mac, a, a, a, flags, Some(&LOOP_MAC)) {
+                self.device.inject_loopback(&r[..len]);
+            }
+        }
+        self.next_seed_ns = self.now_ns + NEIGHBOR_SEED_INTERVAL_NS;
+    }
+
+    fn device_mac(&self) -> Mac {
+        self.device.mac()
+    }
+
+    /// Installs an address configuration (static or from a lease).
+    fn apply_config(&mut self, ip: [u8; 4], prefix: u8, gateway: Option<[u8; 4]>, dns: Option<[u8; 4]>, dhcp: bool) {
+        self.lan_v4 = Some((ip, prefix));
+        self.rebuild_addrs();
         match gateway {
             Some(gw) => {
                 let _ = self.iface.routes_mut().add_default_ipv4_route(v4(gw));
@@ -512,23 +979,40 @@ impl<IO: FrameIo> NetStack<IO> {
                 self.iface.routes_mut().remove_default_ipv4_route();
             }
         }
-        let dns_socket = self.sockets.get_mut::<dns::Socket>(self.dns);
-        match dns {
-            Some(d) => dns_socket.update_servers(&[IpAddress::Ipv4(v4(d))]),
-            None => dns_socket.update_servers(&[]),
-        }
+        self.dns_v4 = dns;
+        self.refresh_dns_servers();
         let ev = NetEvent::LinkConfigured { ip, prefix, gateway, dns, dhcp };
         self.config = Some(ev);
         self.queue_event(ev);
     }
 
-    /// Drops the address configuration (lease lost).
+    /// Drops the IPv4 address configuration (lease lost).
     fn clear_config(&mut self) {
-        self.iface.update_ip_addrs(|addrs| addrs.clear());
+        self.lan_v4 = None;
+        self.rebuild_addrs();
         self.iface.routes_mut().remove_default_ipv4_route();
-        self.sockets.get_mut::<dns::Socket>(self.dns).update_servers(&[]);
+        self.dns_v4 = None;
+        self.refresh_dns_servers();
         self.config = None;
         self.queue_event(NetEvent::LinkLost);
+    }
+
+    /// Pushes the known DNS servers (IPv4 from DHCP/static, IPv6 from RDNSS/
+    /// DHCPv6) into the resolver socket.
+    pub(crate) fn refresh_dns_servers(&mut self) {
+        let mut servers = [IpAddress::v4(0, 0, 0, 0); 4];
+        let mut n = 0;
+        if let Some(d) = self.dns_v4 {
+            servers[n] = IpAddress::Ipv4(v4(d));
+            n += 1;
+        }
+        for a in self.dns_v6.iter().flatten() {
+            if n < servers.len() {
+                servers[n] = IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(*a));
+                n += 1;
+            }
+        }
+        self.sockets.get_mut::<dns::Socket>(self.dns).update_servers(&servers[..n]);
     }
 
     /// The current configuration event (`LinkConfigured`), or `None` while the
@@ -676,7 +1160,7 @@ impl<IO: FrameIo> NetStack<IO> {
     pub fn udp_recv(&mut self, buf: &mut [u8]) -> Option<UdpDatagram> {
         let socket = self.sockets.get_mut::<udp::Socket>(self.udp);
         let (len, meta) = socket.recv_slice(buf).ok()?;
-        let IpAddress::Ipv4(src) = meta.endpoint.addr;
+        let IpAddress::Ipv4(src) = meta.endpoint.addr else { return None };
         Some(UdpDatagram { src: src.octets(), src_port: meta.endpoint.port, len })
     }
 
@@ -727,9 +1211,9 @@ impl<IO: FrameIo> NetStack<IO> {
                 }
                 Ok(addrs) => {
                     self.dns_slots[token] = None;
-                    let first = addrs.iter().map(|a| {
-                        let IpAddress::Ipv4(v) = *a;
-                        v.octets()
+                    let first = addrs.iter().filter_map(|a| match *a {
+                        IpAddress::Ipv4(v) => Some(v.octets()),
+                        IpAddress::Ipv6(_) => None,
                     });
                     match first.into_iter().next() {
                         Some(addr) => {
@@ -794,15 +1278,19 @@ impl<IO: FrameIo> NetStack<IO> {
             }
             return false;
         }
+        self.now_ns = now_ns;
         let now = instant_from_ns(now_ns);
-        let moved = matches!(self.iface.poll(now, &mut self.device, &mut self.sockets), PollResult::SocketStateChanged);
+        let moved = self.run_interface(now);
         self.poll_dhcp();
         self.dhcp_watchdog(now_ns);
         self.collect_ping(now_ns);
         self.collect_dns(now_ns);
+        self.socket_housekeeping(now_ns);
+        if now_ns >= self.next_seed_ns {
+            self.seed_local_neighbors();
+        }
         // A lease acquired above may let queued datagrams/queries leave now.
-        let moved2 =
-            matches!(self.iface.poll(now, &mut self.device, &mut self.sockets), PollResult::SocketStateChanged);
+        let moved2 = self.run_interface(now);
         for slot in self.pending.iter_mut() {
             if let Some(ev) = slot.take() {
                 on_event(ev);
@@ -811,13 +1299,32 @@ impl<IO: FrameIo> NetStack<IO> {
         moved || moved2
     }
 
+    /// Runs smoltcp's interface until loopback traffic has settled: frames a
+    /// socket sent to 127.0.0.1/::1/one of our addresses sit in the device's
+    /// loop queue and are received by the NEXT round, so a request, its reply
+    /// and the ACKs can all complete inside one `poll`. Bounded so a
+    /// misbehaving pair of sockets cannot spin forever.
+    fn run_interface(&mut self, now: Instant) -> bool {
+        let mut moved = false;
+        for _ in 0..LOOP_ROUNDS {
+            moved |= matches!(
+                self.iface.poll(now, &mut self.device, &mut self.sockets),
+                PollResult::SocketStateChanged
+            );
+            if self.device.loop_pending() == 0 {
+                break;
+            }
+        }
+        moved
+    }
+
     fn collect_ping(&mut self, now_ns: u64) {
         let now_ms = (now_ns / 1_000_000) as i64;
         let checksum = self.device.capabilities().checksum;
         let mut events = [None, None];
         let socket = self.sockets.get_mut::<icmp::Socket>(self.icmp);
         while let Ok((payload, from)) = socket.recv() {
-            let IpAddress::Ipv4(from) = from;
+            let IpAddress::Ipv4(from) = from else { continue };
             let Ok(packet) = Icmpv4Packet::new_checked(payload) else { continue };
             let Ok(Icmpv4Repr::EchoReply { ident, seq_no, .. }) = Icmpv4Repr::parse(&packet, &checksum) else {
                 continue;
@@ -845,7 +1352,7 @@ impl<IO: FrameIo> NetStack<IO> {
     /// scheduled; use the caller's idle interval). Zero while events are
     /// waiting to be reported.
     pub fn poll_delay_ms(&mut self, now_ns: u64) -> Option<u64> {
-        if self.pending.iter().any(|e| e.is_some()) {
+        if self.pending.iter().any(|e| e.is_some()) || self.device.loop_pending() > 0 {
             return Some(0);
         }
         self.iface.poll_delay(instant_from_ns(now_ns), &self.sockets).map(|d| d.total_millis())
@@ -855,3 +1362,7 @@ impl<IO: FrameIo> NetStack<IO> {
 #[cfg(test)]
 #[path = "stack_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sockets_tests.rs"]
+pub(crate) mod socket_tests;

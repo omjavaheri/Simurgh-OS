@@ -842,6 +842,14 @@ impl crate::stack::FrameIo for DriverIo {
 /// All memory of the smoltcp stack; `.bss`, zero-initialised by the loader.
 static mut STACK_STORAGE: crate::stack::StackStorage = crate::stack::StackStorage::new();
 
+/// Socket payload buffers and frame queues: all zero bytes, so `.bss` (about
+/// 1.9 MiB, nothing in the ELF file).
+static mut STACK_BUFFERS: crate::stack::StackBuffers = crate::stack::StackBuffers::new();
+
+/// The stack itself lives in `.bss` too: it holds the interface state, the
+/// socket table and DNS cache, far too much for the thread's 32 KiB stack.
+static mut STACK_CELL: core::mem::MaybeUninit<crate::stack::NetStack<DriverIo>> = core::mem::MaybeUninit::uninit();
+
 /// Dotted-quad display for log lines (no heap).
 struct Ip([u8; 4]);
 
@@ -894,6 +902,27 @@ fn log_event(ev: crate::stack::NetEvent) {
     }
 }
 
+/// Prints one boot self-check result on the serial console.
+fn log_test_event(ev: crate::selftest::TestEvent) {
+    use crate::selftest::{Family, TestEvent};
+    let fam = |f: Family| if f == Family::V4 { "127.0.0.1" } else { "::1" };
+    let verdict = |ok: bool| if ok { "ok" } else { "FAILED" };
+    match ev {
+        TestEvent::TcpLoopback { family, ok, bytes } => {
+            nlog!("selftest: tcp loopback echo on {}: {} bytes back, {}", fam(family), bytes, verdict(ok))
+        }
+        TestEvent::UdpLoopback { family, ok } => nlog!("selftest: udp loopback echo on {}: {}", fam(family), verdict(ok)),
+        TestEvent::RawIcmp { family, ok } => nlog!("selftest: raw icmp echo on {}: {}", fam(family), verdict(ok)),
+        TestEvent::Http { addr, ok, status, status_len, bytes, error } => {
+            let line = core::str::from_utf8(&status[..status_len]).unwrap_or("?");
+            match error {
+                None => nlog!("selftest: http GET / from {}:80: \"{}\" ({} bytes), {}", addr, line, bytes, verdict(ok)),
+                Some(e) => nlog!("selftest: http GET / from {}:80 failed: {:?}, {}", addr, e, verdict(false)),
+            }
+        }
+    }
+}
+
 /// The persistent Netstack service (second thread of this process, started
 /// by `kernel_arch_glue::netstack_start_service` on the desktop image): owns
 /// the smoltcp stack and polls it with a sleep in between. It gets its
@@ -908,7 +937,11 @@ fn service_main() -> ! {
     // touches it, and it is taken exactly once.
     let storage = unsafe { &mut *core::ptr::addr_of_mut!(STACK_STORAGE) };
     let start = now_ns();
-    let mut stack = crate::stack::NetStack::new(storage, DriverIo, mac, crate::stack::AddrMode::Dhcp, start);
+    // SAFETY: same single-thread argument as `storage`.
+    let bufs = unsafe { &mut *core::ptr::addr_of_mut!(STACK_BUFFERS) };
+    let new_stack = crate::stack::NetStack::new(storage, bufs, DriverIo, mac, crate::stack::AddrMode::Dhcp, start);
+    // SAFETY: written exactly once, then only used through this reference.
+    let stack = unsafe { (*core::ptr::addr_of_mut!(STACK_CELL)).write(new_stack) };
     nlog!(
         "service: smoltcp stack up, nic mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, asking DHCP for an address",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
@@ -919,6 +952,12 @@ fn service_main() -> ! {
     let mut next_ping_ns = start;
     let mut next_dns_ns = start;
     let mut dns_busy = false;
+    // Boot self-checks (loopback TCP/UDP/ICMP now, an HTTP GET once the test
+    // name resolves) and how many HTTP attempts were queued (retried on later
+    // lookups if the first one failed, up to 3).
+    let mut checks = crate::selftest::BootChecks::new();
+    let mut http_attempts: u8 = 0;
+    let mut http_ok = false;
     // Status page: published at start ("connecting": an adapter exists, no
     // address yet) and again whenever the snapshot changes.
     let mut info_seq: u32 = 0;
@@ -962,9 +1001,22 @@ fn service_main() -> ! {
                 }
             }
         }
+        checks.step(stack, now, &mut |ev| {
+            if let crate::selftest::TestEvent::Http { ok, .. } = ev {
+                http_ok = ok;
+            }
+            log_test_event(ev);
+        });
         stack.poll(now, &mut |ev| {
             match ev {
-                NetEvent::DnsResolved { .. } => dns_busy = false,
+                NetEvent::DnsResolved { addr, cached, .. } => {
+                    dns_busy = false;
+                    // First real answer: prove TCP end to end against the resolved address.
+                    if !http_ok && http_attempts < 3 {
+                        http_attempts += 1;
+                        checks.queue_http(smoltcp::wire::IpAddress::v4(addr[0], addr[1], addr[2], addr[3]), DNS_TEST_NAME);
+                    }
+                }
                 NetEvent::DnsFailed { .. } => {
                     dns_busy = false;
                     next_dns_ns = now_ns() + DNS_RETRY_NS;

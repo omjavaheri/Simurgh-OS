@@ -309,10 +309,25 @@ impl MockLan {
         }
     }
 }
+/// A zeroed `StackBuffers` on the heap (it is ~2 MiB: never build it by value
+/// on a test thread's stack). All-zero bytes are a valid value of every field.
+pub(crate) fn leak_buffers() -> &'static mut StackBuffers {
+    let layout = std::alloc::Layout::new::<StackBuffers>();
+    // SAFETY: non-zero size; the allocation is zeroed, which is a valid
+    // `StackBuffers` (only integers and counters); it is leaked on purpose.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout) as *mut StackBuffers;
+        assert!(!p.is_null());
+        &mut *p
+    }
+}
+
+pub(crate) fn leak_storage() -> &'static mut StackStorage {
+    Box::leak(Box::new(StackStorage::new()))
+}
 
 fn new_stack_with(mode: AddrMode) -> NetStack<MockLan> {
-    let storage: &'static mut StackStorage = Box::leak(Box::new(StackStorage::new()));
-    NetStack::new(storage, MockLan::new(), OUR_MAC, mode, 0)
+    NetStack::new(leak_storage(), leak_buffers(), MockLan::new(), OUR_MAC, mode, 0)
 }
 
 fn new_stack() -> NetStack<MockLan> {
@@ -394,7 +409,9 @@ fn ping_gateway_resolves_arp_then_gets_reply() {
     assert_eq!((from, seq), (GW_IP, 1));
     // First frame out is the ARP request, second the echo request to the MAC
     // the ARP reply taught the stack.
-    let sent = &stack.io().sent;
+    // (MLD reports for the solicited-node groups may precede them: IPv6 is
+    // filtered out, this test is about the IPv4 exchange.)
+    let sent: Vec<&Vec<u8>> = stack.io().sent.iter().filter(|f| f[12..14] != [0x86, 0xdd]).collect();
     assert_eq!(sent[0][12..14], [0x08, 0x06], "first frame must be ARP");
     assert_eq!(sent[1][12..14], [0x08, 0x00], "second frame must be IPv4");
     assert_eq!(sent[1][0..6], GW_MAC, "echo request must use the ARP-resolved MAC");
@@ -506,7 +523,8 @@ fn oversized_receive_is_clamped_and_nothing_transmitted_exceeds_the_driver_buffe
 
 #[test]
 fn device_reports_ethernet_with_driver_sized_mtu() {
-    let dev = FrameDevice::new(MockLan::new());
+    let bufs = leak_buffers();
+    let dev = FrameDevice::new(MockLan::new(), OUR_MAC, &mut bufs.lo, &mut bufs.ctl);
     let caps = dev.capabilities();
     assert_eq!(caps.medium, Medium::Ethernet);
     assert_eq!(caps.max_transmission_unit, MAX_FRAME);
