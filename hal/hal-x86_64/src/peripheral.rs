@@ -462,6 +462,123 @@ impl PeripheralDiscovery {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Full PCI function inventory (for the DEVICES window's info page only).
+// Recorded once at boot by `record_pci_functions`; read via `pci_functions`.
+// Purely informational: nothing here changes which devices drivers claim.
+// ----------------------------------------------------------------------------
+
+/// One PCI function seen during the full ECAM scan.
+#[derive(Debug, Clone, Copy)]
+pub struct PciFunction {
+    /// Bus number.
+    pub bus: u8,
+    /// Device number (0..32).
+    pub device: u8,
+    /// Function number (0..8).
+    pub function: u8,
+    /// Vendor id.
+    pub vendor_id: u16,
+    /// Device id.
+    pub device_id: u16,
+    /// Class code (config byte 0x0B).
+    pub class_code: u8,
+    /// Subclass (0x0A).
+    pub subclass: u8,
+    /// Programming interface (0x09).
+    pub prog_if: u8,
+    /// MAC address when this is a legacy-I/O virtio network device and the
+    /// MAC could be read (`has_mac`), else zeros.
+    pub mac: [u8; 6],
+    /// Whether `mac` is valid.
+    pub has_mac: bool,
+}
+
+/// Capacity of the recorded PCI inventory.
+pub const MAX_PCI_FUNCTIONS: usize = 96;
+
+const PCI_FUNCTION_ZERO: PciFunction =
+    PciFunction { bus: 0, device: 0, function: 0, vendor_id: 0, device_id: 0, class_code: 0, subclass: 0, prog_if: 0, mac: [0; 6], has_mac: false };
+static mut PCI_FUNCS: [PciFunction; MAX_PCI_FUNCTIONS] = [PCI_FUNCTION_ZERO; MAX_PCI_FUNCTIONS];
+static mut PCI_FUNC_COUNT: usize = 0;
+
+/// Scans every bus/device/function through ECAM and records what is there.
+///
+/// # Safety
+/// Same contract as `ecam_read_u32` (`ecam_base` is `0` or the mapped
+/// firmware ECAM base); must run once, single-core, at boot.
+pub unsafe fn record_pci_functions(ecam_base: u64) {
+    if ecam_base == 0 {
+        return;
+    }
+    let mut n = 0usize;
+    'scan: for bus in 0..=255u8 {
+        for device in 0..32u8 {
+            // SAFETY: forwarded from this function's contract.
+            let Some(h0) = (unsafe { read_pci_header(ecam_base, bus, device, 0) }) else {
+                continue;
+            };
+            let fns = if h0.header_type & 0x80 != 0 { 8 } else { 1 };
+            for function in 0..fns {
+                // SAFETY: as above.
+                let Some(h) = (unsafe { read_pci_header(ecam_base, bus, device, function) }) else {
+                    continue;
+                };
+                if n >= MAX_PCI_FUNCTIONS {
+                    break 'scan;
+                }
+                // SAFETY: as above.
+                let dword0 = unsafe { ecam_read_u32(ecam_base, bus, device, function, 0) };
+                let mut f = PciFunction {
+                    bus,
+                    device,
+                    function,
+                    vendor_id: h.vendor_id,
+                    device_id: (dword0 >> 16) as u16,
+                    class_code: h.class_code,
+                    subclass: h.subclass,
+                    prog_if: h.prog_if,
+                    mac: [0; 6],
+                    has_mac: false,
+                };
+                // Legacy/transitional virtio-net: MAC lives at I/O BAR0 + 0x14.
+                if h.vendor_id == VIRTIO_PCI_VENDOR_ID && h.class_code == 0x02 {
+                    // SAFETY: as above; the I/O-space enable bit is set so the
+                    // BAR answers (the same bit any driver sets anyway).
+                    unsafe {
+                        let bar0 = ecam_read_u32(ecam_base, bus, device, function, 0x10);
+                        if bar0 & 1 == 1 && bar0 & !3 != 0 {
+                            let cmd_ptr = (ecam_base + ecam_offset(bus, device, function) + 4) as *mut u16;
+                            let cmd = cmd_ptr.read_volatile();
+                            cmd_ptr.write_volatile(cmd | 1);
+                            let base = (bar0 & !3) as u16;
+                            let mut ok = false;
+                            for i in 0..6u16 {
+                                let v: u8;
+                                core::arch::asm!("in al, dx", out("al") v, in("dx") base + 0x14 + i, options(nomem, nostack, preserves_flags));
+                                f.mac[i as usize] = v;
+                                ok |= v != 0 && v != 0xFF;
+                            }
+                            f.has_mac = ok;
+                        }
+                    }
+                }
+                // SAFETY: single-core boot, sole writer.
+                unsafe { (*core::ptr::addr_of_mut!(PCI_FUNCS))[n] = f };
+                n += 1;
+            }
+        }
+    }
+    // SAFETY: as above.
+    unsafe { PCI_FUNC_COUNT = n };
+}
+
+/// The PCI functions recorded by `record_pci_functions` (empty before it runs).
+pub fn pci_functions() -> &'static [PciFunction] {
+    // SAFETY: written once at boot before any reader; read-only afterwards.
+    unsafe { &(*core::ptr::addr_of!(PCI_FUNCS))[..PCI_FUNC_COUNT] }
+}
+
 impl hal_core::peripheral::PeripheralDeviceDiscovery for PeripheralDiscovery {
     fn enumerate_peripheral_devices(&self) -> &[PeripheralDevice] {
         &self.devices[..self.device_count]

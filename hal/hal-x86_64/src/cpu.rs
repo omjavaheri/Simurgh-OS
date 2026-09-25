@@ -65,6 +65,45 @@ impl CpuidSource for RealCpuid {
     }
 }
 
+/// CPU identification text (info-only, for the DEVICES window).
+#[derive(Debug, Clone, Copy)]
+pub struct CpuIdentity {
+    /// Brand string (CPUID 0x80000002-4), NUL/space padded.
+    pub brand: [u8; 48],
+    /// Vendor string (CPUID 0), e.g. "GenuineIntel".
+    pub vendor: [u8; 12],
+    /// Display family (base + extended when base is 0xF).
+    pub family: u32,
+    /// Display model (extended model folded in for family 6/0xF).
+    pub model: u32,
+    /// Stepping.
+    pub stepping: u32,
+}
+
+/// Reads the CPU brand, vendor, family, model and stepping via CPUID.
+pub fn cpu_identity(cpuid: &impl CpuidSource) -> CpuIdentity {
+    let l0 = cpuid.cpuid(0, 0);
+    let mut vendor = [0u8; 12];
+    vendor[0..4].copy_from_slice(&l0.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&l0.edx.to_le_bytes());
+    vendor[8..12].copy_from_slice(&l0.ecx.to_le_bytes());
+    let l1 = cpuid.cpuid(1, 0);
+    let base_family = (l1.eax >> 8) & 0xF;
+    let base_model = (l1.eax >> 4) & 0xF;
+    let family = if base_family == 0xF { base_family + ((l1.eax >> 20) & 0xFF) } else { base_family };
+    let model = if base_family == 0x6 || base_family == 0xF { base_model | (((l1.eax >> 16) & 0xF) << 4) } else { base_model };
+    let mut brand = [0u8; 48];
+    if cpuid.cpuid(0x8000_0000, 0).eax >= 0x8000_0004 {
+        for (i, leaf) in (0x8000_0002u32..=0x8000_0004).enumerate() {
+            let r = cpuid.cpuid(leaf, 0);
+            for (j, w) in [r.eax, r.ebx, r.ecx, r.edx].iter().enumerate() {
+                brand[i * 16 + j * 4..i * 16 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+    }
+    CpuIdentity { brand, vendor, family, model, stepping: l1.eax & 0xF }
+}
+
 /// Detects CPU features via CPUID and maps them onto hal-core's
 /// architecture-independent `CpuFeatureFlags` (hal-core/src/cpu.rs).
 ///

@@ -337,6 +337,8 @@ pub extern "C" fn hal_x86_64_rust_entry(uefi_memory_map: *const u8) -> ! {
     // guess.
     let ecam_base = unsafe { memory::acpi_mcfg_ecam_base(memory.rsdp_phys()) }.unwrap_or(0);
     let peripheral = peripheral::PeripheralDiscovery::new(ecam_base);
+    // SAFETY: same ECAM-base contract as the scan above.
+    unsafe { peripheral::record_pci_functions(ecam_base) };
 
     // Built into `.bss` static storage, NOT a plain local — mirrors
     // hal-arm64's own identical fix (`hal_arm64_rust_entry`, this

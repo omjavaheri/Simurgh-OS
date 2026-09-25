@@ -780,8 +780,10 @@ pub fn map_machine_id_info(hal: &HalInterface, root_pt: usize, va: usize) -> Opt
 pub const DEVICE_LIST_MAGIC: u64 = 0x5349_4D44_4556_0001;
 /// Size of one device record in the page.
 pub const DEVICE_REC_SIZE: usize = 96;
-/// Maximum number of records that fit in the one page.
-pub const DEVICE_LIST_MAX: usize = (4096 - 16) / DEVICE_REC_SIZE;
+/// Size of the device-list info page: two 4 KiB pages (ABI version 1, machine-id.md 13.3).
+pub const DEVICE_LIST_PAGE_BYTES: usize = 8192;
+/// Maximum number of records that fit in the two-page list (85).
+pub const DEVICE_LIST_MAX: usize = (DEVICE_LIST_PAGE_BYTES - 16) / DEVICE_REC_SIZE;
 /// Category: processors.
 pub const DEVCAT_PROCESSOR: u8 = 1;
 /// Category: memory.
@@ -800,8 +802,28 @@ pub const DEVCAT_INPUT: u8 = 7;
 pub const DEVCAT_COMPUTE: u8 = 8;
 /// Category: other devices.
 pub const DEVCAT_OTHER: u8 = 9;
+/// Category: USB host controllers ("Universal Serial Bus controllers").
+pub const DEVCAT_USB: u8 = 10;
+/// Category: sound / video / game controllers.
+pub const DEVCAT_SOUND: u8 = 11;
+/// Category: Bluetooth radios (slot; filled by a future USB/PCI driver).
+pub const DEVCAT_BLUETOOTH: u8 = 12;
+/// Category: batteries (slot; needs ACPI battery support).
+pub const DEVCAT_BATTERY: u8 = 13;
+/// Category: cameras (slot; no PCI class exists, needs USB video class).
+pub const DEVCAT_CAMERA: u8 = 14;
+/// Category: portable devices (slot).
+pub const DEVCAT_PORTABLE: u8 = 15;
+/// Category: human interface devices (slot; USB HID).
+pub const DEVCAT_HID: u8 = 16;
+/// Category: modems / cellular.
+pub const DEVCAT_MODEM: u8 = 17;
+/// Category: DVD/CD-ROM drives (slot; needs AHCI/IDE ATAPI IDENTIFY).
+pub const DEVCAT_OPTICAL: u8 = 18;
 
-static mut G_DEVLIST: [u8; 4096] = [0; 4096];
+static mut G_DEVLIST: [u8; DEVICE_LIST_PAGE_BYTES] = [0; DEVICE_LIST_PAGE_BYTES];
+static mut G_DEVCOUNT: usize = 0;
+static mut G_DEVTRUNC: bool = false;
 
 /// Fixed-capacity text buffer that silently truncates (never fails).
 struct FixBuf<const N: usize> {
@@ -1005,30 +1027,270 @@ fn capture_device_list(boot: &BootInfo) {
         w.push(DEVCAT_SYSTEM, &n, None);
     }
 
-    // SAFETY: as in `DevWriter::push`.
+    devlist_flush(&w);
+    klog!("device list: {} device record(s){}\r\n", w.count, if w.truncated { " (truncated)" } else { "" });
+}
+
+/// Writes the header (magic, count, flags) and remembers the writer state so
+/// later `devlist_*` additions can continue after `capture_device_list`.
+fn devlist_flush(w: &DevWriter) {
+    // SAFETY: single-core boot, sole writer (see `DevWriter::push`).
     unsafe {
+        G_DEVCOUNT = w.count;
+        G_DEVTRUNC = w.truncated;
         let page = &mut *core::ptr::addr_of_mut!(G_DEVLIST);
         page[0..8].copy_from_slice(&DEVICE_LIST_MAGIC.to_le_bytes());
         page[8..12].copy_from_slice(&(w.count as u32).to_le_bytes());
         page[12..16].copy_from_slice(&(w.truncated as u32).to_le_bytes());
     }
-    klog!("device list: {} device record(s){}\r\n", w.count, if w.truncated { " (truncated)" } else { "" });
 }
 
-/// Maps the device-list info page READ-ONLY into `root_pt` at `va`
-/// (page-aligned, free). Returns `None` only on allocation/mapping failure.
+fn devlist_writer() -> DevWriter {
+    // SAFETY: single-core boot statics, see `devlist_flush`.
+    unsafe { DevWriter { count: G_DEVCOUNT, truncated: G_DEVTRUNC } }
+}
+
+fn fix_str<const N: usize>(s: &str) -> FixBuf<N> {
+    use core::fmt::Write;
+    let mut b = FixBuf::<N>::new();
+    let _ = b.write_str(s);
+    b
+}
+
+/// Replaces the first processor record with a real CPU name and id text
+/// (called by the x86_64 boot glue after CPUID has been read).
+pub fn devlist_set_cpu(name: &str, id: &str) {
+    let n = fix_str::<48>(name);
+    let i = fix_str::<44>(id);
+    // SAFETY: as `devlist_flush`; record 0 exists (capture always pushes CPU first).
+    unsafe {
+        let page = &mut *core::ptr::addr_of_mut!(G_DEVLIST);
+        let off = 16;
+        page[off..off + DEVICE_REC_SIZE].fill(0);
+        page[off] = DEVCAT_PROCESSOR;
+        page[off + 1] = 1;
+        page[off + 2] = n.n as u8;
+        page[off + 3] = i.n as u8;
+        page[off + 4..off + 4 + n.n].copy_from_slice(&n.b[..n.n]);
+        page[off + 52..off + 52 + i.n].copy_from_slice(&i.b[..i.n]);
+    }
+}
+
+/// Appends one record (extra discovery such as the PCI scan).
+pub fn devlist_add(cat: u8, name: &str, id: Option<&str>) {
+    let n = fix_str::<48>(name);
+    let i = id.map(fix_str::<44>);
+    let mut w = devlist_writer();
+    w.push(cat, &n, i.as_ref());
+    devlist_flush(&w);
+}
+
+/// Removes up to `limit` existing records of category `cat_a`/`cat_b` (0 = no
+/// match) whose id text starts with `prefix` (replaces coarse manifest
+/// records by richer ones).
+fn devlist_remove_prefix(cat_a: u8, cat_b: u8, prefix: &str, limit: usize) {
+    let mut removed = 0usize;
+    // SAFETY: as `devlist_flush`.
+    unsafe {
+        let page = &mut *core::ptr::addr_of_mut!(G_DEVLIST);
+        let mut idx = 0usize;
+        while idx < G_DEVCOUNT && removed < limit {
+            let off = 16 + idx * DEVICE_REC_SIZE;
+            let idl = page[off + 3] as usize;
+            let cat_ok = (cat_a == 0 && cat_b == 0) || page[off] == cat_a || page[off] == cat_b;
+            let hit = cat_ok
+                && page[off + 1] & 1 != 0
+                && idl >= prefix.len()
+                && &page[off + 52..off + 52 + prefix.len()] == prefix.as_bytes();
+            if hit {
+                let end = 16 + G_DEVCOUNT * DEVICE_REC_SIZE;
+                page.copy_within(off + DEVICE_REC_SIZE..end, off);
+                page[end - DEVICE_REC_SIZE..end].fill(0);
+                G_DEVCOUNT -= 1;
+                removed += 1;
+            } else {
+                idx += 1;
+            }
+        }
+    }
+    let w = devlist_writer();
+    devlist_flush(&w);
+}
+
+/// Vendor display name for the few vendors seen most often (small on purpose).
+fn pci_vendor_name(v: u16) -> Option<&'static str> {
+    Some(match v {
+        0x8086 => "Intel",
+        0x1022 | 0x1002 => "AMD",
+        0x10de => "NVIDIA",
+        0x1af4 => "Red Hat virtio",
+        0x1b36 => "Red Hat QEMU",
+        0x1234 => "QEMU",
+        0x10ec => "Realtek",
+        0x14e4 => "Broadcom",
+        0x15ad => "VMware",
+        0x144d => "Samsung",
+        0x15b7 => "SanDisk/WD",
+        0x1179 => "Toshiba",
+        0x1344 => "Micron",
+        0x1b4b => "Marvell",
+        0x168c | 0x1969 => "Qualcomm Atheros",
+        0x1106 => "VIA",
+        0x1b21 => "ASMedia",
+        0x1912 => "Renesas",
+        _ => return None,
+    })
+}
+
+/// Specific device-id names for the virtual hardware QEMU commonly shows.
+fn pci_device_name(v: u16, d: u16) -> Option<&'static str> {
+    Some(match (v, d) {
+        (0x1af4, 0x1000) | (0x1af4, 0x1041) => "network device",
+        (0x1af4, 0x1001) | (0x1af4, 0x1042) => "block device",
+        (0x1af4, 0x1002) | (0x1af4, 0x1045) => "memory balloon",
+        (0x1af4, 0x1003) | (0x1af4, 0x1043) => "console",
+        (0x1af4, 0x1004) | (0x1af4, 0x1048) => "SCSI controller",
+        (0x1af4, 0x1005) | (0x1af4, 0x1044) => "RNG",
+        (0x1af4, 0x1009) | (0x1af4, 0x1049) => "filesystem (9p/fs)",
+        (0x1af4, 0x1050) => "GPU",
+        (0x1af4, 0x1052) => "input device",
+        (0x1af4, 0x1110) => "shared memory (ivshmem)",
+        (0x1234, 0x1111) => "standard VGA (Bochs)",
+        (0x1b36, 0x0001) => "PCI bridge",
+        (0x1b36, 0x0008) => "PCIe host bridge",
+        (0x1b36, 0x000c) => "PCIe root port",
+        (0x1b36, 0x000d) => "xHCI USB controller",
+        (0x1b36, 0x0010) => "NVMe controller",
+        (0x8086, 0x1237) => "440FX host bridge",
+        (0x8086, 0x7000) => "PIIX3 ISA bridge",
+        (0x8086, 0x7010) => "PIIX3 IDE controller",
+        (0x8086, 0x7113) => "PIIX4 ACPI",
+        (0x8086, 0x29c0) => "Q35 host bridge",
+        (0x8086, 0x2918) => "ICH9 LPC bridge",
+        (0x8086, 0x2922) => "ICH9 SATA (AHCI) controller",
+        (0x8086, 0x2930) => "ICH9 SMBus controller",
+        (0x8086, 0x293e) => "ICH9 HD Audio",
+        (0x8086, 0x2668) => "ICH6 HD Audio",
+        (0x8086, 0x2934..=0x2936) => "ICH9 USB (UHCI)",
+        (0x8086, 0x293a) => "ICH9 USB 2.0 (EHCI)",
+        (0x8086, 0x100e) => "82540EM Gigabit Ethernet",
+        (0x8086, 0x10d3) => "82574L Gigabit Ethernet",
+        (0x15ad, 0x0405) => "SVGA II adapter",
+        _ => return None,
+    })
+}
+
+/// Maps a PCI class code triple to (category, generic kind name).
+fn pci_class_kind(class: u8, sub: u8, prog: u8) -> (u8, &'static str) {
+    match (class, sub) {
+        (0x01, 0x00) => (DEVCAT_STORAGE, "SCSI storage controller"),
+        (0x01, 0x01) => (DEVCAT_STORAGE, "IDE controller"),
+        (0x01, 0x02) => (DEVCAT_STORAGE, "floppy controller"),
+        (0x01, 0x04) => (DEVCAT_STORAGE, "RAID controller"),
+        (0x01, 0x05) => (DEVCAT_STORAGE, "ATA controller"),
+        (0x01, 0x06) => (DEVCAT_STORAGE, "SATA (AHCI) controller"),
+        (0x01, 0x07) => (DEVCAT_STORAGE, "SAS controller"),
+        (0x01, 0x08) => (DEVCAT_STORAGE, if prog == 2 { "NVMe controller" } else { "non-volatile memory controller" }),
+        (0x01, _) => (DEVCAT_STORAGE, "storage controller"),
+        (0x02, 0x00) => (DEVCAT_NETWORK, "Ethernet adapter"),
+        (0x02, 0x80) => (DEVCAT_NETWORK, "Wi-Fi / network controller"),
+        (0x02, _) => (DEVCAT_NETWORK, "network controller"),
+        (0x03, _) => (DEVCAT_DISPLAY, "display controller"),
+        (0x04, 0x00) => (DEVCAT_SOUND, "video controller"),
+        (0x04, 0x01) => (DEVCAT_SOUND, "audio device"),
+        (0x04, 0x03) => (DEVCAT_SOUND, "HD Audio controller"),
+        (0x04, _) => (DEVCAT_SOUND, "multimedia controller"),
+        (0x05, _) => (DEVCAT_SYSTEM, "memory controller"),
+        (0x06, 0x00) => (DEVCAT_SYSTEM, "host bridge"),
+        (0x06, 0x01) => (DEVCAT_SYSTEM, "ISA/LPC bridge"),
+        (0x06, 0x04) | (0x06, 0x09) => (DEVCAT_SYSTEM, "PCI bridge"),
+        (0x06, _) => (DEVCAT_SYSTEM, "bridge"),
+        (0x07, 0x03) => (DEVCAT_MODEM, "modem"),
+        (0x07, _) => (DEVCAT_SYSTEM, "communication controller"),
+        (0x08, _) => (DEVCAT_SYSTEM, "system peripheral"),
+        (0x09, _) => (DEVCAT_INPUT, "input controller"),
+        (0x0b, _) | (0x12, _) => (DEVCAT_COMPUTE, "processing accelerator"),
+        (0x0c, 0x03) => (
+            DEVCAT_USB,
+            match prog {
+                0x00 => "USB controller (UHCI)",
+                0x10 => "USB controller (OHCI)",
+                0x20 => "USB 2.0 controller (EHCI)",
+                0x30 => "USB 3.x controller (xHCI)",
+                _ => "USB controller",
+            },
+        ),
+        (0x0c, 0x05) => (DEVCAT_SYSTEM, "SMBus controller"),
+        (0x0c, _) => (DEVCAT_SYSTEM, "serial bus controller"),
+        (0x0d, 0x11) => (DEVCAT_BLUETOOTH, "Bluetooth controller"),
+        (0x0d, 0x20) | (0x0d, 0x21) => (DEVCAT_NETWORK, "Wi-Fi adapter"),
+        (0x0d, _) => (DEVCAT_MODEM, "wireless/cellular controller"),
+        (0x10, _) => (DEVCAT_SYSTEM, "encryption controller"),
+        _ => (DEVCAT_OTHER, "PCI device"),
+    }
+}
+
+/// Adds one PCI function found by the x86_64 HAL scan: names it from the
+/// class code (+ a small vendor / QEMU device table), files it under its
+/// Device-Manager-like category and gives it the id text
+/// `PCI bb:dd.f vvvv:dddd` (plus `;MAC ...` when known). Replaces the coarser
+/// manifest record for the same function, if any.
+#[allow(clippy::too_many_arguments)]
+pub fn devlist_add_pci(bus: u8, dev: u8, func: u8, vendor: u16, device: u16, class: u8, sub: u8, prog: u8, mac: Option<[u8; 6]>) {
+    use core::fmt::Write;
+    let (cat, kind) = pci_class_kind(class, sub, prog);
+    // Manifest peripherals carry "PCI bb:dd.f" (+ vendor 1af4); GPU/compute
+    // entries carry "vendor vvvv index n". Drop those before adding richer ones.
+    let mut key = FixBuf::<16>::new();
+    let _ = write!(key, "PCI {:02x}:{:02x}.{}", bus, dev, func);
+    let ks = core::str::from_utf8(&key.b[..key.n]).unwrap_or("");
+    devlist_remove_prefix(0, 0, ks, 1);
+    if class == 0x03 || class == 0x12 || class == 0x0b {
+        let mut vk = FixBuf::<24>::new();
+        let _ = write!(vk, "vendor {:04x} index", vendor);
+        let vs = core::str::from_utf8(&vk.b[..vk.n]).unwrap_or("");
+        devlist_remove_prefix(DEVCAT_DISPLAY, DEVCAT_COMPUTE, vs, 1);
+    }
+    let mut n = FixBuf::<48>::new();
+    match (pci_vendor_name(vendor), pci_device_name(vendor, device)) {
+        (Some(v), Some(d)) => {
+            let _ = write!(n, "{} {}", v, d);
+        }
+        (Some(v), None) => {
+            let _ = write!(n, "{} {}", v, kind);
+        }
+        (None, Some(d)) => {
+            let _ = write!(n, "{}", d);
+        }
+        (None, None) => {
+            let _ = write!(n, "{} ({:04x}:{:04x})", kind, vendor, device);
+        }
+    }
+    let mut i = FixBuf::<44>::new();
+    let _ = write!(i, "PCI {:02x}:{:02x}.{} {:04x}:{:04x}", bus, dev, func, vendor, device);
+    if let Some(m) = mac {
+        let _ = write!(i, ";MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
+    }
+    let mut w = devlist_writer();
+    w.push(cat, &n, Some(&i));
+    devlist_flush(&w);
+}
+
+/// Maps the device-list info page (two 4 KiB pages) READ-ONLY into `root_pt`
+/// at `va` (page-aligned, both pages free). Returns `None` only on
+/// allocation/mapping failure.
 pub fn map_device_list_info(hal: &HalInterface, root_pt: usize, va: usize) -> Option<()> {
     let k = kstate();
-    let page = carve_from_any_untyped(k, 4096, 4096)?;
+    let page = carve_from_any_untyped(k, 4096, DEVICE_LIST_PAGE_BYTES as u64)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core; G_DEVLIST
-    // is fully written by `capture_device_list` before any spawn.
+    // is fully written by `capture_device_list` (+ `devlist_*`) before any spawn.
     unsafe {
-        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(G_DEVLIST) as *const u8, page as *mut u8, 4096);
+        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(G_DEVLIST) as *const u8, page as *mut u8, DEVICE_LIST_PAGE_BYTES);
     }
     let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
     // SAFETY: fresh untyped RAM; `map_range` needs the pool pre-zeroed.
     unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
-    if hal.map_range(root_pt, va, page, 4096, 1 | 8, pool, 2) == u32::MAX {
+    if hal.map_range(root_pt, va, page, DEVICE_LIST_PAGE_BYTES, 1 | 8, pool, 2) == u32::MAX {
         klog!("map_device_list_info: map_range error\r\n");
         return None;
     }

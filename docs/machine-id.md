@@ -449,26 +449,57 @@ layer 4) are not built; when they exist this page should be granted through them
 
 ### 13.3 Device list page (DEVICES window)
 
-Same mechanism, second page: a read-only 4 KiB page at `0xD8B0_1000`
-(`UI_CORE_DEVICE_LIST_VA`), built at boot by `kernel_arch_glue::capture_device_list`
-from the hardware manifest and mapped `R | U` into ui-core only. Little-endian:
+Same mechanism, second area: a read-only **8 KiB (two page)** area at `0xD8B0_1000`
+(`UI_CORE_DEVICE_LIST_VA`, up to `0xD8B0_3000`), built at boot by
+`kernel_arch_glue::capture_device_list` from the hardware manifest, extended on
+x86_64 by `add_x86_device_info` (CPUID brand + the HAL's full PCI scan), and
+mapped `R | U` into ui-core only. Layout version stays 1 (only the size and the
+category set grew). Little-endian:
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | u64 | magic `0x5349_4D44_4556_0001` (ASCII "SIMDEV" + layout version 1); check before use |
 | 8 | u32 | record count |
 | 12 | u32 | flags: bit 0 = truncated (more devices than fit) |
-| 16 | 96 bytes each | records, at most 42 |
+| 16 | 96 bytes each | records, at most 85 |
 
-Record: `+0` category (1 processors, 2 memory, 3 display, 4 network, 5 storage,
-6 system, 7 input, 8 compute, 9 other), `+1` flags (bit 0 = has id), `+2`
-name length, `+3` id length, `+4` name (48 bytes ASCII), `+52` id text (44 bytes).
-The id is the best unique handle the manifest has: PCI `bus:dev.fn` (derived from
-the ECAM address; virtio devices add vendor 1af4), MMIO base as fallback, or
-none. Raw SMBIOS serials/UUID are never put on this page. Known gaps: full PCI
-enumeration (only virtio/NVMe/compute-class devices are in the manifest), PCI
-device ids, NIC MACs (only inside `driver-virtio-net`), disk serials, CPU brand
-string, USB.
+Record: `+0` category, `+1` flags (bit 0 = has id), `+2` name length, `+3` id
+length, `+4` name (48 bytes ASCII), `+52` id text (44 bytes). The id text may
+hold several lines separated by `;` (e.g. `PCI 00:03.0 1af4:1000;MAC 52:54:...`).
+Categories: 1 processors, 2 memory, 3 display, 4 network, 5 storage, 6 system,
+7 input, 8 compute, 9 other, 10 USB controllers, 11 sound/video/game, 12
+Bluetooth, 13 batteries, 14 cameras, 15 portable devices, 16 HID, 17 modems /
+cellular, 18 DVD/CD-ROM drives. Categories 12-16 and 18 are empty slots: no
+discovery fills them yet, ui-core hides empty categories, and a later driver
+only has to emit records with that category byte.
+
+x86_64 content: processor record = CPUID brand string, id = vendor, family,
+model, stepping. Every PCI function (bus:dev.fn) gets a record named from a
+small vendor table + QEMU/virtio device-id table, else from its class code
+(`pci_class_kind`: SATA/IDE/NVMe/SCSI/floppy storage; Ethernet and Wi-Fi
+network; class 0x0D 0x20/0x21 Wi-Fi, 0x0D 0x11 Bluetooth, other 0x0D and 0x07
+0x03 modems/cellular; USB by prog-if UHCI/OHCI/EHCI/xHCI; audio; bridges and
+other system peripherals under System devices). Id = `PCI bb:dd.f vvvv:dddd`.
+It replaces the coarser manifest record for the same function. Legacy or
+transitional virtio-net devices also show `MAC ...` (read from the I/O BAR at
+offset 0x14 by the HAL scan). Raw SMBIOS serials/UUID are never put on this page.
+
+Not yet discoverable (each needs a driver or interpreter that does not exist yet):
+
+- Batteries: ACPI battery devices (PNP0C0A); `_BST`/`_BIF` need an AML
+  interpreter or embedded-controller access.
+- USB devices (most Bluetooth radios, webcams, cellular sticks, HID
+  keyboards/mice, portable devices): need a USB host-controller driver, xHCI
+  first. Only the controllers themselves are listed today.
+- DVD/CD-ROM drives: optical drives are ATAPI devices behind IDE/AHCI; they
+  need an AHCI/IDE driver issuing ATAPI IDENTIFY.
+- Real Wi-Fi: PCI class detection only; working adapters need vendor firmware
+  and drivers. Cameras have no PCI class (USB video class or platform devices).
+- Disk model/serial: `driver-nvme` issues only Identify Namespace (no Identify
+  Controller), and the virtio-blk serial needs a device-id request; neither
+  reaches the kernel page yet, so storage shows PCI ids only.
+- Modern-only (non-transitional) virtio-net MAC (needs the virtio capability
+  walk and a mapped BAR).
 
 ### 13.2 Known limits of v1
 

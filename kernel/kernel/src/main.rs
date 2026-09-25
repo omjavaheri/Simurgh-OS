@@ -356,7 +356,7 @@ const UI_CORE_COMPOSITOR_FB_VA: usize = 0xD850_0000;
 /// Page layout: see `kernel_arch_glue::MACHINE_ID_INFO_MAGIC`'s section.
 #[cfg(target_arch = "x86_64")]
 const UI_CORE_MACHINE_ID_VA: usize = 0xD8B0_0000;
-/// VA of the read-only device-list info page in ui-core (page after the machine-id page).
+/// VA of the read-only device-list info page in ui-core (two pages, after the machine-id page).
 const UI_CORE_DEVICE_LIST_VA: usize = 0xD8B0_1000;
 
 /// `driver-i8042-bin`'s own separately-built ELF image (real-input-
@@ -5769,6 +5769,41 @@ fn spawn_file_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::Th
     }
 }
 
+/// Adds the x86_64-only device facts (CPU brand, full PCI inventory) to the
+/// device-list page before it is mapped into ui-core.
+#[cfg(target_arch = "x86_64")]
+fn add_x86_device_info() {
+    use core::fmt::Write;
+    let ident = hal_x86_64::cpu::cpu_identity(&hal_x86_64::cpu::RealCpuid);
+    let brand = core::str::from_utf8(&ident.brand).unwrap_or("").trim_matches(|c: char| c == '\0' || c == ' ');
+    let vendor = core::str::from_utf8(&ident.vendor).unwrap_or("");
+    let mut id = [0u8; 44];
+    let mut cur = 0usize;
+    struct W<'a>(&'a mut [u8], &'a mut usize);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &b in s.as_bytes() {
+                if *self.1 < self.0.len() {
+                    self.0[*self.1] = b;
+                    *self.1 += 1;
+                }
+            }
+            Ok(())
+        }
+    }
+    let _ = write!(W(&mut id, &mut cur), "{} family {} model {} step {}", vendor, ident.family, ident.model, ident.stepping);
+    let id_s = core::str::from_utf8(&id[..cur]).unwrap_or("");
+    if brand.is_empty() {
+        kernel_arch_glue::devlist_set_cpu(vendor, id_s);
+    } else {
+        kernel_arch_glue::devlist_set_cpu(brand, id_s);
+    }
+    for f in hal_x86_64::peripheral::pci_functions() {
+        let mac = if f.has_mac { Some(f.mac) } else { None };
+        kernel_arch_glue::devlist_add_pci(f.bus, f.device, f.function, f.vendor_id, f.device_id, f.class_code, f.subclass, f.prog_if, mac);
+    }
+}
+
 /// x86_64 counterpart of `spawn_native_loader` (riscv64) — see that
 /// function's own doc comment for the full rationale. Same shape as
 /// `spawn_file_manager_x86`; the ELEVENTH layer-4/5/6 process this
@@ -5837,6 +5872,7 @@ fn spawn_ui_core_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadI
                         "root task (x86_64): machine-id info page NOT mapped into ui-core (out of resources)\r\n"
                     )),
                 }
+                add_x86_device_info();
                 match kernel_arch_glue::map_device_list_info(hal, root_pt, UI_CORE_DEVICE_LIST_VA) {
                     Some(()) => kernel_arch_glue::log(format_args!(
                         "root task (x86_64): mapped the device-list info page read-only into ui-core at {:#x}\r\n",
