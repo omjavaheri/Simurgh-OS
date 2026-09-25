@@ -238,6 +238,57 @@ Verified on the combined tree with `simurgh-login-test.ps1` under both
 `-Accel tcg` and `-Accel whpx`: ALICE / `*******` typed, desktop with UID 1,
 MENU → TERMINAL by mouse.
 
+### Idle desktop: blocking waits instead of polling (2026-09-25)
+
+With the desktop up and nobody touching it, QEMU (WHPX) used ~96% of a host
+core on the login screen and ~60% after login: the desktop idle `hlt`
+(`sys::IDLE_WAIT`) never ran because simurgh-shell busy-waited on the clock
+and ui-core / the Compositor polled each other, so something was always
+`Ready`. Measured (login screen up, 20 s idle,
+x86_64 desktop image, WHPX): **login screen 96% → 0.5%, after login 60% →
+0.7% of one core.** Login, typing and pointer motion still work
+(`simurgh-mouse-bench.ps1`, 5 bursts of 50 moves, 10 ms apart, TCG: net motion
+exact, no drops, average IRQ → driver wake 1.5 → 1.9 ms - inside the noise
+of a TCG run alongside other QEMU instances).
+
+- **New syscall `sys::NOTIF_WAIT_TIMEOUT` (139):** `NOTIF_WAIT` plus a
+  deadline (`a1` ns). Returns the signalled bits, or 0 on timeout. Expiry runs
+  at the top of `p2_tick` (which also runs after every idle halt), so the
+  granularity is one tick (2 ms); the waiter is taken off the notification's
+  waiter list (`Notification::cancel_wait`) and gets `(0, 0)` poked into its
+  saved registers through the architecture's `poke_saved_a0_a1` (registered
+  by each arch's syscall dispatcher).
+- **Compositor:** an EMPTY `PollInputEvent`/`PollMouseEvent` is held open for up
+  to 20 ms (`PARK_MAX_NS`; once per client loop iteration) while the
+  Compositor blocks in `NOTIF_WAIT_TIMEOUT` on the input notification. Any
+  input event ends the hold at once. To wait on both devices with one
+  syscall, driver-mouse now shares driver-i8042's signal `Notification`
+  (`G_INPUT_SIGNAL_CAP`; bit 1 = keyboard, bit 2 = mouse; Compositor's slot
+  layout unchanged).
+- **simurgh-shell:** the serial loop sleeps in `NOTIF_WAIT_TIMEOUT` (20 ms, or
+  until a ui-core keystroke rings the doorbell) instead of spinning 1 ms.
+- **ui-core (not changed here):** it still works unmodified. It must merely
+  tolerate an empty poll taking up to 20 ms to be answered. To go further it
+  would want one blocking "wait for input or timeout" request per frame
+  (e.g. `DisplayRequest::WaitInput { timeout_ms }`, answered like the held
+  poll) and to drop `pace_input_loop`'s idle yield/clock loop.
+
+**Known issues, re-checked 2026-09-25 against the commit before the
+aarch64 image-size fix (riscv64) / against `5e90030` (aarch64 - older images
+do not boot on Windows QEMU's edk2, see that commit): NOT caused by the
+recent changes, identical there.** All three occur in the demo build.
+- riscv64: `preemption: 2000 timer ticks ... process B's counter = 0 ...
+  MISMATCH` (A and C count, B never runs; the counter values are even the
+  same run to run). Cosmetic for the fault-isolation PASS marker, which
+  still passes.
+- aarch64: after `real POWER_CONTROL syscall - shutdown` the boot prints
+  `UNHANDLED EXCEPTION: esr.ec=0x0 ...` (an EL1 address; the PSCI shutdown
+  path, already described under Current status), and threads that touch
+  `0xD8E0_0000`/`0xD920_0000` take U-mode data aborts (isolated by design; the
+  security-broker/store/policy-engine shared-page addresses noted below).
+  `drv_blk_read_result ... MISMATCH` also appears. All present before.
+- riscv64 shows the same three U-mode page faults at those addresses.
+
 ## Current status (honest)
 
 The layer-2 MVP (`02-Microkernel-Layer.md §8`, all six acceptance criteria)
