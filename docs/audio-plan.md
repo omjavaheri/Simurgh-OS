@@ -70,3 +70,34 @@ polls, like Netstack.
    by every driver here have no cache attribute); DMA coherence is fine on x86.
 5. Real-hardware quirks: codec-specific widget setup (EAPD, GPIO amp enables,
    vendor verbs, power-state sequencing) is not covered.
+
+## Status (2026-09-26): phases 1-4 done on x86_64
+
+Built: `driver-hda` (25 host tests), `PeripheralKind::Audio` discovery by PCI
+class, `spawn_hda_driver` (enables PCI memory space + bus master itself, maps
+BAR0, audio page, command area, 200 KiB PCM ring), `HDA_LOG` syscall, ui-core
+`audioinfo` + tray volume icon/flyout (slider, +/-, Mute, Test sound). Run with
+`simurgh-run.ps1 -Audio` (host sound) or `-AudioWav C:\Temp\x.wav` (record).
+The demo image plays the 440 Hz self-check tone; the desktop image is silent.
+
+Evidence (QEMU `-device intel-hda -device hda-duplex`, `-audiodev wav`,
+`scripts/check-wav-tone.ps1`):
+
+- Demo image: serial `hda: codec 0 vendor/device 1af40022: DAC nid 2, pin nid 3`,
+  `playing 440 Hz tone, 1000 ms`, `playback finished`; wav = 48 kHz stereo,
+  0.96 s non-silent, dominant frequency 440 Hz, peak 12337 (16384 x 75 %).
+- Desktop image driven over the QEMU monitor: flyout `Volume: 85%` after two
+  `+` clicks (driver log `volume set to 80% / 85%`), `Test sound` plays 0.6 s
+  (wav peak 13943 = 16384 x 85 %, 440 Hz), `Mute` shows `Volume: muted` and the
+  tray icon gets a red cross; screenshots in `run-audio-ui/`.
+
+Findings worth keeping: QEMU's intel-hda stops fetching CORB commands after
+RINTCNT responses unless RIRBCTL bit 0 is set and RIRBSTS is acknowledged after
+each response; the emulated audio clock can run slower than the guest clock, so
+playback end is detected by link position, with a generous time limit.
+
+Gaps: no capture (microphone), no HDMI/DP codecs, no interrupts (polling), no
+jack sensing or codec-specific quirks, BAR0 mapped without a cache attribute,
+single stream, no mixing, only ui-core can drive the driver, aarch64/riscv64
+compile only, the Devices window still lists the controller from the PCI scan
+(no codec name), and a virtio-sound driver was not written.

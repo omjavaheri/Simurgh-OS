@@ -369,6 +369,7 @@ riscv64) unless noted:**
   because no such hardware exists on aarch64/riscv64, `log-collector-
   native` as a deliberate, conservative first pass for a brand-new real
   IPC edge — see the dedicated bullet below).
+- **Intel HD Audio driver** (x86_64 only, `driver-hda`): controller reset, CORB/RIRB, codec widget walk, 48 kHz 16-bit stereo output through a BDL, amp volume/mute, and a shared audio page ui-core uses for its tray volume control. See `docs/audio-plan.md`; try it with `simurgh-run.ps1 -AudioWav out.wav`.
 - **Real NVMe block driver** (x86_64 only): a real NVMe controller is
   discovered by PCI class code (not vendor id, unlike every virtio
   device), and `driver-nvme` speaks the real Admin/I/O queue protocol
