@@ -5,8 +5,10 @@
 //! interrupt-driven — `DRV_IRQ_WAIT`, same primitive `driver-i8042`
 //! already uses) for `kernel_arch_glue::mouse_irq_trampoline`'s own ring
 //! to have new bytes, groups them into real 3-byte PS/2 packets
-//! (`mouse_packet::PacketAssembler`), and pushes each decoded event to
-//! the Compositor service over a dedicated `Endpoint` — signal-then-
+//! (`mouse_packet::PacketAssembler`), merges each drained run into as few
+//! events as possible (`coalesce::Coalescer` — every button edge kept),
+//! and pushes them to the Compositor service over a dedicated
+//! `Endpoint` — signal-then-
 //! call, the exact same real pattern `driver-i8042`'s own
 //! `subsystem_entry` already established.
 //!
@@ -47,8 +49,43 @@ const DRV_QUEUE_VA: usize = 0xD860_0000;
 /// must stay numerically equal to `kernel_arch_glue::DRV_MOUSE_MSG_VA`.
 const DRV_MSG_VA: usize = 0xD870_0000;
 
-/// Must match `kernel_arch_glue::MOUSE_RING_CAPACITY` exactly.
-const RING_CAPACITY: u64 = 32;
+/// Must match `kernel_arch_glue::MOUSE_RING_CAPACITY` exactly. 2048
+/// bytes (~680 packets), not the original 32 (~10): bytes keep arriving
+/// while this process waits in a `Call` for the Compositor, which can
+/// take a whole ui-core frame, and at 32 the kernel could overwrite
+/// unread bytes — lost motion plus a packet stream misaligned until the
+/// next sync byte. The page has room for it, so there is no reason to
+/// run that risk. Must stay below `RING_READ_COUNT_OFF - 8` (the page's
+/// tail holds the measurement words).
+const RING_CAPACITY: u64 = 2048;
+
+/// Byte offset in the ring page where THIS process publishes how many
+/// bytes it has consumed so far (a `u64`). Must match `kernel_arch_glue::
+/// MOUSE_RING_READ_COUNT_OFF`. The kernel's trampoline compares it with
+/// its own write count to tell "this byte lands in an empty ring" — the
+/// moment the next wake-latency measurement starts (see
+/// [`RING_PENDING_SINCE_OFF`]).
+const RING_READ_COUNT_OFF: usize = 4080;
+/// Byte offset in the ring page where `kernel_arch_glue::
+/// mouse_irq_trampoline` stamps `now_ns` whenever it writes a byte into
+/// an EMPTY ring (per [`RING_READ_COUNT_OFF`]) — the IRQ time of the
+/// oldest byte this process has not read yet. Must match `kernel_arch_
+/// glue::MOUSE_RING_PENDING_SINCE_OFF`. Measurement only
+/// (`crate::latency_stats`); nothing functional depends on it.
+const RING_PENDING_SINCE_OFF: usize = 4088;
+
+/// VA of this process's own debug-print page — the fixed VA
+/// `sys::SERIAL_PRINT` reads from in the CALLING process's address space
+/// (`kernel/src/main.rs`'s `SHELL_OUT_VA`, mapped for this process by
+/// `kernel_arch_glue::spawn_mouse_driver`). Used only for the
+/// `crate::latency_stats` report line.
+const PRINT_VA: usize = 0xD900_0000;
+
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::NOW_NS`.
+const NOW_NS: usize = 86;
+/// Must stay numerically equal to `kernel/src/main.rs`'s
+/// `sys::SERIAL_PRINT`.
+const SERIAL_PRINT: usize = 118;
 
 /// # Safety
 /// Same contract as `driver_i8042::subsystem_entry::raw_syscall`.
@@ -99,6 +136,53 @@ unsafe fn read_ring_byte(i: u64) -> u8 {
     unsafe { ((DRV_QUEUE_VA + offset) as *const u8).read_volatile() }
 }
 
+/// Publishes how many ring bytes this process has consumed (see
+/// [`RING_READ_COUNT_OFF`]).
+///
+/// # Safety
+/// Same contract as [`read_write_count`].
+unsafe fn publish_read_count(read_count: u64) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { ((DRV_QUEUE_VA + RING_READ_COUNT_OFF) as *mut u64).write_volatile(read_count) };
+}
+
+/// The IRQ time of the oldest unread byte (see
+/// [`RING_PENDING_SINCE_OFF`]); `0` if the kernel never stamped one.
+///
+/// # Safety
+/// Same contract as [`read_write_count`].
+unsafe fn read_pending_since() -> u64 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { ((DRV_QUEUE_VA + RING_PENDING_SINCE_OFF) as *const u64).read_volatile() }
+}
+
+/// # Safety
+/// `raw_syscall`'s own contract.
+unsafe fn now_ns() -> u64 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { raw_syscall(NOW_NS, zero!(), zero!()) as u64 }
+}
+
+/// Prints the `crate::latency_stats` report line and resets the totals.
+///
+/// # Safety
+/// `PRINT_VA` is mapped `U=1 R+W` by `kernel_arch_glue::
+/// spawn_mouse_driver`; `raw_syscall`'s own contract.
+unsafe fn print_report(stats: &mut crate::latency_stats::LatencyStats) {
+    // SAFETY: forwarded from this function's own contract.
+    let now = unsafe { now_ns() };
+    let mut line = [0u8; 256];
+    let n = stats.format_report(now, &mut line);
+    for (i, &b) in line[..n].iter().enumerate() {
+        // SAFETY: forwarded from this function's own contract (one page,
+        // `n <= 256`).
+        unsafe { ((PRINT_VA + i) as *mut u8).write_volatile(b) };
+    }
+    // SAFETY: `raw_syscall`'s own contract.
+    unsafe { raw_syscall(SERIAL_PRINT, n, zero!()) };
+    *stats = crate::latency_stats::LatencyStats::new();
+}
+
 /// # Safety
 /// `DRV_MSG_VA` is mapped `U=1 R+W` in this process's own address space
 /// by `kernel_arch_glue::spawn_mouse_driver`.
@@ -139,33 +223,100 @@ unsafe fn call_compositor(event: crate::mouse_packet::MouseEvent) {
     unsafe { raw_syscall(IPC_CALL, DRV_ENDPOINT_CAP, zero!()) };
 }
 
+/// [`call_compositor`] plus the measurement bookkeeping: counts the
+/// message and, once a MIDDLE-button press edge has been handed over,
+/// prints the `crate::latency_stats` report (see that module for why the
+/// middle button is the marker).
+///
+/// # Safety
+/// [`call_compositor`]'s and [`print_report`]'s own contracts.
+unsafe fn send_event(
+    event: crate::mouse_packet::MouseEvent,
+    stats: &mut crate::latency_stats::LatencyStats,
+    last_middle: &mut bool,
+) {
+    stats.messages += 1;
+    stats.net_dx += event.dx as i64;
+    stats.net_dy += event.dy as i64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { call_compositor(event) };
+    if event.middle && !*last_middle {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { print_report(stats) };
+    }
+    *last_middle = event.middle;
+}
+
 /// The mouse driver's process entry point. Real, interrupt-driven,
-/// forever: wait for new packet bytes, drain every byte the ring's own
-/// write-count header reports (bounded to `RING_CAPACITY`, oldest
-/// dropped if this process fell behind — same drop-oldest policy
-/// `driver-i8042` already established), feed each through a real
-/// [`PacketAssembler`], and `call_compositor` for every byte triple that
-/// completes a real packet.
+/// forever: wait for new packet bytes, then drain the ring until it is
+/// really empty — re-reading the kernel's write count after every pass,
+/// because more bytes keep arriving while this process is blocked in a
+/// `Call` — feeding each byte through a [`PacketAssembler`] and each
+/// packet through a [`Coalescer`](crate::coalesce::Coalescer). Button
+/// changes go out the moment they are seen; all remaining motion goes
+/// out as ONE summed event when the ring is empty.
+///
+/// Why batch (measured, see `crate::coalesce`'s module doc comment and
+/// the README entry of 2026-09-24): the Compositor takes one driver
+/// message per display request it serves, so one message per 3-byte
+/// packet let motion pile up behind that gate and the cursor trailed the
+/// hand by more and more. The message format is unchanged — the
+/// Compositor cannot tell a summed event from a single big packet.
+///
+/// Ring overflow (this process fell more than `RING_CAPACITY` bytes
+/// behind) still drops the oldest bytes, as `driver-i8042` does; the
+/// assembler's sync-bit check then resynchronizes.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
     let mut read_count: u64 = 0;
     let mut assembler = PacketAssembler::new();
+    let mut coalescer = crate::coalesce::Coalescer::new();
+    let mut stats = crate::latency_stats::LatencyStats::new();
+    let mut last_middle = false;
     loop {
         // SAFETY: `wait_for_irq`'s own contract.
         unsafe { wait_for_irq() };
-        // SAFETY: `read_write_count`'s own contract.
-        let write_count = unsafe { read_write_count() };
-        if write_count.wrapping_sub(read_count) > RING_CAPACITY {
-            read_count = write_count - RING_CAPACITY;
-        }
-        while read_count < write_count {
-            // SAFETY: `read_ring_byte`'s own contract.
-            let byte = unsafe { read_ring_byte(read_count) };
-            read_count += 1;
-            if let Some(event) = assembler.push(byte) {
-                // SAFETY: `call_compositor`'s own contract.
-                unsafe { call_compositor(event) };
+        loop {
+            // SAFETY: `read_write_count`'s own contract.
+            let write_count = unsafe { read_write_count() };
+            if write_count == read_count {
+                break;
             }
+            // SAFETY: `read_pending_since`/`now_ns`'s own contracts.
+            stats.note_wake(unsafe { read_pending_since() }, unsafe { now_ns() });
+            if write_count.wrapping_sub(read_count) > RING_CAPACITY {
+                stats.dropped_bytes += write_count - RING_CAPACITY - read_count;
+                read_count = write_count - RING_CAPACITY;
+                // Bytes were lost: whatever partial packet the assembler
+                // holds no longer continues with the next byte read.
+                // See `PacketAssembler::reset`.
+                assembler.reset();
+            }
+            while read_count < write_count {
+                // SAFETY: `read_ring_byte`'s own contract.
+                let byte = unsafe { read_ring_byte(read_count) };
+                read_count += 1;
+                // Published per byte, not once per drain: a byte that
+                // arrives while this loop is blocked in a `Call` (a button
+                // edge goes out mid-drain) must see an up-to-date count, or
+                // the kernel would not restamp `RING_PENDING_SINCE_OFF` for
+                // it and its measured wait would wrongly include time from
+                // before it existed.
+                // SAFETY: `publish_read_count`'s own contract.
+                unsafe { publish_read_count(read_count) };
+                stats.bytes += 1;
+                if let Some(packet) = assembler.push(byte) {
+                    stats.packets += 1;
+                    coalescer.push(packet, |event| {
+                        // SAFETY: `send_event`'s own contract.
+                        unsafe { send_event(event, &mut stats, &mut last_middle) }
+                    });
+                }
+            }
+        }
+        if let Some(event) = coalescer.take() {
+            // SAFETY: `send_event`'s own contract.
+            unsafe { send_event(event, &mut stats, &mut last_middle) };
         }
     }
 }

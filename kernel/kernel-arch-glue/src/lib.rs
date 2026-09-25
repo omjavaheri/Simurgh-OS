@@ -7675,8 +7675,30 @@ mod i8042_ring_index_tests {
 // same way `driver-i8042` already does for the keyboard.
 // ============================================================================
 
-/// Must match `driver_mouse::subsystem_entry::RING_CAPACITY` exactly.
-const MOUSE_RING_CAPACITY: u64 = 32;
+/// Must match `driver_mouse::subsystem_entry::RING_CAPACITY` exactly
+/// (see that constant for why 2048, up from 32). Bytes live at offsets
+/// `8..8 + MOUSE_RING_CAPACITY`, clear of the two measurement words at
+/// the page's tail.
+const MOUSE_RING_CAPACITY: u64 = 2048;
+const _: () = assert!(8 + MOUSE_RING_CAPACITY as usize <= MOUSE_RING_READ_COUNT_OFF);
+/// Ring-page offset where `driver-mouse` publishes its own consumed-byte
+/// count — must match `driver_mouse::subsystem_entry::
+/// RING_READ_COUNT_OFF`. Read here only to decide when to stamp
+/// [`MOUSE_RING_PENDING_SINCE_OFF`]; the ring itself does not depend on
+/// it (drop-oldest is still decided by the driver).
+const MOUSE_RING_READ_COUNT_OFF: usize = 4080;
+/// Ring-page offset where [`mouse_irq_trampoline`] stamps `now_ns` each
+/// time a byte lands in a ring the driver has fully drained — the IRQ
+/// time of the oldest byte the driver has not read. Lets the driver
+/// measure its own wake-up (scheduling) latency with the kernel's clock
+/// (`driver_mouse::latency_stats`). Must match `driver_mouse::
+/// subsystem_entry::RING_PENDING_SINCE_OFF`.
+const MOUSE_RING_PENDING_SINCE_OFF: usize = 4088;
+/// VA of `driver-mouse`'s own debug-print page — the fixed VA
+/// `sys::SERIAL_PRINT` reads from in the calling process's address space
+/// (`kernel/src/main.rs`'s `SHELL_OUT_VA`). Only its latency report line
+/// uses it.
+const DRV_MOUSE_PRINT_VA: usize = 0xD900_0000;
 
 /// VA the raw packet-byte ring `SharedRegion` is mapped at in `driver-
 /// mouse`'s own address space — must stay numerically equal to
@@ -7734,6 +7756,10 @@ pub fn mouse_irq_trampoline(irq: hal_core::interrupt::IrqId) {
         let phys = core::ptr::addr_of!(G_MOUSE_QUEUE_PHYS).read();
         if phys != usize::MAX {
             let write_count = (phys as *const u64).read_volatile();
+            let driver_read = ((phys + MOUSE_RING_READ_COUNT_OFF) as *const u64).read_volatile();
+            if driver_read == write_count {
+                ((phys + MOUSE_RING_PENDING_SINCE_OFF) as *mut u64).write_volatile(hal.now_ns());
+            }
             let byte_offset = 8 + (write_count % MOUSE_RING_CAPACITY) as usize;
             ((phys + byte_offset) as *mut u8).write_volatile(byte);
             (phys as *mut u64).write_volatile(write_count.wrapping_add(1));
@@ -7829,6 +7855,13 @@ pub fn spawn_mouse_driver(
     // SAFETY: single-core; written exactly once here, before `IrqBind`
     // below installs `mouse_irq_trampoline`.
     unsafe { core::ptr::addr_of_mut!(G_MOUSE_QUEUE_PHYS).write(queue_phys) };
+
+    // Its own debug-print page, for the latency report line only
+    // (`DRV_MOUSE_PRINT_VA`). A failure here costs the driver nothing
+    // but that line, so it is logged, not fatal.
+    if wire_shared_pages(hal, drv_root_pt, DRV_MOUSE_PRINT_VA, 4096).is_none() {
+        klog!("spawn_mouse_driver: no debug-print page (latency report disabled)\r\n");
+    }
 
     // Slot 1 on driver-mouse's own side: the IRQ-bound Notification.
     let Some(notif_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)

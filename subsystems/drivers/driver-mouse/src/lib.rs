@@ -21,6 +21,8 @@
 //! ============================================================================
 #![no_std]
 
+pub mod coalesce;
+pub mod latency_stats;
 pub mod mouse_packet;
 pub mod subsystem_entry;
 pub mod wire;
