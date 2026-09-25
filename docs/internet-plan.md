@@ -166,13 +166,13 @@ cross-cutting prerequisites (Phases 2 and 4).
 
 ## 6. Open design questions
 
-- TODO(spec) 1: Hand-written TCP/IP versus vendoring `smoltcp` (spec section
+- TODO(spec) 1 (RESOLVED 2026-09-25: use smoltcp): Hand-written TCP/IP versus vendoring `smoltcp` (spec section
   2.3 says "Fuchsia Netstack or smoltcp-inspired"). Vendoring saves months but
   adds a dependency that must fit the repo charter and the "nothing above the
   HAL is architecture-specific" rule. Needs Omid's decision before Phase 2.
-- TODO(spec) 2: Which clock/timer source a layer-3 service uses for
+- TODO(spec) 2 (RESOLVED: `NOW_NS` syscall, see section 8): Which clock/timer source a layer-3 service uses for
   retransmit and lease timers (no timer syscall observed).
-- TODO(spec) 3: A timeout-capable Wait or timer notification in the kernel,
+- TODO(spec) 3 (sleeping RESOLVED by `NOTIF_WAIT_TIMEOUT`; RX notification still open): A timeout-capable Wait or timer notification in the kernel,
   needed for blocking recv and for RX without polling (currently deliberately
   absent, see the driver-virtio-net module comment).
 - TODO(spec) 4: Socket capability model: rights, who mints them (Security
@@ -201,7 +201,7 @@ use the `smoltcp` crate (no_std) for TCP/IP instead of hand-writing it
 | Phase | Status | Evidence |
 |---|---|---|
 | 0 - `-Net` switch, desktop boots with virtio-net | done (2026-09-25) | `simurgh-run.ps1 -Desktop -Net` boots to ui-core; serial: `driver-virtio-net (U-mode, x86_64): real VirtioNet::probe() succeeded=true`, then `ui-core ... self_check ... ok=true` |
-| 1 - persistent netstack on smoltcp: ARP, IPv4, ICMP | in progress | - |
+| 1 - persistent netstack on smoltcp: ARP, IPv4, ICMP | done on x86_64 (2026-09-25) | desktop image with `-Net`: `netstack: link up: 10.0.2.15/24 gateway 10.0.2.2`, then `netstack: ping reply from 10.0.2.2: seq=1..11 time=..ms`; 11 new host tests |
 | 2 - UDP, DHCP client, DNS resolver | not started | - |
 | 3+ | not started | - |
 
@@ -215,3 +215,46 @@ Phase 0 notes:
 - `disable-legacy=on` is kept from section 2: the driver negotiates only
   VERSION_1, so the transitional (legacy-capable) personality of the device
   gains nothing.
+
+Phase 1 notes (2026-09-25):
+- Stack: `smoltcp` 0.12 from crates.io like the other external crates (normal
+  registry dependency, `Cargo.lock` is gitignored in this repo; no vendor
+  folder exists). `default-features = false`, features `proto-ipv4`,
+  `medium-ethernet`, `socket-icmp`; no `alloc` (all buffers are one static
+  `StackStorage`). Builds for all three custom targets; the stack itself has no
+  `cfg(target_arch)`.
+- Structure: `subsystems/netstack/src/stack.rs` (`FrameIo` transport trait,
+  smoltcp `Device` adapter, `NetStack`), `stack_tests.rs` (host tests against a
+  mock LAN), `subsystem_entry.rs` (`DriverIo` = `FrameIo` over the existing
+  `SendFrame`/`PollFrame` IPC and shared pages; the smallest thing that works,
+  no driver change).
+- Service shape: a SECOND thread of the Netstack process, started by
+  `kernel_arch_glue::netstack_start_service` at the end of the desktop boot
+  sequence (desktop image only; the demo image is unchanged). It sleeps between
+  polls with `NOTIF_WAIT_TIMEOUT` on a private never-signalled notification and
+  reads `NOW_NS`. Logs use a new `NET_LOG` syscall (text read from Netstack's
+  own status page). This answers the survey's "no timer syscall observed":
+  `NOW_NS` (monotonic ns) and `NOTIF_WAIT_TIMEOUT` (2 ms granularity, added
+  2026-09-24) exist, so TODO(spec) 2 is resolved and TODO(spec) 3 is resolved
+  for sleeping; only a NIC receive notification (no polling) stays open.
+- Evidence (x86_64 desktop image, `-Net`, serial):
+  `netstack: link up: 10.0.2.15/24 gateway 10.0.2.2` and repeated
+  `netstack: ping reply from 10.0.2.2: seq=N time=..ms` (seq 1..11 in one run).
+- Findings worth knowing:
+  - The blocking ARP/ICMP boot demo is racy on the desktop image (and, less
+    often, on the demo image, also without this work): the driver's TX-complete
+    wait can yield to root mid-demo. The desktop image now skips it.
+  - `p2_ipc_recv` returned at once when nothing else was Ready; the boot
+    sequence only worked because of "phantom" Ready threads. Desktop image now
+    hands off to root in that case (the demo image keeps the old behaviour).
+  - The IRQ trampoline read the INTx ISR window, mapped under only three
+    processes; with MSI-X on it is skipped (an MSI-X interrupt needs no ack).
+  - The kernel clock seems to run faster than wall time under WHPX (the 30 s
+    heartbeat ping showed up much more often than every 30 wall seconds), so
+    the RTT figures are in kernel time, not calibrated wall time. Not
+    investigated.
+- Not done (gaps): link-status bit and RX refill under load in the driver; the
+  driver's 700-byte buffers and 2-descriptor queues (fine for ICMP/UDP/DNS/DHCP,
+  too small for TCP: TODO(spec) at `stack::MAX_FRAME`); riscv64/aarch64 were
+  only compile-checked (no QEMU run of the service); the service does not start
+  on the demo image.
