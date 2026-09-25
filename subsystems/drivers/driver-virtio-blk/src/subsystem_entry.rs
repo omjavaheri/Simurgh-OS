@@ -55,7 +55,9 @@ const IPC_REPLY: usize = 44;
 /// `sys::DRV_IRQ_WAIT` — the real interrupt-driven wait for a
 /// just-submitted request to complete (see this file's own
 /// `handle_io`).
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 const DRV_IRQ_WAIT: usize = 63;
+
 
 /// The endpoint capability's slot in THIS process's own capability
 /// space — see `fs-native::subsystem_entry::FS_ENDPOINT_CAP`'s own doc
@@ -68,6 +70,7 @@ const DRV_ENDPOINT_CAP: usize = 0;
 /// endpoint above is the first, at slot 0), already bound to the
 /// device's own IRQ line via `IrqBind` before this process's first
 /// instruction ever runs.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 const DRV_NOTIF_CAP: usize = 1;
 
 /// VA the virtio-mmio transport window is mapped at in THIS process's
@@ -269,6 +272,7 @@ macro_rules! zero {
 /// `#[inline(never)]` — same rationale as `raw_syscall`'s own doc
 /// comment.
 #[inline(never)]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 unsafe fn wait_for_irq() -> u64 {
     // SAFETY: `raw_syscall`'s own contract; the return value here is a
     // plain `usize` (the notification's signal bits) — `raw_syscall`'s
@@ -306,18 +310,44 @@ fn handle_io(drv: &mut crate::VirtioBlk, kind: crate::BlkReqType, lba: u64, sect
     // infinite loop) for the same reason `VirtioBlk::wait_for_
     // completion`'s own `MAX_SPINS` is bounded: a device that never
     // completes this request must not wedge the driver process forever.
-    const MAX_WAIT_RETRIES: u32 = 8;
-    let mut retries = 0u32;
-    loop {
-        // SAFETY: `raw_syscall`'s own contract (forwarded via `wait_for_irq`).
-        unsafe { wait_for_irq() };
+    // x86_64: poll the used ring instead of blocking in `Wait`. Root cause
+    // of the old boot hang: the demo runs BEFORE the preemption timer is
+    // armed, so a driver that blocks hands the CPU to another thread that
+    // never yields, and the completion interrupt (which only marks the
+    // driver `Ready`) can never get it scheduled again — root's `Call`
+    // then waits forever. Polling keeps the CPU here for the few
+    // milliseconds the device needs; QEMU completes the I/O on another
+    // host thread. Bounded, so a dead device fails the request
+    // (`DeviceIo`) instead of wedging boot. The completion interrupt still
+    // fires and only leaves a harmless sticky bit on the notification.
+    #[cfg(target_arch = "x86_64")]
+    {
+        const MAX_POLL_SPINS: u32 = 100_000_000;
+        let mut spins = 0u32;
         // SAFETY: `submit_request`'s own contract.
-        if unsafe { drv.completion_pending() } {
-            break;
+        while !unsafe { drv.completion_pending() } {
+            spins += 1;
+            if spins >= MAX_POLL_SPINS {
+                return DriverResponse::Failed { code: DriverErrorCode::DeviceIo };
+            }
+            core::hint::spin_loop();
         }
-        retries += 1;
-        if retries >= MAX_WAIT_RETRIES {
-            return DriverResponse::Failed { code: DriverErrorCode::DeviceIo };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        const MAX_WAIT_RETRIES: u32 = 8;
+        let mut retries = 0u32;
+        loop {
+            // SAFETY: `raw_syscall`'s own contract (forwarded via `wait_for_irq`).
+            unsafe { wait_for_irq() };
+            // SAFETY: `submit_request`'s own contract.
+            if unsafe { drv.completion_pending() } {
+                break;
+            }
+            retries += 1;
+            if retries >= MAX_WAIT_RETRIES {
+                return DriverResponse::Failed { code: DriverErrorCode::DeviceIo };
+            }
         }
     }
     // SAFETY: same contract as `submit_request` — the loop above only

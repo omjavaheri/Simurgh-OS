@@ -7001,11 +7001,25 @@ unsafe fn wire_virtio_pci_transport(
         }
     }
 
+    // With MSI-X (`msix_vector` was assigned above) the interrupt is an
+    // edge-style memory write with no INTx line to deassert, so the
+    // trampoline has NO reason to read ISR_CFG at all — and it must not:
+    // `isr_cfg_va` only exists in `drv_root_pt`, while on x86_64 the MSI
+    // can land while ANY other process's CR3 is active (the driver is
+    // `Blocked` in `DRV_IRQ_WAIT` and other subsystems run meanwhile), so
+    // the read page-faulted inside the interrupt handler and hung the boot
+    // right after the first block write. The sentinel makes the trampoline
+    // skip the read (same role `usize::MAX` already has for MMIO).
+    let trampoline_isr_va = if msix_vector == driver_virtio_blk::VIRTIO_MSI_NO_VECTOR {
+        isr_cfg_va
+    } else {
+        usize::MAX
+    };
     // SAFETY: single-core; written once here, before `IrqBind`
     // (`spawn_virtio_blk_driver`'s own caller) installs the trampoline
     // that reads it — see `G_DRV_ISR_CFG_VA`'s own doc comment for why
     // this VA (not a physical address) is what the trampoline needs.
-    unsafe { core::ptr::addr_of_mut!(G_DRV_ISR_CFG_VA).write(isr_cfg_va) };
+    unsafe { core::ptr::addr_of_mut!(G_DRV_ISR_CFG_VA).write(trampoline_isr_va) };
 
     let header = region_phys + driver_virtio_blk::layout::PCI_INFO_OFFSET;
     // SAFETY: `region_phys` is the driver's own fresh, zeroed
