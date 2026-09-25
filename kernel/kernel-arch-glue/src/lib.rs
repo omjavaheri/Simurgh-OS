@@ -406,6 +406,167 @@ const P2_FAULT_DEMO_START_TICK: u32 = 1000;
 /// `0` keeps the gate closed even if a future change spawns it again.)
 #[cfg(feature = "desktop")]
 const P2_FAULT_DEMO_START_TICK: u32 = 0;
+
+/// Desktop build: how soon after an input IRQ wakes its driver the
+/// scheduler gets a decision point ([`desktop_input_wake_tick`]).
+///
+/// **Why this exists (measured 2026-09-24, README entry of that date).**
+/// An IRQ is taken on the generic ISR path, which always resumes the
+/// interrupted thread — it has no way to switch (`hal_x86_64::cpu`'s
+/// `isr_common_trampoline`). Waking a driver there only marks it `Ready`
+/// (`KernelState::wake_blocked`); it actually runs at the NEXT timer
+/// tick, up to a full [`P2_QUANTUM_NS`] later, unless the running thread
+/// happens to block or yield first. Every mouse/keyboard event paid that
+/// wait before any other stage of the input path could even start.
+///
+/// Rather than giving the generic ISR path switch semantics (the HAL's
+/// trap plumbing, three architectures), the IRQ handler pulls the
+/// existing timer deadline in: the tick then takes the ordinary,
+/// already-proven `p2_tick` -> `preempt_tick` route, which switches to
+/// the driver if `pick_next` ranks it first and otherwise just
+/// continues. The cost of a tick nobody needed is one `account` +
+/// `pick_next`.
+///
+/// 20 µs: long enough to be past the `iretq` back to U-mode (a tick
+/// taken at CPL 0 would not re-arm — see `drv_irq_wait_yield`'s doc
+/// comment; kernel code runs with interrupts off anyway, so the tick
+/// can only land in U-mode), and far below anything a human perceives.
+///
+/// Measured (2026-09-25, QEMU TCG on the Windows host, `simurgh-mouse-
+/// bench.ps1`, 30 moves 10 ms apart): worst IRQ-to-driver wait per burst
+/// 2.9 ms -> 1.7 ms on average (max 4.3 -> 2.0 ms); the AVERAGE barely
+/// moves (1.50 -> 1.39 ms, guest clock), most likely because QEMU's own
+/// timers on this host fire with roughly millisecond granularity, so a
+/// 20 µs deadline lands later than asked. It should do better on a
+/// finer-grained timer (real hardware, WHPX), but that is not measured.
+#[cfg(feature = "desktop")]
+const DESKTOP_INPUT_WAKE_TICK_NS: u64 = 20_000;
+
+/// Desktop build: the priority of the input path — the PS/2 drivers, the
+/// Compositor and ui-core ([`desktop_apply_input_priorities`]). Equal to
+/// `kernel_sched::MAX_PRIORITY`, the level every thread is admitted at
+/// (`init_user_thread`), so the input path itself keeps exactly the
+/// priority it always had; it is everything else that moves down.
+#[cfg(feature = "desktop")]
+const DESKTOP_PRIORITY_INPUT: u8 = 39;
+/// Desktop build: the priority every other process drops to. Any value
+/// below [`DESKTOP_PRIORITY_INPUT`] means the same thing to `pick_next`
+/// (Interactive mode ranks by priority first, strictly), so the exact
+/// number only matters for weight: 30 keeps these services' vruntime
+/// weight close to what it was (~3.3 vs 4.0), so how they share the CPU
+/// AMONG THEMSELVES barely changes. It stays well above the idle loop's
+/// 0.
+#[cfg(feature = "desktop")]
+const DESKTOP_PRIORITY_BACKGROUND: u8 = 30;
+
+/// Desktop build: the input-path threads the Root Task registered via
+/// [`desktop_register_input_path`], applied by `p2_preempt_start`.
+#[cfg(feature = "desktop")]
+static mut DESKTOP_INPUT_PATH: [Option<ThreadId>; 4] = [None; 4];
+
+/// Desktop build: records which threads form the input path. Only
+/// RECORDS them — the priorities change in `p2_preempt_start`, after
+/// the cooperative boot phase: during that phase the Root Task's own
+/// hand-offs go through `pick_next`, and lowering the Root Task (or
+/// raising a spawned thread above it) there could reorder them.
+#[cfg(feature = "desktop")]
+pub fn desktop_register_input_path(input_path: [Option<ThreadId>; 4]) {
+    // SAFETY: single-core boot sequencing; read once by `p2_preempt_start`.
+    unsafe { core::ptr::addr_of_mut!(DESKTOP_INPUT_PATH).write(input_path) };
+}
+
+/// Desktop build only: gives the input path priority over everything
+/// else. Every thread `input_path` names is set to
+/// [`DESKTOP_PRIORITY_INPUT`]; every OTHER admitted thread still at that
+/// level (i.e. every service spawned with the default) drops to
+/// [`DESKTOP_PRIORITY_BACKGROUND`]. Threads already below it (the idle
+/// loop at 0) are left alone. Called once from `p2_preempt_start`, just
+/// before the preemptive timer is armed; threads spawned later (e.g. by the
+/// shell) come in at the default and so rank with the input path, the
+/// same footing everything had before.
+///
+/// **Why (measured on a real desktop boot, 2026-09-24).** With every
+/// service at the same priority, a tick histogram over 3000 ticks at the
+/// login screen gave `simurgh-store` 1578 and `simurgh-shell` 1086 (both
+/// sit in busy-poll loops) and ui-core just 40 — about 1%. The
+/// Compositor only moves input when ui-core calls it, so every mouse
+/// event waited on ui-core's rare turns. Ranking the input path first is
+/// what gives ui-core the CPU.
+///
+/// **The trade-off, stated plainly.** `pick_next` has no aging ACROSS
+/// priority levels (aging only slows a thread's vruntime), so a
+/// lower-priority thread gets the CPU only while no input-path thread is
+/// ready. That holds up because every input-path thread gives the CPU
+/// back on its own: the drivers wait in `DRV_IRQ_WAIT` and the Compositor
+/// in `Recv` whenever nothing is pending, and ui-core `P2_YIELD`s after
+/// every poll of its input loop (Simurgh-UI-Template01, since 2026-09-24;
+/// a yield hides the yielder from exactly one `pick_next`, which is when
+/// the background runs). Measured on a desktop boot after this change
+/// (2026-09-25): ~990 ui-core yields per 500 ticks, and security-broker,
+/// profile-policy and store keep serving calls. Everything ui-core USES
+/// (account-manager, shell, file-manager, ...) it reaches through a
+/// blocking `Call`, during which that service runs regardless. A future
+/// input-path member that spins without yielding would starve every
+/// other process — keep this list to threads that block or yield.
+///
+/// **This ranking exposed, and depends on the fix for, a latent kernel
+/// bug** — `p2_ipc_recv`'s switch into the retired Root Task (see the
+/// doc comment at the top of that function). Before that fix, the first
+/// such switch left the CPU running the idle loop under ui-core's name
+/// forever: the login screen drew, but no keystroke ever registered.
+///
+/// Uses `Scheduler::set_base_priority`, which changes nothing but the
+/// priority fields — run state and vruntime are untouched, so a thread
+/// currently blocked in IPC is unaffected until it next competes.
+#[cfg(feature = "desktop")]
+fn desktop_apply_input_priorities(input_path: &[Option<ThreadId>]) {
+    let k = kstate();
+    let mut raised = 0;
+    let mut lowered = 0;
+    for idx in 0..kernel_core::config::MAX_THREADS {
+        let tid = ThreadId::new(idx as u32);
+        let Some(e) = k.sched.entity(tid) else { continue };
+        let on_input_path = input_path.iter().any(|t| *t == Some(tid));
+        if on_input_path {
+            let _ = k.sched.set_base_priority(tid, DESKTOP_PRIORITY_INPUT);
+            raised += 1;
+        } else if e.base_priority >= DESKTOP_PRIORITY_INPUT {
+            let _ = k.sched.set_base_priority(tid, DESKTOP_PRIORITY_BACKGROUND);
+            lowered += 1;
+        }
+    }
+    klog!(
+        "desktop mode: input path ({} thread(s)) at priority {}, {} other thread(s) lowered to {}\r\n",
+        raised,
+        DESKTOP_PRIORITY_INPUT,
+        lowered,
+        DESKTOP_PRIORITY_BACKGROUND
+    );
+}
+
+/// Desktop build: set once `p2_preempt_start` arms the preemptive
+/// timer. Before that, `p2_tick` must not run at all (the Root Task's
+/// cooperative boot phase), so [`desktop_input_wake_tick`] does nothing.
+#[cfg(feature = "desktop")]
+static mut DESKTOP_PREEMPTION_LIVE: bool = false;
+
+/// Called by the PS/2 IRQ trampolines after waking their driver. Desktop
+/// build: if a thread was actually woken and preemption is running,
+/// moves the next scheduler tick to [`DESKTOP_INPUT_WAKE_TICK_NS`] from
+/// now (see that constant for why). Default build: a no-op, so the demo
+/// image's scheduling is untouched.
+fn desktop_input_wake_tick(hal: &HalInterface, woke_someone: bool) {
+    #[cfg(feature = "desktop")]
+    {
+        // SAFETY: single-core; written once by `p2_preempt_start`.
+        let live = unsafe { core::ptr::addr_of!(DESKTOP_PREEMPTION_LIVE).read() };
+        if woke_someone && live {
+            hal.arm_timer(hal.now_ns() + DESKTOP_INPUT_WAKE_TICK_NS);
+        }
+    }
+    #[cfg(not(feature = "desktop"))]
+    let _ = (hal, woke_someone);
+}
 /// Byte offsets into the shared frame each process bumps in its counting
 /// loop — distinct words (the frame is ONE physical page aliased into
 /// both spaces), clear of the `0`/`4` area the §8.4 round-trip used.
@@ -2000,6 +2161,12 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
     // `account()` would charge whatever `pick_next` picks (having found
     // `running == None`) instead of `fresh_tid`, silently misattributing
     // real CPU time to a thread that never actually ran.
+    // Desktop build: rank the input path first (see
+    // `desktop_apply_input_priorities`). Here, not earlier: root is now
+    // retired and nothing else runs until the timer below is armed.
+    // SAFETY: single-core; written once by `desktop_register_input_path`.
+    #[cfg(feature = "desktop")]
+    desktop_apply_input_priorities(&unsafe { core::ptr::addr_of!(DESKTOP_INPUT_PATH).read() });
     let _ = state.sched.dispatch(fresh_tid, hal.now_ns());
     klog!(
         "process A: retiring tid {} (its own vruntime is too QEMU-timing-dependent to fairly compete for {} short ticks) - spawned fresh tid {} (vruntime 0) to run the counting loop\r\n",
@@ -2010,6 +2177,11 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
 
     // SAFETY: single-core; only reset here, before the first tick.
     unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(0) };
+    // SAFETY: single-core; read only by `desktop_input_wake_tick`.
+    #[cfg(feature = "desktop")]
+    unsafe {
+        core::ptr::addr_of_mut!(DESKTOP_PREEMPTION_LIVE).write(true)
+    };
     let armed = hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
     klog!(
         "process A: cooperative round-trip done - arming preemptive timer (quantum {} ns, armed: {}); NO more P2_YIELD from here\r\n",
@@ -7288,6 +7460,7 @@ pub fn i8042_irq_trampoline(irq: hal_core::interrupt::IrqId) {
     for &tid in woken.as_slice() {
         k.wake_blocked(tid, now);
     }
+    desktop_input_wake_tick(hal, !woken.as_slice().is_empty());
 }
 
 /// Spawns `driver-i8042` from its own separately-built ELF (`drv_elf`),
@@ -7580,6 +7753,7 @@ pub fn mouse_irq_trampoline(irq: hal_core::interrupt::IrqId) {
     for &tid in woken.as_slice() {
         k.wake_blocked(tid, now);
     }
+    desktop_input_wake_tick(hal, !woken.as_slice().is_empty());
 }
 
 /// Spawns `driver-mouse` from its own separately-built ELF, wires it to

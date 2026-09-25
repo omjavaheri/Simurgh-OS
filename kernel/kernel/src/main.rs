@@ -4513,7 +4513,7 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // (the function itself is architecture-generic, per `kernel-
             // arch-glue`'s own module doc comment) since no other
             // architecture this project targets has this device.
-            let _ = kernel_arch_glue::spawn_i8042_driver(
+            let i8042_tid_x86 = kernel_arch_glue::spawn_i8042_driver(
                 kernel_arch_glue::khal(),
                 kernel_arch_glue::kstate().root_thread,
                 DRIVER_I8042_ELF,
@@ -4526,12 +4526,27 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
             // `kernel_arch_glue::spawn_mouse_driver`'s own doc comment.
             // Must run after Compositor is spawned, same precondition
             // `spawn_i8042_driver` already documents.
-            let _ = kernel_arch_glue::spawn_mouse_driver(
+            let mouse_tid_x86 = kernel_arch_glue::spawn_mouse_driver(
                 kernel_arch_glue::khal(),
                 kernel_arch_glue::kstate().root_thread,
                 DRIVER_MOUSE_ELF,
                 elf_loader::machine::EM_X86_64,
             );
+            // Desktop build: the input path (both PS/2 drivers, the
+            // Compositor and ui-core) outranks every other process once
+            // preemption starts — see `kernel_arch_glue::desktop_apply_
+            // input_priorities` for the measurement behind it and the
+            // trade-off. The default build leaves every priority exactly
+            // as it was.
+            #[cfg(feature = "desktop")]
+            kernel_arch_glue::desktop_register_input_path([
+                i8042_tid_x86,
+                mouse_tid_x86,
+                kernel_arch_glue::compositor_tid(),
+                ui_core_tid_x86,
+            ]);
+            #[cfg(not(feature = "desktop"))]
+            let _ = (i8042_tid_x86, mouse_tid_x86);
             // Real NVMe block driver (03-Kernel-Subsystems-Layer.md's own
             // driver list): spawns `driver-nvme` as a real isolated
             // process with a real, mapped BAR0 + queue pages — see

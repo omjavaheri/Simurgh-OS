@@ -383,6 +383,29 @@ impl<const NT: usize, const NCG: usize> Scheduler<NT, NCG> {
         Ok(())
     }
 
+    // ---- static priority changes ------------------------------------
+
+    /// Changes an ALREADY-admitted thread's static priority (layer-4
+    /// policy's "base priority", §4.3) in place: `base_priority`, its
+    /// cached weight, and `effective_priority` (never below what an
+    /// active inheritance already raised it to).
+    ///
+    /// Why a setter rather than re-`admit`: `admit` builds a fresh entity —
+    /// `Blocked`, `vruntime = 0` — which is only correct for a thread that
+    /// has never been scheduled. A thread already waiting in IPC, or
+    /// already `Ready`, would have its run state silently overwritten.
+    /// This touches nothing but the priority fields: run state,
+    /// `vruntime`, mode and chain group are left exactly as they were.
+    pub fn set_base_priority(&mut self, thread: ThreadId, priority: u8) -> Result<(), SchedError> {
+        let e = self.slot_mut(thread).ok_or(SchedError::NoSuchThread)?;
+        let p = priority.min(MAX_PRIORITY);
+        let inherited_boost = e.effective_priority > e.base_priority;
+        e.base_priority = p;
+        e.base_weight_fp = base_priority_weight_fp(p);
+        e.effective_priority = if inherited_boost { e.effective_priority.max(p) } else { p };
+        Ok(())
+    }
+
     // ---- chain groups (§4.3) --------------------------------------
 
     /// Creates chain group `id` (index into the group table).
@@ -732,6 +755,42 @@ mod tests {
             "a zero cap removes the aging weight bonus, so the same slice \
              must cost MORE vruntime ({without_aging} vs {with_aging})"
         );
+    }
+
+    #[test]
+    fn set_base_priority_reorders_without_touching_run_state_or_vruntime() {
+        let mut s = sched();
+        s.admit(t(0), SchedulerMode::Interactive, MAX_PRIORITY, None).unwrap();
+        s.admit(t(1), SchedulerMode::Interactive, MAX_PRIORITY, None).unwrap();
+        s.note_ready(t(0), 0).unwrap();
+        s.note_ready(t(1), 0).unwrap();
+        s.dispatch(t(1), 0).unwrap();
+        s.account(1_000_000);
+        let v1 = s.entity(t(1)).unwrap().vruntime;
+        assert_eq!(s.pick_next(0), Some(t(0)), "equal priority: lower vruntime wins");
+
+        s.set_base_priority(t(0), 10).unwrap();
+        assert_eq!(s.pick_next(0), Some(t(1)), "now strictly outranked");
+        assert_eq!(s.entity(t(0)).unwrap().state, RunState::Ready);
+        assert_eq!(s.entity(t(1)).unwrap().vruntime, v1);
+
+        // A blocked thread stays blocked.
+        s.note_blocked(t(1)).unwrap();
+        s.set_base_priority(t(1), MAX_PRIORITY).unwrap();
+        assert_eq!(s.entity(t(1)).unwrap().state, RunState::Blocked);
+        assert_eq!(s.pick_next(0), Some(t(0)));
+    }
+
+    #[test]
+    fn set_base_priority_keeps_an_active_inheritance_boost() {
+        let mut s = sched();
+        s.admit(t(0), SchedulerMode::Interactive, 5, None).unwrap();
+        s.inherit_priority(t(0), 30).unwrap();
+        s.set_base_priority(t(0), 10).unwrap();
+        assert_eq!(s.entity(t(0)).unwrap().effective_priority, 30);
+        s.restore_priority(t(0)).unwrap();
+        assert_eq!(s.entity(t(0)).unwrap().effective_priority, 10);
+        assert!(s.set_base_priority(t(5), 1).is_err());
     }
 
     #[test]
