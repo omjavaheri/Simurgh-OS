@@ -174,6 +174,70 @@ region, off-by-one input capability slots and a one-slot input queue, and
 a queued `Call` returning before its `Reply` (kernel-core `do_recv`) — the
 root cause of file-manager's old fs-native self-check failure.
 
+### Input path: latency, scheduling and a latent kernel bug (2026-09-25)
+
+What a mouse motion crosses: QEMU's PS/2 model → IRQ12 →
+`kernel_arch_glue::mouse_irq_trampoline` (one byte into a ring) →
+`driver-mouse` (woken from `DRV_IRQ_WAIT`) → one blocking `Call` per event
+to the Compositor, which takes one driver message per display request it
+serves → ui-core's next poll. Changes:
+
+- **Latent kernel bug, fixed (all builds).** `p2_ipc_recv` (the narrow
+  `IPC_RECV`, opcode 43) hands the CPU to the Root Task whenever nothing is
+  queued — but `p2_preempt_start` has already retired the Root Task. A
+  thread still using that opcode afterwards (measured: log-collector-native,
+  a few ticks into preemption) was switched into root's stale context (the
+  process-A counting loop) while `dispatch(root)` silently failed, leaving
+  `sched.running() == None`. The next tick then "started" whichever thread
+  `pick_next` chose without switching to it, so the CPU spun in the counting
+  loop under that thread's name. With all threads at equal priority the
+  victim was some background service; once the desktop ranked ui-core first
+  it was always ui-core: **the login screen drew but no keystroke ever
+  registered** (the regression seen in the combined tree). After retirement
+  `p2_ipc_recv` now simply is the general receive. Found by sampling the
+  guest's registers from the QEMU monitor (`x /6i $pc` showed the counting
+  loop in root's address space) plus a temporary tick probe.
+- **Desktop priorities** (`--features desktop` only):
+  `kernel_arch_glue::desktop_apply_input_priorities` puts driver-i8042,
+  driver-mouse, the Compositor and ui-core at priority 39 and every other
+  process at 30, via a new state-preserving `Scheduler::set_base_priority`.
+  Measured before, with everyone equal: store 1578 and simurgh-shell 1086 of
+  3000 ticks at the login screen, ui-core 40 (~1%). `pick_next` has no aging
+  across priority levels, so this relies on every input-path thread
+  blocking or yielding (ui-core `P2_YIELD`s every poll); background services
+  keep running (security-broker, profile-policy and store still serve calls).
+- **Early tick on input IRQs** (desktop only): an IRQ that wakes a driver
+  pulls the next scheduler tick in to 20 µs instead of waiting up to the
+  2 ms quantum. Measured (TCG, 30 moves 10 ms apart, 5 bursts): worst wake
+  per burst 2.9 → 1.7 ms average (max 4.3 → 2.0 ms), average wake
+  1.50 → 1.39 ms (guest clock, which runs ~2× wall-clock under TCG). The
+  average barely moves, most likely because QEMU's timers on the Windows
+  host have ~1 ms granularity. The 2 ms quantum was left unchanged for the
+  same reason (not measured).
+- **driver-mouse:** drains the ring until it is really empty and merges each
+  run of packets into as few events as possible (`coalesce.rs`: button
+  edges are never merged, so every click lands exactly where it did before);
+  ring 32 → 2048 bytes; the packet assembler resets after lost bytes; an
+  overflowed axis saturates instead of decoding garbage. Wire format to the
+  Compositor unchanged. At a steady 100 Hz the desktop keeps up either way
+  (one packet per wake), so batching matters only when the guest falls
+  behind.
+- **Measurement:** driver-mouse prints a `driver-mouse latency:` line when
+  it hands a MIDDLE-button press to the Compositor (ui-core ignores that
+  button): wake latency from IRQ time the kernel stamps into the ring page,
+  burst span, message count, and net motion. `simurgh-mouse-bench.ps1` at the
+  workspace root drives it. Motion is exact: 20 × `mouse_move 10 0` + 3 ×
+  `1 0` arrives as `net_dx=203`; 30 × `4 0` as 120 every time. End to end,
+  press → report takes ~20–70 ms wall-clock (avg 33 ms; 38 ms before).
+- **QEMU behaviour to know when testing:** its PS/2 model hands the guest
+  only ~5 packets per input event and holds the rest, merged, until the next
+  event; a press and release sent while that queue is full collapse into
+  nothing. Monitor-driven tests must pause between a burst and a click.
+
+Verified on the combined tree with `simurgh-login-test.ps1` under both
+`-Accel tcg` and `-Accel whpx`: ALICE / `*******` typed, desktop with UID 1,
+MENU → TERMINAL by mouse.
+
 ## Current status (honest)
 
 The layer-2 MVP (`02-Microkernel-Layer.md §8`, all six acceptance criteria)
