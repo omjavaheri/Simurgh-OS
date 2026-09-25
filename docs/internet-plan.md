@@ -191,3 +191,27 @@ Phase 0 plus the Phase 1 core: add the `-Net` option, get a desktop boot with
 virtio-net attached, then make netstack a persistent service that pings
 10.0.2.2 repeatedly. It is small, exercises the whole driver path, and is the
 foundation for everything else. Decide TODO(spec) 1 before starting Phase 2.
+
+## 8. Progress (updated as phases land)
+
+Branch `feat/net-smoltcp` (from `fix/33-fix`). Owner decision of 2026-09-25:
+use the `smoltcp` crate (no_std) for TCP/IP instead of hand-writing it
+(TODO(spec) 1 below is resolved by this).
+
+| Phase | Status | Evidence |
+|---|---|---|
+| 0 - `-Net` switch, desktop boots with virtio-net | done (2026-09-25) | `simurgh-run.ps1 -Desktop -Net` boots to ui-core; serial: `driver-virtio-net (U-mode, x86_64): real VirtioNet::probe() succeeded=true`, then `ui-core ... self_check ... ok=true` |
+| 1 - persistent netstack on smoltcp: ARP, IPv4, ICMP | in progress | - |
+| 2 - UDP, DHCP client, DNS resolver | not started | - |
+| 3+ | not started | - |
+
+Phase 0 notes:
+- `-Net` lives in the workspace-root `simurgh-run.ps1` (not a git repo). It
+  replaces `-net none` with `-netdev user,id=n0 -device
+  virtio-net-pci,netdev=n0,disable-legacy=on` (riscv64: `virtio-net-device`,
+  the mmio transport this driver speaks there). Default stays `-net none`.
+  Two extra parameters, `-OsDir` and `-RunDir`, let a second checkout boot
+  side by side with the main one without sharing images or logs.
+- `disable-legacy=on` is kept from section 2: the driver negotiates only
+  VERSION_1, so the transitional (legacy-capable) personality of the device
+  gains nothing.
