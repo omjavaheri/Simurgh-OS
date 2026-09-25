@@ -20,6 +20,57 @@
 // than embedding stale or absent bytes.
 // ============================================================================
 
+
+/// Copies an embedded subsystem ELF into `OUT_DIR` with its debug info
+/// stripped, and returns the copy's path (what `include_bytes!` embeds).
+///
+/// Why: the debug-profile subsystem ELFs carry tens of MiB of DWARF that
+/// nothing at runtime reads (the ELF loader walks program headers only),
+/// yet it lands inside the kernel image. On aarch64 that pushes the image
+/// across PA 0x4400_0000, where the Windows QEMU edk2 build fails with
+/// "ConvertPages ... kernel image corrupted" (WSL's AAVMF tolerates it).
+/// `--strip-debug` keeps symbols and every PT_LOAD segment byte-identical,
+/// so behaviour is unchanged. If no objcopy is found the ELF is copied
+/// unstripped, which is still correct, just bigger.
+fn staged_elf(src: &std::path::Path) -> std::path::PathBuf {
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let dst = out_dir.join(src.file_name().expect("ELF path has a file name"));
+    let src = src.canonicalize().unwrap();
+    let _ = std::fs::remove_file(&dst);
+    let stripped = objcopy_path()
+        .map(|tool| {
+            std::process::Command::new(tool)
+                .arg("--strip-debug")
+                .arg(&src)
+                .arg(&dst)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !stripped {
+        println!("cargo:warning=objcopy unavailable; embedding {} unstripped", src.display());
+        std::fs::copy(&src, &dst).expect("copy ELF into OUT_DIR");
+    }
+    dst.canonicalize().unwrap()
+}
+
+/// Finds `llvm-objcopy` from the pinned toolchain's `llvm-tools-preview`.
+fn objcopy_path() -> Option<std::path::PathBuf> {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let out = std::process::Command::new(rustc).args(["--print", "sysroot"]).output().ok()?;
+    let sysroot = std::path::PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    for entry in std::fs::read_dir(sysroot.join("lib").join("rustlib")).ok()?.flatten() {
+        for name in ["llvm-objcopy.exe", "llvm-objcopy"] {
+            let cand = entry.path().join("bin").join(name);
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     let manifest_dir =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
@@ -69,7 +120,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dm_path.display());
     println!(
         "cargo:rustc-env=DEVICE_MANAGER_ELF_PATH={}",
-        dm_path.canonicalize().unwrap().display()
+        staged_elf(&dm_path).display()
     );
 
     // Same as above, for `fs-native-bin` (03-Kernel-Subsystems-Layer.md
@@ -94,7 +145,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", fs_path.display());
     println!(
         "cargo:rustc-env=FS_NATIVE_ELF_PATH={}",
-        fs_path.canonicalize().unwrap().display()
+        staged_elf(&fs_path).display()
     );
 
     // Same as above, for `driver-virtio-blk-bin` (03-Kernel-Subsystems-
@@ -119,7 +170,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", drv_path.display());
     println!(
         "cargo:rustc-env=DRIVER_VIRTIO_BLK_ELF_PATH={}",
-        drv_path.canonicalize().unwrap().display()
+        staged_elf(&drv_path).display()
     );
 
     // Same as above, for `driver-virtio-net-bin` (03-Kernel-Subsystems-
@@ -148,7 +199,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", net_path.display());
     println!(
         "cargo:rustc-env=DRIVER_VIRTIO_NET_ELF_PATH={}",
-        net_path.canonicalize().unwrap().display()
+        staged_elf(&net_path).display()
     );
 
     // Same as above, for `netstack-bin` (03-Kernel-Subsystems-Layer.md
@@ -175,7 +226,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", netstack_path.display());
     println!(
         "cargo:rustc-env=NETSTACK_ELF_PATH={}",
-        netstack_path.canonicalize().unwrap().display()
+        staged_elf(&netstack_path).display()
     );
 
     // Same as above, for `compositor-bin` (03-Kernel-Subsystems-Layer.md
@@ -201,7 +252,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", compositor_path.display());
     println!(
         "cargo:rustc-env=COMPOSITOR_ELF_PATH={}",
-        compositor_path.canonicalize().unwrap().display()
+        staged_elf(&compositor_path).display()
     );
 
     // Same as above, for `mm-service-bin` (03-Kernel-Subsystems-Layer.md
@@ -227,7 +278,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", mm_service_path.display());
     println!(
         "cargo:rustc-env=MM_SERVICE_ELF_PATH={}",
-        mm_service_path.canonicalize().unwrap().display()
+        staged_elf(&mm_service_path).display()
     );
 
     // Same as above, for `log-collector-native-bin` (04-System-Services-
@@ -256,7 +307,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", log_collector_path.display());
     println!(
         "cargo:rustc-env=LOG_COLLECTOR_ELF_PATH={}",
-        log_collector_path.canonicalize().unwrap().display()
+        staged_elf(&log_collector_path).display()
     );
 
     // Same as above, for `security-broker-bin` — the first LAYER-4 process
@@ -296,7 +347,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", sb_path.display());
     println!(
         "cargo:rustc-env=SECURITY_BROKER_ELF_PATH={}",
-        sb_path.canonicalize().unwrap().display()
+        staged_elf(&sb_path).display()
     );
 
     // Same as above, for `security-broker-intermediary-bin` (Issue #28) —
@@ -325,7 +376,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", sbi_path.display());
     println!(
         "cargo:rustc-env=SECURITY_BROKER_INTERMEDIARY_ELF_PATH={}",
-        sbi_path.canonicalize().unwrap().display()
+        staged_elf(&sbi_path).display()
     );
 
     // Same as `security-broker-bin` above, for `init-bin` — the SECOND
@@ -358,7 +409,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", init_path.display());
     println!(
         "cargo:rustc-env=INIT_ELF_PATH={}",
-        init_path.canonicalize().unwrap().display()
+        staged_elf(&init_path).display()
     );
 
     // Same as `init-bin` above, for `account-manager-bin` — the THIRD
@@ -388,7 +439,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", am_path.display());
     println!(
         "cargo:rustc-env=ACCOUNT_MANAGER_ELF_PATH={}",
-        am_path.canonicalize().unwrap().display()
+        staged_elf(&am_path).display()
     );
 
     // Same as `account-manager-bin` above, for `backup-manager-bin` — the
@@ -418,7 +469,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", bm_path.display());
     println!(
         "cargo:rustc-env=BACKUP_MANAGER_ELF_PATH={}",
-        bm_path.canonicalize().unwrap().display()
+        staged_elf(&bm_path).display()
     );
 
     // Same as `backup-manager-bin` above, for `diagnostics-manager-bin` —
@@ -448,7 +499,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dg_path.display());
     println!(
         "cargo:rustc-env=DIAGNOSTICS_MANAGER_ELF_PATH={}",
-        dg_path.canonicalize().unwrap().display()
+        staged_elf(&dg_path).display()
     );
 
     // Same as `diagnostics-manager-bin` above, for `store-bin` — the
@@ -478,7 +529,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", st_path.display());
     println!(
         "cargo:rustc-env=STORE_ELF_PATH={}",
-        st_path.canonicalize().unwrap().display()
+        staged_elf(&st_path).display()
     );
 
     // Same as `store-bin` above, for `native-loader-bin` — the SEVENTH
@@ -508,7 +559,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", nl_path.display());
     println!(
         "cargo:rustc-env=NATIVE_LOADER_ELF_PATH={}",
-        nl_path.canonicalize().unwrap().display()
+        staged_elf(&nl_path).display()
     );
 
     // Same as `native-loader-bin` above, for `policy-engine-bin` — the
@@ -554,7 +605,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", pp_path.display());
     println!(
         "cargo:rustc-env=POLICY_ENGINE_ELF_PATH={}",
-        pp_path.canonicalize().unwrap().display()
+        staged_elf(&pp_path).display()
     );
 
     // Same as `policy-engine-bin` above, for `shell-bin` — the NINTH
@@ -588,7 +639,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", shell_path.display());
     println!(
         "cargo:rustc-env=SHELL_ELF_PATH={}",
-        shell_path.canonicalize().unwrap().display()
+        staged_elf(&shell_path).display()
     );
 
     // Same as `shell-bin` above, for `fm-core-bin` — the TENTH layer-4
@@ -619,7 +670,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", fm_path.display());
     println!(
         "cargo:rustc-env=FILE_MANAGER_ELF_PATH={}",
-        fm_path.canonicalize().unwrap().display()
+        staged_elf(&fm_path).display()
     );
 
     // Same as `fm-core-bin` above, for `ui-core-bin` — the ELEVENTH
@@ -650,7 +701,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ui_path.display());
     println!(
         "cargo:rustc-env=UI_CORE_ELF_PATH={}",
-        ui_path.canonicalize().unwrap().display()
+        staged_elf(&ui_path).display()
     );
 
     // `driver-i8042-bin` (real-input-handling plan, Stage B) — x86_64
@@ -683,7 +734,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", i8042_path.display());
         println!(
             "cargo:rustc-env=DRIVER_I8042_ELF_PATH={}",
-            i8042_path.canonicalize().unwrap().display()
+            staged_elf(&i8042_path).display()
         );
 
         // `driver-mouse-bin` (mouse-input plan, Stage 1b) — x86_64-only,
@@ -708,7 +759,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", mouse_path.display());
         println!(
             "cargo:rustc-env=DRIVER_MOUSE_ELF_PATH={}",
-            mouse_path.canonicalize().unwrap().display()
+            staged_elf(&mouse_path).display()
         );
 
         // `driver-nvme-bin` — x86_64-only, same reason as `driver-i8042-
@@ -734,7 +785,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", nvme_path.display());
         println!(
             "cargo:rustc-env=DRIVER_NVME_ELF_PATH={}",
-            nvme_path.canonicalize().unwrap().display()
+            staged_elf(&nvme_path).display()
         );
     }
 }
