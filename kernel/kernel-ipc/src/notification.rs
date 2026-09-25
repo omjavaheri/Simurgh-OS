@@ -118,6 +118,22 @@ impl<const W: usize> Notification<W> {
         self.waiters_len += 1;
         Ok(())
     }
+
+    /// Removes `thread` from the waiter list, keeping the order of the
+    /// others. Returns `true` iff it was there.
+    ///
+    /// The timeout half of a timed wait: a waiter whose deadline passed is
+    /// taken off the list so a LATER `signal` cannot wake it a second time
+    /// (or hand a value to a thread that has long since moved on).
+    /// `false` means a `signal` got there first and already woke it.
+    pub fn cancel_wait(&mut self, thread: ThreadId) -> bool {
+        let Some(at) = self.waiters[..self.waiters_len].iter().position(|&t| t == thread) else {
+            return false;
+        };
+        self.waiters.copy_within(at + 1..self.waiters_len, at);
+        self.waiters_len -= 1;
+        true
+    }
 }
 
 impl<const W: usize> Default for Notification<W> {
@@ -140,6 +156,19 @@ mod tests {
         let _ = n.signal(0b010);
         assert_eq!(n.poll(), 0b111);
         assert_eq!(n.poll(), 0);
+    }
+
+    #[test]
+    fn cancel_wait_removes_only_that_waiter_and_reports_whether_it_was_there() {
+        let mut n: Notification<W> = Notification::new();
+        n.wait(ThreadId::new(1)).unwrap();
+        n.wait(ThreadId::new(2)).unwrap();
+        n.wait(ThreadId::new(3)).unwrap();
+        assert!(n.cancel_wait(ThreadId::new(2)));
+        assert!(!n.cancel_wait(ThreadId::new(2)), "already gone");
+        assert!(!n.cancel_wait(ThreadId::new(9)), "never waited");
+        let woken = n.signal(0b1);
+        assert_eq!(woken.as_slice(), &[ThreadId::new(1), ThreadId::new(3)]);
     }
 
     #[test]

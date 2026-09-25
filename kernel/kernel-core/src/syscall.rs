@@ -1146,6 +1146,27 @@ impl KernelState {
         Ok(SyscallReturn::Blocked)
     }
 
+    /// Timeout half of a timed `Wait` (`kernel_arch_glue::p2_wait_timeout_
+    /// general`): if `tid` is still parked on `notification` (looked up in
+    /// `tid`'s own capability space), takes it off the waiter list and makes
+    /// it `Ready` again, returning `true`. Returns `false` when it is not
+    /// there any more - a `Signal` already woke it, which is the normal race
+    /// between a signal and a deadline, not an error.
+    pub fn cancel_notification_wait(&mut self, tid: ThreadId, notification: CapId, now_ns: u64) -> bool {
+        let Ok(cap) = self.resolve(tid, notification, KernelObjectKind::Notification, CapabilityRights::READ) else {
+            return false;
+        };
+        let nid = NotificationId::new(cap.object.id.as_u32());
+        let Some(notif) = self.notification_mut(nid) else {
+            return false;
+        };
+        if !notif.cancel_wait(tid) {
+            return false;
+        }
+        self.wake_blocked(tid, now_ns);
+        true
+    }
+
     /// `SyscallOp::Poll` — never blocks.
     fn do_poll(
         &mut self,
@@ -1855,6 +1876,46 @@ mod tests {
             &hal,
         );
         assert_eq!(r, Ok(SyscallReturn::Mapped));
+    }
+
+    #[test]
+    fn a_timed_out_wait_is_cancelled_once_and_a_later_signal_does_not_wake_it_again() {
+        let mut k = kernel();
+        let caller = k.root_thread;
+        let (cpu, timer, irqc, power) = mock_hal_pair();
+        let hal = hal_core::build_interface(&cpu, &timer, &irqc, &power);
+        let notif_cap = match k
+            .dispatch(
+                caller,
+                0,
+                SyscallOp::Retype {
+                    untyped: CapId::new(0),
+                    target_type: KernelObjectType::Notification,
+                    count: 1,
+                },
+                &hal,
+            )
+            .unwrap()
+        {
+            SyscallReturn::NewCaps { cap, .. } => cap,
+            other => panic!("unexpected {other:?}"),
+        };
+        let r = k.dispatch(caller, 0, SyscallOp::Wait { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Blocked));
+
+        // The deadline passes: the waiter is taken off the list and Ready.
+        assert!(k.cancel_notification_wait(caller, notif_cap, 5));
+        assert_eq!(k.sched.entity(caller).unwrap().state, kernel_sched::RunState::Ready);
+        // Cancelling again is a no-op: it is not parked any more.
+        assert!(!k.cancel_notification_wait(caller, notif_cap, 6));
+
+        // A signal after the timeout finds nobody to wake, so the bits stay
+        // pending for the next Wait/Poll instead of being handed to a thread
+        // that already moved on.
+        let r = k.dispatch(caller, 7, SyscallOp::Signal { notification: notif_cap, bits: 0b10 }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Done));
+        let r = k.dispatch(caller, 8, SyscallOp::Poll { notification: notif_cap }, &hal);
+        assert_eq!(r, Ok(SyscallReturn::Value(0b10)));
     }
 
     #[test]

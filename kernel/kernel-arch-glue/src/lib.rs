@@ -2208,6 +2208,10 @@ pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
     // touched only from this path and the one-time setup.
     let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
 
+    // Timed notification waits whose deadline has passed become Ready before
+    // this tick picks who runs next (see `expire_timed_waits`).
+    expire_timed_waits(hal.now_ns());
+
     // Device-manager's own scheduling is governed ENTIRELY by the
     // deterministic crash/respawn hand-off (`p2_fault`'s hand-off to
     // `DM_TID` / `p2_dm_handoff_to_driver`), not this ordinary
@@ -3094,9 +3098,137 @@ pub enum SignalOutcome {
 pub fn p2_signal(hal: &HalInterface, caller: ThreadId, notif_cap: u32, bits: u64) -> SignalOutcome {
     let k = kstate();
     match k.dispatch(caller, hal.now_ns(), SyscallOp::Signal { notification: kernel_cap::CapId::new(notif_cap), bits }, hal) {
-        Ok(SyscallReturn::DeliveredValue { woke, value }) => SignalOutcome::OkWithPoke { woke, value },
+        Ok(SyscallReturn::DeliveredValue { woke, value }) => {
+            // The signal beat the deadline: the wait is over, so its timer
+            // entry (if it was a timed wait at all) must not fire later.
+            clear_timed_wait(woke);
+            SignalOutcome::OkWithPoke { woke, value }
+        }
         Ok(_) => SignalOutcome::Ok,
         Err(_) => SignalOutcome::Failed,
+    }
+}
+
+// ============================================================================
+// Timed notification waits (`sys::NOTIF_WAIT_TIMEOUT`).
+//
+// Why this exists: a server that has to wait for "an input signal OR a
+// deadline" (the Compositor holding a client's poll open; simurgh-shell
+// waiting for a GUI keystroke while it also has to look at the serial line
+// now and then) had only two choices - `NOTIF_POLL` in a loop (an always-
+// Ready thread, so the idle `hlt` never engages) or `NOTIF_WAIT` with no
+// deadline at all (blocks forever if the event never comes). This is
+// `NOTIF_WAIT` plus a deadline.
+//
+// Mechanism: the wait is an ordinary `Wait` (the caller sits on the
+// notification's waiter list, `Blocked` in the scheduler). One extra
+// record per thread says WHEN to give up. `p2_tick` - which also runs after
+// every idle halt (`desktop_halt_then_tick`) - checks the records; an
+// expired one is taken off the waiter list, made `Ready`, and its saved
+// return registers are poked to `0`, i.e. "timed out, no bits".
+// Granularity is therefore one scheduler tick (`P2_QUANTUM_NS`, 2 ms).
+// ============================================================================
+
+/// One thread's pending deadline for its timed wait.
+#[derive(Clone, Copy)]
+struct TimedWait {
+    /// Absolute `hal.now_ns()` time after which the wait gives up.
+    deadline_ns: u64,
+    /// The caller's own capability slot for the notification - needed to
+    /// find the waiter list again at expiry.
+    notif_cap: u32,
+}
+
+/// Per-thread timed-wait records, indexed by raw `ThreadId`. Single-core:
+/// touched only from syscall/tick context, never concurrently.
+static mut TIMED_WAITS: [Option<TimedWait>; kernel_core::config::MAX_THREADS] =
+    [None; kernel_core::config::MAX_THREADS];
+
+/// How the timeout path writes `(0, 0)` into a woken thread's SAVED return
+/// registers. The layout is architecture-specific and this crate may not
+/// know it, so the architecture's own dispatcher registers
+/// `hal_<arch>::cpu::poke_saved_a0_a1` here (see [`register_saved_reg_poke`]).
+static mut SAVED_REG_POKE: Option<unsafe fn(*mut u8, usize, usize)> = None;
+
+/// Registers the architecture's `poke_saved_a0_a1`. Called by each
+/// architecture's `NOTIF_WAIT_TIMEOUT` handler before its first timed wait
+/// can possibly expire, so a timeout can never fire without a poke function.
+pub fn register_saved_reg_poke(f: unsafe fn(*mut u8, usize, usize)) {
+    // SAFETY: single-core; a plain store of a function pointer.
+    unsafe { core::ptr::addr_of_mut!(SAVED_REG_POKE).write(Some(f)) };
+}
+
+fn clear_timed_wait(tid: ThreadId) {
+    if let Some(slot) = unsafe { (*core::ptr::addr_of_mut!(TIMED_WAITS)).get_mut(tid.as_u32() as usize) } {
+        *slot = None;
+    }
+}
+
+/// Gives up every timed wait whose deadline has passed: the thread leaves
+/// the notification's waiter list, becomes `Ready`, and resumes with
+/// `(0, 0)` in its return registers. Called at the top of [`p2_tick`].
+fn expire_timed_waits(now: u64) {
+    // SAFETY: single-core; read once, the table is only mutated below and
+    // in syscall context, which cannot interleave with a tick handler.
+    let poke = unsafe { core::ptr::addr_of!(SAVED_REG_POKE).read() };
+    let k = kstate();
+    for idx in 0..kernel_core::config::MAX_THREADS {
+        // SAFETY: single-core, see above.
+        let Some(tw) = (unsafe { (*core::ptr::addr_of!(TIMED_WAITS))[idx] }) else {
+            continue;
+        };
+        if tw.deadline_ns > now {
+            continue;
+        }
+        // SAFETY: single-core.
+        unsafe { (*core::ptr::addr_of_mut!(TIMED_WAITS))[idx] = None };
+        let tid = ThreadId::new(idx as u32);
+        // `false` = a Signal already woke it (the ordinary race); nothing
+        // to do, and in particular no poke: it holds the signalled bits.
+        if !k.cancel_notification_wait(tid, CapId::new(tw.notif_cap), now) {
+            continue;
+        }
+        if let (Some(poke), Some(ctx)) = (poke, k.thread_context_mut_ptr(tid)) {
+            // SAFETY: `tid` is `Blocked` (just cancelled, not `Running`), so
+            // nothing else touches its saved context; `poke` is this
+            // architecture's own `poke_saved_a0_a1`.
+            unsafe { poke(ctx, 0, 0) };
+        }
+    }
+}
+
+/// `sys::NOTIF_WAIT_TIMEOUT`: [`p2_wait_general`] with a deadline. Bits
+/// already pending return at once; otherwise the caller blocks until a
+/// `Signal` (it then resumes with the bits, exactly like `NOTIF_WAIT`) or
+/// `timeout_ns` have passed (it then resumes with `0`). A `timeout_ns` of
+/// zero is a plain poll that never blocks.
+pub fn p2_wait_timeout_general(hal: &HalInterface, caller: ThreadId, notif_cap: u32, timeout_ns: u64) -> Option<WaitOutcome> {
+    let k = kstate();
+    clear_timed_wait(caller);
+    if timeout_ns == 0 {
+        return Some(WaitOutcome::Immediate(p2_poll(hal, caller, notif_cap)));
+    }
+    let now = hal.now_ns();
+    match k.dispatch(caller, now, SyscallOp::Wait { notification: kernel_cap::CapId::new(notif_cap) }, hal) {
+        Ok(SyscallReturn::Value(bits)) => Some(WaitOutcome::Immediate(bits)),
+        Ok(SyscallReturn::Blocked) => {
+            let Some(next) = k.sched.pick_next(now) else {
+                // Nothing else runnable: undo the block (leave the waiter
+                // list too - unlike `p2_wait_general`, which cannot) and
+                // report "nothing yet".
+                let _ = k.cancel_notification_wait(caller, kernel_cap::CapId::new(notif_cap), now);
+                let _ = k.sched.dispatch(caller, now);
+                return Some(WaitOutcome::Immediate(0));
+            };
+            // SAFETY: single-core; `caller` is a valid table index.
+            if let Some(slot) = unsafe { (*core::ptr::addr_of_mut!(TIMED_WAITS)).get_mut(caller.as_u32() as usize) } {
+                *slot = Some(TimedWait { deadline_ns: now.saturating_add(timeout_ns), notif_cap });
+            }
+            let _ = k.sched.dispatch(next, now);
+            let (save, into) = k.user_ctx_switch_ptrs(caller, next)?;
+            Some(WaitOutcome::Switch(IpcSwitch { save, into, poke: None }))
+        }
+        _ => None,
     }
 }
 

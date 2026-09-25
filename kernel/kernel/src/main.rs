@@ -1522,6 +1522,14 @@ mod sys {
     /// as one scheduler tick (`kernel_arch_glue::desktop_idle_wait`), so a
     /// thread an interrupt just woke runs immediately.
     pub const IDLE_WAIT: usize = 138;
+    /// `a0` = notification capability slot, `a1` = timeout in nanoseconds.
+    /// `NOTIF_WAIT` with a deadline: returns the pending bit-set (in `a0`) as
+    /// soon as it is non-zero, or `0` once `a1` ns have passed with nothing
+    /// signalled. Blocks (a real switch, the caller is not Ready meanwhile), so
+    /// it lets a server sleep until "a signal OR a deadline" instead of polling
+    /// with `NOTIF_POLL`. `a1` = 0 never blocks (a plain poll). Granularity is
+    /// one scheduler tick (2 ms). See `kernel_arch_glue::p2_wait_timeout_general`.
+    pub const NOTIF_WAIT_TIMEOUT: usize = 139;
 }
 
 /// Human-readable name for one of `kernel_arch_glue`'s `THREAD_EXIT_*`
@@ -3649,6 +3657,22 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                     // `SwitchToFast`.
                     TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
                 }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_WAIT_TIMEOUT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // The timeout path pokes (0, 0) into a woken thread's saved
+            // registers from inside the tick handler, which cannot know this
+            // architecture's context layout - so hand it the poke here.
+            kernel_arch_glue::register_saved_reg_poke(hal_x86_64::cpu::poke_saved_a0_a1);
+            return match kernel_arch_glue::p2_wait_timeout_general(hal, caller, a0 as u32, a1 as u64) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
                 None => TrapOutcome::Resume(0),
             };
         }
@@ -7740,6 +7764,22 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 None => TrapOutcome::Resume(0),
             };
         }
+        sys::NOTIF_WAIT_TIMEOUT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // The timeout path pokes (0, 0) into a woken thread's saved
+            // registers from inside the tick handler, which cannot know this
+            // architecture's context layout - so hand it the poke here.
+            kernel_arch_glue::register_saved_reg_poke(hal_arm64::cpu::poke_saved_a0_a1);
+            return match kernel_arch_glue::p2_wait_timeout_general(hal, caller, x0 as u32, x1 as u64) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
         sys::NOTIF_SIGNAL => {
             let hal = kernel_arch_glue::khal();
             let caller = kernel_arch_glue::kstate()
@@ -9480,6 +9520,22 @@ fn simurgh_syscall(
                     // `SwitchToFast`.
                     TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
                 }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_WAIT_TIMEOUT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // The timeout path pokes (0, 0) into a woken thread's saved
+            // registers from inside the tick handler, which cannot know this
+            // architecture's context layout - so hand it the poke here.
+            kernel_arch_glue::register_saved_reg_poke(hal_riscv64::cpu::poke_saved_a0_a1);
+            return match kernel_arch_glue::p2_wait_timeout_general(hal, caller, a0 as u32, a1 as u64) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
                 None => TrapOutcome::Resume(0),
             };
         }
