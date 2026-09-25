@@ -289,6 +289,15 @@ recent changes, identical there.** All three occur in the demo build.
   security-broker/store/policy-engine shared-page addresses noted below).
   `drv_blk_read_result ... MISMATCH` also appears. All present before.
 - riscv64 shows the same three U-mode page faults at those addresses.
+- x86_64 desktop with `-device virtio-blk-pci` (any raw disk): the boot log stops
+  right after `driver-virtio-blk ... probe() succeeded=true` (last lines are two
+  `root task (U-mode, x86_64): syscall result = 0x38 / 0x200`), ui-core is never
+  spawned, so the screen stays black (checked 2026-09-25). NOT caused by the
+  Devices work: the pre-Devices image `run-ui3/final.efi` (built 15:23, hours
+  before the 20:01 Devices commit) stops at exactly the same line. The hang is in
+  the demo-time virtio-blk read/write round trip of the root task / driver
+  (desktop boots still run it), before the desktop spawn; not investigated further.
+  NVMe (`-device nvme`) does not hit it.
 
 ### Machine id (2026-09-25, booted on x86_64; aarch64/riscv64 compile; design: `docs/machine-id.md`)
 
