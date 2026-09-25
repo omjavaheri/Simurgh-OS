@@ -1,0 +1,25 @@
+# ============================================================================
+# machine-id-core
+#
+# The pure, no_std, no-heap logic of the machine id (docs/machine-id.md
+# sections 5, 6, 8, 9, 11): SMBIOS structure parsing, canonicalisation and
+# placeholder rejection, the versioned SHA-256 construction, and the
+# weak/virtual flags. Host-testable with fixed vectors. Used by
+# `uefi-bootloader` (SMBIOS parse) and `kernel-core` (id computation).
+#
+# Depends only on hal-manifest's raw identity record (no heap, no arch code).
+# ============================================================================
+[package]
+name        = "machine-id-core"
+description = "Machine id derivation: SMBIOS parse, canonicalisation, SHA-256 (no_std)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+hal-manifest = { path = "../hal/hal-manifest", default-features = false }

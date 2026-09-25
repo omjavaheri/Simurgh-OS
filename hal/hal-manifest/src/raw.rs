@@ -22,6 +22,11 @@
 
 #![allow(clippy::upper_case_acronyms)]
 
+pub use crate::identity::{
+    IdentitySourceRaw, IdentityTextRaw, MachineIdentityRaw, IDENTITY_PRESENT_UUID, IDENTITY_TEXT_MAX,
+    MACHINE_IDENTITY_RAW_SIZE,
+};
+
 // ----------------------------------------------------------------------------
 // Fixed capacity limits for the boot-time transfer format.
 //
@@ -765,6 +770,12 @@ pub struct HardwareManifestRaw {
     /// install profile (section 2's Discovery + Policy split).
     pub framebuffer: FramebufferInfoRaw,
 
+    /// Raw board-level identifiers (SMBIOS strings/UUID) for the machine id
+    /// (docs/machine-id.md sections 3, 11); `MachineIdentityRaw::ZERO` when
+    /// firmware exposed none. Raw bytes only: never canonicalised here and
+    /// never logged (section 10).
+    pub machine_identity: MachineIdentityRaw,
+
     pub power_domain_count: u32,
     pub power_domains: [PowerDomainRaw; MAX_POWER_DOMAINS],
 
@@ -810,6 +821,7 @@ impl HardwareManifestRaw {
             interrupt_controller: InterruptControllerInfoRaw::ZERO,
             timer: TimerInfoRaw::ZERO,
             framebuffer: FramebufferInfoRaw::ZERO,
+            machine_identity: MachineIdentityRaw::ZERO,
             power_domain_count: 0,
             power_domains: [PowerDomainRaw::ZERO; MAX_POWER_DOMAINS],
             truncated_memory_regions: 0,

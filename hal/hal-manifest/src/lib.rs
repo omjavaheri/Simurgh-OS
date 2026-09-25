@@ -30,6 +30,7 @@
 // pulling in the alloc dependency at all in the boot-path configuration.
 #![cfg_attr(feature = "alloc", allow(clippy::module_name_repetitions))]
 
+pub mod identity;
 pub mod raw;
 
 #[cfg(feature = "alloc")]

@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "elf-loader",
     "hal/hal-manifest",
+    "machine-id-core",
     "hal/hal-core",
     "hal/hal-direct",
     "hal/hal-x86_64",
@@ -52,6 +53,7 @@ members = [
 default-members = [
     "elf-loader",
     "hal/hal-manifest",
+    "machine-id-core",
     "hal/hal-core",
     "hal/hal-direct",
     "kernel/kernel-cap",
