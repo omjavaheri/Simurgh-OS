@@ -1,0 +1,30 @@
+# ============================================================================
+# driver-hda  (docs/audio-plan.md)
+#
+# Intel High Definition Audio controller driver: controller reset, CORB/RIRB,
+# codec discovery + widget walk, 48 kHz 16-bit stereo PCM output through a
+# buffer descriptor list, per-widget amp volume/mute, and a shared "audio
+# page" (status + mailbox) for clients. x86_64 only for the process image; the
+# library is pure register/verb protocol logic and also builds on the host.
+#
+# `#![no_std]`, no dependencies. `rlib` plus a `subsystem-bin` `[[bin]]`, the
+# same two-target shape as driver-nvme.
+# ============================================================================
+[package]
+name        = "driver-hda"
+description = "Intel HD Audio driver for Simurgh (docs/audio-plan.md)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "driver-hda-bin"
+path = "src/bin/driver-hda-bin.rs"
+# A host `cargo test` harness would pull in `std` and collide on `panic_impl`.
+test = false

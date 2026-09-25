@@ -258,6 +258,7 @@ xbuild-subsystem-driver-mouse-x86_64 = "build -p driver-mouse --bin driver-mouse
 # (03-Kernel-Subsystems-Layer.md's own driver list) — x86_64-only, same
 # reason as driver-i8042 (NVMe discovery only exists in hal_x86_64 today).
 xbuild-subsystem-driver-nvme-x86_64 = "build -p driver-nvme --bin driver-nvme-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-driver-hda-x86_64 = "build -p driver-hda --bin driver-hda-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
 # ----------------------------------------------------------------------------
 # Host build behavior (no --target passed)

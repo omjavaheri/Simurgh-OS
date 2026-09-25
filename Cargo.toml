@@ -31,6 +31,7 @@ members = [
     "subsystems/drivers/driver-i8042",
     "subsystems/drivers/driver-mouse",
     "subsystems/drivers/driver-nvme",
+    "subsystems/drivers/driver-hda",
     "subsystems/vfs-service/vfs-router",
     "subsystems/vfs-service/fs-native",
     "subsystems/netstack",
@@ -194,6 +195,13 @@ debug-assertions = true
 overflow-checks = true
 
 [profile.dev.package.driver-mouse]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
+# driver-hda polls device registers in bounded busy loops (reset handshakes,
+# CORB/RIRB, stream position); same opt-level-0 hazard as the virtio drivers.
+[profile.dev.package.driver-hda]
 opt-level = 2
 debug-assertions = true
 overflow-checks = true
