@@ -381,6 +381,17 @@ static DRIVER_MOUSE_ELF: &[u8] = include_bytes!(env!("DRIVER_MOUSE_ELF_PATH"));
 #[cfg(target_arch = "x86_64")]
 static DRIVER_NVME_ELF: &[u8] = include_bytes!(env!("DRIVER_NVME_ELF_PATH"));
 
+/// `driver-hda-bin`'s own separately-built ELF image (Intel HD Audio,
+/// docs/audio-plan.md) — x86_64-only, same reasoning as `DRIVER_NVME_ELF`.
+#[cfg(target_arch = "x86_64")]
+static DRIVER_HDA_ELF: &[u8] = include_bytes!(env!("DRIVER_HDA_ELF_PATH"));
+
+/// VA of the shared audio page in ui-core (R+W: status is read, the mailbox is
+/// written), right after the network status page. Must stay numerically equal
+/// to `ui_core::audioinfo::AUDIO_PAGE_VA`.
+#[cfg(target_arch = "x86_64")]
+const UI_CORE_AUDIO_VA: usize = 0xD8B0_4000;
+
 // ----------------------------------------------------------------------------
 // Minimal serial output, per architecture — identical scope to
 // kernel-stub's backends (boot diagnostics only, not a driver).
@@ -1550,6 +1561,11 @@ mod sys {
     /// keyed on Netstack's page instead of the shell's. Any other caller is
     /// ignored (returns `usize::MAX`).
     pub const NET_LOG: usize = 140;
+    /// `a0` = byte count (capped at 512). `driver-hda` only: prints that many
+    /// bytes of UTF-8 text from the log area of its own command area as one
+    /// `hda: ...` serial line (`kernel_arch_glue::hda_log`). Same shape as
+    /// `NET_LOG`.
+    pub const HDA_LOG: usize = 141;
 }
 
 /// Human-readable name for one of `kernel_arch_glue`'s `THREAD_EXIT_*`
@@ -4239,6 +4255,9 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::NET_LOG => {
             return TrapOutcome::Resume(kernel_arch_glue::netstack_log(a0));
         }
+        sys::HDA_LOG => {
+            return TrapOutcome::Resume(kernel_arch_glue::hda_log(a0));
+        }
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
         }
@@ -4658,6 +4677,16 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 kernel_arch_glue::kstate().root_thread,
                 DRIVER_NVME_ELF,
                 elf_loader::machine::EM_X86_64,
+            );
+            // Intel HD Audio driver (docs/audio-plan.md): a no-op unless a
+            // controller was discovered (`-device intel-hda`). The demo image
+            // asks it for a 440 Hz self-check tone; the desktop stays silent.
+            let _ = kernel_arch_glue::spawn_hda_driver(
+                kernel_arch_glue::khal(),
+                kernel_arch_glue::kstate().root_thread,
+                DRIVER_HDA_ELF,
+                elf_loader::machine::EM_X86_64,
+                cfg!(not(feature = "desktop")),
             );
             // Spawned here as always (its capability wiring, its
             // `p2_watch_driver` registration and its own log line are
@@ -5893,6 +5922,15 @@ fn spawn_ui_core_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadI
                     )),
                     None => kernel_arch_glue::log(format_args!(
                         "root task (x86_64): network status page NOT mapped into ui-core (out of resources)\r\n"
+                    )),
+                }
+                match kernel_arch_glue::map_audio_page(hal, root_pt, UI_CORE_AUDIO_VA) {
+                    Some(()) => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): mapped the audio page into ui-core at {:#x}\r\n",
+                        UI_CORE_AUDIO_VA
+                    )),
+                    None => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): audio page NOT mapped into ui-core (out of resources)\r\n"
                     )),
                 }
                 match kernel_arch_glue::map_device_list_info(hal, root_pt, UI_CORE_DEVICE_LIST_VA) {

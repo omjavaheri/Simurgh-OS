@@ -314,6 +314,10 @@ pub enum PeripheralKindRaw {
     /// glue`'s own driver-dispatch code unable to tell which real driver
     /// binary a given device needs.
     Nvme = 7,
+    /// An Intel High Definition Audio controller (PCI class 0x04 "Multimedia",
+    /// subclass 0x03 "HD Audio"), discovered by CLASS CODE like `Nvme`. BAR0 is
+    /// the register window `driver-hda` maps (docs/audio-plan.md). x86_64 only.
+    Audio = 8,
 }
 
 /// One discovered MMIO-transport peripheral (virtio-mmio on QEMU's

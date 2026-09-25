@@ -158,6 +158,10 @@ pub struct KernelState {
     /// yet). `CapId::new(u32::MAX)` if none was found or the cap space
     /// was full, same sentinel as `root_mmio_blk_cap`.
     pub root_mmio_nvme_cap: CapId,
+    /// Capability naming the FIRST `Audio`-kind `MmioRegion` (an Intel HD Audio
+    /// controller found by PCI class code, docs/audio-plan.md). x86_64 only;
+    /// `CapId::new(u32::MAX)` if none.
+    pub root_mmio_audio_cap: CapId,
     /// The capability, in the Root Task's own cap space, naming the
     /// firmware-programmed display framebuffer
     /// (`populate_from_boot_info`'s Step 3h) — an `MmioRegion`, exactly
@@ -567,6 +571,7 @@ impl KernelState {
         root_mmio_i8042_cap: CapId::new(u32::MAX),
         root_mmio_mouse_cap: CapId::new(u32::MAX),
         root_mmio_nvme_cap: CapId::new(u32::MAX),
+        root_mmio_audio_cap: CapId::new(u32::MAX),
         root_mmio_framebuffer_cap: CapId::new(u32::MAX),
         framebuffer: hal_manifest::raw::FramebufferInfoRaw::ZERO,
         machine_id: machine_id_core::MachineId { id: [0; 16], weak: true, virtual_machine: false, strong_mask: 0 },
@@ -908,6 +913,32 @@ impl KernelState {
             })
             .unwrap_or(CapId::new(u32::MAX));
 
+        // Step 3g2: same again for the first `Audio`-kind device (Intel HD Audio).
+        let root_mmio_audio_cap = boot
+            .hardware_manifest
+            .peripheral_devices()
+            .iter()
+            .find(|d| d.kind == PeripheralKindRaw::Audio)
+            .and_then(|d| {
+                self.alloc_mmio_region_direct(MmioRegionDescriptor {
+                    phys_base: d.mmio_base,
+                    size: d.mmio_size,
+                    irq: d.irq,
+                    config_space_base: d.config_space_base,
+                })
+            })
+            .and_then(|mmio_id| {
+                let cap = Capability::full(ObjectRef::new(
+                    KernelObjectKind::MmioRegion,
+                    ObjectId::new(mmio_id.as_u32()),
+                ));
+                self.cap_space_mut(root_cs)
+                    .expect("root cap space exists")
+                    .insert_root(cap)
+                    .ok()
+            })
+            .unwrap_or(CapId::new(u32::MAX));
+
         // Step 3h: mint an `MmioRegion` capability for the firmware-
         // programmed display framebuffer, if this machine has one.
         //
@@ -1002,6 +1033,7 @@ impl KernelState {
         self.root_mmio_i8042_cap = root_mmio_i8042_cap;
         self.root_mmio_mouse_cap = root_mmio_mouse_cap;
         self.root_mmio_nvme_cap = root_mmio_nvme_cap;
+        self.root_mmio_audio_cap = root_mmio_audio_cap;
         self.root_mmio_framebuffer_cap = root_mmio_framebuffer_cap;
         self.untyped_count = untyped_made;
         Ok(())

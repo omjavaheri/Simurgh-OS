@@ -251,7 +251,8 @@ impl<'p> Driver<'p> {
             if pos as usize >= clip_bytes + 960 {
                 break "end of clip reached";
             }
-            if self.plat.now_ns().wrapping_sub(start) > dur_ns + 40_000_000 + dur_ns / 8 {
+            // Generous: the emulated audio clock can run slower than the guest clock.
+            if self.plat.now_ns().wrapping_sub(start) > dur_ns * 4 + 400_000_000 {
                 break "time limit";
             }
         };
@@ -361,7 +362,9 @@ pub extern "C" fn subsystem_main() -> ! {
                 found = Some(p);
                 break;
             }
-            Err(e) => log(format_args!("codec {}: no output path ({:?})", cad, e)),
+            Err(e) => {
+                log(format_args!("codec {}: no output path ({:?}) regs {:x?}", cad, e, hda.diagnostics()));
+            }
         }
     }
     let Some(path) = found else { fail(&mut st, HdaError::NoCodec, "no usable codec") };

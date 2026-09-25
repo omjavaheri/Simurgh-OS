@@ -212,7 +212,10 @@ impl<'p, P: Platform> Hda<'p, P> {
         self.wr16(regs::RIRBWP, 1 << 15);
         self.rirb_rp = 0;
         self.wr16(regs::RINTCNT, 1);
-        self.wr8(regs::RIRBCTL, 1 << 1); // DMA enable, no interrupt
+        // DMA enable + response-interrupt flag enable (bit 0): QEMU only counts and
+        // flags RINTCNT responses when it is set, and only then does the RIRBSTS
+        // acknowledge restart the CORB. No interrupt is delivered: INTCTL stays 0.
+        self.wr8(regs::RIRBCTL, 0x03);
         self.wr8(regs::CORBCTL, 1 << 1); // DMA run
         if !self.wait_until(10_000_000, |s| s.rd8(regs::CORBCTL) & (1 << 1) != 0) {
             return Err(HdaError::RingSetup);
@@ -236,6 +239,9 @@ impl<'p, P: Platform> Hda<'p, P> {
                 // SAFETY: the RIRB lives in the command area (module contract).
                 let (resp, ex) = unsafe { (read_volatile(e as *const u32), read_volatile((e + 4) as *const u32)) };
                 if ex & (1 << 4) == 0 {
+                    // Acknowledge RINTFL (write 1 to clear): the controller stops
+                    // fetching commands once RINTCNT responses are unacknowledged.
+                    self.wr8(regs::RIRBSTS, 0x05);
                     return Some(resp);
                 }
                 // Unsolicited response (jack event): not used, skip it.
@@ -355,5 +361,28 @@ impl<'p, P: Platform> Hda<'p, P> {
     pub unsafe fn ring_mut(&self) -> &'static mut [u8] {
         // SAFETY: `Layout::ring_va` maps `ring_len` bytes (module contract).
         unsafe { core::slice::from_raw_parts_mut(self.l.ring_va as *mut u8, self.l.ring_len) }
+    }
+}
+
+impl<'p, P: Platform> Hda<'p, P> {
+    /// Register snapshot for failure diagnostics: GCTL, STATESTS, CORBWP,
+    /// CORBRP, CORBCTL, CORBSIZE, RIRBWP, RIRBCTL, RIRBSTS, RIRBSIZE, and the
+    /// first RIRB dword.
+    pub fn diagnostics(&self) -> [u32; 11] {
+        // SAFETY: the RIRB lives in the command area (module contract).
+        let r0 = unsafe { read_volatile((self.l.cmd_va + cmd_area::RIRB + 8) as *const u32) };
+        [
+            self.rd32(regs::GCTL),
+            self.rd16(regs::STATESTS) as u32,
+            self.rd16(regs::CORBWP) as u32,
+            self.rd16(regs::CORBRP) as u32,
+            self.rd8(regs::CORBCTL) as u32,
+            self.rd8(regs::CORBSIZE) as u32,
+            self.rd16(regs::RIRBWP) as u32,
+            self.rd8(regs::RIRBCTL) as u32,
+            self.rd8(regs::RIRBSTS) as u32,
+            self.rd8(regs::RIRBSIZE) as u32,
+            r0,
+        ]
     }
 }

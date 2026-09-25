@@ -1002,6 +1002,7 @@ fn capture_device_list(boot: &BootInfo) {
         let (cat, name, virtio) = match d.kind {
             PeripheralKindRaw::Block => (DEVCAT_STORAGE, "virtio block device", true),
             PeripheralKindRaw::Nvme => (DEVCAT_STORAGE, "NVMe controller", false),
+            PeripheralKindRaw::Audio => (DEVCAT_SOUND, "HD Audio controller", false),
             PeripheralKindRaw::Network => (DEVCAT_NETWORK, "virtio network device", true),
             PeripheralKindRaw::Gpu => (DEVCAT_DISPLAY, "virtio GPU", true),
             PeripheralKindRaw::Console => (DEVCAT_OTHER, "virtio console", true),
@@ -8974,6 +8975,208 @@ pub fn spawn_nvme_driver(
 
     // NOT a context switch — same "linear boot sequence, scheduler picks
     // it up later" reasoning as `spawn_i8042_driver`'s own tail comment.
+    Some(drv_tid)
+}
+
+// ============================================================================
+// Intel HD Audio driver spawn + shared audio page (docs/audio-plan.md)
+//
+// ONE zeroed 4 KiB frame (the "audio page": driver-written STATUS record and a
+// client-written MAILBOX, layout in `driver_hda::page`), mapped read-write into
+// the driver process and into ui-core only. A machine without an HDA
+// controller never starts the driver, so the page stays zero and ui-core reads
+// "no audio device".
+// TODO(spec): who may write the mailbox is decided by kernel code that maps the
+// page into ui-core only, not by a capability (same as the network status page).
+// ============================================================================
+
+/// Physical address of the shared audio page (`usize::MAX` until carved).
+static mut G_AUDIO_PAGE_PHYS: usize = usize::MAX;
+/// Physical address of the driver's command area (for `hda_log`).
+static mut G_HDA_CMD_PHYS: usize = usize::MAX;
+
+/// Offset / length of the log text area in the command area - must stay
+/// numerically equal to `driver_hda::controller::cmd_area::{LOG, LOG_MAX}`.
+const HDA_LOG_OFFSET: usize = 0x400;
+const HDA_LOG_MAX: usize = 512;
+
+/// The shared audio page frame, carved and zeroed on first call.
+fn audio_info_frame(k: &mut KernelState) -> Option<usize> {
+    // SAFETY: single-core; only this function writes the static.
+    let cur = unsafe { core::ptr::addr_of!(G_AUDIO_PAGE_PHYS).read() };
+    if cur != usize::MAX {
+        return Some(cur);
+    }
+    let page = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe {
+        core::ptr::write_bytes(page as *mut u8, 0, 4096);
+        core::ptr::addr_of_mut!(G_AUDIO_PAGE_PHYS).write(page);
+    }
+    Some(page)
+}
+
+/// Maps the audio page READ+WRITE into the address space rooted at `root_pt`
+/// at `va` (ui-core). `None` only on an allocation/mapping failure.
+pub fn map_audio_page(hal: &HalInterface, root_pt: usize, va: usize) -> Option<()> {
+    let k = kstate();
+    let page = audio_info_frame(k)?;
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    // R | W | U: ui-core reads the status and writes the mailbox; never executable.
+    if hal.map_range(root_pt, va, page, 4096, 1 | 2 | 8, pool, 2) == u32::MAX {
+        klog!("map_audio_page: map_range error\r\n");
+        return None;
+    }
+    Some(())
+}
+
+/// `HDA_LOG` syscall body: prints `len` bytes of the driver's own log area as
+/// one `hda: <text>` line. Returns 0, or `usize::MAX` if no driver was spawned.
+pub fn hda_log(len: usize) -> usize {
+    // SAFETY: single-core; written once by `spawn_hda_driver`.
+    let base = unsafe { core::ptr::addr_of!(G_HDA_CMD_PHYS).read() };
+    if base == usize::MAX {
+        return usize::MAX;
+    }
+    let len = len.min(HDA_LOG_MAX);
+    // SAFETY: `base` is the driver's zeroed command area, identity-addressable;
+    // the log area lies inside its first page; single-core.
+    let bytes = unsafe { core::slice::from_raw_parts((base + HDA_LOG_OFFSET) as *const u8, len) };
+    let text = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+    klog!("hda: {}\r\n", text);
+    0
+}
+
+/// Spawns `driver-hda` from its own ELF: enables PCI memory space + bus
+/// mastering on the controller (firmware leaves it off for devices it does not
+/// use), maps BAR0, the shared audio page, a two-page command area (header,
+/// BDL, log, CORB, RIRB) and a contiguous 200 KiB PCM ring at the VAs
+/// `driver_hda::subsystem_entry` names, and grants one Notification at slot 0
+/// (the driver's timed sleep). `selftest` asks the driver to play a 440 Hz
+/// tone for one second once it is up.
+///
+/// Returns `None` (and logs) when no `Audio`-kind peripheral was discovered
+/// (the normal case without `-device intel-hda`) or on any allocation failure.
+pub fn spawn_hda_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+    selftest: bool,
+) -> Option<ThreadId> {
+    let k = kstate();
+    let mmio_cap = k.root_mmio_audio_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_hda_driver: no HD Audio controller was discovered at boot\r\n");
+        return None;
+    }
+    let src_cs = k.tcb(caller)?.cap_space;
+    let mmio_id = kernel_cap::MmioRegionId::new(k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32());
+    let mmio = *k.mmio_region(mmio_id)?;
+
+    // Memory Space + Bus Master Enable (PCI Local Bus Spec 6.2.2): OVMF only
+    // enables devices it has a boot driver for, and HDA is not one.
+    if mmio.config_space_base != 0 {
+        let caller_addr_space = k.tcb(caller)?.addr_space;
+        let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+        let cfg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+        // SAFETY: fresh untyped RAM, identity-addressable, single-core; `map_range`
+        // needs the pool pre-zeroed.
+        unsafe { core::ptr::write_bytes(cfg_pool as *mut u8, 0, 4096 * 2) };
+        if hal.map_range(caller_root_pt, KERNEL_PCI_CFG_VA, mmio.config_space_base as usize, 4096, 1 | 2, cfg_pool, 2)
+            == u32::MAX
+        {
+            klog!("spawn_hda_driver: map_range error (ECAM config page)\r\n");
+            return None;
+        }
+        // The caller's table is live: flush before touching the new mapping.
+        hal.flush_tlb();
+        // SAFETY: `KERNEL_PCI_CFG_VA` maps this function's own 4 KiB config space.
+        unsafe {
+            let cmd = pci_cfg_read32(KERNEL_PCI_CFG_VA as u64, PCI_COMMAND_OFFSET);
+            pci_cfg_write32(
+                KERNEL_PCI_CFG_VA as u64,
+                PCI_COMMAND_OFFSET,
+                cmd | PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER,
+            );
+        }
+    }
+
+    const DRV_HDA_STACK_VMA: usize = 0xC0D0_0000;
+    const DRV_HDA_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_HDA_STACK_VMA, DRV_HDA_STACK_LEN)?;
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    // Slot 0: the sleep Notification nobody signals (timed waits only).
+    let Some(sleep_notif) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1) else {
+        klog!("spawn_hda_driver: failed to retype the sleep Notification\r\n");
+        return None;
+    };
+    grant_cap_into(k, src_cs, sleep_notif, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // One pool of two zeroed table pages per mapping call.
+    let map = |k: &mut KernelState, va: usize, phys: usize, len: usize| -> Option<()> {
+        let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+        // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+        unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+        // R | W | U.
+        if hal.map_range(drv_root_pt, va, phys, len, 1 | 2 | 8, pool, 2) == u32::MAX {
+            None
+        } else {
+            Some(())
+        }
+    };
+
+    const DRV_HDA_BAR0_VA: usize = 0xD8E0_0000;
+    const DRV_HDA_PAGE_VA: usize = 0xD8E1_0000;
+    const DRV_HDA_CMD_VA: usize = 0xD8E2_0000;
+    const DRV_HDA_RING_VA: usize = 0xD8E4_0000;
+    const HDA_CMD_LEN: usize = 4096 * 2;
+    const HDA_RING_LEN: usize = 4096 * 50;
+
+    if map(k, DRV_HDA_BAR0_VA, mmio.phys_base as usize, 4096).is_none() {
+        klog!("spawn_hda_driver: map_range error (BAR0)\r\n");
+        return None;
+    }
+    let page_phys = audio_info_frame(k)?;
+    if map(k, DRV_HDA_PAGE_VA, page_phys, 4096).is_none() {
+        klog!("spawn_hda_driver: map_range error (audio page)\r\n");
+        return None;
+    }
+    let cmd_phys = carve_from_any_untyped(k, 4096, HDA_CMD_LEN as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(cmd_phys as *mut u8, 0, HDA_CMD_LEN) };
+    let ring_phys = carve_from_any_untyped(k, 4096, HDA_RING_LEN as u64)?;
+    // SAFETY: as above.
+    unsafe { core::ptr::write_bytes(ring_phys as *mut u8, 0, HDA_RING_LEN) };
+    // Header the driver reads (`driver_hda::controller::cmd_area::HEADER`): its
+    // own physical addresses (a process cannot translate VAs), self-check flag,
+    // initial volume percent.
+    // SAFETY: inside the zeroed command area written above.
+    unsafe {
+        let h = cmd_phys as *mut u64;
+        h.write_volatile(cmd_phys as u64);
+        h.add(1).write_volatile(ring_phys as u64);
+        h.add(2).write_volatile(HDA_RING_LEN as u64);
+        h.add(3).write_volatile(selftest as u64);
+        h.add(4).write_volatile(75);
+        core::ptr::addr_of_mut!(G_HDA_CMD_PHYS).write(cmd_phys);
+    }
+    if map(k, DRV_HDA_CMD_VA, cmd_phys, HDA_CMD_LEN).is_none() || map(k, DRV_HDA_RING_VA, ring_phys, HDA_RING_LEN).is_none() {
+        klog!("spawn_hda_driver: map_range error (command area / ring)\r\n");
+        return None;
+    }
+
+    klog!(
+        "spawn_hda_driver: driver-hda spawned (BAR0 {:#x}, ring {} KiB, self-check tone {})\r\n",
+        mmio.phys_base,
+        HDA_RING_LEN / 1024,
+        if selftest { "on" } else { "off" }
+    );
     Some(drv_tid)
 }
 

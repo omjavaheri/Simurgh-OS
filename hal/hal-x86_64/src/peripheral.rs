@@ -64,6 +64,13 @@ const VIRTIO_PCI_VENDOR_ID: u16 = 0x1AF4;
 const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
 const PCI_CLASS_NETWORK: u8 = 0x02;
 const PCI_CLASS_DISPLAY: u8 = 0x03;
+/// PCI class 0x04 "Multimedia", subclass 0x03 "HD Audio" (Intel HDA), found by
+/// class code like NVMe (docs/audio-plan.md).
+const PCI_CLASS_MULTIMEDIA: u8 = 0x04;
+const PCI_SUBCLASS_HD_AUDIO: u8 = 0x03;
+/// Reserved MSI vector for an HD Audio controller (polling driver today; distinct
+/// from blk/net/nvme so a future IrqBind cannot collide).
+const X86_64_HDA_MSI_VECTOR: u32 = 48;
 
 /// Reserved APIC vector for the virtio-blk device's own MSI-X interrupt
 /// — see this file's own module doc comment for why this is an
@@ -114,6 +121,7 @@ fn msi_vector_for_kind(kind: PeripheralKind) -> u32 {
         PeripheralKind::Block => X86_64_VIRTIO_BLK_MSI_VECTOR,
         PeripheralKind::Network => X86_64_VIRTIO_NET_MSI_VECTOR,
         PeripheralKind::Nvme => X86_64_NVME_MSI_VECTOR,
+        PeripheralKind::Audio => X86_64_HDA_MSI_VECTOR,
         _ => X86_64_NVME_MSI_VECTOR + 1,
     }
 }
@@ -379,7 +387,8 @@ impl PeripheralDiscovery {
                     // other kind this scan already recognises).
                     let is_virtio = header.vendor_id == VIRTIO_PCI_VENDOR_ID;
                     let is_nvme = is_nvme_controller(&header);
-                    if !is_virtio && !is_nvme {
+                    let is_audio = header.class_code == PCI_CLASS_MULTIMEDIA && header.subclass == PCI_SUBCLASS_HD_AUDIO;
+                    if !is_virtio && !is_nvme && !is_audio {
                         continue;
                     }
 
@@ -389,7 +398,13 @@ impl PeripheralDiscovery {
 
                     let config_space_base = ecam_base + ecam_offset(bus, device, function);
 
-                    let (kind, mmio_base, mmio_size) = if is_nvme {
+                    let (kind, mmio_base, mmio_size) = if is_audio {
+                        // SAFETY: same ordering contract as above. HDA BAR0 is a
+                        // memory BAR (32-bit on ICH6/QEMU, may be 64-bit).
+                        let bar0 = unsafe { probe_bar0_maybe64(ecam_base, bus, device, function) };
+                        let (mmio_base, mmio_size) = bar0.unwrap_or((0, 0));
+                        (PeripheralKind::Audio, mmio_base, mmio_size)
+                    } else if is_nvme {
                         // SAFETY: same ordering contract as above. NVMe's
                         // BAR0 is commonly 64-bit (`probe_bar0_maybe64`'s
                         // own doc comment) — a plain 32-bit `probe_bar0`

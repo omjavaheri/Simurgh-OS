@@ -787,5 +787,30 @@ fn main() {
             "cargo:rustc-env=DRIVER_NVME_ELF_PATH={}",
             staged_elf(&nvme_path).display()
         );
+
+        // `driver-hda-bin` (Intel HD Audio, docs/audio-plan.md) — x86_64-only,
+        // same reason as the NVMe driver just above.
+        let hda_build_alias = "cargo xbuild-subsystem-driver-hda-x86_64".to_string();
+        let hda_path = std::path::PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("target")
+            .join(dm_target_dir_name)
+            .join("debug")
+            .join("driver-hda-bin");
+
+        if !hda_path.exists() {
+            panic!(
+                "kernel build.rs: driver-hda-bin binary not found at {} (target_arch = {target_arch}).\n\
+                 Build it first with: {hda_build_alias}",
+                hda_path.display()
+            );
+        }
+
+        println!("cargo:rerun-if-changed={}", hda_path.display());
+        println!(
+            "cargo:rustc-env=DRIVER_HDA_ELF_PATH={}",
+            staged_elf(&hda_path).display()
+        );
     }
 }
