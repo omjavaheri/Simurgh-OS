@@ -1540,6 +1540,14 @@ mod sys {
     /// with `NOTIF_POLL`. `a1` = 0 never blocks (a plain poll). Granularity is
     /// one scheduler tick (2 ms). See `kernel_arch_glue::p2_wait_timeout_general`.
     pub const NOTIF_WAIT_TIMEOUT: usize = 139;
+    /// `a0` = byte count (capped at 512). Netstack only: prints that many
+    /// bytes of UTF-8 text, read from the log area of Netstack's OWN status
+    /// region (`kernel_arch_glue::netstack_log`), as one `netstack: ...`
+    /// serial line. Same "peek the process's own pre-mapped page by physical
+    /// address, no VA in a syscall argument" shape as `SERIAL_PRINT`, but
+    /// keyed on Netstack's page instead of the shell's. Any other caller is
+    /// ignored (returns `usize::MAX`).
+    pub const NET_LOG: usize = 140;
 }
 
 /// Human-readable name for one of `kernel_arch_glue`'s `THREAD_EXIT_*`
@@ -4225,6 +4233,9 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
         sys::NOW_NS => {
             let hal = kernel_arch_glue::khal();
             return TrapOutcome::Resume(hal.now_ns() as usize);
+        }
+        sys::NET_LOG => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_log(a0));
         }
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
@@ -8326,6 +8337,9 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
             let hal = kernel_arch_glue::khal();
             return TrapOutcome::Resume(hal.now_ns() as usize);
         }
+        sys::NET_LOG => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_log(x0));
+        }
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
         }
@@ -10082,6 +10096,9 @@ fn simurgh_syscall(
         sys::NOW_NS => {
             let hal = kernel_arch_glue::khal();
             return TrapOutcome::Resume(hal.now_ns() as usize);
+        }
+        sys::NET_LOG => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_log(a0));
         }
         sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
             return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());

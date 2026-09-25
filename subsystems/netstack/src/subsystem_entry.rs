@@ -50,6 +50,14 @@
 //! pattern `drv_net_probe_result`'s own MAC read already used before
 //! this session, now relocated here).
 //!
+//! **Second thread (Internet plan, phase 1)**: on the desktop image the kernel
+//! (`kernel_arch_glue::netstack_start_service`) starts a SECOND thread of this
+//! process at the same entry point, marked by a role byte in the status region.
+//! That thread runs `service_main`: the persistent smoltcp service (link up,
+//! gateway pings, later DHCP/DNS), sleeping on a private notification between
+//! polls. The first thread skips the racy ARP/ICMP boot demo there and only
+//! serves the bypass control plane. Logging goes through `sys::NET_LOG`.
+//!
 //! Safety/invariants: unlike `device-manager::subsystem_entry` (whose
 //! `#[link_section = ".user_text"]` code shares a binary with kernel
 //! `.text`), this file compiles into `netstack-bin`'s OWN fully separate
@@ -346,6 +354,50 @@ macro_rules! zero {
     }};
 }
 
+/// `sys::NET_LOG` — must stay numerically equal to `kernel/src/main.rs`'s
+/// constant of the same name.
+const NET_LOG: usize = 140;
+/// Offset of the log text area inside this process's status region — must
+/// stay numerically equal to `kernel_arch_glue::NETSTACK_LOG_OFFSET`.
+const LOG_OFFSET: usize = 256;
+/// Longest log line — must stay numerically equal to
+/// `kernel_arch_glue::NETSTACK_LOG_MAX`.
+const LOG_MAX: usize = 512;
+
+/// Formats into the status region's log area (no heap).
+struct LogBuf {
+    len: usize,
+}
+
+impl core::fmt::Write for LogBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len >= LOG_MAX {
+                break;
+            }
+            // SAFETY: `STATUS_VA` is mapped `U=1 R+W` in this process's own
+            // address space before its first instruction (`spawn_netstack_
+            // service`); `LOG_OFFSET + LOG_MAX` stays inside that page.
+            unsafe { ((STATUS_VA + LOG_OFFSET + self.len) as *mut u8).write_volatile(b) };
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Prints one line on the serial console through `sys::NET_LOG`. Netstack
+/// has no console of its own; the kernel reads the text from this process's
+/// status region (`LOG_OFFSET`). Only one thread of this process logs at a
+/// time (the boot demo thread finishes before the service thread starts).
+macro_rules! nlog {
+    ($($arg:tt)*) => {{
+        let mut buf = LogBuf { len: 0 };
+        let _ = core::fmt::Write::write_fmt(&mut buf, core::format_args!($($arg)*));
+        // SAFETY: `raw_syscall`'s own contract; never blocks.
+        unsafe { raw_syscall(NET_LOG, buf.len, 0) };
+    }};
+}
+
 /// Reads the driver's own negotiated MAC — written by its `do_probe`
 /// before this process was ever spawned (this file's own module doc
 /// comment on why that ordering is guaranteed).
@@ -616,6 +668,159 @@ fn write_status(verdict: u8, gw_mac: Option<[u8; 6]>) {
     }
 }
 
+/// Offset of the role byte in the status region — must stay numerically
+/// equal to `kernel_arch_glue::NETSTACK_ROLE_OFFSET`. `0` = boot-demo thread,
+/// `1` = persistent service thread (`kernel_arch_glue::netstack_start_
+/// service` writes it before that thread's first instruction).
+const ROLE_OFFSET: usize = 16;
+/// Offset of the "skip the boot demo" byte - must stay numerically equal to
+/// `kernel_arch_glue::NETSTACK_SKIP_DEMO_OFFSET`. Written by the kernel only on
+/// the desktop image, where the persistent service replaces the demo.
+const SKIP_DEMO_OFFSET: usize = 17;
+
+/// `sys::NOW_NS` — must stay numerically equal to `kernel/src/main.rs`'s
+/// constant of the same name. Returns the kernel's monotonic clock in
+/// nanoseconds; the only time source a layer-3 process has (Internet plan,
+/// TODO(spec) 2).
+const NOW_NS: usize = 86;
+/// `sys::NOTIF_WAIT_TIMEOUT` — must stay numerically equal to
+/// `kernel/src/main.rs`'s constant of the same name.
+const NOTIF_WAIT_TIMEOUT: usize = 139;
+/// Capability slot of the private, never-signalled sleep `Notification`
+/// (`kernel_arch_glue::spawn_netstack_service`'s slot 2). A timed wait on it
+/// is "wake me in N ns".
+const SLEEP_NOTIF_CAP: usize = 2;
+
+/// Longest sleep between two polls of the stack. RX is poll-only (the
+/// driver has no blocking receive, see its module doc), so this is also the
+/// worst-case receive latency; smoltcp's own timers (ARP retry, DHCP, DNS
+/// retransmit) shorten it when something is due sooner.
+const IDLE_POLL_NS: u64 = 10_000_000;
+
+/// Gateway pings: this many, one per second, once the link is up...
+const PING_BURST: u32 = 5;
+const PING_BURST_INTERVAL_NS: u64 = 1_000_000_000;
+/// ...then one heartbeat ping per interval, forever.
+const PING_HEARTBEAT_INTERVAL_NS: u64 = 30_000_000_000;
+
+/// Reads the kernel's monotonic clock.
+fn now_ns() -> u64 {
+    // SAFETY: `raw_syscall`'s own contract; never blocks.
+    unsafe { raw_syscall(NOW_NS, zero!(), zero!()) as u64 }
+}
+
+/// Sleeps for about `ns` nanoseconds (scheduler-tick granularity, 2 ms).
+fn sleep_ns(ns: u64) {
+    // SAFETY: `raw_syscall`'s own contract. Blocks this thread on a
+    // notification nobody signals until the deadline; the result (pending
+    // bits, always 0) is irrelevant.
+    unsafe { raw_syscall(NOTIF_WAIT_TIMEOUT, SLEEP_NOTIF_CAP, ns as usize) };
+}
+
+/// The smoltcp frame transport over the driver's IPC (`SendFrame`/
+/// `PollFrame`), reusing the RX/TX shared pages already mapped for the boot
+/// demo. Chosen over a new shared-ring protocol because it is the smallest
+/// thing that works and needs no driver change; one IPC round trip per RX
+/// poll is cheap next to the 10 ms poll interval. TODO(spec): a deeper RX
+/// queue or a notification on RX (Internet plan TODO(spec) 3) would remove
+/// the polling.
+struct DriverIo;
+
+impl crate::stack::FrameIo for DriverIo {
+    fn recv_frame(&mut self, buf: &mut [u8]) -> Option<usize> {
+        // SAFETY: `call_driver`'s own contract; the RX region is mapped from
+        // process entry onward.
+        match unsafe { call_driver(&DriverRequest::PollFrame) } {
+            Some(DriverResponse::FrameReceived { len }) => {
+                let n = (len as usize).min(FRAME_MAX).min(buf.len());
+                // SAFETY: same contract; `n <= FRAME_MAX` stays inside the
+                // frame buffer that follows the virtio-net header.
+                unsafe {
+                    let base = (DRV_RX_VA + BUFFER_OFFSET + VIRTIO_NET_HDR_LEN) as *const u8;
+                    for (i, b) in buf[..n].iter_mut().enumerate() {
+                        *b = base.add(i).read_volatile();
+                    }
+                }
+                Some(n)
+            }
+            _ => None,
+        }
+    }
+
+    fn send_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.len() > FRAME_MAX {
+            return false;
+        }
+        // SAFETY: `stage_frame_for_tx`/`call_driver` contracts; length
+        // checked above.
+        unsafe {
+            stage_frame_for_tx(frame);
+            matches!(call_driver(&DriverRequest::SendFrame { len: frame.len() as u32 }), Some(DriverResponse::FrameSent))
+        }
+    }
+}
+
+/// All memory of the smoltcp stack; `.bss`, zero-initialised by the loader.
+static mut STACK_STORAGE: crate::stack::StackStorage = crate::stack::StackStorage::new();
+
+fn log_event(ev: crate::stack::NetEvent) {
+    use crate::stack::NetEvent;
+    match ev {
+        NetEvent::LinkConfigured { ip, prefix, gateway } => match gateway {
+            Some(g) => nlog!(
+                "link up: {}.{}.{}.{}/{} gateway {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3], prefix, g[0], g[1], g[2], g[3]
+            ),
+            None => nlog!("link up: {}.{}.{}.{}/{} (no gateway)", ip[0], ip[1], ip[2], ip[3], prefix),
+        },
+        NetEvent::PingReply { from, seq, rtt_us } => nlog!(
+            "ping reply from {}.{}.{}.{}: seq={} time={}.{:03} ms",
+            from[0], from[1], from[2], from[3], seq, rtt_us / 1000, rtt_us % 1000
+        ),
+        NetEvent::PingTimeout { seq } => nlog!("ping seq={} timed out", seq),
+    }
+}
+
+/// The persistent Netstack service (second thread of this process, started
+/// by `kernel_arch_glue::netstack_start_service` on the desktop image): owns
+/// the smoltcp stack, polls it with a sleep in between, and pings the
+/// gateway repeatedly so a serial log shows the network is alive.
+fn service_main() -> ! {
+    // SAFETY: `DRV_RX_VA` is mapped from process entry onward.
+    let mac = unsafe { read_driver_mac() };
+    // SAFETY: single-threaded use of the static: only this thread ever
+    // touches it, and it is taken exactly once.
+    let storage = unsafe { &mut *core::ptr::addr_of_mut!(STACK_STORAGE) };
+    let start = now_ns();
+    let mut stack = crate::stack::NetStack::new(
+        storage,
+        DriverIo,
+        mac,
+        crate::stack::AddrMode::Static { ip: OUR_IP, prefix: 24, gateway: GATEWAY_IP },
+        start,
+    );
+    nlog!("service: smoltcp stack up, nic mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    let mut seq: u16 = 0;
+    let mut pings_sent: u32 = 0;
+    let mut next_ping_ns = start;
+    loop {
+        let now = now_ns();
+        if now >= next_ping_ns && !stack.ping_outstanding() {
+            seq = seq.wrapping_add(1);
+            if stack.ping(GATEWAY_IP, seq, now).is_ok() {
+                pings_sent += 1;
+                next_ping_ns =
+                    now + if pings_sent < PING_BURST { PING_BURST_INTERVAL_NS } else { PING_HEARTBEAT_INTERVAL_NS };
+            }
+        }
+        stack.poll(now, &mut log_event);
+        let now = now_ns();
+        let wait = stack.poll_delay_ms(now).map(|ms| ms * 1_000_000).unwrap_or(IDLE_POLL_NS).clamp(1_000_000, IDLE_POLL_NS);
+        sleep_ns(wait);
+    }
+}
+
 /// The Netstack process's own entry point. Runs the ARP-resolve-then-
 /// ICMP-echo MVP demo (03-Kernel-Subsystems-Layer.md §5.4) exactly once,
 /// driving `driver-virtio-net` over real IPC throughout, then reports
@@ -627,10 +832,22 @@ fn write_status(verdict: u8, gw_mac: Option<[u8; 6]>) {
 /// yet built, still future scope.
 #[no_mangle]
 pub extern "C" fn subsystem_main() -> ! {
+    // SAFETY: `STATUS_VA` is mapped from process entry onward; the kernel wrote
+    // the role byte (if at all) before this thread's first instruction.
+    if unsafe { ((STATUS_VA + ROLE_OFFSET) as *const u8).read_volatile() } == 1 {
+        service_main();
+    }
+    // SAFETY: as above.
+    if unsafe { ((STATUS_VA + SKIP_DEMO_OFFSET) as *const u8).read_volatile() } == 1 {
+        nlog!("boot demo skipped (desktop image: the service thread pings the gateway instead)");
+        write_status(4, None);
+        park();
+    }
     // SAFETY: `DRV_RX_VA` is mapped by the time this process's first
     // instruction ever runs (this file's own module doc comment).
     let our_mac = unsafe { read_driver_mac() };
 
+    nlog!("boot demo: started, nic mac {:02x?}", our_mac);
     let arp_request = crate::build_arp_request(our_mac, OUR_IP, GATEWAY_IP);
     // SAFETY: `call_driver`'s own contract; `arp_request.len() <=
     // FRAME_MAX` (42 bytes, this crate's own fixed ARP frame size).
@@ -638,6 +855,7 @@ pub extern "C" fn subsystem_main() -> ! {
         send_then_poll(&arp_request, |frame| crate::parse_arp_reply(frame, GATEWAY_IP))
     };
 
+    nlog!("boot demo: ARP {}", if gw_mac.is_some() { "answered" } else { "gave up" });
     let Some(gw_mac) = gw_mac else {
         write_status(1, None);
         park();
@@ -662,6 +880,7 @@ pub extern "C" fn subsystem_main() -> ! {
         })
     };
 
+    nlog!("boot demo: echo {}", if matched.is_some() { "matched" } else { "mismatch or timeout" });
     write_status(if matched.is_some() { 3 } else { 2 }, Some(gw_mac));
     park();
 }

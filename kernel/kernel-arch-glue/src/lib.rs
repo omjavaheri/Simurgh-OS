@@ -2772,6 +2772,13 @@ pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
     if let Some(ns_tid) = unsafe { core::ptr::addr_of!(G_NETSTACK_TID).read() } {
         let _ = state.sched.note_blocked(ns_tid);
     }
+    // Desktop build: Netstack's persistent service thread (a SECOND thread
+    // of the Netstack process, so the first one can keep serving the bypass
+    // control plane). It is created here, at the very end of the boot-time
+    // demo sequence, so nothing above (the timing-sensitive IPC demos)
+    // ever sees it as a scheduling candidate.
+    #[cfg(feature = "desktop")]
+    let _ = netstack_start_service(hal);
     // `state.sched.remove(root)` clears `running` (root was it), and this
     // switch to `fresh_tid` happens directly via `user_ctx_switch_ptrs`,
     // bypassing `preempt_tick`/`cooperative_yield` (whose own `Switch`
@@ -3498,7 +3505,19 @@ pub fn p2_ipc_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> O
         Ok(SyscallReturn::Message { from, msg }) => {
             Some(IpcRecvOutcome::Immediate { from: from.as_u32() as usize, label: msg.label as usize })
         }
-        Ok(SyscallReturn::Reschedule { next: Some(_) }) => {
+        // `next: None` (nothing else Ready) hands off to root too: while root is
+        // alive this opcode is the one-shot RPC hand-off, whose destination is
+        // ALWAYS root, and `pick_next` answering `None` only means root is not
+        // marked Ready (it sits suspended inside its own spawn/Call syscall),
+        // not that there is nobody to resume. Returning immediately instead (the
+        // `_` arm) made the caller's serve loop spin without blocking. Found
+        // via QEMU (Internet plan phase 1): with the Netstack boot demo skipped
+        // no phantom Ready thread existed any more, and the Compositor spun
+        // its request loop on a stale message until its heap ran out. Desktop image
+        // only: the demo image's NIC demo (Netstack <-> driver, timing-sensitive)
+        // relies on the immediate return, verified via QEMU. A caller that IS
+        // root has nobody to hand off to and keeps the old behaviour.
+        Ok(SyscallReturn::Reschedule { next }) if next.is_some() || (cfg!(feature = "desktop") && caller != k.root_thread) => {
             // **Real bug found via QEMU**: `do_recv`'s own `next` here
             // is `pick_next`'s GENERAL fairness answer — correct for
             // the general syscall surface, but wrong for THIS demo's
@@ -7156,6 +7175,8 @@ unsafe fn wire_virtio_pci_transport_net(
                 return None;
             }
             msix_vector = 0; // table entry 0 — this MVP's only vector, matching enable_and_program_msix's own table write.
+            // SAFETY: single-core; written once here, before `IrqBind` installs the trampoline that reads it.
+            unsafe { core::ptr::addr_of_mut!(G_DRV_NET_MSIX_ACTIVE).write(true) };
         }
     }
 
@@ -7768,6 +7789,17 @@ static mut G_DRV_NET_MMIO_PHYS: usize = usize::MAX;
 /// is active when the IRQ actually lands.
 static mut G_DRV_NET_ISR_CFG_VA: usize = usize::MAX;
 
+/// `true` once `wire_virtio_pci_transport_net` enabled MSI-X for the NIC.
+/// An MSI-X interrupt is a plain edge-triggered memory write, so unlike
+/// legacy INTx it needs no ISR-status read to deassert - which lets
+/// `virtio_net_irq_trampoline` skip that read entirely. This matters as
+/// soon as Netstack runs as a persistent service next to the desktop
+/// processes (Internet plan, phase 1): the completion IRQ can then land
+/// while ANY process's page table is active, and the ISR window is mapped
+/// only under the driver, Netstack and root (see `G_DRV_NET_ISR_CFG_PHYS`
+/// "known remaining gap"), so the read would fault in kernel mode.
+static mut G_DRV_NET_MSIX_ACTIVE: bool = false;
+
 /// The ISR_CFG register window's own PHYSICAL base (`bar_phys + w.
 /// offset`, re-derived via `pci_bar_phys` right after `wire_virtio_pci_
 /// transport_net` maps it into `drv_root_pt`) — `usize::MAX` if no ISR
@@ -7898,6 +7930,20 @@ static mut G_NETSTACK_STATUS_PHYS: usize = usize::MAX;
 /// trusting the general scheduler's own answer.
 static mut G_NETSTACK_TID: Option<ThreadId> = None;
 
+/// Netstack process stack region (VA and length) - shared by the boot-demo
+/// thread (top half) and the persistent service thread (bottom half, see
+/// `netstack_start_service`).
+const NETSTACK_STACK_VMA: usize = 0xC0A0_0000;
+const NETSTACK_STACK_LEN: usize = 4096 * 16;
+
+/// ELF entry point (`e_entry`) of the Netstack image, recorded at spawn so
+/// `netstack_start_service` can start a second thread of the same process
+/// at it. `0` until `spawn_netstack_service` has run.
+static mut G_NETSTACK_ENTRY: usize = 0;
+
+/// The Netstack service thread once `netstack_start_service` created it.
+static mut G_NETSTACK_SVC_TID: Option<ThreadId> = None;
+
 /// Root's (`caller`'s) own capability slot for the SAME Endpoint object
 /// Netstack's own `subsystem_entry::BYPASS_ENDPOINT_CAP` (slot 1) holds a
 /// derived copy of — granted to root FIRST, by the very same `Retype`
@@ -7953,7 +7999,7 @@ pub fn virtio_net_irq_trampoline(irq: hal_core::interrupt::IrqId) {
     // runs.
     unsafe {
         let isr_va = core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read();
-        if isr_va != usize::MAX {
+        if isr_va != usize::MAX && !core::ptr::addr_of!(G_DRV_NET_MSIX_ACTIVE).read() {
             let _isr_reason = (isr_va as *const u8).read_volatile();
         }
     }
@@ -9005,8 +9051,6 @@ pub fn spawn_netstack_service(
 
     let src_cs = k.tcb(caller)?.cap_space;
 
-    const NETSTACK_STACK_VMA: usize = 0xC0A0_0000;
-    const NETSTACK_STACK_LEN: usize = 4096 * 16;
     let (ns_tid, ns_cs, _stack_phys) =
         spawn_process_from_elf(hal, k, netstack_elf, expected_machine, NETSTACK_STACK_VMA, NETSTACK_STACK_LEN)?;
 
@@ -9017,6 +9061,24 @@ pub fn spawn_netstack_service(
     // why NOBODY ever `Call`s it.
     let park_ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
     grant_cap_into(k, src_cs, park_ep_cap, ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Slot 2: a private Notification that nobody ever signals. The
+    // persistent service thread (`netstack_start_service`) sleeps between
+    // polls with `NOTIF_WAIT_TIMEOUT` on it: a timed wait on a
+    // notification that never fires is exactly "wake me in N ns", which is
+    // the only timer primitive a layer-3 process has (Internet plan,
+    // TODO(spec) 2/3).
+    let sleep_notif = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)?;
+    grant_cap_into(k, src_cs, sleep_notif, ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // ELF64 header: `e_entry` is the u64 at byte offset 24 (the ELF was
+    // already validated by `spawn_process_from_elf`).
+    let entry = netstack_elf
+        .get(24..32)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as usize)
+        .unwrap_or(0);
+    // SAFETY: single-core; written once here, read by `netstack_start_service`.
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_ENTRY).write(entry) };
+
     // SAFETY: single-core; written once here, before any kernel-bypass
     // call (reached only after this function returns) can read either.
     unsafe { core::ptr::addr_of_mut!(G_NETSTACK_TID).write(Some(ns_tid)) };
@@ -9091,6 +9153,15 @@ pub fn spawn_netstack_service(
     // SAFETY: single-core; written exactly once here, before any
     // `netstack_status` call (reached only after this function returns).
     unsafe { core::ptr::addr_of_mut!(G_NETSTACK_STATUS_PHYS).write(status_phys) };
+    // Desktop image: tell the boot thread to skip its ARP/ICMP demo. That demo
+    // is a blocking, timing-sensitive exchange whose two halves can be split
+    // by the scheduler once the desktop runs (root resumes mid-demo and the
+    // desktop boot goes on), and the persistent service thread supersedes it.
+    #[cfg(feature = "desktop")]
+    // SAFETY: `status_phys` is Netstack's own zeroed status page, identity-addressable.
+    unsafe {
+        ((status_phys + NETSTACK_SKIP_DEMO_OFFSET) as *mut u8).write_volatile(1)
+    };
 
     // Also map the driver's own ISR_CFG and NOTIFY_CFG register pages
     // into Netstack's AND root's (`caller`'s) own page tables, at the
@@ -9167,6 +9238,110 @@ pub fn spawn_netstack_service(
     Some((save, into))
 }
 
+/// Offset of the text area inside Netstack's status region — must stay
+/// numerically equal to `netstack::subsystem_entry::LOG_OFFSET`. The bytes
+/// below it hold the verdict/MAC/role fields `netstack_status` reads.
+const NETSTACK_LOG_OFFSET: usize = 256;
+/// Longest line `netstack_log` prints — must stay numerically equal to
+/// `netstack::subsystem_entry::LOG_MAX`.
+const NETSTACK_LOG_MAX: usize = 512;
+
+/// `NET_LOG` opcode's own kernel-side half: prints `len` bytes of text
+/// from the log area of Netstack's own status region as one serial line
+/// (`netstack: <text>`). Netstack has no console of its own and, unlike the
+/// shell, no dedicated print page; its status region is already mapped in
+/// its address space and readable here by physical address, so it doubles
+/// as the log buffer. Any caller may trigger a print (it can only ever show
+/// what Netstack itself last wrote there), which is why no caller check is
+/// made. Returns `0`, or `usize::MAX` if Netstack was never spawned.
+pub fn netstack_log(len: usize) -> usize {
+    // SAFETY: single-core; written once by `spawn_netstack_service`.
+    let base = unsafe { core::ptr::addr_of!(G_NETSTACK_STATUS_PHYS).read() };
+    if base == usize::MAX {
+        return usize::MAX;
+    }
+    let len = len.min(NETSTACK_LOG_MAX);
+    // SAFETY: `base` is Netstack's own zeroed 4 KiB `SharedRegion`,
+    // identity-addressable; `NETSTACK_LOG_OFFSET + NETSTACK_LOG_MAX` stays
+    // inside that page; single-core.
+    let bytes = unsafe { core::slice::from_raw_parts((base + NETSTACK_LOG_OFFSET) as *const u8, len) };
+    let text = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+    klog!("netstack: {}\r\n", text);
+    0
+}
+
+/// Offset of the "role" byte inside Netstack's status region - must stay
+/// numerically equal to `netstack::subsystem_entry::ROLE_OFFSET`. `0` = the
+/// boot-demo thread (ARP/ICMP demo, then serving the bypass control plane),
+/// `1` = the persistent service thread.
+const NETSTACK_ROLE_OFFSET: usize = 16;
+
+/// Offset of the "skip the boot demo" byte - must stay numerically equal to
+/// `netstack::subsystem_entry::SKIP_DEMO_OFFSET`. Set by the desktop image only.
+const NETSTACK_SKIP_DEMO_OFFSET: usize = 17;
+
+/// Priority of the Netstack service thread: the same as the other desktop
+/// background services (`DESKTOP_PRIORITY_BACKGROUND`), below the input
+/// path. Not lower: `pick_next` ranks by priority strictly, and services that
+/// keep polling would then starve a lower-priority thread for good. It sleeps
+/// between polls, so its share of the CPU stays tiny anyway.
+const NETSTACK_SERVICE_PRIORITY: u8 = 30;
+
+/// Starts Netstack's persistent service thread (Internet plan, phase 1).
+///
+/// Netstack's first thread does the boot-time ARP/ICMP demo and then parks
+/// on its bypass endpoint forever, serving the kernel-bypass control plane.
+/// The service loop (smoltcp: ARP, ICMP, later DHCP/DNS) needs a thread that
+/// stays runnable and sleeps on a timer instead, so it is a SECOND thread of
+/// the same process - same page table, same capability space, its own stack
+/// (the lower half of the process stack region; the first thread only uses
+/// the top few KiB). It enters at the ELF entry point like the first thread;
+/// `netstack::subsystem_entry::subsystem_main` tells the two apart by the
+/// role byte written here.
+///
+/// Desktop image only (the caller is `p2_preempt_start`'s desktop branch):
+/// the demo image's scheduler demos are timing-sensitive and do not need a
+/// network service. No-op if Netstack was never spawned (no NIC) or the
+/// service already runs.
+pub fn netstack_start_service(hal: &HalInterface) -> Option<ThreadId> {
+    let k = kstate();
+    // SAFETY: single-core; these statics are written once by
+    // `spawn_netstack_service` (before this can be called) and by this fn.
+    let (ns_tid, entry, status, running) = unsafe {
+        (
+            core::ptr::addr_of!(G_NETSTACK_TID).read(),
+            core::ptr::addr_of!(G_NETSTACK_ENTRY).read(),
+            core::ptr::addr_of!(G_NETSTACK_STATUS_PHYS).read(),
+            core::ptr::addr_of!(G_NETSTACK_SVC_TID).read(),
+        )
+    };
+    let ns_tid = ns_tid?;
+    if entry == 0 || status == usize::MAX || running.is_some() {
+        return None;
+    }
+    let (cap_space, addr_space) = {
+        let t = k.tcb(ns_tid)?;
+        (t.cap_space, t.addr_space)
+    };
+    let root_pt = k.addr_space_mut(addr_space)?.root_phys().as_usize();
+    let svc = k.alloc_tcb(cap_space, addr_space)?;
+    // SAFETY: `status` is Netstack's own zeroed status page, identity-
+    // addressable; the role byte is read by the new thread only after it
+    // starts running, i.e. after this write.
+    unsafe { ((status + NETSTACK_ROLE_OFFSET) as *mut u8).write_volatile(1) };
+    let stack_top = NETSTACK_STACK_VMA + NETSTACK_STACK_LEN / 2;
+    k.init_user_thread(svc, entry, stack_top, root_pt, hal);
+    let _ = k.sched.admit_following_system_default(svc, NETSTACK_SERVICE_PRIORITY, None);
+    // `init_user_thread` admitted it at MAX_PRIORITY; make the low priority stick
+    // even if the admit above kept the first admission.
+    let _ = k.sched.set_base_priority(svc, NETSTACK_SERVICE_PRIORITY);
+    let _ = k.sched.note_ready(svc, hal.now_ns());
+    // SAFETY: single-core; written here only.
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_SVC_TID).write(Some(svc)) };
+    klog!("netstack service: second thread tid {} started (persistent smoltcp service, priority {})\r\n", svc.as_u32(), NETSTACK_SERVICE_PRIORITY);
+    Some(svc)
+}
+
 /// `NET_STATUS_POLL` demo opcode's own kernel-side half: reads the
 /// Netstack process's own status region directly (`spawn_netstack_
 /// service`'s own doc comment — `G_NETSTACK_STATUS_PHYS`, physical
@@ -9203,6 +9378,11 @@ pub fn netstack_status() -> usize {
         for (i, b) in gw_mac.iter_mut().enumerate() {
             *b = mac_base.add(i).read_volatile();
         }
+    }
+    if verdict == 4 {
+        klog!("netstack: boot ARP/ICMP demo skipped on the desktop image - the persistent service thread reports link state and gateway pings instead
+");
+        return verdict as usize;
     }
     if verdict >= 2 {
         klog!(
