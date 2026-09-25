@@ -497,6 +497,17 @@ impl<const NT: usize, const NCG: usize> Scheduler<NT, NCG> {
         self.running = None;
     }
 
+    /// True iff some `Ready` thread other than `except` exists. Read-only.
+    /// The desktop idle path uses it to decide whether the core may be
+    /// halted: `pick_next` cannot answer that, because it would also
+    /// return the always-`Ready` idle thread.
+    pub fn has_ready_except(&self, except: &[Option<ThreadId>]) -> bool {
+        self.entities
+            .iter()
+            .flatten()
+            .any(|e| e.state == RunState::Ready && !except.contains(&Some(e.thread)))
+    }
+
     /// Selects the next thread to run, without committing to it. Returns
     /// `None` if nothing is `Ready`.
     ///
@@ -566,6 +577,18 @@ mod tests {
 
     fn sched() -> Scheduler<NT, NCG> {
         Scheduler::new(Q)
+    }
+
+    #[test]
+    fn has_ready_except_ignores_listed_threads_and_non_ready_ones() {
+        let mut s = sched();
+        s.admit(t(0), SchedulerMode::Interactive, 5, None).unwrap();
+        s.admit(t(1), SchedulerMode::Interactive, 5, None).unwrap();
+        assert!(!s.has_ready_except(&[]));
+        s.note_ready(t(1), 0).unwrap();
+        assert!(s.has_ready_except(&[]));
+        assert!(s.has_ready_except(&[Some(t(0))]));
+        assert!(!s.has_ready_except(&[Some(t(1)), None]));
     }
 
     #[test]

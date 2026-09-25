@@ -1516,6 +1516,12 @@ mod sys {
     /// per distinct real proof" split `sys::DG_LC_REPORT` already made
     /// from `sys::DG_REPORT`, for the same reason.
     pub const IN_SUPERVISE_REPORT: usize = 137;
+    /// No arguments. Desktop build only: the idle thread's wait. If no other
+    /// thread is `Ready` the core is halted until the next interrupt
+    /// (`hlt`/`wfi`) instead of spinning; either way the call then behaves
+    /// as one scheduler tick (`kernel_arch_glue::desktop_idle_wait`), so a
+    /// thread an interrupt just woke runs immediately.
+    pub const IDLE_WAIT: usize = 138;
 }
 
 /// Human-readable name for one of `kernel_arch_glue`'s `THREAD_EXIT_*`
@@ -2555,6 +2561,23 @@ extern "C" fn umode_a_loop() -> ! {
     }
 }
 
+/// Desktop build's idle thread body (replaces the counting loop): waits
+/// for an interrupt through `sys::IDLE_WAIT` instead of spinning, so an
+/// idle desktop no longer pins a host core at 100%. The kernel side
+/// (`kernel_arch_glue::desktop_idle_wait`) only halts when nothing else
+/// is `Ready` and always finishes with one scheduler tick, which keeps
+/// the preemption timer alive and lets a just-woken input driver run at
+/// once.
+#[cfg(all(feature = "desktop", target_arch = "riscv64"))]
+#[link_section = ".user_text"]
+extern "C" fn umode_idle_loop() -> ! {
+    loop {
+        // SAFETY: plain trap into the kernel; `raw_syscall` lives in
+        // `.user_text` like every other U-mode syscall wrapper.
+        unsafe { raw_syscall(sys::IDLE_WAIT, 0, 0) };
+    }
+}
+
 /// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
 /// Layer.md §5.2 acceptance-test demo: "inject a panic in a driver,
 /// prove the rest of the system is unaffected". Executes an illegal
@@ -3376,6 +3399,23 @@ extern "C" fn umode_a_loop_x86() -> ! {
     }
 }
 
+/// Desktop build's idle thread body (replaces the counting loop): waits
+/// for an interrupt through `sys::IDLE_WAIT` instead of spinning, so an
+/// idle desktop no longer pins a host core at 100%. The kernel side
+/// (`kernel_arch_glue::desktop_idle_wait`) only halts when nothing else
+/// is `Ready` and always finishes with one scheduler tick, which keeps
+/// the preemption timer alive and lets a just-woken input driver run at
+/// once.
+#[cfg(all(feature = "desktop", target_arch = "x86_64"))]
+#[link_section = ".user_text"]
+extern "C" fn umode_idle_loop_x86() -> ! {
+    loop {
+        // SAFETY: plain trap into the kernel; `raw_syscall_x86` lives in
+        // `.user_text` like every other U-mode syscall wrapper.
+        unsafe { raw_syscall_x86(sys::IDLE_WAIT, 0, 0) };
+    }
+}
+
 /// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
 /// Layer.md §5.2 acceptance-test demo: "inject a panic in a driver,
 /// prove the rest of the system is unaffected". Executes `ud2`
@@ -3432,7 +3472,11 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
     // own dispatch order exactly.
     match a7 {
         sys::P2_YIELD => {
-            return match kernel_arch_glue::p2_yield() {
+            #[cfg(feature = "desktop")]
+            let yielded = kernel_arch_glue::desktop_yield(hal_x86_64::cpu::hlt_wait_for_irq);
+            #[cfg(not(feature = "desktop"))]
+            let yielded = kernel_arch_glue::p2_yield();
+            return match yielded {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
             };
@@ -3676,6 +3720,13 @@ fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::Trap
                 return TrapOutcome::SwitchTo { save, into };
             }
             return TrapOutcome::Resume(0);
+        }
+        #[cfg(feature = "desktop")]
+        sys::IDLE_WAIT => {
+            return match kernel_arch_glue::desktop_idle_wait(hal_x86_64::cpu::hlt_wait_for_irq) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
         }
         sys::SCHED_SET_SYSTEM_POLICY => {
             return TrapOutcome::Resume(
@@ -4958,7 +5009,12 @@ fn user_image() -> kernel_arch_glue::UserImage {
             entry_vma: umode_root_x86 as usize,
             worker_entry_vma: umode_worker_x86 as usize,
             subsystem_entry_vma: umode_subsystem_x86 as usize,
-            a_loop_entry_vma: umode_a_loop_x86 as usize,
+            a_loop_entry_vma: {
+                #[cfg(feature = "desktop")]
+                { umode_idle_loop_x86 as usize }
+                #[cfg(not(feature = "desktop"))]
+                { umode_a_loop_x86 as usize }
+            },
         }
     }
 }
@@ -7433,6 +7489,23 @@ extern "C" fn umode_a_loop_aarch64() -> ! {
     }
 }
 
+/// Desktop build's idle thread body (replaces the counting loop): waits
+/// for an interrupt through `sys::IDLE_WAIT` instead of spinning, so an
+/// idle desktop no longer pins a host core at 100%. The kernel side
+/// (`kernel_arch_glue::desktop_idle_wait`) only halts when nothing else
+/// is `Ready` and always finishes with one scheduler tick, which keeps
+/// the preemption timer alive and lets a just-woken input driver run at
+/// once.
+#[cfg(all(feature = "desktop", target_arch = "aarch64"))]
+#[link_section = ".user_text"]
+extern "C" fn umode_idle_loop_aarch64() -> ! {
+    loop {
+        // SAFETY: plain trap into the kernel; `raw_syscall_aarch64` lives in
+        // `.user_text` like every other U-mode syscall wrapper.
+        unsafe { raw_syscall_aarch64(sys::IDLE_WAIT, 0, 0) };
+    }
+}
+
 /// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
 /// Layer.md §5.2 acceptance-test demo. Executes `udf #0` (Permanently
 /// Undefined) the instant it is scheduled, taking a synchronous EL0
@@ -7491,7 +7564,11 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
     // dispatch order exactly.
     match x8 {
         sys::P2_YIELD => {
-            return match kernel_arch_glue::p2_yield() {
+            #[cfg(feature = "desktop")]
+            let yielded = kernel_arch_glue::desktop_yield(hal_arm64::cpu::wfi);
+            #[cfg(not(feature = "desktop"))]
+            let yielded = kernel_arch_glue::p2_yield();
+            return match yielded {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
             };
@@ -7718,6 +7795,13 @@ fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::T
                 thread_exit_status_name(x1)
             ));
             return TrapOutcome::Resume(0);
+        }
+        #[cfg(feature = "desktop")]
+        sys::IDLE_WAIT => {
+            return match kernel_arch_glue::desktop_idle_wait(hal_arm64::cpu::wfi) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
         }
         sys::SCHED_SET_SYSTEM_POLICY => {
             return TrapOutcome::Resume(
@@ -8924,7 +9008,12 @@ fn user_image() -> kernel_arch_glue::UserImage {
             entry_vma: umode_root_aarch64 as usize,
             worker_entry_vma: umode_worker_aarch64 as usize,
             subsystem_entry_vma: umode_subsystem_aarch64 as usize,
-            a_loop_entry_vma: umode_a_loop_aarch64 as usize,
+            a_loop_entry_vma: {
+                #[cfg(feature = "desktop")]
+                { umode_idle_loop_aarch64 as usize }
+                #[cfg(not(feature = "desktop"))]
+                { umode_a_loop_aarch64 as usize }
+            },
         }
     }
 }
@@ -9096,7 +9185,11 @@ fn simurgh_syscall(
     // outcome or run before the object-model borrow below.
     match a7 {
         sys::P2_YIELD => {
-            return match kernel_arch_glue::p2_yield() {
+            #[cfg(feature = "desktop")]
+            let yielded = kernel_arch_glue::desktop_yield(hal_riscv64::cpu::wfi);
+            #[cfg(not(feature = "desktop"))]
+            let yielded = kernel_arch_glue::p2_yield();
+            return match yielded {
                 Some((save, into)) => TrapOutcome::SwitchTo { save, into },
                 None => TrapOutcome::Resume(0),
             };
@@ -9452,6 +9545,13 @@ fn simurgh_syscall(
                 thread_exit_status_name(a1)
             ));
             return TrapOutcome::Resume(0);
+        }
+        #[cfg(feature = "desktop")]
+        sys::IDLE_WAIT => {
+            return match kernel_arch_glue::desktop_idle_wait(hal_riscv64::cpu::wfi) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
         }
         sys::SCHED_SET_SYSTEM_POLICY => {
             return TrapOutcome::Resume(
@@ -10303,7 +10403,12 @@ fn user_image() -> kernel_arch_glue::UserImage {
             entry_vma: umode_root as usize,
             worker_entry_vma: umode_worker as usize,
             subsystem_entry_vma: umode_subsystem as usize,
-            a_loop_entry_vma: umode_a_loop as usize,
+            a_loop_entry_vma: {
+                #[cfg(feature = "desktop")]
+                { umode_idle_loop as usize }
+                #[cfg(not(feature = "desktop"))]
+                { umode_a_loop as usize }
+            },
         }
     }
 }

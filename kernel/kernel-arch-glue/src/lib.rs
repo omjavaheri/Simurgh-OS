@@ -2512,6 +2512,66 @@ pub fn desktop_park_caller() -> Option<(*mut u8, *const u8)> {
     k.user_ctx_switch_ptrs(caller, next)
 }
 
+/// Desktop build only: parks the core in `halt` (`hlt` on x86_64, `wfi`
+/// elsewhere) until the next interrupt when NOTHING useful is runnable,
+/// then runs one scheduler tick. The idle thread never counts as useful
+/// work (see [`desktop_yield`] and [`desktop_idle_wait`], its two callers).
+///
+/// Why this is safe where the 2026-09-17 Ring-0 `hlt` loop was not (see
+/// [`drv_irq_wait_yield`]): a timer tick that lands at CPL 0 is only
+/// acknowledged, never handed to `p2_tick`, and `p2_tick` is what re-arms
+/// the one-shot preemption timer. So (1) the deadline is armed BEFORE
+/// halting, which guarantees a wake-up even on a quiet machine, and (2)
+/// the function always ends by running one `p2_tick` itself, which
+/// re-arms the timer whichever interrupt woke the core. An input IRQ that
+/// woke a driver (`wake_blocked` makes it `Ready`) is therefore acted on
+/// by that same tick, immediately, rather than a quantum later.
+///
+/// Returns `None` (without halting) before the preemptive phase starts
+/// (no idle thread yet, timer not armed), so boot-time cooperative yields
+/// behave exactly as before.
+#[cfg(feature = "desktop")]
+fn desktop_halt_then_tick(halt: fn()) -> Option<Option<(*mut u8, *const u8)>> {
+    let hal = khal();
+    let k = kstate();
+    // SAFETY: single-core; written once by `p2_preempt_start`.
+    let idle = unsafe { core::ptr::addr_of!(G_FRESH_A_TID).read() }?;
+    let running = k.sched.running();
+    if k.sched.has_ready_except(&[running, Some(idle)]) {
+        return None;
+    }
+    hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+    halt();
+    Some(p2_tick())
+}
+
+/// Desktop build only: `P2_YIELD`. A yield with no other useful thread
+/// `Ready` (ui-core polling for input while everything else is blocked
+/// is the common case) used to return immediately, turning the desktop
+/// into a busy loop that kept a host core at 100%. Now the core is halted
+/// until the next interrupt (see [`desktop_halt_then_tick`]); if other
+/// work is `Ready` it is the ordinary [`p2_yield`].
+#[cfg(feature = "desktop")]
+pub fn desktop_yield(halt: fn()) -> Option<(*mut u8, *const u8)> {
+    match desktop_halt_then_tick(halt) {
+        Some(r) => r,
+        None => p2_yield(),
+    }
+}
+
+/// Desktop build only: the idle thread's own wait (`sys::IDLE_WAIT`).
+/// The idle thread is the always-`Ready` fallback `pick_next` lands on
+/// when every interactive process is blocked (see `p2_preempt_start`); it
+/// used to be a counting loop. With other work `Ready` it just yields
+/// through one tick; otherwise it halts as above.
+#[cfg(feature = "desktop")]
+pub fn desktop_idle_wait(halt: fn()) -> Option<(*mut u8, *const u8)> {
+    match desktop_halt_then_tick(halt) {
+        Some(r) => r,
+        None => p2_tick(),
+    }
+}
+
 /// Holds the FIRST faulty-driver instance back from `pick_next` until
 /// the general scheduler has had [`P2_FAULT_DEMO_START_TICK`] real
 /// rounds — see that constant's own doc comment for the QEMU
