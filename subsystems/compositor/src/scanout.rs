@@ -355,11 +355,188 @@ impl Scanout {
         }
         plan
     }
+
+    /// Presents a committed frame by writing ONLY what changed since the
+    /// last one, and returns the plan used plus the number of bytes
+    /// actually written to the framebuffer.
+    ///
+    /// Why: ui-core commits a whole 800x600 frame for every input event,
+    /// yet a mouse move changes a few hundred pixels of it. Writing the
+    /// other ~1.9 MB again every time is the dominant per-commit cost —
+    /// video memory is the slow side (under QEMU every framebuffer page
+    /// written is also marked dirty and re-scanned for the display), so
+    /// this compares against a SHADOW copy of what was last presented,
+    /// kept in ordinary RAM, and touches the framebuffer only for the
+    /// spans that differ. An identical frame writes nothing at all.
+    ///
+    /// The shadow is laid out exactly like the source (packed, row
+    /// stride `src_width * 4`); only the region inside the returned plan
+    /// is meaningful. `shadow_valid` says whether it currently mirrors
+    /// the screen for a frame of this same size — when it does not (the
+    /// first frame, or a size change), every visible row is written and
+    /// the shadow refilled.
+    ///
+    /// # Safety
+    /// `src_va` must be readable, and `shadow_va` readable and writable,
+    /// for `src_width * src_height * 4` bytes each, and the two must not
+    /// overlap each other or the framebuffer.
+    pub unsafe fn present_diff(
+        &self,
+        src_va: usize,
+        shadow_va: usize,
+        src_width: u32,
+        src_height: u32,
+        shadow_valid: bool,
+    ) -> (BlitPlan, u64) {
+        let plan = BlitPlan::compute(self.info.width, self.info.height, src_width, src_height);
+        if plan.is_empty() {
+            return (plan, 0);
+        }
+        let width = plan.copy_width as usize;
+        let src_stride = src_width as usize * 4;
+        let order = self.info.order;
+        let mut written: u64 = 0;
+        for row in 0..plan.copy_height as usize {
+            let src_row = (src_va + row * src_stride) as *const u8;
+            let shadow_row = (shadow_va + row * src_stride) as *mut u8;
+            let dst_row = (self.base + self.info.pixel_offset(plan.dst_x, plan.dst_y + row as u32)) as *mut u8;
+            if shadow_valid {
+                // SAFETY: both rows are `width * 4 <= src_stride` bytes
+                // inside their regions per this function's contract;
+                // every emitted span lies inside `[0, width)`, so the
+                // destination stays inside the visible rectangle and
+                // therefore inside the mapping (`from_bytes`'s check).
+                unsafe {
+                    diff_row(src_row, shadow_row, width, |start, len| {
+                        write_span(dst_row.add(start * 4), src_row.add(start * 4), len, order);
+                        written += len as u64 * 4;
+                    });
+                }
+            } else {
+                // SAFETY: same bounds argument as above, for the whole
+                // visible row.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src_row, shadow_row, width * 4);
+                    write_span(dst_row, src_row, width, order);
+                }
+                written += width as u64 * 4;
+            }
+        }
+        (plan, written)
+    }
+}
+
+/// Compares one row of `width_px` pixels of a new frame against the
+/// shadow of what is on screen, 8 bytes (two pixels) at a time, updates
+/// the shadow to the new contents, and calls `emit(start_px, len_px)`
+/// once per maximal run of changed pixels, in left-to-right order.
+///
+/// Two-pixel granularity is a deliberate trade: comparing whole words
+/// halves the loop count and a span can be at most one pixel wider than
+/// the true change, which costs 4 bytes of extra framebuffer write. An
+/// odd trailing pixel is compared on its own. Raw pointers, not slices,
+/// because this is the hot loop of every commit and must carry no bounds
+/// checks.
+///
+/// # Safety
+/// `new` must be readable and `shadow` readable and writable for
+/// `width_px * 4` bytes; they must not overlap. Neither needs any
+/// alignment beyond what `read_unaligned`/`write_unaligned` accept.
+pub unsafe fn diff_row(new: *const u8, shadow: *mut u8, width_px: usize, mut emit: impl FnMut(usize, usize)) {
+    let mut run_start: Option<usize> = None;
+    let mut px = 0;
+    while px + 2 <= width_px {
+        // SAFETY: `px + 2 <= width_px`, so these 8 bytes are in range
+        // for both rows per this function's contract.
+        let (a, b) = unsafe {
+            (
+                core::ptr::read_unaligned(new.add(px * 4) as *const u64),
+                core::ptr::read_unaligned(shadow.add(px * 4) as *const u64),
+            )
+        };
+        if a != b {
+            // SAFETY: same range as the read just above.
+            unsafe { core::ptr::write_unaligned(shadow.add(px * 4) as *mut u64, a) };
+            if run_start.is_none() {
+                run_start = Some(px);
+            }
+        } else if let Some(start) = run_start.take() {
+            emit(start, px - start);
+        }
+        px += 2;
+    }
+    if px < width_px {
+        // SAFETY: the one remaining pixel, `px == width_px - 1`.
+        let (a, b) = unsafe {
+            (
+                core::ptr::read_unaligned(new.add(px * 4) as *const u32),
+                core::ptr::read_unaligned(shadow.add(px * 4) as *const u32),
+            )
+        };
+        if a != b {
+            // SAFETY: same pixel as the read just above.
+            unsafe { core::ptr::write_unaligned(shadow.add(px * 4) as *mut u32, a) };
+            if run_start.is_none() {
+                run_start = Some(px);
+            }
+        } else if let Some(start) = run_start.take() {
+            emit(start, px - start);
+        }
+    }
+    if let Some(start) = run_start {
+        emit(start, width_px - start);
+    }
+}
+
+/// Writes `len_px` packed-BGRA8 source pixels to the framebuffer at
+/// `dst`, converting to the output's byte order.
+///
+/// Volatile, word-wide stores: volatile because the effect of the write
+/// IS the display (and so LLVM cannot turn the loop back into a call to
+/// an unoptimized `memcpy` from the build-std `compiler_builtins`); an
+/// 8-byte-aligned middle section so the framebuffer sees aligned 64-bit
+/// stores, never a misaligned access to device memory — one leading
+/// 4-byte store fixes up an odd start, one trailing store an odd length.
+///
+/// # Safety
+/// `dst` must be writable and `src` readable for `len_px * 4` bytes, and
+/// `dst` 4-byte aligned (every pixel address in a 32-bpp framebuffer is).
+pub unsafe fn write_span(dst: *mut u8, src: *const u8, len_px: usize, order: PixelOrder) {
+    // SAFETY (whole body): every access below is at a pixel index in
+    // `[0, len_px)`, in range per this function's own contract.
+    unsafe {
+        match order {
+            PixelOrder::Bgrx8 => {
+                let mut i = 0;
+                if len_px > 0 && (dst as usize) % 8 != 0 {
+                    core::ptr::write_volatile(dst as *mut u32, core::ptr::read_unaligned(src as *const u32));
+                    i = 1;
+                }
+                while i + 2 <= len_px {
+                    let v = core::ptr::read_unaligned(src.add(i * 4) as *const u64);
+                    core::ptr::write_volatile(dst.add(i * 4) as *mut u64, v);
+                    i += 2;
+                }
+                if i < len_px {
+                    let v = core::ptr::read_unaligned(src.add(i * 4) as *const u32);
+                    core::ptr::write_volatile(dst.add(i * 4) as *mut u32, v);
+                }
+            }
+            PixelOrder::Rgbx8 => {
+                for i in 0..len_px {
+                    let v = core::ptr::read_unaligned(src.add(i * 4) as *const u32);
+                    core::ptr::write_volatile(dst.add(i * 4) as *mut u32, convert_pixel(v, PixelOrder::Rgbx8));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     fn info_bytes(magic: u64, width: u32, height: u32, stride: u32, order: u32, mapped: u64) -> [u8; 32] {
         let mut b = [0u8; 32];
@@ -455,5 +632,142 @@ mod tests {
         // ui-core's Color::DESKTOP_BACKGROUND is RGB(0x2C, 0x1A, 0x3D);
         // packed BGRA8 puts B in the low byte and opaque alpha on top.
         assert_eq!(DESKTOP_BACKGROUND, 0xFF2C_1A3D);
+    }
+
+    /// Runs `diff_row` over two pixel rows and returns the spans it
+    /// emitted, leaving `shadow` updated.
+    fn spans(new: &[u32], shadow: &mut [u32]) -> Vec<(usize, usize)> {
+        assert_eq!(new.len(), shadow.len());
+        let mut out = Vec::new();
+        // SAFETY: both slices are `len * 4` bytes and distinct.
+        unsafe {
+            diff_row(new.as_ptr() as *const u8, shadow.as_mut_ptr() as *mut u8, new.len(), |s, l| out.push((s, l)));
+        }
+        out
+    }
+
+    #[test]
+    fn an_identical_row_emits_nothing() {
+        let row = [7u32; 800];
+        let mut shadow = row;
+        assert!(spans(&row, &mut shadow).is_empty());
+    }
+
+    #[test]
+    fn one_changed_pixel_emits_one_small_span_and_updates_the_shadow() {
+        let mut new = [7u32; 800];
+        let mut shadow = new;
+        new[401] = 9;
+        let s = spans(&new, &mut shadow);
+        // Two-pixel granularity: the span is the word holding pixel 401.
+        assert_eq!(s, vec![(400, 2)]);
+        assert_eq!(shadow, new);
+        // Presenting the same frame again is now a no-op.
+        assert!(spans(&new, &mut shadow).is_empty());
+    }
+
+    #[test]
+    fn separate_changes_become_separate_spans_in_order() {
+        let mut new = [0u32; 20];
+        let mut shadow = new;
+        new[0] = 1;
+        new[1] = 1;
+        new[2] = 1;
+        new[10] = 1;
+        assert_eq!(spans(&new, &mut shadow), vec![(0, 4), (10, 2)]);
+    }
+
+    #[test]
+    fn an_odd_width_row_compares_its_last_pixel_alone() {
+        let mut new = [0u32; 7];
+        let mut shadow = new;
+        new[6] = 5;
+        assert_eq!(spans(&new, &mut shadow), vec![(6, 1)]);
+        // A run reaching the odd tail is one span, not two.
+        new[5] = 5;
+        new[6] = 6;
+        assert_eq!(spans(&new, &mut shadow), vec![(4, 3)]);
+        assert_eq!(shadow, new);
+    }
+
+    /// A fake framebuffer in host memory, so `present_diff` can be run
+    /// end to end: `stride` > `width` exercises the padding columns.
+    fn fake_scanout(fb: &mut Vec<u32>, width: u32, height: u32, stride: u32) -> Scanout {
+        fb.clear();
+        fb.resize((stride * height) as usize, 0);
+        Scanout {
+            base: fb.as_mut_ptr() as usize,
+            info: ScanoutInfo {
+                width,
+                height,
+                stride_pixels: stride,
+                order: PixelOrder::Bgrx8,
+                mapped_bytes: stride as u64 * height as u64 * 4,
+            },
+        }
+    }
+
+    fn present(s: &Scanout, frame: &[u32], shadow: &mut [u32], w: u32, h: u32, valid: bool) -> (BlitPlan, u64) {
+        // SAFETY: `frame`/`shadow` are `w * h` pixels; the fake
+        // framebuffer covers the scanout's whole geometry.
+        unsafe { s.present_diff(frame.as_ptr() as usize, shadow.as_mut_ptr() as usize, w, h, valid) }
+    }
+
+    #[test]
+    fn the_shadowed_present_writes_everything_once_then_only_changes() {
+        let mut fb = Vec::new();
+        let s = fake_scanout(&mut fb, 8, 6, 10);
+        let mut frame = vec![3u32; 8 * 6];
+        let mut shadow = vec![0u32; 8 * 6];
+        let (plan, bytes) = present(&s, &frame, &mut shadow, 8, 6, false);
+        assert_eq!(plan, BlitPlan { dst_x: 0, dst_y: 0, copy_width: 8, copy_height: 6 });
+        assert_eq!(bytes, 8 * 6 * 4);
+        // Identical frame: zero framebuffer writes.
+        assert_eq!(present(&s, &frame, &mut shadow, 8, 6, true).1, 0);
+        // One changed pixel: one 2-pixel span, and it really lands.
+        frame[2 * 8 + 5] = 42;
+        assert_eq!(present(&s, &frame, &mut shadow, 8, 6, true).1, 8);
+        assert_eq!(fb[2 * 10 + 5], 42);
+        // Padding columns past the visible width are never written.
+        assert!(fb.iter().enumerate().all(|(i, &p)| (i % 10) < 8 || p == 0));
+    }
+
+    #[test]
+    fn the_shadowed_present_keeps_the_centering_and_clipping_policy() {
+        let mut fb = Vec::new();
+        // Centered: a 2x2 frame on 8x6 lands at (3, 2).
+        let s = fake_scanout(&mut fb, 8, 6, 8);
+        let frame = [1u32, 2, 3, 4];
+        let mut shadow = [0u32; 4];
+        let (plan, bytes) = present(&s, &frame, &mut shadow, 2, 2, false);
+        assert_eq!(plan, BlitPlan::compute(8, 6, 2, 2));
+        assert_eq!(bytes, 16);
+        assert_eq!((fb[2 * 8 + 3], fb[2 * 8 + 4], fb[3 * 8 + 3], fb[3 * 8 + 4]), (1, 2, 3, 4));
+        // Clipped: a 12x8 frame on 8x6 draws its top-left 8x6 only.
+        let s = fake_scanout(&mut fb, 8, 6, 8);
+        let frame: Vec<u32> = (0..12 * 8).collect();
+        let mut shadow = vec![0u32; 12 * 8];
+        let (plan, bytes) = present(&s, &frame, &mut shadow, 12, 8, false);
+        assert_eq!(plan, BlitPlan::compute(8, 6, 12, 8));
+        assert_eq!(bytes, 8 * 6 * 4);
+        assert_eq!(fb[5 * 8 + 7], 5 * 12 + 7);
+        // A change outside the visible part writes nothing.
+        let mut frame2 = frame.clone();
+        frame2[7 * 12 + 11] = 999;
+        assert_eq!(present(&s, &frame2, &mut shadow, 12, 8, true).1, 0);
+    }
+
+    #[test]
+    fn write_span_aligns_to_eight_bytes_and_handles_both_orders() {
+        let src = [0x0011_2233u32, 0x0044_5566, 0x0077_8899];
+        let mut dst = [0u32; 4];
+        // Start at an odd pixel so the leading 4-byte fix-up runs.
+        // SAFETY: 3 pixels from index 1 stay inside the 4-pixel buffer.
+        unsafe { write_span(dst.as_mut_ptr().add(1) as *mut u8, src.as_ptr() as *const u8, 3, PixelOrder::Bgrx8) };
+        assert_eq!(dst, [0, 0x0011_2233, 0x0044_5566, 0x0077_8899]);
+        let mut dst = [0u32; 1];
+        // SAFETY: one pixel into a one-pixel buffer.
+        unsafe { write_span(dst.as_mut_ptr() as *mut u8, src.as_ptr() as *const u8, 1, PixelOrder::Rgbx8) };
+        assert_eq!(dst[0], convert_pixel(src[0], PixelOrder::Rgbx8));
     }
 }

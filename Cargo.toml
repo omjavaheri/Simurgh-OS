@@ -169,6 +169,33 @@ opt-level = 2
 [profile.dev.package.kernel-arch-glue]
 opt-level = 2
 
+# The interactive input->display path is optimized even in the dev
+# profile, for SPEED this time (every override above is a miscompile
+# workaround): the Compositor compares and presents an 800x600 frame on
+# every commit, and the two PS/2 drivers run once per input byte/packet.
+# Unoptimized, each of those loops runs 10-50x slower under QEMU TCG,
+# which made the desktop's mouse visibly lag (2026-09-24). Same shape as
+# `Simurgh-UI-Template01`'s own `[profile.dev.package.ui-core]`: a
+# per-package override keeps each ELF at the `debug/` path
+# `kernel/kernel/build.rs` embeds from, so no build step changes, and
+# assertions/overflow checks stay on. Only these packages' own code is
+# affected — the kernel's debug build and `core`/`alloc` from build-std
+# keep their profiles.
+[profile.dev.package.compositor]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.package.driver-i8042]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.package.driver-mouse]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
 [profile.release]
 panic         = "abort"
 lto           = true

@@ -312,6 +312,151 @@ unsafe fn raw_syscall2(_a7: usize, _a0: usize, _a1: usize) -> (usize, usize) {
     unreachable!("compositor's subsystem_main never runs on a host build")
 }
 
+/// Module-level twin of `subsystem_main`'s own `zero!` — same QEMU-found
+/// stack-slot-reuse miscompilation `fs_native::subsystem_entry`
+/// documents, so every literal argument to a raw syscall OUTSIDE that
+/// function goes through this. Defined here, before its first use,
+/// because `macro_rules!` scoping is textual.
+macro_rules! fresh {
+    ($val:expr) => {{
+        let mut v: usize = $val;
+        // SAFETY: a no-op asm block (`v` is read back unchanged) — its
+        // only purpose is defeating the stack-slot-reuse miscompilation
+        // above.
+        core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+        v
+    }};
+}
+
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::NOW_NS`
+/// — a plain timestamp read, served on all three architectures.
+const NOW_NS: usize = 86;
+
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::
+/// SERIAL_PRINT` (x86_64 only; an unknown opcode is a harmless no-op on
+/// the other two). See [`serial_print`] for how this process can use it.
+const SERIAL_PRINT: usize = 118;
+
+/// Master switch for the Compositor's own performance log line (see
+/// [`PerfStats`]). A `const`, not a Cargo feature, because this crate is
+/// built by the same command line in the demo and the desktop image;
+/// flipping it to `false` removes the whole path at compile time.
+///
+/// It stays silent in the default demo boot on its own: a line is only
+/// printed every [`PERF_LOG_EVERY`] commits, and the demo boot makes a
+/// handful at most (the Root Task's 2x2 bootstrap frame, plus ui-core's
+/// if it gets scheduled) before it powers off. The desktop commits a
+/// frame per input event, so there it appears within seconds of moving
+/// the mouse.
+const PERF_LOG: bool = true;
+
+/// How many commits one [`PerfStats`] window covers. Large enough that
+/// the log line itself (a trap plus a few hundred bytes of serial
+/// output) is noise next to the frames it measures.
+const PERF_LOG_EVERY: u64 = 64;
+
+/// Reads the kernel clock, in nanoseconds.
+fn now_ns() -> u64 {
+    // SAFETY: `raw_syscall`'s own contract; `NOW_NS` takes no arguments
+    // and touches no state.
+    unsafe { raw_syscall(NOW_NS, fresh!(0), fresh!(0)) as u64 }
+}
+
+/// Writes `text` to the serial console through `sys::SERIAL_PRINT`.
+///
+/// That opcode reads its bytes from a FIXED VA in the caller's own
+/// address space (`kernel/src/main.rs`'s `SHELL_OUT_VA`, `0xD900_0000`,
+/// simurgh-shell's print page), and in THIS process that VA is
+/// [`SCANOUT_INFO_VA`] — the scanout info page, private R+W memory this
+/// process already owns. So the text is staged there and the bytes it
+/// covered are restored right after, which avoids a kernel change for a
+/// diagnostic. Safe against the kernel's own reads of that page because
+/// the only one after spawn (`compositor_scanout_report`) runs during the
+/// Root Task's bootstrap commit, long before the first line is printed
+/// ([`PERF_LOG_EVERY`] commits later).
+fn serial_print(text: &[u8]) {
+    const MAX: usize = 256;
+    let len = text.len().min(MAX);
+    let mut saved = [0u8; MAX];
+    // SAFETY: the info page is mapped `U=1 R+W` for this process before
+    // it is first scheduled (`SCANOUT_INFO_VA`'s own doc comment), and
+    // `len <= 256` stays well inside its 4 KiB. The syscall only reads
+    // it; the original bytes are put back before anything else runs in
+    // this single-threaded process.
+    unsafe {
+        core::ptr::copy_nonoverlapping(SCANOUT_INFO_VA as *const u8, saved.as_mut_ptr(), len);
+        core::ptr::copy_nonoverlapping(text.as_ptr(), SCANOUT_INFO_VA as *mut u8, len);
+        raw_syscall(SERIAL_PRINT, fresh!(len), fresh!(0));
+        core::ptr::copy_nonoverlapping(saved.as_ptr(), SCANOUT_INFO_VA as *mut u8, len);
+    }
+}
+
+/// A fixed-size, allocation-free text buffer for one log line.
+struct LineBuf {
+    buf: [u8; 192],
+    len: usize,
+}
+
+impl core::fmt::Write for LineBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// Per-window commit statistics behind the `compositor: commits=...`
+/// serial line — how the cost of one committed frame was measured
+/// before and after the dirty-span present (README, Compositor entry).
+///
+/// `commit` covers the whole `CommitBuffer` handling (confirm copy plus
+/// present); `present` just the framebuffer part; `fb_bytes` counts bytes
+/// actually written to video memory. Only collected while a real
+/// framebuffer exists, so a headless boot never makes a clock syscall
+/// for it.
+#[derive(Default)]
+struct PerfStats {
+    commits: u64,
+    window_start_ns: u64,
+    commit_ns: u64,
+    present_ns: u64,
+    fb_bytes: u64,
+}
+
+impl PerfStats {
+    /// Accounts one commit, and every [`PERF_LOG_EVERY`] commits prints
+    /// the window's averages and resets it.
+    fn record(&mut self, commit_ns: u64, present_ns: u64, fb_bytes: u64, now: u64) {
+        use core::fmt::Write;
+        if self.window_start_ns == 0 {
+            self.window_start_ns = now.saturating_sub(commit_ns);
+        }
+        self.commits += 1;
+        self.commit_ns += commit_ns;
+        self.present_ns += present_ns;
+        self.fb_bytes += fb_bytes;
+        if self.commits % PERF_LOG_EVERY != 0 {
+            return;
+        }
+        let window_ns = now.saturating_sub(self.window_start_ns).max(1);
+        let mut line = LineBuf { buf: [0; 192], len: 0 };
+        let _ = write!(
+            line,
+            "compositor: commits={} window_ms={} rate_x10={}/s commit_us={} present_us={} bytes_written={}\r\n",
+            self.commits,
+            window_ns / 1_000_000,
+            PERF_LOG_EVERY * 10_000_000_000 / window_ns,
+            self.commit_ns / PERF_LOG_EVERY / 1000,
+            self.present_ns / PERF_LOG_EVERY / 1000,
+            self.fb_bytes / PERF_LOG_EVERY,
+        );
+        serial_print(&line.buf[..line.len]);
+        let commits = self.commits;
+        *self = Self { commits, window_start_ns: now, ..Self::default() };
+    }
+}
+
 /// Reads the `SmallMessage` the caller wrote into the shared message
 /// page — same fixed 56-byte layout `kernel_arch_glue::write_shared_
 /// compositor_message` uses on the other side.
@@ -345,18 +490,39 @@ fn write_shared_message(msg: &SmallMessage) {
     }
 }
 
-/// Copies `len` bytes from the committed frame (`FB_VA`) into this
-/// process's own private confirm region (`CONFIRM_VA`) — this file's own
-/// module doc comment on why: proves this process genuinely
-/// dereferenced the shared frame, for `kernel_arch_glue::compositor_
-/// commit_verify` to check afterward. `len` is trusted (bounded by
-/// `FRAME_MAX`, checked before this is ever called).
+/// How much of each committed frame [`copy_frame_to_confirm`] copies.
+///
+/// It used to copy the WHOLE frame — 1.92 MB per commit for ui-core's
+/// 800x600 desktop, on every mouse move — although the only reader,
+/// `kernel_arch_glue::compositor_commit_verify`, compares just the Root
+/// Task's 2x2 bootstrap frame (16 bytes). One page is plenty to prove
+/// this process really dereferenced `FB_VA`, and costs nothing next to
+/// a frame.
+const CONFIRM_PROOF_BYTES: u32 = 4096;
+
+/// Copies the first `min(len, CONFIRM_PROOF_BYTES)` bytes of the
+/// committed frame (`FB_VA`) into this process's own private confirm
+/// region (`CONFIRM_VA`) — this file's own module doc comment on why:
+/// proves this process genuinely dereferenced the shared frame, for
+/// `kernel_arch_glue::compositor_commit_verify` to check afterward.
+/// `len` is trusted (bounded by `FRAME_MAX`, checked before this is ever
+/// called).
+///
+/// Must run AFTER `Output::present`: the confirm region doubles as the
+/// present path's shadow of what is on screen (see `Output::present`),
+/// and copying the new frame into it first would make the diff believe
+/// those bytes were already on screen. Copied after, they are exactly
+/// what was just presented, so the shadow stays consistent.
 fn copy_frame_to_confirm(len: u32) {
     // SAFETY: `FB_VA`/`CONFIRM_VA` are both mapped `U=1 R+W` in this
     // process's own address space by `compositor_demo_start`; `len <=
     // FRAME_MAX` (each mapped page's own size) is checked by the caller.
     unsafe {
-        core::ptr::copy_nonoverlapping(FB_VA as *const u8, CONFIRM_VA as *mut u8, len as usize);
+        core::ptr::copy_nonoverlapping(
+            FB_VA as *const u8,
+            CONFIRM_VA as *mut u8,
+            len.min(CONFIRM_PROOF_BYTES) as usize,
+        );
     }
 }
 
@@ -398,27 +564,82 @@ const INPUT_QUEUE_LEN: usize = 64;
 /// one slot, every event that arrived before ui-core's next poll
 /// overwrote the previous one: on a real interactive boot (2026-09-24)
 /// typing "alice" at normal speed produced an empty username field and
-/// only two of seven password characters. When full, the OLDEST event is
-/// dropped — for a bounded queue under sustained overload, keeping the
-/// most recent input is what a user sees as "responsive".
-struct EventQueue<T: Copy> {
+/// only two of seven password characters.
+///
+/// When full, a new event does not simply push another one out: it is
+/// COALESCED ([`QueueEvent`]). Mouse motion with unchanged buttons is
+/// summed, so a burst never loses net pointer travel; button changes and
+/// key releases are never discarded while anything cheaper to lose
+/// exists. Only if every queued event is a distinct, un-mergeable
+/// transition is the oldest dropped.
+struct EventQueue<T: QueueEvent> {
     buf: [Option<T>; INPUT_QUEUE_LEN],
     head: usize,
     len: usize,
 }
 
-impl<T: Copy> EventQueue<T> {
+/// How an input event kind survives a full [`EventQueue`].
+trait QueueEvent: Copy {
+    /// `older` followed by `newer`, as ONE event with the same net
+    /// effect — or `None` if the pair cannot be merged without losing
+    /// something a client must see.
+    fn merge(older: &Self, newer: &Self) -> Option<Self>;
+    /// Whether this event may be discarded outright when nothing can be
+    /// merged. Losing it must never leave the client with a wrong state
+    /// (a key press is expendable; its release is not — losing a release
+    /// leaves a key "held down" forever).
+    fn expendable(&self) -> bool;
+}
+
+impl<T: QueueEvent> EventQueue<T> {
     const fn new() -> Self {
         Self { buf: [None; INPUT_QUEUE_LEN], head: 0, len: 0 }
     }
 
+    /// Physical slot of logical position `i` (0 = oldest).
+    fn slot(&self, i: usize) -> usize {
+        (self.head + i) % INPUT_QUEUE_LEN
+    }
+
+    /// Removes logical position `i`, closing the gap.
+    fn remove_at(&mut self, i: usize) {
+        for j in i..self.len - 1 {
+            self.buf[self.slot(j)] = self.buf[self.slot(j + 1)];
+        }
+        let last = self.slot(self.len - 1);
+        self.buf[last] = None;
+        self.len -= 1;
+    }
+
     fn push(&mut self, event: T) {
         if self.len == INPUT_QUEUE_LEN {
-            // Drop the oldest (see the type's own doc comment).
-            self.head = (self.head + 1) % INPUT_QUEUE_LEN;
-            self.len -= 1;
+            // 1. Fold the new event into the newest queued one — the
+            //    common case: a burst of plain mouse motion.
+            let tail = self.slot(self.len - 1);
+            if let Some(merged) = self.buf[tail].as_ref().and_then(|t| T::merge(t, &event)) {
+                self.buf[tail] = Some(merged);
+                return;
+            }
+            // 2. Otherwise merge the OLDEST mergeable adjacent pair,
+            //    which frees a slot without reordering anything.
+            let merged_pair = (0..self.len - 1).find_map(|i| {
+                let a = self.buf[self.slot(i)]?;
+                let b = self.buf[self.slot(i + 1)]?;
+                T::merge(&a, &b).map(|m| (i, m))
+            });
+            if let Some((i, m)) = merged_pair {
+                self.buf[self.slot(i)] = Some(m);
+                self.remove_at(i + 1);
+            } else if let Some(i) = (0..self.len).find(|&i| self.buf[self.slot(i)].is_some_and(|e| e.expendable())) {
+                // 3. Drop the oldest expendable event.
+                self.remove_at(i);
+            } else {
+                // 4. Nothing cheaper to lose: drop the oldest.
+                self.remove_at(0);
+            }
         }
-        self.buf[(self.head + self.len) % INPUT_QUEUE_LEN] = Some(event);
+        let at = self.slot(self.len);
+        self.buf[at] = Some(event);
         self.len += 1;
     }
 
@@ -449,6 +670,20 @@ struct KeyEvent {
     keycode: u8,
     pressed: bool,
     extended: bool,
+}
+
+impl QueueEvent for KeyEvent {
+    /// Two key events never merge: each press/release is a distinct
+    /// character or state change.
+    fn merge(_older: &Self, _newer: &Self) -> Option<Self> {
+        None
+    }
+
+    /// A press may be lost under overload (one missed character); a
+    /// release may not (a stuck key).
+    fn expendable(&self) -> bool {
+        self.pressed
+    }
 }
 
 /// Must match `driver_i8042::wire::KEY_EVENT_LABEL` exactly.
@@ -495,6 +730,27 @@ struct MouseEvent {
     left: bool,
     right: bool,
     middle: bool,
+}
+
+impl QueueEvent for MouseEvent {
+    /// Consecutive events with the SAME button state are one motion:
+    /// their deltas add up (saturating at the wire's `i16` range, far
+    /// past any real burst). A button change never merges, so every
+    /// press and release reaches the client, in order.
+    fn merge(older: &Self, newer: &Self) -> Option<Self> {
+        let same_buttons =
+            older.left == newer.left && older.right == newer.right && older.middle == newer.middle;
+        same_buttons.then(|| MouseEvent {
+            dx: older.dx.saturating_add(newer.dx),
+            dy: older.dy.saturating_add(newer.dy),
+            ..*newer
+        })
+    }
+
+    /// Never: every mouse event carries either motion or a button state.
+    fn expendable(&self) -> bool {
+        false
+    }
 }
 
 /// Must match `driver_mouse::wire::MOUSE_EVENT_LABEL` exactly.
@@ -547,29 +803,63 @@ struct Output {
     /// AFTER clipping — not the size requested, which is the number
     /// worth knowing when a client and the firmware mode disagree.
     last_size: (u32, u32),
+    /// Nanoseconds the last `present` spent, for [`PerfStats`]. Only
+    /// measured when [`PERF_LOG`] is on.
+    last_present_ns: u64,
+    /// Bytes the last `present` actually wrote to the framebuffer, for
+    /// [`PerfStats`].
+    last_present_bytes: u64,
+    /// The frame size the shadow (at `CONFIRM_VA`) currently mirrors the
+    /// screen for, or `None` when it mirrors nothing yet. A commit of any
+    /// other size is drawn in full and re-seeds the shadow.
+    shadow_size: Option<(u32, u32)>,
 }
 
 impl Output {
     /// No display. The state every machine starts in, and the one a
     /// machine with no framebuffer stays in forever.
     const fn headless() -> Self {
-        Self { scanout: None, blits: 0, last_size: (0, 0) }
+        Self {
+            scanout: None,
+            blits: 0,
+            last_size: (0, 0),
+            last_present_ns: 0,
+            last_present_bytes: 0,
+            shadow_size: None,
+        }
     }
 
     /// Puts a committed frame on the screen and records that it
     /// happened. A no-op when no framebuffer was granted.
+    ///
+    /// Only the pixels that differ from the previous frame are written
+    /// (`Scanout::present_diff`). The shadow of what is on screen lives
+    /// in the `CONFIRM_VA` region: private RAM of exactly `FRAME_MAX`
+    /// bytes that the kernel already maps for this process, so the
+    /// shadow needs neither a new kernel mapping nor 1.9 MB of `.bss`
+    /// that every architecture's loader would have to back — and the
+    /// confirm proof it used to hold survives unchanged (see
+    /// `copy_frame_to_confirm`).
     fn present(&mut self, src_va: usize, width: u32, height: u32) {
         let Some(scanout) = self.scanout else {
             return;
         };
+        let t0 = if PERF_LOG { now_ns() } else { 0 };
+        let shadow_valid = self.shadow_size == Some((width, height));
         // SAFETY: `src_va` is `FB_VA`, the shared frame region the
         // kernel maps for this process before it is first scheduled,
         // and the caller has already rejected any `width * height * 4`
-        // exceeding `FRAME_MAX` (the region's own mapped length).
-        let plan = unsafe { scanout.blit(src_va, width, height) };
+        // exceeding `FRAME_MAX` (the mapped length of both `FB_VA` and
+        // the `CONFIRM_VA` shadow, two distinct regions).
+        let (plan, bytes) = unsafe { scanout.present_diff(src_va, CONFIRM_VA, width, height, shadow_valid) };
+        self.last_present_bytes = bytes;
+        if PERF_LOG {
+            self.last_present_ns = now_ns().saturating_sub(t0);
+        }
         if plan.is_empty() {
             return;
         }
+        self.shadow_size = Some((width, height));
         self.blits += 1;
         self.last_size = (plan.copy_width, plan.copy_height);
         self.write_status();
@@ -636,12 +926,13 @@ fn handle_request(
             }
             match comp.commit_buffer(surface.0, width, height) {
                 Ok(()) => {
-                    copy_frame_to_confirm(len);
-                    // The real scanout hop — strictly AFTER the confirm
-                    // copy, so the pre-existing `compositor_commit_
-                    // verify` proof is byte-for-byte unaffected by it,
-                    // and a no-op on a machine with no framebuffer.
+                    // The real scanout hop (a no-op on a machine with no
+                    // framebuffer), then the confirm proof — in THIS
+                    // order, because the confirm region is also the
+                    // present path's shadow; `copy_frame_to_confirm`'s
+                    // own doc comment has why the reverse would be wrong.
                     output.present(FB_VA, width, height);
+                    copy_frame_to_confirm(len);
                     DisplayResponse::Committed
                 }
                 Err(_) => DisplayResponse::Error {
@@ -822,6 +1113,7 @@ pub extern "C" fn subsystem_main() -> ! {
     // framebuffer was granted — both per those constants' own doc
     // comments.
     let mut output = Output::headless();
+    let mut perf = PerfStats::default();
     output.scanout = unsafe { Scanout::from_info_page(SCANOUT_INFO_VA, SCANOUT_VA) };
     if let Some(scanout) = output.scanout {
         // Take ownership of every pixel: what is on screen at this
@@ -904,7 +1196,19 @@ pub extern "C" fn subsystem_main() -> ! {
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, COMPOSITOR_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();
         let resp = match decode_display_request(&req_msg) {
-            Ok(req) => handle_request(&mut comp, &mut last_key_event, &mut last_mouse_event, &mut output, req),
+            Ok(req) => {
+                // Timed only with a real display: a headless boot has
+                // no present cost worth measuring and should not pay
+                // two clock syscalls per commit for nothing.
+                let timed = PERF_LOG && output.scanout.is_some() && matches!(req, DisplayRequest::CommitBuffer { .. });
+                let t0 = if timed { now_ns() } else { 0 };
+                let resp = handle_request(&mut comp, &mut last_key_event, &mut last_mouse_event, &mut output, req);
+                if timed {
+                    let now = now_ns();
+                    perf.record(now.saturating_sub(t0), output.last_present_ns, output.last_present_bytes, now);
+                }
+                resp
+            }
             Err(_) => DisplayResponse::Error {
                 code: DisplayErrorCode::Unsupported,
             },
@@ -1044,8 +1348,19 @@ mod tests {
         assert_eq!(resp, DisplayResponse::NoInputPending);
     }
 
+    /// A plain un-mergeable, always-expendable event: the queue's last-
+    /// resort behaviour on its own.
+    impl QueueEvent for u32 {
+        fn merge(_: &Self, _: &Self) -> Option<Self> {
+            None
+        }
+        fn expendable(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
-    fn a_full_queue_drops_the_oldest_event_not_the_newest() {
+    fn a_full_queue_of_unmergeable_events_drops_the_oldest_not_the_newest() {
         let mut q: EventQueue<u32> = EventQueue::new();
         for i in 0..(INPUT_QUEUE_LEN as u32 + 3) {
             q.push(i);
@@ -1056,5 +1371,66 @@ mod tests {
             last = v;
         }
         assert_eq!(last, INPUT_QUEUE_LEN as u32 + 2);
+    }
+
+    fn motion(dx: i16, dy: i16, left: bool) -> MouseEvent {
+        MouseEvent { dx, dy, left, right: false, middle: false }
+    }
+
+    #[test]
+    fn a_mouse_burst_past_capacity_keeps_all_net_motion() {
+        let mut q = EventQueue::new();
+        for _ in 0..500 {
+            q.push(motion(3, -1, false));
+        }
+        assert_eq!(q.len, INPUT_QUEUE_LEN);
+        let (mut dx, mut dy) = (0i32, 0i32);
+        while let Some(e) = q.pop() {
+            dx += e.dx as i32;
+            dy += e.dy as i32;
+        }
+        assert_eq!((dx, dy), (1500, -500));
+    }
+
+    #[test]
+    fn a_mouse_burst_never_loses_a_press_or_release_or_reorders_them() {
+        let mut q = EventQueue::new();
+        for _ in 0..100 {
+            q.push(motion(1, 0, false));
+        }
+        q.push(motion(0, 0, true)); // press
+        for _ in 0..100 {
+            q.push(motion(1, 0, true)); // drag
+        }
+        q.push(motion(0, 0, false)); // release
+        for _ in 0..100 {
+            q.push(motion(1, 0, false));
+        }
+        let mut states = alloc::vec::Vec::new();
+        let mut dx = 0i32;
+        while let Some(e) = q.pop() {
+            dx += e.dx as i32;
+            if states.last() != Some(&e.left) {
+                states.push(e.left);
+            }
+        }
+        assert_eq!(dx, 300);
+        assert_eq!(states, [false, true, false]);
+    }
+
+    #[test]
+    fn a_key_burst_past_capacity_keeps_every_release() {
+        let mut q = EventQueue::new();
+        for i in 0..50u8 {
+            q.push(KeyEvent { keycode: i, pressed: true, extended: false });
+            q.push(KeyEvent { keycode: i, pressed: false, extended: false });
+        }
+        let mut releases = 0;
+        while let Some(e) = q.pop() {
+            if !e.pressed {
+                releases += 1;
+            }
+        }
+        assert_eq!(releases, 50);
     }
 }
