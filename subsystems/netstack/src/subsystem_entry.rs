@@ -763,58 +763,124 @@ impl crate::stack::FrameIo for DriverIo {
 /// All memory of the smoltcp stack; `.bss`, zero-initialised by the loader.
 static mut STACK_STORAGE: crate::stack::StackStorage = crate::stack::StackStorage::new();
 
+/// Dotted-quad display for log lines (no heap).
+struct Ip([u8; 4]);
+
+impl core::fmt::Display for Ip {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}.{}.{}.{}", self.0[0], self.0[1], self.0[2], self.0[3])
+    }
+}
+
+/// `Ip` or "none".
+struct OptIp(Option<[u8; 4]>);
+
+impl core::fmt::Display for OptIp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(ip) => Ip(ip).fmt(f),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// The one name the service resolves to prove name resolution end to end
+/// (Internet plan phase 2 acceptance), and how often it is looked up again
+/// (the second lookup within the cache TTL is answered from the cache).
+const DNS_TEST_NAME: &str = "example.com";
+const DNS_LOOKUP_INTERVAL_NS: u64 = 60_000_000_000;
+/// Retry delay after a failed lookup.
+const DNS_RETRY_NS: u64 = 5_000_000_000;
+
 fn log_event(ev: crate::stack::NetEvent) {
     use crate::stack::NetEvent;
     match ev {
-        NetEvent::LinkConfigured { ip, prefix, gateway } => match gateway {
-            Some(g) => nlog!(
-                "link up: {}.{}.{}.{}/{} gateway {}.{}.{}.{}",
-                ip[0], ip[1], ip[2], ip[3], prefix, g[0], g[1], g[2], g[3]
-            ),
-            None => nlog!("link up: {}.{}.{}.{}/{} (no gateway)", ip[0], ip[1], ip[2], ip[3], prefix),
-        },
-        NetEvent::PingReply { from, seq, rtt_us } => nlog!(
-            "ping reply from {}.{}.{}.{}: seq={} time={}.{:03} ms",
-            from[0], from[1], from[2], from[3], seq, rtt_us / 1000, rtt_us % 1000
+        NetEvent::LinkConfigured { ip, prefix, gateway, dns, dhcp } => nlog!(
+            "link up ({}): address {}/{} gateway {} dns {}",
+            if dhcp { "DHCP lease" } else { "static" },
+            Ip(ip),
+            prefix,
+            OptIp(gateway),
+            OptIp(dns)
         ),
+        NetEvent::LinkLost => nlog!("link down: DHCP lease lost, waiting for a new one"),
+        NetEvent::PingReply { from, seq, rtt_us } => {
+            nlog!("ping reply from {}: seq={} time={}.{:03} ms", Ip(from), seq, rtt_us / 1000, rtt_us % 1000)
+        }
         NetEvent::PingTimeout { seq } => nlog!("ping seq={} timed out", seq),
+        NetEvent::DnsResolved { token: _, addr, cached } => {
+            nlog!("dns: {} resolved to {}{}", DNS_TEST_NAME, Ip(addr), if cached { " (from cache)" } else { "" })
+        }
+        NetEvent::DnsFailed { token: _ } => nlog!("dns: lookup of {} failed", DNS_TEST_NAME),
     }
 }
 
 /// The persistent Netstack service (second thread of this process, started
 /// by `kernel_arch_glue::netstack_start_service` on the desktop image): owns
-/// the smoltcp stack, polls it with a sleep in between, and pings the
-/// gateway repeatedly so a serial log shows the network is alive.
+/// the smoltcp stack and polls it with a sleep in between. It gets its
+/// address, gateway and DNS server from DHCP (nothing hard-coded), then
+/// pings the gateway repeatedly and resolves a real name, so a serial log
+/// shows the network is alive end to end.
 fn service_main() -> ! {
+    use crate::stack::NetEvent;
     // SAFETY: `DRV_RX_VA` is mapped from process entry onward.
     let mac = unsafe { read_driver_mac() };
     // SAFETY: single-threaded use of the static: only this thread ever
     // touches it, and it is taken exactly once.
     let storage = unsafe { &mut *core::ptr::addr_of_mut!(STACK_STORAGE) };
     let start = now_ns();
-    let mut stack = crate::stack::NetStack::new(
-        storage,
-        DriverIo,
-        mac,
-        crate::stack::AddrMode::Static { ip: OUR_IP, prefix: 24, gateway: GATEWAY_IP },
-        start,
+    let mut stack = crate::stack::NetStack::new(storage, DriverIo, mac, crate::stack::AddrMode::Dhcp, start);
+    nlog!(
+        "service: smoltcp stack up, nic mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, asking DHCP for an address",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-    nlog!("service: smoltcp stack up, nic mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     let mut seq: u16 = 0;
     let mut pings_sent: u32 = 0;
     let mut next_ping_ns = start;
+    let mut next_dns_ns = start;
+    let mut dns_busy = false;
     loop {
         let now = now_ns();
-        if now >= next_ping_ns && !stack.ping_outstanding() {
-            seq = seq.wrapping_add(1);
-            if stack.ping(GATEWAY_IP, seq, now).is_ok() {
-                pings_sent += 1;
-                next_ping_ns =
-                    now + if pings_sent < PING_BURST { PING_BURST_INTERVAL_NS } else { PING_HEARTBEAT_INTERVAL_NS };
+        // Only act while the interface has an address.
+        if let Some(NetEvent::LinkConfigured { gateway, .. }) = stack.config() {
+            if let Some(gw) = gateway {
+                if now >= next_ping_ns && !stack.ping_outstanding() {
+                    seq = seq.wrapping_add(1);
+                    if stack.ping(gw, seq, now).is_ok() {
+                        pings_sent += 1;
+                        next_ping_ns = now
+                            + if pings_sent < PING_BURST { PING_BURST_INTERVAL_NS } else { PING_HEARTBEAT_INTERVAL_NS };
+                    }
+                }
+            }
+            if now >= next_dns_ns && !dns_busy {
+                match stack.dns_resolve(DNS_TEST_NAME, now) {
+                    Ok(_) => {
+                        dns_busy = true;
+                        next_dns_ns = now + DNS_LOOKUP_INTERVAL_NS;
+                    }
+                    Err(_) => next_dns_ns = now + DNS_RETRY_NS,
+                }
             }
         }
-        stack.poll(now, &mut log_event);
+        stack.poll(now, &mut |ev| {
+            match ev {
+                NetEvent::DnsResolved { .. } => dns_busy = false,
+                NetEvent::DnsFailed { .. } => {
+                    dns_busy = false;
+                    next_dns_ns = now_ns() + DNS_RETRY_NS;
+                }
+                // A new lease restarts the ping burst and the lookup.
+                NetEvent::LinkConfigured { .. } => {
+                    pings_sent = 0;
+                    next_ping_ns = 0;
+                    next_dns_ns = 0;
+                }
+                _ => {}
+            }
+            log_event(ev);
+        });
         let now = now_ns();
         let wait = stack.poll_delay_ms(now).map(|ms| ms * 1_000_000).unwrap_or(IDLE_POLL_NS).clamp(1_000_000, IDLE_POLL_NS);
         sleep_ns(wait);

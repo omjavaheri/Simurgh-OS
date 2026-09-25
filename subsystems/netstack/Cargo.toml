@@ -46,4 +46,4 @@ kernel-ipc   = { path = "../../kernel/kernel-ipc" }
 [dependencies.smoltcp]
 version = "0.12"
 default-features = false
-features = ["proto-ipv4", "medium-ethernet", "socket-icmp"]
+features = ["proto-ipv4", "proto-dhcpv4", "proto-dns", "medium-ethernet", "socket-icmp", "socket-udp", "socket-dhcpv4", "socket-dns"]

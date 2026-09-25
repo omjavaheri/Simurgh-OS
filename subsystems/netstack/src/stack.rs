@@ -26,9 +26,12 @@
 
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::icmp;
+use smoltcp::socket::{dhcpv4, dns, icmp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
+    Ipv4Address,
+};
 
 /// Largest Ethernet frame the driver's buffers hold
 /// (`driver_virtio_net::FRAME_MAX`; must stay numerically equal). It is also
@@ -164,8 +167,28 @@ impl<IO: FrameIo> Device for FrameDevice<IO> {
 // Storage
 // ---------------------------------------------------------------------------
 
-/// Number of smoltcp sockets the stack can hold.
-const SOCKET_SLOTS: usize = 4;
+/// Number of smoltcp sockets the stack can hold: ICMP, UDP, DHCP, DNS (+2
+/// spare for the socket API of phase 3).
+const SOCKET_SLOTS: usize = 6;
+
+/// Concurrent DNS lookups (smoltcp query slots) and the owner-visible token
+/// space of `dns_resolve`.
+pub const DNS_SLOTS: usize = 2;
+
+/// Longest host name `dns_resolve` accepts (the cache keys on it verbatim).
+pub const DNS_NAME_MAX: usize = 64;
+
+/// DNS cache entries.
+const DNS_CACHE_SLOTS: usize = 4;
+
+/// How long a resolved name stays in the cache. TODO(spec): smoltcp's DNS
+/// socket does not expose the record TTL, so this is a fixed compromise
+/// instead of the server's value.
+pub const DNS_CACHE_TTL_NS: u64 = 300 * 1_000_000_000;
+
+/// Largest UDP payload the generic UDP socket buffers (one datagram at a
+/// time; fits the driver's 700-byte frames).
+pub const UDP_PAYLOAD_MAX: usize = 512;
 
 /// All memory the stack uses. No heap: sockets and their buffers are carved
 /// out of this one struct, which the caller places in a `static` (the process
@@ -176,6 +199,11 @@ pub struct StackStorage {
     icmp_rx_data: [u8; 512],
     icmp_tx_meta: [icmp::PacketMetadata; 4],
     icmp_tx_data: [u8; 512],
+    udp_rx_meta: [udp::PacketMetadata; 4],
+    udp_rx_data: [u8; UDP_PAYLOAD_MAX],
+    udp_tx_meta: [udp::PacketMetadata; 4],
+    udp_tx_data: [u8; UDP_PAYLOAD_MAX],
+    dns_queries: [Option<dns::DnsQuery>; DNS_SLOTS],
 }
 
 impl StackStorage {
@@ -187,6 +215,11 @@ impl StackStorage {
             icmp_rx_data: [0; 512],
             icmp_tx_meta: [icmp::PacketMetadata::EMPTY; 4],
             icmp_tx_data: [0; 512],
+            udp_rx_meta: [udp::PacketMetadata::EMPTY; 4],
+            udp_rx_data: [0; UDP_PAYLOAD_MAX],
+            udp_tx_meta: [udp::PacketMetadata::EMPTY; 4],
+            udp_tx_data: [0; UDP_PAYLOAD_MAX],
+            dns_queries: [const { None }; DNS_SLOTS],
         }
     }
 }
@@ -204,9 +237,9 @@ impl Default for StackStorage {
 /// How the interface gets its IPv4 address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrMode {
-    /// Fixed address, prefix length and default gateway, applied at
-    /// construction. Used until the DHCP client (Phase 2) lands and kept as
-    /// the fallback for networks without DHCP.
+    /// Fixed address, prefix length, default gateway and (optionally) DNS
+    /// server, applied at construction. For networks without DHCP and for
+    /// tests; the service does not fall back to it silently.
     Static {
         /// Interface address.
         ip: [u8; 4],
@@ -214,14 +247,22 @@ pub enum AddrMode {
         prefix: u8,
         /// Default gateway.
         gateway: [u8; 4],
+        /// DNS server, if any.
+        dns: Option<[u8; 4]>,
     },
+    /// DHCP client: the interface has no address until a server's ACK
+    /// arrives; address, gateway and DNS server then come from the lease.
+    /// smoltcp's DHCP socket handles DISCOVER/OFFER/REQUEST/ACK, retransmit
+    /// with backoff, lease renewal (T1/T2) and re-discovery on expiry or NAK.
+    Dhcp,
 }
 
 /// Something the stack tells its owner about. The owner logs it or acts on
 /// it; the stack itself has no output channel (it cannot print).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetEvent {
-    /// The interface has an address (static configuration applied).
+    /// The interface has an address: a static configuration was applied or a
+    /// DHCP lease was acquired (or changed at renewal).
     LinkConfigured {
         /// Interface address.
         ip: [u8; 4],
@@ -229,7 +270,14 @@ pub enum NetEvent {
         prefix: u8,
         /// Default gateway, if any.
         gateway: Option<[u8; 4]>,
+        /// First DNS server, if any.
+        dns: Option<[u8; 4]>,
+        /// `true` when the configuration came from DHCP.
+        dhcp: bool,
     },
+    /// The DHCP lease was lost (expired or NAKed); the interface has no
+    /// address until a new lease arrives.
+    LinkLost,
     /// An echo request got its reply.
     PingReply {
         /// Who answered.
@@ -244,6 +292,20 @@ pub enum NetEvent {
         /// Sequence number of the request.
         seq: u16,
     },
+    /// A name lookup finished successfully.
+    DnsResolved {
+        /// The token `dns_resolve` returned for this lookup.
+        token: u8,
+        /// The first IPv4 address of the answer.
+        addr: [u8; 4],
+        /// `true` when it came from the cache (no packet was sent).
+        cached: bool,
+    },
+    /// A name lookup failed (server unreachable, NXDOMAIN, timeout).
+    DnsFailed {
+        /// The token `dns_resolve` returned for this lookup.
+        token: u8,
+    },
 }
 
 /// Why `ping` refused to send.
@@ -255,26 +317,88 @@ pub enum PingError {
     NoBuffer,
 }
 
+/// Why `dns_resolve` refused to start a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsError {
+    /// The name is empty, too long (`DNS_NAME_MAX`) or malformed.
+    InvalidName,
+    /// All `DNS_SLOTS` lookups are in use.
+    NoFreeSlot,
+    /// No DNS server is known yet (no lease / no static server).
+    NoServer,
+}
+
+/// Why a UDP call failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpError {
+    /// The port is 0 or the socket is already bound.
+    Bind,
+    /// The socket is not bound, or its transmit buffer is full, or the
+    /// payload exceeds `UDP_PAYLOAD_MAX`, or there is no route.
+    Send,
+}
+
+/// One received UDP datagram's metadata (`udp_recv` copies the payload out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpDatagram {
+    /// Sender address.
+    pub src: [u8; 4],
+    /// Sender port.
+    pub src_port: u16,
+    /// Payload length copied into the caller's buffer.
+    pub len: usize,
+}
+
 #[derive(Clone, Copy)]
 struct OutstandingPing {
     seq: u16,
     sent_ns: u64,
 }
 
+/// One in-flight DNS lookup.
+#[derive(Clone, Copy)]
+struct DnsSlot {
+    handle: dns::QueryHandle,
+    name: [u8; DNS_NAME_MAX],
+    name_len: usize,
+}
+
+/// One cached name.
+#[derive(Clone, Copy)]
+struct DnsCacheEntry {
+    name: [u8; DNS_NAME_MAX],
+    name_len: usize,
+    addr: [u8; 4],
+    expires_ns: u64,
+}
+
+/// A tiny fixed queue of events raised outside `poll`'s own detection (a
+/// cache hit answers at once but is reported by the next `poll`).
+const PENDING_EVENTS: usize = 8;
+
 // ---------------------------------------------------------------------------
 // The stack
 // ---------------------------------------------------------------------------
 
-/// The Netstack: one Ethernet interface, an ICMP socket, and the small API
-/// the service loop drives. Call `poll` regularly (it is what moves frames);
-/// everything else only queues work for the next `poll`.
+/// The Netstack: one Ethernet interface with ICMP, UDP, DHCP-client and DNS
+/// sockets, and the small API the service loop drives. Call `poll` regularly
+/// (it is what moves frames and runs protocol timers); everything else only
+/// queues work for the next `poll`.
 pub struct NetStack<IO: FrameIo> {
     device: FrameDevice<IO>,
     iface: Interface,
     sockets: SocketSet<'static>,
     icmp: SocketHandle,
+    udp: SocketHandle,
+    dns: SocketHandle,
+    dhcp: Option<SocketHandle>,
     ping: Option<OutstandingPing>,
-    pending_configured: Option<NetEvent>,
+    dns_slots: [Option<DnsSlot>; DNS_SLOTS],
+    dns_cache: [Option<DnsCacheEntry>; DNS_CACHE_SLOTS],
+    dns_cache_next: usize,
+    pending: [Option<NetEvent>; PENDING_EVENTS],
+    /// Cached view of the current lease/config for the API (`ip()` etc.).
+    config: Option<NetEvent>,
 }
 
 /// Converts the process clock (nanoseconds) to smoltcp's `Instant`.
@@ -282,15 +406,31 @@ pub fn instant_from_ns(now_ns: u64) -> Instant {
     Instant::from_micros((now_ns / 1_000) as i64)
 }
 
+fn v4(a: [u8; 4]) -> Ipv4Address {
+    Ipv4Address::new(a[0], a[1], a[2], a[3])
+}
+
 impl<IO: FrameIo> NetStack<IO> {
     /// Builds the stack over `io` with hardware address `mac`.
     pub fn new(storage: &'static mut StackStorage, io: IO, mac: [u8; 6], mode: AddrMode, now_ns: u64) -> Self {
-        let StackStorage { sockets, icmp_rx_meta, icmp_rx_data, icmp_tx_meta, icmp_tx_data } = storage;
+        let StackStorage {
+            sockets,
+            icmp_rx_meta,
+            icmp_rx_data,
+            icmp_tx_meta,
+            icmp_tx_data,
+            udp_rx_meta,
+            udp_rx_data,
+            udp_tx_meta,
+            udp_tx_data,
+            dns_queries,
+        } = storage;
 
         let mut device = FrameDevice::new(io);
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-        // Not cryptographic: seeds smoltcp's source ports / ARP jitter. Mixing
-        // the MAC in keeps two VMs booted at the same instant apart.
+        // Not cryptographic: seeds smoltcp's source ports, DNS transaction ids
+        // and DHCP xid/jitter. Mixing the MAC in keeps two VMs booted at the
+        // same instant apart.
         config.random_seed = now_ns ^ u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0x5A, 0xA5]);
         let iface = Interface::new(config, &mut device, instant_from_ns(now_ns));
 
@@ -301,26 +441,83 @@ impl<IO: FrameIo> NetStack<IO> {
         );
         let icmp = socket_set.add(icmp_socket);
         socket_set.get_mut::<icmp::Socket>(icmp).bind(icmp::Endpoint::Ident(PING_IDENT)).ok();
+        let udp_socket = udp::Socket::new(
+            udp::PacketBuffer::new(&mut udp_rx_meta[..], &mut udp_rx_data[..]),
+            udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_data[..]),
+        );
+        let udp = socket_set.add(udp_socket);
+        let dns = socket_set.add(dns::Socket::new(&[], &mut dns_queries[..]));
+        let dhcp = match mode {
+            AddrMode::Dhcp => Some(socket_set.add(dhcpv4::Socket::new())),
+            AddrMode::Static { .. } => None,
+        };
 
-        let mut stack = Self { device, iface, sockets: socket_set, icmp, ping: None, pending_configured: None };
-        stack.apply_mode(mode);
+        let mut stack = Self {
+            device,
+            iface,
+            sockets: socket_set,
+            icmp,
+            udp,
+            dns,
+            dhcp,
+            ping: None,
+            dns_slots: [None; DNS_SLOTS],
+            dns_cache: [None; DNS_CACHE_SLOTS],
+            dns_cache_next: 0,
+            pending: [None; PENDING_EVENTS],
+            config: None,
+        };
+        if let AddrMode::Static { ip, prefix, gateway, dns } = mode {
+            stack.apply_config(ip, prefix, Some(gateway), dns, false);
+        }
         stack
     }
 
-    fn apply_mode(&mut self, mode: AddrMode) {
-        match mode {
-            AddrMode::Static { ip, prefix, gateway } => {
-                let addr = Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]);
-                self.iface.update_ip_addrs(|addrs| {
-                    addrs.clear();
-                    let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(addr), prefix));
-                });
-                let gw = Ipv4Address::new(gateway[0], gateway[1], gateway[2], gateway[3]);
-                let _ = self.iface.routes_mut().add_default_ipv4_route(gw);
-                self.pending_configured =
-                    Some(NetEvent::LinkConfigured { ip, prefix, gateway: Some(gateway) });
+    fn queue_event(&mut self, ev: NetEvent) {
+        if let Some(slot) = self.pending.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(ev);
+        }
+        // A full queue drops the event: the owner is not polling at all then.
+    }
+
+    /// Installs an address configuration (static or from a lease).
+    fn apply_config(&mut self, ip: [u8; 4], prefix: u8, gateway: Option<[u8; 4]>, dns: Option<[u8; 4]>, dhcp: bool) {
+        let addr = v4(ip);
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.clear();
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(addr), prefix));
+        });
+        match gateway {
+            Some(gw) => {
+                let _ = self.iface.routes_mut().add_default_ipv4_route(v4(gw));
+            }
+            None => {
+                self.iface.routes_mut().remove_default_ipv4_route();
             }
         }
+        let dns_socket = self.sockets.get_mut::<dns::Socket>(self.dns);
+        match dns {
+            Some(d) => dns_socket.update_servers(&[IpAddress::Ipv4(v4(d))]),
+            None => dns_socket.update_servers(&[]),
+        }
+        let ev = NetEvent::LinkConfigured { ip, prefix, gateway, dns, dhcp };
+        self.config = Some(ev);
+        self.queue_event(ev);
+    }
+
+    /// Drops the address configuration (lease lost).
+    fn clear_config(&mut self) {
+        self.iface.update_ip_addrs(|addrs| addrs.clear());
+        self.iface.routes_mut().remove_default_ipv4_route();
+        self.sockets.get_mut::<dns::Socket>(self.dns).update_servers(&[]);
+        self.config = None;
+        self.queue_event(NetEvent::LinkLost);
+    }
+
+    /// The current configuration event (`LinkConfigured`), or `None` while the
+    /// interface has no address.
+    pub fn config(&self) -> Option<NetEvent> {
+        self.config
     }
 
     /// Access to the transport (host tests only in practice).
@@ -333,6 +530,8 @@ impl<IO: FrameIo> NetStack<IO> {
         self.device.io_mut()
     }
 
+    // ---- ICMP -------------------------------------------------------------
+
     /// Queues one ICMP echo request to `dst` with sequence number `seq`. The
     /// frame (and the ARP request for `dst`'s MAC, if needed) leaves on the
     /// next `poll`.
@@ -343,7 +542,7 @@ impl<IO: FrameIo> NetStack<IO> {
         let repr = Icmpv4Repr::EchoRequest { ident: PING_IDENT, seq_no: seq, data: PING_PAYLOAD };
         let checksum = self.device.capabilities().checksum;
         let socket = self.sockets.get_mut::<icmp::Socket>(self.icmp);
-        let addr = IpAddress::Ipv4(Ipv4Address::new(dst[0], dst[1], dst[2], dst[3]));
+        let addr = IpAddress::Ipv4(v4(dst));
         let buf = socket.send(repr.buffer_len(), addr).map_err(|_| PingError::NoBuffer)?;
         let mut packet = Icmpv4Packet::new_unchecked(buf);
         repr.emit(&mut packet, &checksum);
@@ -356,23 +555,157 @@ impl<IO: FrameIo> NetStack<IO> {
         self.ping.is_some()
     }
 
-    /// Runs the stack once: receive queued frames, run protocol timers,
-    /// transmit whatever is due, then report events through `on_event`.
-    /// Returns `true` if any frame moved (the caller may poll again at once
-    /// instead of sleeping).
-    pub fn poll(&mut self, now_ns: u64, on_event: &mut dyn FnMut(NetEvent)) -> bool {
-        if let Some(ev) = self.pending_configured.take() {
-            on_event(ev);
-        }
-        let now = instant_from_ns(now_ns);
-        let moved = matches!(self.iface.poll(now, &mut self.device, &mut self.sockets), PollResult::SocketStateChanged);
-        self.collect_ping(now_ns, on_event);
-        moved
+    // ---- UDP --------------------------------------------------------------
+
+    /// Binds the generic UDP socket to local `port`. One socket for now; the
+    /// socket API of phase 3 hands out one per client.
+    pub fn udp_bind(&mut self, port: u16) -> Result<(), UdpError> {
+        self.sockets.get_mut::<udp::Socket>(self.udp).bind(port).map_err(|_| UdpError::Bind)
     }
 
-    fn collect_ping(&mut self, now_ns: u64, on_event: &mut dyn FnMut(NetEvent)) {
+    /// Queues one datagram to `dst:dst_port`; it leaves on the next `poll`.
+    pub fn udp_send(&mut self, dst: [u8; 4], dst_port: u16, data: &[u8]) -> Result<(), UdpError> {
+        if data.len() > UDP_PAYLOAD_MAX {
+            return Err(UdpError::Send);
+        }
+        let endpoint = IpEndpoint::new(IpAddress::Ipv4(v4(dst)), dst_port);
+        self.sockets.get_mut::<udp::Socket>(self.udp).send_slice(data, endpoint).map_err(|_| UdpError::Send)
+    }
+
+    /// Copies the oldest received datagram into `buf` (truncating nothing: a
+    /// datagram larger than `buf` is dropped and `None` returned).
+    pub fn udp_recv(&mut self, buf: &mut [u8]) -> Option<UdpDatagram> {
+        let socket = self.sockets.get_mut::<udp::Socket>(self.udp);
+        let (len, meta) = socket.recv_slice(buf).ok()?;
+        let IpAddress::Ipv4(src) = meta.endpoint.addr;
+        Some(UdpDatagram { src: src.octets(), src_port: meta.endpoint.port, len })
+    }
+
+    // ---- DNS --------------------------------------------------------------
+
+    /// Starts resolving `name` (an A record). Returns a token; the outcome
+    /// arrives as `DnsResolved`/`DnsFailed` with that token from a later
+    /// `poll`. A name in the cache is answered without any packet. smoltcp
+    /// retransmits the query and gives up after its own timeout (10 s).
+    pub fn dns_resolve(&mut self, name: &str, now_ns: u64) -> Result<u8, DnsError> {
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() > DNS_NAME_MAX {
+            return Err(DnsError::InvalidName);
+        }
+        let token = self.dns_slots.iter().position(|s| s.is_none()).ok_or(DnsError::NoFreeSlot)?;
+        // Cache first.
+        for entry in self.dns_cache.iter().flatten() {
+            if entry.expires_ns > now_ns && &entry.name[..entry.name_len] == bytes {
+                // Reserve the token only for the event's sake: nothing is
+                // in flight, so the slot stays free.
+                self.queue_event(NetEvent::DnsResolved { token: token as u8, addr: entry.addr, cached: true });
+                return Ok(token as u8);
+            }
+        }
+        if self.config.is_none() {
+            return Err(DnsError::NoServer);
+        }
+        let socket = self.sockets.get_mut::<dns::Socket>(self.dns);
+        let handle = socket.start_query(self.iface.context(), name, DnsQueryType::A).map_err(|e| match e {
+            dns::StartQueryError::NoFreeSlot => DnsError::NoFreeSlot,
+            dns::StartQueryError::InvalidName | dns::StartQueryError::NameTooLong => DnsError::InvalidName,
+        })?;
+        let mut slot = DnsSlot { handle, name: [0; DNS_NAME_MAX], name_len: bytes.len() };
+        slot.name[..bytes.len()].copy_from_slice(bytes);
+        self.dns_slots[token] = Some(slot);
+        Ok(token as u8)
+    }
+
+    fn collect_dns(&mut self, now_ns: u64) {
+        for token in 0..DNS_SLOTS {
+            let Some(slot) = self.dns_slots[token] else { continue };
+            let socket = self.sockets.get_mut::<dns::Socket>(self.dns);
+            match socket.get_query_result(slot.handle) {
+                Err(dns::GetQueryResultError::Pending) => {}
+                Err(dns::GetQueryResultError::Failed) => {
+                    self.dns_slots[token] = None;
+                    self.queue_event(NetEvent::DnsFailed { token: token as u8 });
+                }
+                Ok(addrs) => {
+                    self.dns_slots[token] = None;
+                    let first = addrs.iter().map(|a| {
+                        let IpAddress::Ipv4(v) = *a;
+                        v.octets()
+                    });
+                    match first.into_iter().next() {
+                        Some(addr) => {
+                            self.dns_cache[self.dns_cache_next] = Some(DnsCacheEntry {
+                                name: slot.name,
+                                name_len: slot.name_len,
+                                addr,
+                                expires_ns: now_ns.saturating_add(DNS_CACHE_TTL_NS),
+                            });
+                            self.dns_cache_next = (self.dns_cache_next + 1) % DNS_CACHE_SLOTS;
+                            self.queue_event(NetEvent::DnsResolved { token: token as u8, addr, cached: false });
+                        }
+                        None => self.queue_event(NetEvent::DnsFailed { token: token as u8 }),
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- DHCP -------------------------------------------------------------
+
+    fn poll_dhcp(&mut self) {
+        let Some(handle) = self.dhcp else { return };
+        // Copy everything out of the event before touching `self` again: the
+        // `Configured` config borrows the socket.
+        enum Change {
+            Up { ip: [u8; 4], prefix: u8, gateway: Option<[u8; 4]>, dns: Option<[u8; 4]> },
+            Down,
+        }
+        let change = match self.sockets.get_mut::<dhcpv4::Socket>(handle).poll() {
+            None => return,
+            Some(dhcpv4::Event::Deconfigured) => Change::Down,
+            Some(dhcpv4::Event::Configured(cfg)) => Change::Up {
+                ip: cfg.address.address().octets(),
+                prefix: cfg.address.prefix_len(),
+                gateway: cfg.router.map(|r| r.octets()),
+                dns: cfg.dns_servers.first().map(|d| d.octets()),
+            },
+        };
+        match change {
+            Change::Up { ip, prefix, gateway, dns } => self.apply_config(ip, prefix, gateway, dns, true),
+            // smoltcp reports `Deconfigured` once at start-up too (initial state
+            // change); that is not a lost lease.
+            Change::Down if self.config.is_some() => self.clear_config(),
+            Change::Down => {}
+        }
+    }
+
+    // ---- polling ----------------------------------------------------------
+
+    /// Runs the stack once: receive queued frames, run protocol timers
+    /// (ARP retry, DHCP, DNS retransmit), transmit whatever is due, then
+    /// report events through `on_event`. Returns `true` if any socket state
+    /// changed (the caller may poll again at once instead of sleeping).
+    pub fn poll(&mut self, now_ns: u64, on_event: &mut dyn FnMut(NetEvent)) -> bool {
+        let now = instant_from_ns(now_ns);
+        let moved = matches!(self.iface.poll(now, &mut self.device, &mut self.sockets), PollResult::SocketStateChanged);
+        self.poll_dhcp();
+        self.collect_ping(now_ns);
+        self.collect_dns(now_ns);
+        // A lease acquired above may let queued datagrams/queries leave now.
+        let moved2 =
+            matches!(self.iface.poll(now, &mut self.device, &mut self.sockets), PollResult::SocketStateChanged);
+        for slot in self.pending.iter_mut() {
+            if let Some(ev) = slot.take() {
+                on_event(ev);
+            }
+        }
+        moved || moved2
+    }
+
+    fn collect_ping(&mut self, now_ns: u64) {
         let now_ms = (now_ns / 1_000_000) as i64;
         let checksum = self.device.capabilities().checksum;
+        let mut events = [None, None];
         let socket = self.sockets.get_mut::<icmp::Socket>(self.icmp);
         while let Ok((payload, from)) = socket.recv() {
             let IpAddress::Ipv4(from) = from;
@@ -386,19 +719,26 @@ impl<IO: FrameIo> NetStack<IO> {
             }
             self.ping = None;
             let rtt_us = now_ns.saturating_sub(out.sent_ns) / 1_000;
-            on_event(NetEvent::PingReply { from: from.octets(), seq: seq_no, rtt_us });
+            events[0] = Some(NetEvent::PingReply { from: from.octets(), seq: seq_no, rtt_us });
         }
         if let Some(out) = self.ping {
             if now_ms - (out.sent_ns / 1_000_000) as i64 >= PING_TIMEOUT_MS {
                 self.ping = None;
-                on_event(NetEvent::PingTimeout { seq: out.seq });
+                events[1] = Some(NetEvent::PingTimeout { seq: out.seq });
             }
+        }
+        for ev in events.into_iter().flatten() {
+            self.queue_event(ev);
         }
     }
 
     /// Milliseconds until the stack next needs a `poll` (`None` = nothing
-    /// scheduled; use the caller's idle interval).
+    /// scheduled; use the caller's idle interval). Zero while events are
+    /// waiting to be reported.
     pub fn poll_delay_ms(&mut self, now_ns: u64) -> Option<u64> {
+        if self.pending.iter().any(|e| e.is_some()) {
+            return Some(0);
+        }
         self.iface.poll_delay(instant_from_ns(now_ns), &self.sockets).map(|d| d.total_millis())
     }
 }

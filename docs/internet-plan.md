@@ -202,7 +202,7 @@ use the `smoltcp` crate (no_std) for TCP/IP instead of hand-writing it
 |---|---|---|
 | 0 - `-Net` switch, desktop boots with virtio-net | done (2026-09-25) | `simurgh-run.ps1 -Desktop -Net` boots to ui-core; serial: `driver-virtio-net (U-mode, x86_64): real VirtioNet::probe() succeeded=true`, then `ui-core ... self_check ... ok=true` |
 | 1 - persistent netstack on smoltcp: ARP, IPv4, ICMP | done on x86_64 (2026-09-25) | desktop image with `-Net`: `netstack: link up: 10.0.2.15/24 gateway 10.0.2.2`, then `netstack: ping reply from 10.0.2.2: seq=1..11 time=..ms`; 11 new host tests |
-| 2 - UDP, DHCP client, DNS resolver | not started | - |
+| 2 - UDP, DHCP client, DNS resolver | done on x86_64 (2026-09-25) | desktop image with `-Net`: `netstack: link up (DHCP lease): address 10.0.2.15/24 gateway 10.0.2.2 dns 10.0.2.3`, `netstack: dns: example.com resolved to 104.20.23.154`, later lookups `(from cache)`; 18 more host tests (42 in netstack) |
 | 3+ | not started | - |
 
 Phase 0 notes:
@@ -258,3 +258,37 @@ Phase 1 notes (2026-09-25):
   too small for TCP: TODO(spec) at `stack::MAX_FRAME`); riscv64/aarch64 were
   only compile-checked (no QEMU run of the service); the service does not start
   on the demo image.
+
+Phase 2 notes (2026-09-25):
+- smoltcp features added: `proto-dhcpv4`, `proto-dns`, `socket-udp`,
+  `socket-dhcpv4`, `socket-dns`. Still no heap: the UDP buffers, the DNS
+  query slots and the socket table are all in `StackStorage`.
+- The service now starts in `AddrMode::Dhcp`: no address, gateway or DNS
+  server is hard-coded any more. Address, gateway and DNS come from the lease
+  (smoltcp's DHCP socket does DISCOVER/OFFER/REQUEST/ACK, retransmit,
+  renewal at T1/T2 and re-discovery on expiry/NAK); `NetEvent::LinkConfigured`
+  / `LinkLost` report it. The static mode stays for tests and DHCP-less
+  networks but the service never falls back to it silently.
+- `NetStack::dns_resolve(name)` -> token; `DnsResolved`/`DnsFailed` events.
+  smoltcp retransmits and times out (10 s) by itself. On top of it: a 4-entry
+  name cache. TODO(spec): smoltcp does not expose record TTLs, so entries
+  live a fixed `DNS_CACHE_TTL_NS` (300 s) instead of the server's TTL.
+- `udp_bind`/`udp_send`/`udp_recv`: one generic UDP socket (single datagram
+  buffered each way, 512-byte payload). It is what a future socket API builds
+  on; DHCP and DNS use smoltcp's own sockets.
+- Evidence (x86_64 desktop image, QEMU user-net, real internet behind it):
+  address/gateway/DNS from DHCP, then `example.com` resolved through
+  10.0.2.3 to a real public address, with the repeat lookups served from the
+  cache. Host tests use a mock LAN with recorded-style DHCP/DNS packets built
+  in the test (DISCOVER/OFFER/REQUEST/ACK, renewal, lease expiry, DHCP
+  silence, A record, NXDOMAIN, DNS silence with retransmit, cache hit and
+  expiry, bad names, slot limit, UDP echo).
+- Gaps / open: riscv64 and aarch64 only compile (netstack image builds; no
+  QEMU run of the service); the service starts on the desktop image only;
+  `-Net` with the demo image still runs the old, sometimes racy blocking
+  ARP/ICMP demo; the guest clock question from phase 1 (kernel time vs wall
+  time under WHPX) still affects how DHCP/DNS timeouts map to wall seconds.
+- Next: phase 3 (TCP, socket API over IPC, plain HTTP). smoltcp's `socket-tcp`
+  is one feature away; the real work is the IPC socket protocol and the
+  capability model (TODO(spec) 4/5), the driver buffer size (700-byte frames,
+  2-descriptor queues), and a NIC RX notification instead of polling.
