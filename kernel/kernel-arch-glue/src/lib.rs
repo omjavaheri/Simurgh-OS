@@ -2618,6 +2618,26 @@ pub enum IpcRecvOutcome {
 
 pub fn p2_ipc_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
     let k = kstate();
+    // **Real bug found via QEMU (2026-09-25, the desktop "no keystroke
+    // registers" regression).** The hardcoded hand-off below is only
+    // meaningful while the Root Task is alive. `p2_preempt_start` RETIRES
+    // it (`sched.remove(root)`), yet a thread that still uses this narrow
+    // opcode after that point (measured: log-collector-native, tid 15,
+    // `IPC_RECV` on an empty endpoint a few ticks into preemption) was
+    // switched straight into root's stale saved context — the process-A
+    // counting loop — while `dispatch(root)` silently failed, leaving
+    // `sched.running() == None`. The next tick then "started" whichever
+    // thread `pick_next` chose WITHOUT switching to it (`preempt_tick`'s
+    // cold-start arm), so the CPU kept spinning in the counting loop under
+    // that thread's name, and the first real switch away saved the loop's
+    // registers into that thread's context. On the old all-equal-priority
+    // scheduler the victim was an arbitrary background service; with the
+    // desktop input path ranked first it was always ui-core, and input
+    // froze. Once root is gone there is no root-only phase left for
+    // anyone, so this becomes exactly the general receive.
+    if k.sched.entity(k.root_thread).is_none() {
+        return p2_ipc_recv_general(hal, caller, endpoint_raw);
+    }
     match k.dispatch(caller, hal.now_ns(), SyscallOp::Recv { endpoint: kernel_cap::CapId::new(endpoint_raw) }, hal) {
         Ok(SyscallReturn::Message { from, msg }) => {
             Some(IpcRecvOutcome::Immediate { from: from.as_u32() as usize, label: msg.label as usize })
