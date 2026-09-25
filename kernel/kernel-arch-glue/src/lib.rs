@@ -7587,6 +7587,13 @@ static mut G_I8042_QUEUE_PHYS: usize = usize::MAX;
 /// The `Notification` id the i8042 IRQ line is bound to — `u32::MAX`
 /// until `spawn_i8042_driver` has run.
 static mut G_I8042_NOTIF_ID: u32 = u32::MAX;
+/// The Root Task's own capability slot for the "tell Compositor" signal
+/// `Notification` [`spawn_i8042_driver`] created - `u32::MAX` until then.
+/// [`spawn_mouse_driver`] grants THIS SAME object to Compositor and to
+/// driver-mouse instead of creating a second one: Compositor can then block
+/// on one notification for "keyboard OR mouse" (there is no wait-on-any-of-N
+/// syscall). driver-i8042 signals bit 1, driver-mouse bit 2.
+static mut G_INPUT_SIGNAL_CAP: u32 = u32::MAX;
 
 /// The trampoline `SyscallOp::IrqBind` installs for the i8042 keyboard's
 /// own IRQ line. Reads and acknowledges the real scancode byte through
@@ -7766,8 +7773,11 @@ pub fn spawn_i8042_driver(
     // interrupts are ever enabled.
     unsafe { core::ptr::addr_of_mut!(G_I8042_NOTIF_ID).write(notif_id) };
 
-    // Slot 2 on both sides: the shared "tell Compositor" Notification.
-    wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // Slot 2 on both sides: the shared "tell Compositor" Notification. Kept
+    // in `G_INPUT_SIGNAL_CAP` so driver-mouse can join the same object.
+    let signal_cap = wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // SAFETY: single-core boot sequencing.
+    unsafe { core::ptr::addr_of_mut!(G_INPUT_SIGNAL_CAP).write(signal_cap.as_u32()) };
 
     klog!("spawn_i8042_driver: driver-i8042 spawned and wired to Compositor (real IRQ1, vector-routed via 8259 PIC remap)\r\n");
     let _ = ep_cap; // boot-log value only, per this function's own doc comment
@@ -8079,8 +8089,20 @@ pub fn spawn_mouse_driver(
     // interrupts are ever enabled.
     unsafe { core::ptr::addr_of_mut!(G_MOUSE_NOTIF_ID).write(notif_id) };
 
-    // Slot 2 on both sides: the shared "tell Compositor" Notification.
-    wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // Slot 2 on driver-mouse's side, and the next free slot on Compositor's:
+    // the "tell Compositor" Notification. When driver-i8042 already created
+    // one, THAT object is granted again (same object, new slot) so Compositor
+    // has a single notification to block on for both input devices; the
+    // Compositor's slot layout is unchanged either way.
+    // SAFETY: single-core boot sequencing.
+    let shared = unsafe { core::ptr::addr_of!(G_INPUT_SIGNAL_CAP).read() };
+    if shared != u32::MAX {
+        let rights = CapabilityRights::READ | CapabilityRights::WRITE;
+        grant_cap_into(k, src_cs, CapId::new(shared), comp_cs, rights)?;
+        grant_cap_into(k, src_cs, CapId::new(shared), drv_cs, rights)?;
+    } else {
+        wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
+    }
 
     klog!("spawn_mouse_driver: driver-mouse spawned and wired to Compositor (real IRQ12, slave-PIC dual-EOI cascade)\r\n");    let _ = ep_cap; // boot-log value only
 

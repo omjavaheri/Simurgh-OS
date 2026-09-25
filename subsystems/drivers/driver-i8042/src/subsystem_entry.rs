@@ -71,6 +71,7 @@ const DRV_SIGNAL_NOTIF_CAP: usize = 2;
 /// signal source on this particular `Notification` today, so any
 /// nonzero bit works; `1` matches this project's own established
 /// convention for a Notification's first (and so far only) client.
+// Bit 1 (driver-mouse uses bit 2 on the same shared Notification).
 const SIGNAL_BIT: u64 = 1;
 
 /// VA the raw-scancode ring `SharedRegion` is mapped at in THIS

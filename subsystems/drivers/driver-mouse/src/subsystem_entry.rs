@@ -38,7 +38,9 @@ const NOTIF_SIGNAL: usize = 110;
 const DRV_ENDPOINT_CAP: usize = 0;
 const DRV_NOTIF_CAP: usize = 1;
 const DRV_SIGNAL_NOTIF_CAP: usize = 2;
-const SIGNAL_BIT: u64 = 1;
+// Bit 2: driver-i8042 owns bit 1 and both may signal ONE shared Notification
+// (kernel_arch_glue::G_INPUT_SIGNAL_CAP), which Compositor tells apart by bit.
+const SIGNAL_BIT: u64 = 2;
 
 /// VA the raw packet-byte ring `SharedRegion` is mapped at — must stay
 /// numerically equal to `kernel_arch_glue::DRV_MOUSE_QUEUE_VA`. Same

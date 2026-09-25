@@ -142,6 +142,29 @@ const MOUSE_ENDPOINT_CAP: usize = 4;
 /// (`kernel_arch_glue::wire_notification`).
 const MOUSE_SIGNAL_NOTIF_CAP: usize = 5;
 
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::
+/// NOTIF_WAIT_TIMEOUT`: `NOTIF_WAIT` plus a deadline (`a1`, nanoseconds).
+/// Returns the signalled bits, or `0` on timeout.
+const NOTIF_WAIT_TIMEOUT: usize = 139;
+/// Bit `driver-i8042` signals with (`driver_i8042::subsystem_entry::SIGNAL_BIT`).
+const I8042_SIGNAL_BIT: usize = 1;
+/// Bit `driver-mouse` signals with (`driver_mouse::subsystem_entry::SIGNAL_BIT`).
+const MOUSE_SIGNAL_BIT: usize = 2;
+/// How long an EMPTY `PollInputEvent`/`PollMouseEvent` is held open, waiting
+/// for input, before it is answered "nothing pending".
+///
+/// This is what lets the desktop go idle. ui-core polls for input in a loop;
+/// answered at once, every poll makes ui-core (and this process) runnable
+/// again immediately, so the CPU never has nothing to do. Held for up to this
+/// long, ui-core sits blocked in its `Call`, this process sits blocked on the
+/// input notification, and the kernel halts the core - and any input event
+/// ends the wait at once (the drivers signal the notification), so input
+/// latency is unchanged. It also bounds how stale ui-core's own timers
+/// (notification expiry, cursor animation) can get: they still run at least
+/// every PARK_MAX_NS. Long enough to save power, short enough that those
+/// timers stay smooth.
+const PARK_MAX_NS: u64 = 20_000_000;
+
 /// VA the shared message page is mapped at in THIS process's own address
 /// space — must stay numerically equal to `kernel_arch_glue::
 /// COMPOSITOR_SHARED_VA`.
@@ -783,6 +806,65 @@ fn read_mouse_message() -> Option<MouseEvent> {
     })
 }
 
+/// Handles the input-driver signals named by `bits` (`I8042_SIGNAL_BIT` /
+/// `MOUSE_SIGNAL_BIT`): for each set bit, receives that driver's one queued
+/// event, queues it, and replies so the driver can send its next byte.
+///
+/// A real message is guaranteed to be queued or arriving imminently: the
+/// drivers signal BEFORE their blocking `Call`, so the `Recv` is not an
+/// open-ended block in practice.
+fn drain_input_signals(
+    bits: usize,
+    keys: &mut EventQueue<KeyEvent>,
+    mouse: &mut EventQueue<MouseEvent>,
+) {
+    if bits & I8042_SIGNAL_BIT != 0 {
+        // SAFETY: `raw_syscall2`/`raw_syscall`'s own contracts.
+        let (from, _label) = unsafe { raw_syscall2(IPC_RECV_GENERIC, I8042_ENDPOINT_CAP, fresh!(0)) };
+        if let Some(event) = read_i8042_message() {
+            keys.push(event);
+        }
+        // SAFETY: as above - wakes driver-i8042's blocking `Call`.
+        unsafe { raw_syscall(IPC_REPLY, from, fresh!(0)) };
+    }
+    if bits & MOUSE_SIGNAL_BIT != 0 {
+        // SAFETY: as above.
+        let (from, _label) = unsafe { raw_syscall2(IPC_RECV_GENERIC, MOUSE_ENDPOINT_CAP, fresh!(0)) };
+        if let Some(event) = read_mouse_message() {
+            mouse.push(event);
+        }
+        // SAFETY: as above - wakes driver-mouse's blocking `Call`.
+        unsafe { raw_syscall(IPC_REPLY, from, fresh!(0)) };
+    }
+}
+
+/// Blocks until an input driver signals or [`PARK_MAX_NS`] passes, queueing
+/// what arrives. Returns `true` iff it ended by timeout with no input.
+///
+/// Waits on the i8042 notification only: the kernel wires driver-mouse to the
+/// SAME notification object (`kernel_arch_glue::G_INPUT_SIGNAL_CAP`, bits
+/// told apart by [`I8042_SIGNAL_BIT`]/[`MOUSE_SIGNAL_BIT`]) precisely so one
+/// wait covers both, there being no wait-on-any-of-N syscall.
+fn park_for_input(keys: &mut EventQueue<KeyEvent>, mouse: &mut EventQueue<MouseEvent>) -> bool {
+    let deadline = now_ns().saturating_add(PARK_MAX_NS);
+    loop {
+        let now = now_ns();
+        if now >= deadline {
+            return true;
+        }
+        // SAFETY: `raw_syscall`'s own contract. Blocks this thread; the kernel
+        // wakes it on a signal (bits returned) or at the deadline (0).
+        let bits = unsafe { raw_syscall(NOTIF_WAIT_TIMEOUT, I8042_SIGNAL_NOTIF_CAP, (deadline - now) as usize) };
+        if bits == 0 {
+            return true;
+        }
+        drain_input_signals(bits, keys, mouse);
+        if keys.len > 0 || mouse.len > 0 {
+            return false;
+        }
+    }
+}
+
 /// This process's display output, and the running proof of what it has
 /// actually put on screen.
 ///
@@ -1144,59 +1226,41 @@ pub extern "C" fn subsystem_main() -> ! {
         }};
     }
 
+    // True after a hold ended by timeout: the next empty poll is answered at once.
+    let mut skip_park = false;
     loop {
-        // Additive i8042 check — see this function's own doc comment.
-        // Never touches the display Endpoint's own blocking `Recv` call
-        // right below: `NOTIF_POLL` never blocks (`kernel_arch_glue::
-        // p2_poll`'s own doc comment), and the `Recv` this only takes
-        // when `bits != 0` targets a DIFFERENT Endpoint entirely
-        // (`I8042_ENDPOINT_CAP`, not `COMPOSITOR_ENDPOINT_CAP`) — the
-        // existing Root-Task-bootstrap and `ui-core` call sequences on
-        // the display Endpoint are byte-for-byte unchanged below.
+        // Input check - see this function's own doc comment. `NOTIF_POLL`
+        // never blocks. Both slots are polled because they are the same
+        // notification whenever the kernel shares one (the normal case; the
+        // second poll then reads 0), and two separate ones otherwise. The
+        // driver's bit says which device signalled.
         // SAFETY: `raw_syscall`'s own contract.
-        let bits = unsafe { raw_syscall(NOTIF_POLL, I8042_SIGNAL_NOTIF_CAP, zero!()) };
-        if bits != 0 {
-            // SAFETY: `raw_syscall2`'s own contract. A real message is
-            // guaranteed to already be queued or arriving imminently —
-            // `driver-i8042` signaled BEFORE its own blocking `Call`
-            // (`driver_i8042::subsystem_entry::call_compositor`'s own
-            // doc comment) — so this `Recv` is not a genuine open-ended
-            // block in practice, matching `wire_notification`'s own doc
-            // comment on this exact pattern.
-            let (i8042_from, _label) = unsafe { raw_syscall2(IPC_RECV_GENERIC, I8042_ENDPOINT_CAP, zero!()) };
-            if let Some(event) = read_i8042_message() {
-                last_key_event.push(event);
-            }
-            // SAFETY: `raw_syscall`'s own contract — wakes `driver-
-            // i8042`'s own blocking `Call` so it can process its next
-            // queued byte.
-            unsafe { raw_syscall(IPC_REPLY, i8042_from, zero!()) };
-        }
-
-        // Additive mouse check — same shape as the i8042 check just
-        // above, for `driver-mouse`'s own edge (mouse-input plan, Stage
-        // 1b). Also never touches the display Endpoint's own blocking
-        // `Recv` below.
-        // SAFETY: `raw_syscall`'s own contract.
-        let mouse_bits = unsafe { raw_syscall(NOTIF_POLL, MOUSE_SIGNAL_NOTIF_CAP, zero!()) };
-        if mouse_bits != 0 {
-            // SAFETY: `raw_syscall2`'s own contract — same "already
-            // queued or arriving imminently" reasoning as the i8042
-            // check above.
-            let (mouse_from, _label) = unsafe { raw_syscall2(IPC_RECV_GENERIC, MOUSE_ENDPOINT_CAP, zero!()) };
-            if let Some(event) = read_mouse_message() {
-                last_mouse_event.push(event);
-            }
-            // SAFETY: `raw_syscall`'s own contract — wakes `driver-
-            // mouse`'s own blocking `Call`.
-            unsafe { raw_syscall(IPC_REPLY, mouse_from, zero!()) };
-        }
+        let bits = unsafe {
+            raw_syscall(NOTIF_POLL, I8042_SIGNAL_NOTIF_CAP, zero!())
+                | raw_syscall(NOTIF_POLL, MOUSE_SIGNAL_NOTIF_CAP, zero!())
+        };
+        drain_input_signals(bits, &mut last_key_event, &mut last_mouse_event);
 
         // SAFETY: `raw_syscall2`'s own contract.
         let (from, _label) = unsafe { raw_syscall2(IPC_RECV, COMPOSITOR_ENDPOINT_CAP, zero!()) };
         let req_msg = read_shared_message();
         let resp = match decode_display_request(&req_msg) {
             Ok(req) => {
+                // An empty input poll is held open (see `PARK_MAX_NS`) so the
+                // desktop can idle; input arriving ends the hold at once. Only
+                // ONE hold per idle loop iteration: after a timeout the next
+                // empty poll is answered immediately, so a client that polls
+                // keyboard then mouse waits once, not twice.
+                if matches!(req, DisplayRequest::PollInputEvent | DisplayRequest::PollMouseEvent)
+                    && last_key_event.len == 0
+                    && last_mouse_event.len == 0
+                {
+                    skip_park = if skip_park {
+                        false
+                    } else {
+                        park_for_input(&mut last_key_event, &mut last_mouse_event)
+                    };
+                }
                 // Timed only with a real display: a headless boot has
                 // no present cost worth measuring and should not pay
                 // two clock syscalls per commit for nothing.
