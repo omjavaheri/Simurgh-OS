@@ -959,3 +959,4 @@ fn recv_until_type(t: &mut Solo, s: SockId, buf: &mut [u8], ty: u8) -> RecvFrom 
     }
     panic!("no ICMP message of type {ty}");
 }
+

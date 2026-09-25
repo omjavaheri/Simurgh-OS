@@ -7985,7 +7985,10 @@ static mut G_NETSTACK_TID: Option<ThreadId> = None;
 /// thread (top half) and the persistent service thread (bottom half, see
 /// `netstack_start_service`).
 const NETSTACK_STACK_VMA: usize = 0xC0A0_0000;
-const NETSTACK_STACK_LEN: usize = 4096 * 32;
+/// 512 KiB: debug builds keep every temporary of `NetStack::new` and smoltcp's
+/// `Interface::new` in their frames (about 130 KiB together), and the service
+/// thread only gets the lower half.
+const NETSTACK_STACK_LEN: usize = 4096 * 128;
 
 /// ELF entry point (`e_entry`) of the Netstack image, recorded at spawn so
 /// `netstack_start_service` can start a second thread of the same process

@@ -939,9 +939,19 @@ fn service_main() -> ! {
     let start = now_ns();
     // SAFETY: same single-thread argument as `storage`.
     let bufs = unsafe { &mut *core::ptr::addr_of_mut!(STACK_BUFFERS) };
-    let new_stack = crate::stack::NetStack::new(storage, bufs, DriverIo, mac, crate::stack::AddrMode::Dhcp, start);
-    // SAFETY: written exactly once, then only used through this reference.
-    let stack = unsafe { (*core::ptr::addr_of_mut!(STACK_CELL)).write(new_stack) };
+    // SAFETY: written exactly once, then only used through this reference. No
+    // intermediate local: the stack is ~21 KiB and debug builds keep every
+    // temporary in the frame.
+    let stack = unsafe {
+        (*core::ptr::addr_of_mut!(STACK_CELL)).write(crate::stack::NetStack::new(
+            storage,
+            bufs,
+            DriverIo,
+            mac,
+            crate::stack::AddrMode::Dhcp,
+            start,
+        ))
+    };
     nlog!(
         "service: smoltcp stack up, nic mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, asking DHCP for an address",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
