@@ -447,6 +447,29 @@ today made by kernel code that maps the page only into ui-core, not by a
 capability. The `MachineIdRaw` / `MachineIdInfo` capabilities of section 10 (issued by
 layer 4) are not built; when they exist this page should be granted through them.
 
+### 13.3 Device list page (DEVICES window)
+
+Same mechanism, second page: a read-only 4 KiB page at `0xD8B0_1000`
+(`UI_CORE_DEVICE_LIST_VA`), built at boot by `kernel_arch_glue::capture_device_list`
+from the hardware manifest and mapped `R | U` into ui-core only. Little-endian:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | u64 | magic `0x5349_4D44_4556_0001` (ASCII "SIMDEV" + layout version 1); check before use |
+| 8 | u32 | record count |
+| 12 | u32 | flags: bit 0 = truncated (more devices than fit) |
+| 16 | 96 bytes each | records, at most 42 |
+
+Record: `+0` category (1 processors, 2 memory, 3 display, 4 network, 5 storage,
+6 system, 7 input, 8 compute, 9 other), `+1` flags (bit 0 = has id), `+2`
+name length, `+3` id length, `+4` name (48 bytes ASCII), `+52` id text (44 bytes).
+The id is the best unique handle the manifest has: PCI `bus:dev.fn` (derived from
+the ECAM address; virtio devices add vendor 1af4), MMIO base as fallback, or
+none. Raw SMBIOS serials/UUID are never put on this page. Known gaps: full PCI
+enumeration (only virtio/NVMe/compute-class devices are in the manifest), PCI
+device ids, NIC MACs (only inside `driver-virtio-net`), disk serials, CPU brand
+string, USB.
+
 ### 13.2 Known limits of v1
 
 - Only SMBIOS-sourced identity. riscv64: device-tree root `serial-number` is not

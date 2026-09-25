@@ -356,6 +356,8 @@ const UI_CORE_COMPOSITOR_FB_VA: usize = 0xD850_0000;
 /// Page layout: see `kernel_arch_glue::MACHINE_ID_INFO_MAGIC`'s section.
 #[cfg(target_arch = "x86_64")]
 const UI_CORE_MACHINE_ID_VA: usize = 0xD8B0_0000;
+/// VA of the read-only device-list info page in ui-core (page after the machine-id page).
+const UI_CORE_DEVICE_LIST_VA: usize = 0xD8B0_1000;
 
 /// `driver-i8042-bin`'s own separately-built ELF image (real-input-
 /// handling plan, Stage B) — x86_64-only: no i8042 device exists on
@@ -5833,6 +5835,15 @@ fn spawn_ui_core_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadI
                     )),
                     None => kernel_arch_glue::log(format_args!(
                         "root task (x86_64): machine-id info page NOT mapped into ui-core (out of resources)\r\n"
+                    )),
+                }
+                match kernel_arch_glue::map_device_list_info(hal, root_pt, UI_CORE_DEVICE_LIST_VA) {
+                    Some(()) => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): mapped the device-list info page read-only into ui-core at {:#x}\r\n",
+                        UI_CORE_DEVICE_LIST_VA
+                    )),
+                    None => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): device-list info page NOT mapped into ui-core (out of resources)\r\n"
                     )),
                 }
             }

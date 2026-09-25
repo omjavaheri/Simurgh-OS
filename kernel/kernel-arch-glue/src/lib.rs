@@ -662,6 +662,7 @@ pub fn build(
 
     let state = KernelState::init_global(boot)?;
     log_machine_id(state);
+    capture_device_list(boot);
     let first_scheduled = state.sched.pick_next(hal.now_ns()).map(|t| t.as_u32());
 
     let report = BootReport {
@@ -757,6 +758,283 @@ pub fn map_machine_id_info(hal: &HalInterface, root_pt: usize, va: usize) -> Opt
     }
     Some(())
 }
+
+// ============================================================================
+// Device list info page (docs/machine-id.md section 13.3)
+//
+// Same mechanism as the machine-id page: a read-only, kernel-owned 4 KiB page
+// mapped into ui-core only, for the DEVICES window. Built once at boot from
+// the hardware manifest (`capture_device_list`), copied into a fresh page on
+// `map_device_list_info`. Layout (little-endian):
+//   0   u64  DEVICE_LIST_MAGIC ("SIMDEV" + layout version 1)
+//   8   u32  record count
+//   12  u32  flags: bit0 = list truncated (more devices than fit)
+//   16  records, DEVICE_REC_SIZE (96) bytes each, up to DEVICE_LIST_MAX:
+//         +0 u8 category (DEVCAT_*)   +1 u8 flags (bit0 = has id)
+//         +2 u8 name_len  +3 u8 id_len
+//         +4  [u8;48] name (ASCII, not terminated)
+//         +52 [u8;44] id text (only id_len bytes valid)
+// ============================================================================
+
+/// Magic word of the device-list info page: ASCII `"SIMDEV"` + version 1.
+pub const DEVICE_LIST_MAGIC: u64 = 0x5349_4D44_4556_0001;
+/// Size of one device record in the page.
+pub const DEVICE_REC_SIZE: usize = 96;
+/// Maximum number of records that fit in the one page.
+pub const DEVICE_LIST_MAX: usize = (4096 - 16) / DEVICE_REC_SIZE;
+/// Category: processors.
+pub const DEVCAT_PROCESSOR: u8 = 1;
+/// Category: memory.
+pub const DEVCAT_MEMORY: u8 = 2;
+/// Category: display adapters.
+pub const DEVCAT_DISPLAY: u8 = 3;
+/// Category: network adapters.
+pub const DEVCAT_NETWORK: u8 = 4;
+/// Category: storage controllers.
+pub const DEVCAT_STORAGE: u8 = 5;
+/// Category: system devices (interrupt controller, timer, board).
+pub const DEVCAT_SYSTEM: u8 = 6;
+/// Category: input devices.
+pub const DEVCAT_INPUT: u8 = 7;
+/// Category: compute devices (NPU/TPU/FPGA...).
+pub const DEVCAT_COMPUTE: u8 = 8;
+/// Category: other devices.
+pub const DEVCAT_OTHER: u8 = 9;
+
+static mut G_DEVLIST: [u8; 4096] = [0; 4096];
+
+/// Fixed-capacity text buffer that silently truncates (never fails).
+struct FixBuf<const N: usize> {
+    b: [u8; N],
+    n: usize,
+}
+
+impl<const N: usize> FixBuf<N> {
+    const fn new() -> Self {
+        Self { b: [0; N], n: 0 }
+    }
+}
+
+impl<const N: usize> core::fmt::Write for FixBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() {
+            if self.n < N {
+                self.b[self.n] = if c.is_ascii() && c >= 0x20 { c } else { b'?' };
+                self.n += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct DevWriter {
+    count: usize,
+    truncated: bool,
+}
+
+impl DevWriter {
+    fn push(&mut self, cat: u8, name: &FixBuf<48>, id: Option<&FixBuf<44>>) {
+        if self.count >= DEVICE_LIST_MAX {
+            self.truncated = true;
+            return;
+        }
+        let off = 16 + self.count * DEVICE_REC_SIZE;
+        // SAFETY: single-core boot, `build` is the only writer and runs once
+        // before any reader; `off + 96 <= 4096` by `DEVICE_LIST_MAX`.
+        let page = unsafe { &mut *core::ptr::addr_of_mut!(G_DEVLIST) };
+        page[off] = cat;
+        page[off + 1] = id.is_some() as u8;
+        page[off + 2] = name.n as u8;
+        page[off + 3] = id.map_or(0, |i| i.n as u8);
+        page[off + 4..off + 4 + name.n].copy_from_slice(&name.b[..name.n]);
+        if let Some(i) = id {
+            page[off + 52..off + 52 + i.n].copy_from_slice(&i.b[..i.n]);
+        }
+        self.count += 1;
+    }
+}
+
+/// Builds the device-list page from the hardware manifest (called once from
+/// `build`). Architecture-erased: every arch reports what its manifest has.
+fn capture_device_list(boot: &BootInfo) {
+    use core::fmt::Write;
+    use hal_manifest::raw::{ComputeKindRaw, InterruptControllerKindRaw, MemoryRegionKindRaw, PeripheralKindRaw, TimerKindRaw};
+    let m = &boot.hardware_manifest;
+    let mut w = DevWriter { count: 0, truncated: false };
+    let mut n = FixBuf::<48>::new();
+    let mut i = FixBuf::<44>::new();
+
+    // Processors: only the core count is in the manifest (no brand string).
+    let _ = write!(n, "CPU, {} core(s)", m.cpu_core_count);
+    w.push(DEVCAT_PROCESSOR, &n, None);
+
+    // Memory: one summary line.
+    let mut usable = 0u64;
+    let mut total = 0u64;
+    for r in m.memory_regions() {
+        total = total.saturating_add(r.length_bytes);
+        if r.kind == MemoryRegionKindRaw::Usable {
+            usable = usable.saturating_add(r.length_bytes);
+        }
+    }
+    n = FixBuf::new();
+    let _ = write!(n, "RAM, {} MiB usable", usable >> 20);
+    i = FixBuf::new();
+    let _ = write!(i, "{} MiB in firmware map, {} regions", total >> 20, m.memory_regions().len());
+    w.push(DEVCAT_MEMORY, &n, Some(&i));
+
+    // Framebuffer (firmware GOP), when present.
+    let fb = &m.framebuffer;
+    if fb.phys_base != 0 {
+        n = FixBuf::new();
+        let _ = write!(n, "Framebuffer {}x{} {} bpp", fb.width, fb.height, fb.bits_per_pixel);
+        i = FixBuf::new();
+        let _ = write!(i, "MMIO {:#x}", fb.phys_base);
+        w.push(DEVCAT_DISPLAY, &n, Some(&i));
+    }
+
+    // Compute devices (PCI-class discovered GPUs/NPUs/...).
+    for d in m.compute_devices() {
+        n = FixBuf::new();
+        let len = (d.short_name_len as usize).min(d.short_name.len());
+        match core::str::from_utf8(&d.short_name[..len]) {
+            Ok(s) if len > 0 => {
+                let _ = write!(n, "{}", s);
+            }
+            _ => {
+                let _ = write!(
+                    n,
+                    "{}",
+                    match d.kind {
+                        ComputeKindRaw::Cpu => "Processor",
+                        ComputeKindRaw::Gpu => "Graphics adapter",
+                        ComputeKindRaw::Npu => "NPU",
+                        ComputeKindRaw::Tpu => "TPU",
+                        ComputeKindRaw::Fpga => "FPGA",
+                    }
+                );
+            }
+        }
+        i = FixBuf::new();
+        let _ = write!(i, "vendor {:04x} index {}", d.vendor.0, d.device_index);
+        let cat = match d.kind {
+            ComputeKindRaw::Cpu => DEVCAT_PROCESSOR,
+            ComputeKindRaw::Gpu => DEVCAT_DISPLAY,
+            _ => DEVCAT_COMPUTE,
+        };
+        w.push(cat, &n, Some(&i));
+    }
+
+    // Peripherals: virtio / NVMe over PCI, plus synthesized PS/2 input.
+    for d in m.peripheral_devices() {
+        let (cat, name, virtio) = match d.kind {
+            PeripheralKindRaw::Block => (DEVCAT_STORAGE, "virtio block device", true),
+            PeripheralKindRaw::Nvme => (DEVCAT_STORAGE, "NVMe controller", false),
+            PeripheralKindRaw::Network => (DEVCAT_NETWORK, "virtio network device", true),
+            PeripheralKindRaw::Gpu => (DEVCAT_DISPLAY, "virtio GPU", true),
+            PeripheralKindRaw::Console => (DEVCAT_OTHER, "virtio console", true),
+            PeripheralKindRaw::Input => (DEVCAT_INPUT, "PS/2 keyboard", false),
+            PeripheralKindRaw::Pointer => (DEVCAT_INPUT, "PS/2 mouse", false),
+            PeripheralKindRaw::Unknown => (DEVCAT_OTHER, "Unknown peripheral", false),
+        };
+        n = FixBuf::new();
+        let _ = write!(n, "{}", name);
+        i = FixBuf::new();
+        let mut has_id = true;
+        if d.config_space_base != 0 {
+            // ECAM offset = bus<<20 | dev<<15 | fn<<12 (ECAM bases are
+            // 256 MiB aligned, so the low 28 bits are the offset).
+            let bdf = (d.config_space_base >> 12) & 0xFFFF;
+            let _ = write!(i, "PCI {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1F, bdf & 7);
+            if virtio {
+                let _ = write!(i, " vendor 1af4");
+            }
+        } else if d.mmio_base != 0 {
+            let _ = write!(i, "MMIO {:#x}", d.mmio_base);
+        } else {
+            has_id = false;
+        }
+        w.push(cat, &n, if has_id { Some(&i) } else { None });
+    }
+
+    // System devices: interrupt controller, timer, board.
+    let ic = &m.interrupt_controller;
+    n = FixBuf::new();
+    let _ = write!(
+        n,
+        "{}, {} lines",
+        match ic.kind {
+            InterruptControllerKindRaw::ApicXapic => "Interrupt controller (APIC)",
+            InterruptControllerKindRaw::ApicX2apic => "Interrupt controller (x2APIC)",
+            InterruptControllerKindRaw::Gicv3 => "Interrupt controller (GICv3)",
+            InterruptControllerKindRaw::Gicv4 => "Interrupt controller (GICv4)",
+            InterruptControllerKindRaw::PlicClic => "Interrupt controller (PLIC)",
+        },
+        ic.irq_line_count
+    );
+    i = FixBuf::new();
+    let _ = write!(i, "MMIO {:#x}", ic.primary_base);
+    w.push(DEVCAT_SYSTEM, &n, if ic.primary_base != 0 { Some(&i) } else { None });
+
+    let t = &m.timer;
+    n = FixBuf::new();
+    let _ = write!(
+        n,
+        "{}, {} Hz",
+        match t.kind {
+            TimerKindRaw::Tsc => "Timer (TSC)",
+            TimerKindRaw::Hpet => "Timer (HPET)",
+            TimerKindRaw::ArmGenericTimer => "Timer (ARM generic)",
+            TimerKindRaw::RiscvSbiTimer => "Timer (RISC-V SBI)",
+        },
+        t.frequency_hz
+    );
+    w.push(DEVCAT_SYSTEM, &n, None);
+
+    // Board: manufacturer + product only. Raw serials/UUID are never
+    // exposed (docs/machine-id.md privacy rule).
+    let id = &m.machine_identity;
+    if id.manufacturer.len > 0 || id.product.len > 0 {
+        n = FixBuf::new();
+        let _ = write!(
+            n,
+            "{} {}",
+            core::str::from_utf8(id.manufacturer.as_slice()).unwrap_or(""),
+            core::str::from_utf8(id.product.as_slice()).unwrap_or("")
+        );
+        w.push(DEVCAT_SYSTEM, &n, None);
+    }
+
+    // SAFETY: as in `DevWriter::push`.
+    unsafe {
+        let page = &mut *core::ptr::addr_of_mut!(G_DEVLIST);
+        page[0..8].copy_from_slice(&DEVICE_LIST_MAGIC.to_le_bytes());
+        page[8..12].copy_from_slice(&(w.count as u32).to_le_bytes());
+        page[12..16].copy_from_slice(&(w.truncated as u32).to_le_bytes());
+    }
+    klog!("device list: {} device record(s){}\r\n", w.count, if w.truncated { " (truncated)" } else { "" });
+}
+
+/// Maps the device-list info page READ-ONLY into `root_pt` at `va`
+/// (page-aligned, free). Returns `None` only on allocation/mapping failure.
+pub fn map_device_list_info(hal: &HalInterface, root_pt: usize, va: usize) -> Option<()> {
+    let k = kstate();
+    let page = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core; G_DEVLIST
+    // is fully written by `capture_device_list` before any spawn.
+    unsafe {
+        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(G_DEVLIST) as *const u8, page as *mut u8, 4096);
+    }
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM; `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(root_pt, va, page, 4096, 1 | 8, pool, 2) == u32::MAX {
+        klog!("map_device_list_info: map_range error\r\n");
+        return None;
+    }
+    Some(())
+}
+
 /// Carves `bytes` (aligned to `align`) out of the first `UntypedMemory`
 /// region that has room, trying every region in order instead of only
 /// `UntypedId(0)`.
