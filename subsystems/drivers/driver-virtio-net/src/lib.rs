@@ -7,6 +7,17 @@
 //! virtio-pci "modern" (aarch64/x86_64, PCI/ECAM discovery) — mirrors
 //! `driver_virtio_blk::Transport`'s own shape exactly, one session later.
 //!
+//! **Queues (2026-09-26, TCP-ready transport)**: each queue now has
+//! `QUEUE_SIZE` = 16 descriptors and 16 frame buffers of `BUFFER_STRIDE`
+//! bytes holding full `FRAME_MAX` = 1514-byte Ethernet frames (was 2 slots and
+//! 700 bytes). RX keeps all 16 buffers posted to the device and hands frames
+//! out one per `PollFrame` (the previous buffer is re-posted at the next poll),
+//! so a burst of up to 15 frames between polls is not lost; TX is
+//! asynchronous: `SendFrame` queues the frame in the slot the caller staged it
+//! into and replies at once, completions are reaped lazily, and the driver
+//! only waits (bounded spin, then the IRQ `Wait` described next) when every
+//! slot is in flight. See `layout` for the region format (version 2).
+//!
 //! TX completion is now genuinely interrupt-driven (PLIC/MSI-X/legacy
 //! INTx, matching `driver_virtio_blk`'s own IRQ-line wiring exactly —
 //! `kernel_arch_glue::wire_virtio_pci_transport_net` programs MSI-X on
@@ -239,15 +250,14 @@ pub const VIRTIO_NET_S_LINK_UP: u16 = 1;
 /// is defensive, not exercised in this project's own QEMU testing.
 pub const FALLBACK_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
-/// Fixed virtqueue size this driver sets up for EACH of its two queues —
-/// same power-of-2 requirement `driver_virtio_blk::QUEUE_SIZE`'s own doc
-/// comment documents in full (QEMU's own virtio-mmio ring-index
-/// wraparound is `idx & (QUEUE_SIZE - 1)`, only correct for a power of 2).
-/// `2` is the smallest legal power of 2; this driver only ever keeps ONE
-/// descriptor chain in flight per queue (MVP scope, mirroring
-/// `driver_virtio_blk`'s own one-request-in-flight philosophy), so one
-/// slot goes unused per queue — costs nothing.
-pub const QUEUE_SIZE: u16 = 2;
+/// Fixed virtqueue size this driver sets up for EACH of its two queues.
+/// Must be a power of two (virtio 1.x 2.6: split-ring index wrap is
+/// `idx & (size - 1)`, same requirement `driver_virtio_blk::QUEUE_SIZE`
+/// documents). 16 slots let the receive queue hold sixteen frames while
+/// Netstack is busy and the transmit queue keep sixteen frames in flight;
+/// descriptor `i` ALWAYS points at buffer `i` (no descriptor allocator).
+/// Was `2` (one buffer in flight per queue) in the ICMP-only MVP.
+pub const QUEUE_SIZE: u16 = 16;
 
 /// receiveq1 (spec §5.1.2) — the only RX queue when `VIRTIO_NET_F_MQ`
 /// (multiqueue) is not negotiated, which this driver never does.
@@ -280,12 +290,26 @@ pub const TX_QUEUE: u32 = 1;
 /// semantics on this leg, spec §5.1.6.2.1).
 pub const VIRTIO_NET_HDR_LEN: usize = 12;
 
-/// Largest Ethernet frame (header included) this driver's fixed buffers
-/// accept — comfortably covers this project's own MVP traffic (a 42-byte
-/// ARP frame, a ~74-98-byte ICMP echo) with generous headroom for
-/// whatever else QEMU's slirp network might hand the guest (e.g. an
-/// unsolicited broadcast) without truncation.
-pub const FRAME_MAX: usize = 700;
+/// Largest Ethernet frame (14-byte header included, no FCS) this driver's
+/// buffers hold: the standard 1500-byte MTU plus the Ethernet header. No VLAN
+/// tag and no jumbo frames; `VIRTIO_NET_F_MRG_RXBUF` is never negotiated, so
+/// one RX descriptor must hold a whole frame. Was 700 (ICMP/UDP/DHCP/DNS
+/// only) before TCP support.
+pub const FRAME_MAX: usize = 1514;
+
+/// Distance between two frame buffers of one queue: `virtio_net_hdr` (12)
+/// plus `FRAME_MAX` (1514) is 1526 bytes, rounded up to 2 KiB so slot
+/// addresses are a shift away.
+pub const BUFFER_STRIDE: usize = 2048;
+
+/// Pages in EACH queue `SharedRegion`: page 0 is the control block (rings,
+/// header fields, message area), pages 1.. hold the `QUEUE_SIZE` frame
+/// buffers (`QUEUE_SIZE * BUFFER_STRIDE` = 32 KiB = 8 pages).
+/// `kernel_arch_glue` retypes and maps exactly this many pages per region.
+pub const REGION_PAGES: usize = 1 + (QUEUE_SIZE as usize * BUFFER_STRIDE) / 4096;
+
+/// Bytes in each queue region (`REGION_PAGES * 4096`).
+pub const REGION_LEN: usize = REGION_PAGES * 4096;
 
 // `VIRTQ_DESC_F_NEXT` (bit 0) is unused: every descriptor chain this
 // driver builds is exactly ONE descriptor (the `virtio_net_hdr` and frame
@@ -313,22 +337,28 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 ///   `8..14`   `MAC_OFFSET`: the negotiated device MAC, written by THIS
 ///             driver's own `do_probe` (RX region only — see that
 ///             constant's own doc comment).
-///   `16..48`  descriptor table (`QUEUE_SIZE` * 16 bytes = 32 bytes).
-///   `48..56`  avail (driver) ring (`4 + QUEUE_SIZE * 2` = 8 bytes).
-///   `64..84`  used (device) ring (`4 + QUEUE_SIZE * 8` = 20 bytes).
-///   `96..96+48` `PCI_INFO_OFFSET`: RX region only, `Transport::Pci`'s own
+///   `16..18`  `SLOT_OFFSET`: which frame buffer a `PollFrame`/`SendFrame`
+///             refers to (see that constant).
+///   `96..96+56` `PCI_INFO_OFFSET`: RX region only, `Transport::Pci`'s own
 ///             resolved register-window VAs — see that constant's own
 ///             doc comment.
-///   `256..256+712` the `virtio_net_hdr` (12 bytes) + frame buffer
-///             (`FRAME_MAX` = 700 bytes) — descriptor slot 0 always
-///             points here (single buffer in flight per queue, MVP
-///             scope).
-///   `1024..1080` the `DriverRequest`/`DriverResponse` `SmallMessage`
+///   `512..768`  descriptor table (`QUEUE_SIZE` * 16 bytes).
+///   `768..806`  avail (driver) ring (`4 + QUEUE_SIZE * 2 + 2` bytes).
+///   `1024..1158` used (device) ring (`4 + QUEUE_SIZE * 8 + 2` bytes).
+///   `2048..2104` the `DriverRequest`/`DriverResponse` `SmallMessage`
 ///             marshaling area (RX region ONLY — `subsystem_entry.rs`'s
 ///             own `read_shared_message`/`write_shared_message` target
 ///             the RX region exclusively, reusing it rather than
 ///             requesting a third capability grant, exactly like
 ///             `driver_virtio_blk`'s own single-region reuse).
+///   `4096..4096 + QUEUE_SIZE * BUFFER_STRIDE` the frame buffers: slot `i`
+///             lives at `BUFFER_OFFSET + i * BUFFER_STRIDE` and holds the
+///             12-byte `virtio_net_hdr` followed by up to `FRAME_MAX`
+///             frame bytes; descriptor `i` always points at buffer `i`.
+///
+/// Layout version 2 (multi-buffer queues). Version 1 had 2-slot queues,
+/// 700-byte frames and everything inside one 4 KiB page; the rings moved so
+/// the larger descriptor table fits, and the buffers moved to pages 1...
 pub mod layout {
     /// The region's own physical base address, as a little-endian `u64`.
     pub const PHYS_BASE_OFFSET: usize = 0;
@@ -347,12 +377,20 @@ pub mod layout {
     /// RX region only: one byte, 1 = link up, 0 = link down. Refreshed by
     /// `do_probe` and on every `PollFrame` (`VirtioNet::refresh_link`).
     pub const LINK_UP_OFFSET: usize = 15;
+    /// A `u16` naming a frame buffer slot (`0..QUEUE_SIZE`). RX region:
+    /// written by the driver before it answers `PollFrame` with
+    /// `FrameReceived`, it says which buffer holds the frame (valid until the
+    /// NEXT `PollFrame`, which re-posts the buffer to the device). TX region:
+    /// written by the caller before `SendFrame`, it says which buffer the
+    /// caller staged the frame into; the caller rotates through the slots so
+    /// frames already queued at the device are never overwritten.
+    pub const SLOT_OFFSET: usize = 16;
     /// The descriptor table (`QUEUE_SIZE` * 16 bytes).
-    pub const DESC_OFFSET: usize = 16;
+    pub const DESC_OFFSET: usize = 512;
     /// The avail (driver) ring.
-    pub const AVAIL_OFFSET: usize = 48;
+    pub const AVAIL_OFFSET: usize = 768;
     /// The used (device) ring.
-    pub const USED_OFFSET: usize = 64;
+    pub const USED_OFFSET: usize = 1024;
     /// RX region only: the register-window info block `kernel_arch_glue`'s
     /// own PCI capability-list walk resolves at spawn time and writes here
     /// for `Transport::Pci` — this driver process has no other way to
@@ -391,12 +429,17 @@ pub mod layout {
     /// way `notify_queue`'s own `Transport::Pci` arm does, but from
     /// kernel-mode, bypassing this driver process entirely.
     pub const TX_NOTIFY_OFF_OFFSET: usize = 152;
-    /// The `virtio_net_hdr` + frame buffer (descriptor slot 0, both
-    /// queues).
-    pub const BUFFER_OFFSET: usize = 256;
+    /// The first `virtio_net_hdr` + frame buffer (slot 0, both queues); slot
+    /// `i` is at `BUFFER_OFFSET + i * BUFFER_STRIDE` (`buffer_offset`).
+    pub const BUFFER_OFFSET: usize = 4096;
     /// Small-message (`DriverRequest`/`DriverResponse`) marshaling area —
     /// RX region only, see this module's own doc comment.
-    pub const MESSAGE_OFFSET: usize = 1024;
+    pub const MESSAGE_OFFSET: usize = 2048;
+
+    /// Byte offset, inside a queue region, of frame buffer `slot`.
+    pub const fn buffer_offset(slot: usize) -> usize {
+        BUFFER_OFFSET + slot * super::BUFFER_STRIDE
+    }
 }
 
 /// Reads a `u16` from `region_base + offset` (ordinary RAM — the granted
@@ -485,9 +528,18 @@ pub struct VirtioNet {
     /// posted — same single-descriptor-in-flight semantics as
     /// `driver_virtio_blk::VirtioBlk::next_idx`'s own doc comment,
     /// applied per-queue here.
-    rx_next_idx: u16,
-    /// Same role as `rx_next_idx`, for the TX queue.
-    tx_next_idx: u16,
+    /// The RX used-ring index this driver has consumed up to: entries
+    /// `rx_used_seen..used.idx` are received frames not yet handed out.
+    rx_used_seen: u16,
+    /// The RX buffer last handed to the caller by `poll_rx`. It stays
+    /// owned by the caller (its bytes must not be overwritten) until the
+    /// NEXT `poll_rx`, which re-posts it to the device first.
+    rx_held: Option<u16>,
+    /// The TX used-ring index this driver has reaped up to (`reap_tx`).
+    tx_used_seen: u16,
+    /// Bit `i` set = TX buffer `i` is queued at the device and must not be
+    /// rewritten; cleared by `reap_tx` when the device reports it used.
+    tx_busy: u16,
     /// The negotiated device MAC (all-zero until `do_probe` runs).
     mac: [u8; 6],
     /// Whether `VIRTIO_NET_F_STATUS` was negotiated (link state readable).
@@ -521,8 +573,10 @@ impl VirtioNet {
             rx_base,
             tx_base,
             ready: false,
-            rx_next_idx: 0,
-            tx_next_idx: 0,
+            rx_used_seen: 0,
+            rx_held: None,
+            tx_used_seen: 0,
+            tx_busy: 0,
             mac: [0; 6],
             status_negotiated: false,
             rx_notify_off: 0,
@@ -553,8 +607,10 @@ impl VirtioNet {
             rx_base,
             tx_base,
             ready: false,
-            rx_next_idx: 0,
-            tx_next_idx: 0,
+            rx_used_seen: 0,
+            rx_held: None,
+            tx_used_seen: 0,
+            tx_busy: 0,
             mac: [0; 6],
             status_negotiated: false,
             rx_notify_off: 0,
@@ -810,66 +866,114 @@ impl VirtioNet {
         base + offset as u64
     }
 
-    /// Publishes descriptor slot 0 of `region_base`'s own queue into the
-    /// avail ring and rings the doorbell for `queue_idx` (using
-    /// `notify_off` — `enable_queue`'s own doc comment on why this is a
-    /// per-call parameter, not a single cached field). `desc` is the
-    /// caller-built descriptor (already pointing at `BUFFER_OFFSET`, with
-    /// the right `len`/`flags` for the direction — device-writable for
-    /// RX, device-readable for TX). `next_idx` is threaded through
-    /// (rather than a `&mut self` field access) so `post_rx_buffer` can
-    /// call this for `rx_base` and `submit_tx` for `tx_base` without
-    /// aliasing `self` twice.
+    /// Physical address of frame buffer `slot` inside `region_base`'s region.
     ///
     /// # Safety
-    /// `region_base` must be mapped; `queue_idx` must already be
-    /// `select_queue`d and set up (`do_probe`'s own contract).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn publish_and_notify(
-        &self,
-        region_base: usize,
-        queue_idx: u32,
-        notify_off: u16,
-        next_idx: &mut u16,
-        desc: VirtqDescRaw,
-    ) {
-        // SAFETY: `DESC_OFFSET` (32 bytes, slot 0 only ever used) is
-        // within the mapped region — forwarded from this method's own
-        // contract.
-        unsafe { ((region_base + layout::DESC_OFFSET) as *mut VirtqDescRaw).write_volatile(desc) };
-        // SAFETY: `q_write_u16`'s own contract — every offset here is
-        // within the mapped region.
-        unsafe {
-            let ring_slot = layout::AVAIL_OFFSET + 4 + (*next_idx as usize % QUEUE_SIZE as usize) * 2;
-            q_write_u16(region_base, ring_slot, 0); // head descriptor index (always slot 0)
-            *next_idx = next_idx.wrapping_add(1);
-            q_write_u16(region_base, layout::AVAIL_OFFSET + 2, *next_idx); // avail.idx
-        }
-        // SAFETY: `notify_queue`'s own contract (forwarded).
-        unsafe { self.notify_queue(queue_idx, notify_off) };
+    /// `region_base` must be mapped and its header word populated.
+    unsafe fn slot_phys(region_base: usize, slot: u16) -> u64 {
+        // SAFETY: forwarded from this method's own contract.
+        unsafe { Self::region_phys(region_base, layout::buffer_offset(slot as usize)) }
     }
 
-    /// Posts (or re-posts) the ONE RX buffer this driver keeps in flight
-    /// — a device-writable descriptor covering `virtio_net_hdr` + up to
-    /// `FRAME_MAX` bytes.
+    /// Writes descriptor `slot` (buffer `slot`, `len` bytes, `flags`).
+    /// Descriptor `i` always points at buffer `i`, so this is idempotent for
+    /// RX (written once at probe) and rewritten per frame for TX (`len`).
     ///
     /// # Safety
-    /// `self.rx_base` must be mapped.
-    unsafe fn post_rx_buffer(&mut self) {
-        // SAFETY: forwarded from this method's own contract.
-        let buf_phys = unsafe { Self::region_phys(self.rx_base, layout::BUFFER_OFFSET) };
+    /// `region_base` mapped, header populated, `slot < QUEUE_SIZE`.
+    unsafe fn write_desc(region_base: usize, slot: u16, len: u32, flags: u16) {
         let desc = VirtqDescRaw {
-            addr: buf_phys,
-            len: (VIRTIO_NET_HDR_LEN + FRAME_MAX) as u32,
-            flags: VIRTQ_DESC_F_WRITE,
+            // SAFETY: forwarded.
+            addr: unsafe { Self::slot_phys(region_base, slot) },
+            len,
+            flags,
             next: 0,
         };
-        // SAFETY: `self.rx_base` is mapped (forwarded); RX_QUEUE was
-        // already selected/enabled by `do_probe`.
-        let rx_base = self.rx_base;
-        let mut next_idx = self.rx_next_idx;
-        unsafe { self.publish_and_notify(rx_base, RX_QUEUE, self.rx_notify_off, &mut next_idx, desc) };
-        self.rx_next_idx = next_idx;
+        // SAFETY: the descriptor table (`QUEUE_SIZE` * 16 bytes at
+        // `DESC_OFFSET`) is inside the mapped region; forwarded contract.
+        unsafe {
+            ((region_base + layout::DESC_OFFSET + slot as usize * core::mem::size_of::<VirtqDescRaw>())
+                as *mut VirtqDescRaw)
+                .write_volatile(desc)
+        };
+    }
+
+    /// Appends descriptor `slot` to the avail ring of `region_base`'s queue
+    /// WITHOUT ringing the doorbell (callers batch several, then notify
+    /// once). The avail index is read back from the shared ring rather than
+    /// cached, so the kernel-bypass demo path (which writes the same ring
+    /// directly) can never desynchronise this driver.
+    ///
+    /// # Safety
+    /// `region_base` mapped, header populated, `slot < QUEUE_SIZE`.
+    unsafe fn avail_push(region_base: usize, slot: u16) {
+        // SAFETY: every offset is inside the mapped region (forwarded).
+        unsafe {
+            let idx = q_read_u16(region_base, layout::AVAIL_OFFSET + 2);
+            let ring_slot = layout::AVAIL_OFFSET + 4 + (idx as usize % QUEUE_SIZE as usize) * 2;
+            q_write_u16(region_base, ring_slot, slot);
+            // The device must see the ring entry before the new index
+            // (virtio 1.x 2.7.13.3); a plain volatile store pair is only
+            // ordered on x86, so fence explicitly for aarch64/riscv64.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            q_write_u16(region_base, layout::AVAIL_OFFSET + 2, idx.wrapping_add(1));
+        }
+    }
+
+    /// Reads the device's used index of `region_base`'s queue (with the
+    /// acquire fence that makes the entries it covers visible).
+    ///
+    /// # Safety
+    /// `region_base` mapped.
+    unsafe fn used_idx(region_base: usize) -> u16 {
+        // SAFETY: forwarded.
+        let idx = unsafe { q_read_u16(region_base, layout::USED_OFFSET + 2) };
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        idx
+    }
+
+    /// Used-ring entry `n` of `region_base`'s queue: `(descriptor id, len)`.
+    ///
+    /// # Safety
+    /// `region_base` mapped.
+    unsafe fn used_entry(region_base: usize, n: u16) -> (u16, u32) {
+        let off = layout::USED_OFFSET + 4 + (n as usize % QUEUE_SIZE as usize) * 8;
+        // SAFETY: the entry is inside the mapped region (forwarded).
+        unsafe {
+            let id = ((region_base + off) as *const u32).read_volatile();
+            let len = ((region_base + off + 4) as *const u32).read_volatile();
+            (id as u16, len)
+        }
+    }
+
+    /// Hands every RX buffer to the device (probe time): writes all
+    /// descriptors, pushes all slots, rings the RX doorbell once.
+    ///
+    /// # Safety
+    /// `self.rx_base` mapped, RX queue enabled.
+    unsafe fn post_all_rx_buffers(&mut self) {
+        let rx = self.rx_base;
+        for slot in 0..QUEUE_SIZE {
+            // SAFETY: forwarded; `slot < QUEUE_SIZE`.
+            unsafe {
+                Self::write_desc(rx, slot, (VIRTIO_NET_HDR_LEN + FRAME_MAX) as u32, VIRTQ_DESC_F_WRITE);
+                Self::avail_push(rx, slot);
+            }
+        }
+        // SAFETY: forwarded.
+        unsafe { self.notify_queue(RX_QUEUE, self.rx_notify_off) };
+    }
+
+    /// Re-posts one RX buffer the caller has finished with.
+    ///
+    /// # Safety
+    /// `self.rx_base` mapped, RX queue enabled, `slot < QUEUE_SIZE`.
+    unsafe fn repost_rx(&mut self, slot: u16) {
+        // SAFETY: forwarded.
+        unsafe {
+            Self::avail_push(self.rx_base, slot);
+            self.notify_queue(RX_QUEUE, self.rx_notify_off);
+        }
     }
 
     /// Runs the virtio 1.x device-init handshake (spec §3.1) for BOTH
@@ -985,159 +1089,156 @@ impl VirtioNet {
         // SAFETY: `self.rx_base` is mapped (this method's own contract,
         // verified by the caller `probe`); RX_QUEUE was just enabled
         // above.
-        unsafe { self.post_rx_buffer() };
+        unsafe { self.post_all_rx_buffers() };
         // SAFETY: same contract (probe finished, config space readable).
         unsafe { self.refresh_link() };
 
         Ok(())
     }
 
-    /// Publishes ONE frame's descriptor chain on the TX queue and rings
-    /// the doorbell — does NOT wait for completion. `len` is the frame's
-    /// own byte length; the frame's bytes themselves must ALREADY be
-    /// written at `tx_base + layout::BUFFER_OFFSET + VIRTIO_NET_HDR_LEN`
-    /// by the caller BEFORE this call — this method only zero-fills the
-    /// `virtio_net_hdr` ahead of them and builds the descriptor, exactly
-    /// mirroring `driver_virtio_blk::VirtioBlk::submit_request`'s own
-    /// "caller already placed the data, this method only writes the
-    /// header" convention (avoids a same-address `copy_nonoverlapping`,
-    /// which `subsystem_entry.rs`'s own zero-copy staging would otherwise
-    /// trigger).
+    /// Queues ONE frame on the TX queue and rings the doorbell — does NOT
+    /// wait for completion. `slot` names the frame buffer the caller already
+    /// staged the frame into (at `layout::buffer_offset(slot) +
+    /// VIRTIO_NET_HDR_LEN` in the TX region) and `len` is the frame length;
+    /// this method zero-fills the `virtio_net_hdr` in front of it, writes the
+    /// descriptor and publishes it. Frames already queued at the device sit
+    /// in other slots, so up to `QUEUE_SIZE` frames can be in flight.
     ///
-    /// `pub`: `subsystem_entry.rs` calls this directly for the real
-    /// interrupt-driven TX path — only it can issue the actual `Wait`
-    /// ecall in between submission and completion (this crate's own
-    /// module doc comment on why TX, unlike RX, is safe to make
-    /// interrupt-driven).
+    /// Returns `false` (nothing queued) when `slot` is out of range, `len`
+    /// exceeds `FRAME_MAX`, or the slot's previous frame is still queued
+    /// (`tx_busy`; `reap_tx` first).
+    ///
+    /// `pub`: `subsystem_entry.rs` calls this directly.
     ///
     /// # Safety
-    /// `self.ready` must be true (`probe` already mapped every region and
-    /// set up both queues), and the frame bytes must already be staged as
-    /// described above.
-    pub unsafe fn submit_tx_request(&mut self, len: usize) {
-        // SAFETY: `layout::BUFFER_OFFSET..+VIRTIO_NET_HDR_LEN` is within
-        // the mapped TX region (forwarded from this method's own
-        // contract) — the header is always all-zero (no GSO/checksum
-        // offload requested, this crate's own module doc comment).
+    /// `self.ready` must be true (`probe` mapped every region and set up
+    /// both queues) and the frame bytes must already be staged as above.
+    pub unsafe fn submit_tx_slot(&mut self, slot: u16, len: usize) -> bool {
+        if slot >= QUEUE_SIZE || len > FRAME_MAX || self.tx_busy & (1 << slot) != 0 {
+            return false;
+        }
+        // SAFETY: the header bytes are inside the mapped TX region — the
+        // header is always all-zero (no GSO/checksum offload requested).
         unsafe {
-            core::ptr::write_bytes((self.tx_base + layout::BUFFER_OFFSET) as *mut u8, 0, VIRTIO_NET_HDR_LEN);
+            core::ptr::write_bytes(
+                (self.tx_base + layout::buffer_offset(slot as usize)) as *mut u8,
+                0,
+                VIRTIO_NET_HDR_LEN,
+            );
+            Self::write_desc(self.tx_base, slot, (VIRTIO_NET_HDR_LEN + len) as u32, 0);
+            Self::avail_push(self.tx_base, slot);
         }
-        // SAFETY: `Self::region_phys`'s own contract (forwarded).
-        let buf_phys = unsafe { Self::region_phys(self.tx_base, layout::BUFFER_OFFSET) };
-        let desc = VirtqDescRaw {
-            addr: buf_phys,
-            len: (VIRTIO_NET_HDR_LEN + len) as u32,
-            flags: 0, // device-readable (TX), single descriptor, no NEXT
-            next: 0,
-        };
-        let tx_base = self.tx_base;
-        let mut next_idx = self.tx_next_idx;
-        // SAFETY: `publish_and_notify`'s own contract — `tx_base` is
-        // mapped, TX_QUEUE was set up by `do_probe`.
-        unsafe { self.publish_and_notify(tx_base, TX_QUEUE, self.tx_notify_off, &mut next_idx, desc) };
-        self.tx_next_idx = next_idx;
+        self.tx_busy |= 1 << slot;
+        // SAFETY: `notify_queue`'s own contract — TX_QUEUE was set up by
+        // `do_probe`.
+        unsafe { self.notify_queue(TX_QUEUE, self.tx_notify_off) };
+        true
     }
 
-    /// Whether the LAST `submit_tx_request`'s own chain has landed in the
-    /// TX used ring yet — same "`used.idx == next_idx` means done"
-    /// direction as `driver_virtio_blk::VirtioBlk::completion_pending`.
+    /// Collects the frames the device has finished sending: every new
+    /// used-ring entry frees its buffer (`tx_busy`). Returns how many were
+    /// reaped. Cheap (one index read when nothing is new).
     ///
-    /// `pub`: `subsystem_entry.rs`'s own real interrupt-driven TX path
-    /// checks this itself after each `Wait`, rather than trusting a
-    /// single `Wait` return as proof of completion — same "the shared
-    /// vector can carry other event sources too" rationale as `driver_
-    /// virtio_blk::VirtioBlk::completion_pending`'s own doc comment.
+    /// `pub`: `subsystem_entry.rs` calls it before staging a new frame.
     ///
     /// # Safety
-    /// Same contract as `submit_tx_request`.
-    pub unsafe fn tx_completion_pending(&self) -> bool {
-        // SAFETY: `q_read_u16`'s own contract.
-        let used_idx = unsafe { q_read_u16(self.tx_base, layout::USED_OFFSET + 2) };
-        used_idx == self.tx_next_idx
-    }
-
-    /// Acknowledges the interrupt at the device — the tail end of TX
-    /// completion handling, called once `tx_completion_pending` is true.
-    ///
-    /// `pub`: same reasoning as `submit_tx_request`'s own doc comment.
-    ///
-    /// # Safety
-    /// Same contract as `submit_tx_request`.
-    pub unsafe fn ack_tx_completion(&mut self) {
-        // SAFETY: `ack_interrupt`'s own contract (forwarded).
-        unsafe { self.ack_interrupt() };
-    }
-
-    /// Submits ONE frame on the TX queue and busy-polls (bounded) for its
-    /// own completion via `submit_tx_request`/`tx_completion_pending`/
-    /// `ack_tx_completion` above — mirrors `driver_virtio_blk::VirtioBlk::
-    /// wait_for_completion`'s own bounded-spin shape exactly, and kept
-    /// for the same reason that method is kept: a documented, still-
-    /// correct, host-testable alternative to the real interrupt-driven
-    /// path `subsystem_entry.rs` now uses in production. Returns `true`
-    /// once the device's used ring shows this chain consumed, `false` on
-    /// timeout (the caller should treat this as `DriverErrorCode::
-    /// DeviceIo`, same as `driver_virtio_blk`'s own `STATUS_TIMEOUT`
-    /// handling).
-    ///
-    /// # Safety
-    /// Same contract as `submit_tx_request`.
-    pub unsafe fn submit_tx(&mut self, len: usize) -> bool {
-        // SAFETY: forwarded from this method's own contract.
-        unsafe { self.submit_tx_request(len) };
-
-        let mut completed = false;
-        for _ in 0..MAX_SPINS {
-            // SAFETY: forwarded from this method's own contract.
-            if unsafe { self.tx_completion_pending() } {
-                completed = true;
-                break;
+    /// Same contract as `submit_tx_slot`.
+    pub unsafe fn reap_tx(&mut self) -> u32 {
+        let mut n = 0;
+        // SAFETY: `used_idx`/`used_entry` contracts (mapped TX region).
+        unsafe {
+            let used = Self::used_idx(self.tx_base);
+            while self.tx_used_seen != used {
+                let (id, _len) = Self::used_entry(self.tx_base, self.tx_used_seen);
+                if id < QUEUE_SIZE {
+                    self.tx_busy &= !(1 << id);
+                }
+                self.tx_used_seen = self.tx_used_seen.wrapping_add(1);
+                n += 1;
             }
-            core::hint::spin_loop();
         }
-        // SAFETY: forwarded from this method's own contract — drain
-        // whatever interrupt cause is pending so a later `submit_tx`/
-        // `poll_rx` is not stuck behind a stale one.
-        unsafe { self.ack_tx_completion() };
-        completed
+        if n > 0 {
+            // SAFETY: `ack_interrupt`'s own contract — drain a stale cause.
+            unsafe { self.ack_interrupt() };
+        }
+        n
     }
 
-    /// Checks the RX queue ONCE for a newly-received frame — never
-    /// blocks (this module's own doc comment on why). Returns the frame's
-    /// own length (`virtio_net_hdr` NOT included) if one arrived — the
-    /// caller reads the bytes directly from `rx_base + layout::
-    /// BUFFER_OFFSET + VIRTIO_NET_HDR_LEN` (same "read it from the fixed
-    /// offset directly" convention `driver_virtio_blk`'s own demo path
-    /// uses) — or `None` if nothing had arrived yet. Re-posts the RX
-    /// buffer before returning `Some`, so the queue is always ready for
-    /// the next frame.
+    /// Whether TX buffer `slot` is free to be staged into (after
+    /// `reap_tx`).
+    pub fn tx_slot_free(&self, slot: u16) -> bool {
+        slot < QUEUE_SIZE && self.tx_busy & (1 << slot) == 0
+    }
+
+    /// Number of frames queued at the device and not yet reaped.
+    pub fn tx_in_flight(&self) -> u32 {
+        self.tx_busy.count_ones()
+    }
+
+    /// Queues one frame staged in TX slot 0 and busy-polls (bounded) for
+    /// its completion — the pre-multi-buffer behaviour, kept as a
+    /// documented, host-testable alternative to the asynchronous
+    /// `submit_tx_slot`/`reap_tx` pair. Returns `true` once the device's
+    /// used ring shows the frame consumed, `false` on timeout.
+    ///
+    /// # Safety
+    /// Same contract as `submit_tx_slot`.
+    pub unsafe fn submit_tx(&mut self, len: usize) -> bool {
+        // SAFETY: forwarded.
+        unsafe {
+            self.reap_tx();
+            if !self.submit_tx_slot(0, len) {
+                return false;
+            }
+            for _ in 0..MAX_SPINS {
+                self.reap_tx();
+                if self.tx_slot_free(0) {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        false
+    }
+
+    /// Checks the RX queue ONCE for a received frame — never blocks (this
+    /// module's own doc comment on why). First re-posts the buffer handed
+    /// out by the PREVIOUS call (the caller is done with it by contract:
+    /// Netstack copies the frame out before its next poll), then takes the
+    /// next completed entry from the used ring. Returns `(slot, len)`: the
+    /// frame lives in RX buffer `slot` at `layout::buffer_offset(slot) +
+    /// VIRTIO_NET_HDR_LEN` and is `len` bytes (header excluded, clamped to
+    /// `FRAME_MAX`); `None` when nothing has arrived.
+    ///
+    /// Keeping one buffer out at a time means the device always has
+    /// `QUEUE_SIZE - 1` buffers to fill, so a burst of up to 15 frames
+    /// arriving between two polls is not dropped.
     ///
     /// # Safety
     /// `self.ready` must be true.
-    pub unsafe fn poll_rx(&mut self) -> Option<u32> {
-        // SAFETY: `q_read_u16`'s own contract.
-        let used_idx = unsafe { q_read_u16(self.rx_base, layout::USED_OFFSET + 2) };
-        // A completion is ready once `used.idx` CATCHES UP to `rx_next_
-        // idx` (the avail.idx value `post_rx_buffer` last published) —
-        // same "used_idx == next_idx means done" direction `driver_
-        // virtio_blk::VirtioBlk::completion_pending`/`wait_for_
-        // completion` both use.
-        if used_idx != self.rx_next_idx {
-            return None;
+    pub unsafe fn poll_rx(&mut self) -> Option<(u16, u32)> {
+        if let Some(slot) = self.rx_held.take() {
+            // SAFETY: `repost_rx`'s own contract (ready driver).
+            unsafe { self.repost_rx(slot) };
         }
-        // SAFETY: the used ring entry at slot `(rx_next_idx - 1) %
-        // QUEUE_SIZE` is within the mapped RX region — `driver_virtio_
-        // blk`'s own used-ring-entry layout (`id: u32, len: u32`, spec
-        // §2.6.8) applies identically here; `len` is this entry's
-        // second `u32`, so `+4`.
-        let slot = ((self.rx_next_idx.wrapping_sub(1)) as usize % QUEUE_SIZE as usize) as usize;
-        let entry_off = layout::USED_OFFSET + 4 + slot * 8 + 4;
-        let total_len = unsafe { ((self.rx_base + entry_off) as *const u32).read_volatile() };
+        // SAFETY: `used_idx`/`used_entry` contracts (mapped RX region).
+        let (id, total_len) = unsafe {
+            if Self::used_idx(self.rx_base) == self.rx_used_seen {
+                return None;
+            }
+            let entry = Self::used_entry(self.rx_base, self.rx_used_seen);
+            self.rx_used_seen = self.rx_used_seen.wrapping_add(1);
+            entry
+        };
         // SAFETY: `ack_interrupt`'s own contract (forwarded).
         unsafe { self.ack_interrupt() };
-        // SAFETY: `post_rx_buffer`'s own contract (`self.rx_base` mapped).
-        unsafe { self.post_rx_buffer() };
-        Some(total_len.saturating_sub(VIRTIO_NET_HDR_LEN as u32))
+        if id >= QUEUE_SIZE {
+            // A device bug; skip the entry rather than index out of range.
+            return None;
+        }
+        self.rx_held = Some(id);
+        let len = (total_len as usize).saturating_sub(VIRTIO_NET_HDR_LEN).min(FRAME_MAX);
+        Some((id, len as u32))
     }
 
     /// Current link state: the device's `status` config field when
@@ -1328,3 +1429,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod ring_tests;

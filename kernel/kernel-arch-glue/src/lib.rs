@@ -8143,18 +8143,18 @@ pub fn spawn_virtio_net_driver(
     }
 
     // Retype and pre-map the RX queue's own `SharedRegion`.
-    let rx_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
+    let rx_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, driver_virtio_net::REGION_PAGES as u32)?;
     let rx_id = k.cap_space(src_cs)?.lookup(rx_cap)?.object.id;
     let rx_phys = k.shared_region(kernel_cap::SharedRegionId::new(rx_id.as_u32()))?.phys_base.as_usize();
     // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
-    unsafe { core::ptr::write_bytes(rx_phys as *mut u8, 0, 4096) };
+    unsafe { core::ptr::write_bytes(rx_phys as *mut u8, 0, driver_virtio_net::REGION_LEN) };
     // Self-referential physical-base header word — same reasoning as
     // `driver_virtio_blk::layout::PHYS_BASE_OFFSET`'s own doc comment.
     unsafe { (rx_phys as *mut u64).write_volatile(rx_phys as u64) };
 
-    let rx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
-    unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 2) };
-    let n_rx = hal.map_range(drv_root_pt, DRV_NET_RX_VA, rx_phys, 4096, 1 | 2 | 8, rx_pool, 2);
+    let rx_pool = carve_from_any_untyped(k, 4096, 4096 * 4)?;
+    unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 4) };
+    let n_rx = hal.map_range(drv_root_pt, DRV_NET_RX_VA, rx_phys, driver_virtio_net::REGION_LEN, 1 | 2 | 8, rx_pool, 4);
     if n_rx == u32::MAX {
         klog!("spawn_virtio_net_driver: map_range error (rx region)\r\n");
         return None;
@@ -8164,15 +8164,15 @@ pub fn spawn_virtio_net_driver(
     unsafe { core::ptr::addr_of_mut!(G_DRV_NET_RX_PHYS).write(rx_phys) };
 
     // Retype and pre-map the TX queue's own `SharedRegion` — same shape.
-    let tx_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
+    let tx_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, driver_virtio_net::REGION_PAGES as u32)?;
     let tx_id = k.cap_space(src_cs)?.lookup(tx_cap)?.object.id;
     let tx_phys = k.shared_region(kernel_cap::SharedRegionId::new(tx_id.as_u32()))?.phys_base.as_usize();
-    unsafe { core::ptr::write_bytes(tx_phys as *mut u8, 0, 4096) };
+    unsafe { core::ptr::write_bytes(tx_phys as *mut u8, 0, driver_virtio_net::REGION_LEN) };
     unsafe { (tx_phys as *mut u64).write_volatile(tx_phys as u64) };
 
-    let tx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
-    unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 2) };
-    let n_tx = hal.map_range(drv_root_pt, DRV_NET_TX_VA, tx_phys, 4096, 1 | 2 | 8, tx_pool, 2);
+    let tx_pool = carve_from_any_untyped(k, 4096, 4096 * 4)?;
+    unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 4) };
+    let n_tx = hal.map_range(drv_root_pt, DRV_NET_TX_VA, tx_phys, driver_virtio_net::REGION_LEN, 1 | 2 | 8, tx_pool, 4);
     if n_tx == u32::MAX {
         klog!("spawn_virtio_net_driver: map_range error (tx region)\r\n");
         return None;
@@ -9345,11 +9345,11 @@ pub fn spawn_netstack_service(
     // `spawn_virtio_net_driver`, already run to completion (this
     // function's own doc comment).
     let rx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read() };
-    let rx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    let rx_pool = carve_from_any_untyped(k, 4096, 4096 * 4)?;
     // SAFETY: fresh untyped RAM, identity-addressable, single-core;
     // `map_range` needs the pool pre-zeroed.
-    unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 2) };
-    let n_rx = hal.map_range(ns_root_pt, NETSTACK_DRV_RX_VA, rx_phys, 4096, 1 | 2 | 8, rx_pool, 2);
+    unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 4) };
+    let n_rx = hal.map_range(ns_root_pt, NETSTACK_DRV_RX_VA, rx_phys, driver_virtio_net::REGION_LEN, 1 | 2 | 8, rx_pool, 4);
     if n_rx == u32::MAX {
         klog!("spawn_netstack_service: map_range error (driver rx region)\r\n");
         return None;
@@ -9358,9 +9358,9 @@ pub fn spawn_netstack_service(
     // Same for the driver's own TX region.
     // SAFETY: same contract as the RX read above.
     let tx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_TX_PHYS).read() };
-    let tx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
-    unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 2) };
-    let n_tx = hal.map_range(ns_root_pt, NETSTACK_DRV_TX_VA, tx_phys, 4096, 1 | 2 | 8, tx_pool, 2);
+    let tx_pool = carve_from_any_untyped(k, 4096, 4096 * 4)?;
+    unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 4) };
+    let n_tx = hal.map_range(ns_root_pt, NETSTACK_DRV_TX_VA, tx_phys, driver_virtio_net::REGION_LEN, 1 | 2 | 8, tx_pool, 4);
     if n_tx == u32::MAX {
         klog!("spawn_netstack_service: map_range error (driver tx region)\r\n");
         return None;

@@ -37,10 +37,9 @@ use smoltcp::wire::{
 /// (`driver_virtio_net::FRAME_MAX`; must stay numerically equal). It is also
 /// the interface MTU as smoltcp counts it for Ethernet (frame size including
 /// the 14-byte header), so no frame this stack builds can overflow a driver
-/// buffer. TODO(spec): the driver's 700-byte buffers and 2-descriptor queues
-/// are an MVP size; TCP (Phase 3) wants full 1514-byte frames and a deeper RX
-/// queue - see `docs/internet-plan.md`.
-pub const MAX_FRAME: usize = 700;
+/// buffer. 1514 = the standard 1500-byte MTU + Ethernet header; the driver has
+/// 16-slot queues of these (the old 700-byte / 2-slot MVP limit is gone).
+pub const MAX_FRAME: usize = 1514;
 
 /// First DHCP restart delay while the link is up but there is no lease
 /// (smoltcp also retransmits DISCOVER by itself); doubles up to the cap.

@@ -144,7 +144,7 @@ const BYPASS_SHARED_VA: usize = 0xD8A0_0000;
 /// MVP value, not a placeholder — unlike `rx_ring_cap`/`tx_ring_cap`
 /// below, which this process does not resolve — see `handle_bypass_
 /// request`'s own doc comment).
-const DRV_QUEUE_SIZE: u32 = 2;
+const DRV_QUEUE_SIZE: u32 = 16;
 
 /// `driver_virtio_net::layout::MAC_OFFSET` — must stay numerically
 /// equal. The negotiated device MAC, written by the driver's own
@@ -154,10 +154,10 @@ const DRV_QUEUE_SIZE: u32 = 2;
 const MAC_OFFSET: usize = 8;
 /// `driver_virtio_net::layout::BUFFER_OFFSET` — must stay numerically
 /// equal.
-const BUFFER_OFFSET: usize = 256;
+const BUFFER_OFFSET: usize = 4096;
 /// `driver_virtio_net::layout::MESSAGE_OFFSET` — must stay numerically
 /// equal.
-const MESSAGE_OFFSET: usize = 1024;
+const MESSAGE_OFFSET: usize = 2048;
 /// `driver_virtio_net::VIRTIO_NET_HDR_LEN` — must stay numerically
 /// equal (the 12-byte `virtio_net_hdr_v1` every frame buffer is
 /// prefixed with — see that constant's own doc comment for the real
@@ -166,7 +166,13 @@ const VIRTIO_NET_HDR_LEN: usize = 12;
 /// `driver_virtio_net::FRAME_MAX` — must stay numerically equal. Bounds
 /// this file's own local frame-copy buffer (`poll_frame`'s own stack
 /// array).
-const FRAME_MAX: usize = 700;
+const FRAME_MAX: usize = 1514;
+/// `driver_virtio_net::BUFFER_STRIDE` - must stay numerically equal.
+const BUFFER_STRIDE: usize = 2048;
+/// `driver_virtio_net::layout::SLOT_OFFSET` - must stay numerically equal.
+const SLOT_OFFSET: usize = 16;
+/// `driver_virtio_net::QUEUE_SIZE` - must stay numerically equal.
+const TX_SLOTS: u16 = 16;
 
 /// This demo's own fixed guest IPv4 address — same value `kernel_arch_
 /// glue`'s own (now-removed) `NET_DEMO_OUR_IP` used, kept identical so
@@ -584,13 +590,35 @@ unsafe fn copy_received_frame(len: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(len);
     // SAFETY: forwarded from this function's own contract.
     unsafe {
-        let base = (DRV_RX_VA + BUFFER_OFFSET + VIRTIO_NET_HDR_LEN) as *const u8;
+        let base = rx_frame_ptr();
         for i in 0..len {
             buf.push(base.add(i).read_volatile());
         }
     }
     buf
 }
+
+/// Address of the frame the driver's LAST `PollFrame` reply announced: the
+/// driver stores the buffer slot in the RX region's `SLOT_OFFSET` before it
+/// replies (`driver_virtio_net::layout::SLOT_OFFSET`); the frame bytes follow
+/// the 12-byte virtio header at that slot. A slot outside the queue (a driver
+/// bug) is clamped to 0 so this never reads outside the mapped region.
+///
+/// # Safety
+/// Same contract as `read_driver_mac`.
+unsafe fn rx_frame_ptr() -> *const u8 {
+    // SAFETY: forwarded; the slot field is inside page 0 of the RX region.
+    let slot = unsafe { ((DRV_RX_VA + SLOT_OFFSET) as *const u16).read_volatile() };
+    let slot = if slot < TX_SLOTS { slot as usize } else { 0 };
+    (DRV_RX_VA + BUFFER_OFFSET + slot * BUFFER_STRIDE + VIRTIO_NET_HDR_LEN) as *const u8
+}
+
+/// Next TX buffer slot to stage into. The driver queues frames without
+/// waiting for the device, so consecutive frames must land in different
+/// buffers; rotating through all `TX_SLOTS` gives the device that many frames
+/// of slack before a slot is reused (and the driver waits for it if not yet
+/// sent).
+static NEXT_TX_SLOT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
 /// Writes `frame`'s own bytes at `DRV_TX_VA + BUFFER_OFFSET +
 /// VIRTIO_NET_HDR_LEN` — `driver_virtio_net::VirtioNet::submit_tx_
@@ -600,9 +628,12 @@ unsafe fn copy_received_frame(len: usize) -> Vec<u8> {
 /// # Safety
 /// Same contract as `read_driver_mac`; `frame.len() <= FRAME_MAX`.
 unsafe fn stage_frame_for_tx(frame: &[u8]) {
-    // SAFETY: forwarded from this function's own contract.
+    let slot = NEXT_TX_SLOT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % TX_SLOTS;
+    // SAFETY: forwarded from this function's own contract; the slot field
+    // is in page 0 of the TX region and the buffer of `slot` is inside it.
     unsafe {
-        let base = (DRV_TX_VA + BUFFER_OFFSET + VIRTIO_NET_HDR_LEN) as *mut u8;
+        ((DRV_TX_VA + SLOT_OFFSET) as *mut u16).write_volatile(slot);
+        let base = (DRV_TX_VA + BUFFER_OFFSET + slot as usize * BUFFER_STRIDE + VIRTIO_NET_HDR_LEN) as *mut u8;
         core::ptr::copy_nonoverlapping(frame.as_ptr(), base, frame.len());
     }
 }
@@ -784,7 +815,7 @@ impl crate::stack::FrameIo for DriverIo {
                 // SAFETY: same contract; `n <= FRAME_MAX` stays inside the
                 // frame buffer that follows the virtio-net header.
                 unsafe {
-                    let base = (DRV_RX_VA + BUFFER_OFFSET + VIRTIO_NET_HDR_LEN) as *const u8;
+                    let base = rx_frame_ptr();
                     for (i, b) in buf[..n].iter_mut().enumerate() {
                         *b = base.add(i).read_volatile();
                     }
@@ -1078,5 +1109,30 @@ fn park() -> ! {
         // continues here only on the (unreachable in practice) error
         // case, matching every other real IPC server in this codebase.
         unsafe { raw_syscall(IPC_REPLY, from, zero!()) };
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The duplicated region-layout constants must equal the driver crate's
+    /// (they are copied, not shared, per this project's "no cross-driver
+    /// crate dependency at run time" convention; this test is the sync check).
+    #[test]
+    fn driver_layout_constants_match() {
+        use driver_virtio_net as d;
+        assert_eq!(MAC_OFFSET, d::layout::MAC_OFFSET);
+        assert_eq!(BUFFER_OFFSET, d::layout::BUFFER_OFFSET);
+        assert_eq!(MESSAGE_OFFSET, d::layout::MESSAGE_OFFSET);
+        assert_eq!(SLOT_OFFSET, d::layout::SLOT_OFFSET);
+        assert_eq!(LINK_VALID_OFFSET, d::layout::LINK_VALID_OFFSET);
+        assert_eq!(LINK_UP_OFFSET, d::layout::LINK_UP_OFFSET);
+        assert_eq!(VIRTIO_NET_HDR_LEN, d::VIRTIO_NET_HDR_LEN);
+        assert_eq!(FRAME_MAX, d::FRAME_MAX);
+        assert_eq!(BUFFER_STRIDE, d::BUFFER_STRIDE);
+        assert_eq!(TX_SLOTS, d::QUEUE_SIZE);
+        assert_eq!(DRV_QUEUE_SIZE, d::QUEUE_SIZE as u32);
+        assert_eq!(crate::stack::MAX_FRAME, d::FRAME_MAX);
     }
 }

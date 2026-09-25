@@ -47,3 +47,8 @@ kernel-ipc   = { path = "../../kernel/kernel-ipc" }
 version = "0.12"
 default-features = false
 features = ["proto-ipv4", "proto-dhcpv4", "proto-dns", "medium-ethernet", "socket-icmp", "socket-udp", "socket-dhcpv4", "socket-dns"]
+
+[dev-dependencies]
+# Host tests assert the numeric constants `subsystem_entry` duplicates (region
+# layout) still equal the driver crate's.
+driver-virtio-net = { path = "../drivers/driver-virtio-net" }

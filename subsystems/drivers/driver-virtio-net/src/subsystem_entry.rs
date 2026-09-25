@@ -294,63 +294,70 @@ unsafe fn wait_for_irq() -> u64 {
     unsafe { raw_syscall(DRV_IRQ_WAIT, DRV_NOTIF_CAP, zero!()) as u64 }
 }
 
-/// Handles a `SendFrame { len }` request: the frame bytes are ALREADY
-/// staged (by `kernel_arch_glue`'s own demo, before issuing the `Call`)
-/// at `DRV_TX_VA + driver_virtio_net::layout::BUFFER_OFFSET + VIRTIO_NET_
-/// HDR_LEN` — see `VirtioNet::submit_tx_request`'s own doc comment for
-/// why this avoids a same-address copy. Drives the REAL interrupt-driven
-/// completion path (`VirtioNet::submit_tx_request`/`tx_completion_
-/// pending`/`ack_tx_completion`) — `drv.submit_tx` (the busy-poll
-/// alternative) is deliberately NOT called here, mirroring `driver_
-/// virtio_blk::subsystem_entry::handle_io`'s own split for the identical
-/// reason: only THIS file can issue the actual `Wait` ecall in between
-/// submission and completion.
+/// Reads the `u16` slot field of the region at `base` (`layout::SLOT_OFFSET`).
+fn read_slot(base: usize) -> u16 {
+    // SAFETY: both regions are mapped `U=1 R+W` in this process's own
+    // address space before its first instruction; the field is inside page 0.
+    unsafe { ((base + crate::layout::SLOT_OFFSET) as *const u16).read_volatile() }
+}
+
+/// Writes the `u16` slot field of the region at `base`.
+fn write_slot(base: usize, slot: u16) {
+    // SAFETY: same contract as `read_slot`.
+    unsafe { ((base + crate::layout::SLOT_OFFSET) as *mut u16).write_volatile(slot) };
+}
+
+/// Handles a `SendFrame { len }` request: the caller already staged the frame
+/// in TX buffer `slot` (the `u16` at `layout::SLOT_OFFSET` of the TX region,
+/// at `layout::buffer_offset(slot) + VIRTIO_NET_HDR_LEN`) and rotates through
+/// the slots, so frames still queued at the device are never overwritten.
+///
+/// Asynchronous: the frame is queued and the reply goes out at once; the
+/// completion is collected (`reap_tx`) the next time a slot is needed. Only
+/// when the caller reuses a slot that is still queued (all `QUEUE_SIZE`
+/// frames in flight) does this wait: a bounded spin on the used ring, then
+/// the interrupt-driven `Wait` on the device's IRQ notification exactly as
+/// the one-frame-in-flight version did (a TX completion is a LOCAL virtqueue
+/// event the device always produces on its own, so a bounded wait is safe -
+/// see the module doc for why RX never waits).
 fn handle_send_frame(drv: &mut crate::VirtioNet, len: u32) -> DriverResponse {
     if !drv.is_ready() {
         return DriverResponse::Failed { code: DriverErrorCode::ProbeFailed };
     }
-    if len as usize > crate::FRAME_MAX {
+    let slot = read_slot(DRV_TX_VA);
+    if len as usize > crate::FRAME_MAX || slot >= crate::QUEUE_SIZE {
         return DriverResponse::Failed { code: DriverErrorCode::Unsupported };
     }
-    // SAFETY: `drv.is_ready()` (checked above) means `probe` already
-    // mapped every region and set up both queues; the frame bytes are
-    // staged per this function's own doc comment (the caller's
-    // responsibility, matching `driver_virtio_blk::subsystem_entry`'s own
-    // `handle_io` trust boundary for `WriteBlocks`' pre-staged data).
-    unsafe { drv.submit_tx_request(len as usize) };
-    // Loop `Wait`, not a single call — see `VirtioBlk::completion_
-    // pending`'s own doc comment (referenced from `VirtioNet::tx_
-    // completion_pending`'s own) for why one interrupt fire is not proof
-    // THIS request completed. Bounded (not infinite): a TX completion is
-    // a LOCAL virtqueue event the device always eventually produces on
-    // its own (unlike an RX reply, which may never arrive at all — this
-    // crate's own module doc comment on why ONLY TX is safe to make
-    // interrupt-driven at all), so a bounded retry here is exactly as
-    // safe as `driver_virtio_blk::subsystem_entry::handle_io`'s own
-    // identical bound.
-    const MAX_WAIT_RETRIES: u32 = 8;
-    let mut retries = 0u32;
-    loop {
-        // SAFETY: `raw_syscall`'s own contract (forwarded via `wait_for_irq`).
-        unsafe { wait_for_irq() };
-        // SAFETY: `submit_tx_request`'s own contract.
-        if unsafe { drv.tx_completion_pending() } {
-            break;
+    // SAFETY: `drv.is_ready()` (checked above) means `probe` mapped both
+    // regions and set up both queues; the frame is staged per this
+    // function's own doc comment (the caller's responsibility).
+    unsafe {
+        drv.reap_tx();
+        if !drv.tx_slot_free(slot) {
+            const MAX_WAIT_RETRIES: u32 = 8;
+            let mut retries = 0u32;
+            loop {
+                wait_for_irq();
+                drv.reap_tx();
+                if drv.tx_slot_free(slot) {
+                    break;
+                }
+                retries += 1;
+                if retries >= MAX_WAIT_RETRIES {
+                    return DriverResponse::Failed { code: DriverErrorCode::DeviceIo };
+                }
+            }
         }
-        retries += 1;
-        if retries >= MAX_WAIT_RETRIES {
+        if !drv.submit_tx_slot(slot, len as usize) {
             return DriverResponse::Failed { code: DriverErrorCode::DeviceIo };
         }
     }
-    // SAFETY: same contract as `submit_tx_request` — the loop above only
-    // exits once the used ring genuinely shows this request's own
-    // completion.
-    unsafe { drv.ack_tx_completion() };
     DriverResponse::FrameSent
 }
 
-/// Handles a `PollFrame` request: one non-blocking check of the RX queue
-/// — see `VirtioNet::poll_rx`'s own doc comment.
+/// Handles a `PollFrame` request: one non-blocking check of the RX queue -
+/// see `VirtioNet::poll_rx`. On success the frame's buffer slot is written to
+/// the RX region's `layout::SLOT_OFFSET` before the reply.
 fn handle_poll_frame(drv: &mut crate::VirtioNet) -> DriverResponse {
     if !drv.is_ready() {
         return DriverResponse::Failed { code: DriverErrorCode::ProbeFailed };
@@ -362,7 +369,10 @@ fn handle_poll_frame(drv: &mut crate::VirtioNet) -> DriverResponse {
     unsafe { drv.refresh_link() };
     // SAFETY: same contract.
     match unsafe { drv.poll_rx() } {
-        Some(len) => DriverResponse::FrameReceived { len },
+        Some((slot, len)) => {
+            write_slot(DRV_RX_VA, slot);
+            DriverResponse::FrameReceived { len }
+        }
         None => DriverResponse::Failed { code: DriverErrorCode::NoData },
     }
 }
