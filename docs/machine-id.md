@@ -1,8 +1,10 @@
 # Machine ID — design note
 
-Status: DESIGN ONLY. No code exists for this yet. Open questions are recorded
-as `TODO(spec)` items in section 12 and must be answered by Omid before the
-parts of the implementation that depend on them are built.
+Status: PARTIALLY IMPLEMENTED (v1, 2026-09-25): board-level ids only, recompute-only
+stability, raw id visible to ui-core. See section 13 for exactly what exists and the
+read ABI. Sections 1-12 are the full design; parts not listed in section 13 are still
+design only. Open questions remain as `TODO(spec)` items in section 12 and must be
+answered by Omid before the parts that depend on them are built.
 
 Architecture reference: 01-HAL-Layer.md (discovery is always complete),
 03-Kernel-Subsystems-Layer.md (device-manager, drivers), 04 (policy layer).
@@ -25,7 +27,7 @@ Non-goals: it is not a secret, not an authenticator, and not proof of
 identity (identifiers can be spoofed on VMs and by hardware modification).
 Anything needing authentication must combine it with enrollment (see TODO-5 in section 12).
 
-## 2. Survey: what the code exposes today
+## 2. Survey: what the code exposes today (before v1; SMBIOS row is now implemented, see 13)
 
 Surveyed in branch `fix/33-fix`. "HardwareManifestRaw" is the fixed-size
 discovery result the HAL hands to the kernel inside `BootInfo`.
@@ -347,7 +349,8 @@ a strong id via DT `serial-number` or via NIC/disk; otherwise it is weak.
   whether disk serial should count at all.
 - TODO(spec) TODO-3 (blocks 6/7.3): is the hash over ALL strong ids or only
   the board-level subset? (Recommendation in 7.3; not decided.) Also whether
-  weak ids (CPU model, board name) are ever included as salt.
+  weak ids (CPU model, board name) are ever included as salt. v1 (owner, 2026-09-25):
+  board-level subset only; W2 manufacturer/product salt only in the weak case (section 13).
 - TODO(spec) TODO-4 (blocks 5.2): use only the smallest valid NIC MAC, or
   all onboard MACs? Behaviour on multi-NIC servers where one NIC is removed.
 - TODO(spec) TODO-5 (blocks 10, 9): who may hold `MachineIdRaw`. Only
@@ -379,3 +382,87 @@ a strong id via DT `serial-number` or via NIC/disk; otherwise it is weak.
   company enrollment at all, or is it flagged and gated by policy?
 - TODO(spec) TODO-15 (blocks 10): should the derived per-service id also
   include the user or install, or strictly per (machine, service)?
+
+## 13. Implementation status (v1, 2026-09-25)
+
+Owner decisions of 2026-09-25 that scope this first implementation:
+
+- (a) The id is built from BOARD-LEVEL identifiers only: S1 SMBIOS system UUID,
+  S2 baseboard serial, S3 system serial (Type 3 chassis serial as its
+  fallback). This settles the recommendation in 7.3 / TODO-3 for v1: disk (S5),
+  NIC MAC (S4) and TPM (S6) are NOT hashed. No central source of a physical NIC
+  MAC or disk serial exists yet (section 2), so they were left out rather than
+  obtained expensively. Weak ids (W2 manufacturer/product) are hashed ONLY when
+  no strong id was accepted, so a weak id at least differs between models.
+- (b) Stability is the deterministic recompute only: same hardware gives the
+  same id on every boot and after a reinstall. The persisted identifier record,
+  the K-of-N match rule (7.2) and the random-seed weak case (8) are NOT
+  implemented; they remain TODO-1, TODO-6 and TODO-10 above.
+- (c) The raw id is a GUID-shaped 128-bit value that the logged-in user may SEE
+  in the desktop USERS window. That is the only consumer for now. The per-service
+  HMAC derivation of section 10 is out of scope and unimplemented.
+
+What exists:
+
+| Piece | Where |
+|---|---|
+| Raw record `MachineIdentityRaw` (344 bytes, all-`u8`, alignment 1), carried in `HardwareManifestRaw::machine_identity` | `hal/hal-manifest/src/identity.rs` |
+| SMBIOS 2.x / 3.x entry point + Type 1/2/3 parser, canonicalisation, placeholder/junk rejection, SHA-256 construction of section 6, weak/virtual flags, own streaming SHA-256; host tests with fixed vectors | `machine-id-core/` |
+| Bootloader: reads SMBIOS from the UEFI configuration table (SMBIOS3 preferred) BEFORE ExitBootServices and appends the record to the handoff block after the framebuffer record (`SIMSMB` magic) | `uefi-bootloader/src/main.rs` |
+| HAL decode (x86_64 and aarch64 share the UEFI handoff; riscv64 has no identity source and reports "none") | `hal-x86_64/src/memory.rs`, `hal-arm64/src/memory.rs` |
+| Derivation at boot, serial log line `machine id: <guid> (weak=.., virtual=.., ...)` | `kernel-core` (`KernelState::machine_id`), `kernel-arch-glue::build` |
+| Exposure to ui-core | `kernel-arch-glue::map_machine_id_info`, mapped by `spawn_ui_core_x86` |
+
+Handoff byte contract (after the memory-map descriptors): `u64 RSDP`, then the
+48-byte framebuffer record, then `u64 0x5349_4D53_4D42_0001` ("SIMSMB", version
+1) followed by the 344-byte `MachineIdentityRaw` (header 8 bytes: present bits,
+source, SMBIOS major, minor, 4 reserved; UUID 16 bytes as stored; then five
+64-byte text fields manufacturer, product, system serial, board serial, chassis
+serial, each `len` byte + 63 bytes). A missing or different magic reads as "no
+identity" (weak id).
+
+### 13.1 Exposure ABI (how a client reads the id)
+
+No new syscall (the syscall surface is deliberately tiny and fuzzed). The
+kernel derives the id once and maps ONE read-only 4 KiB page into ui-core's
+address space (x86_64), at virtual address `0xD8B0_0000` (`UI_CORE_MACHINE_ID_VA`
+in `kernel/kernel/src/main.rs`; the mapping is `R | U`, not writable, not
+executable). All values little-endian, every other byte zero:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | u64 | magic `0x5349_4D4D_4944_0001` (ASCII "SIMMID" + layout version 1); the client MUST check it before trusting the page |
+| 8 | 16 bytes | machine id in RFC 4122 byte order (identical to the text form's order) |
+| 24 | u32 | flags: bit 0 = `weak` (no strong board-level id; advisory only), bit 1 = `virtual` (firmware strings name a hypervisor) |
+| 28 | u32 | algorithm version (1 = label `simurgh-machine-id-v1`) |
+| 32 | 36 bytes | canonical lowercase `8-4-4-4-12` text form, ASCII, no terminator |
+
+A follow-up ui-core client only has to read that page (a `const` pointer at the
+fixed VA) and print the text at offset 32 in the USERS window; show a "weak" or
+"virtual" note from the flags. A page whose magic does not match means the
+kernel did not map it (out of resources): show "unavailable".
+
+TODO(spec) TODO-5 (access control): the "who may see the raw id" decision is
+today made by kernel code that maps the page only into ui-core, not by a
+capability. The `MachineIdRaw` / `MachineIdInfo` capabilities of section 10 (issued by
+layer 4) are not built; when they exist this page should be granted through them.
+
+### 13.2 Known limits of v1
+
+- Only SMBIOS-sourced identity. riscv64: device-tree root `serial-number` is not
+  captured (the DT walker does not expose root properties cheaply), so riscv64
+  always yields a weak id. aarch64 uses the same UEFI/SMBIOS path as x86_64 and
+  compiles, but was not booted in QEMU for this.
+- SMBIOS UUID byte order: 2.6+ tables use the mixed-endian rule (first three
+  fields swapped), older tables are used as reported. Exact handling of < 2.6
+  firmware is still TODO-13.
+- The virtual flag is derived from firmware strings only (QEMU, KVM, VMware,
+  VirtualBox, Xen, Hyper-V, ...); the CPUID hypervisor bit and virtual-OUI MACs
+  (section 9) are not folded in yet.
+- The placeholder list and the small duplicated-UUID list are the v1 lists of
+  section 5.1; growing them requires a new label (TODO-9).
+- Plain QEMU without `-smbios type=1,uuid=...` reports an all-zero UUID and empty
+  serials, so its id is WEAK (and differs only by machine model); give QEMU a UUID to
+  get a strong id.
+- The serial log prints the derived id and its flags, never the raw UUID or serials
+  (section 10). The id itself is meant to be visible to the logged-in user.

@@ -30,6 +30,7 @@ Simurgh-OS/
 │   ├── hal-arm64/       ARM64 implementation
 │   └── hal-riscv64/     RISC-V implementation
 ├── uefi-bootloader/     UEFI app that loads the kernel image and hands off (x86_64 / aarch64)
+├── machine-id-core/     machine id: SMBIOS parse, canonicalisation, SHA-256 (docs/machine-id.md)
 │
 ├── kernel/
 │   ├── kernel-cap/      Capability + Capability Derivation Tree + revocation (02 §2)
@@ -288,6 +289,27 @@ recent changes, identical there.** All three occur in the demo build.
   security-broker/store/policy-engine shared-page addresses noted below).
   `drv_blk_read_result ... MISMATCH` also appears. All present before.
 - riscv64 shows the same three U-mode page faults at those addresses.
+
+### Machine id (2026-09-25, booted on x86_64; aarch64/riscv64 compile; design: `docs/machine-id.md`)
+
+Every UEFI machine (aarch64 uses the same path, not booted yet) now derives one GUID-shaped, hardware-based id at boot. The
+bootloader reads SMBIOS (system UUID, board and system serials) from the UEFI
+configuration table before ExitBootServices and hands the raw fields through
+the handoff block; `hal-x86_64`/`hal-arm64` decode them into
+`HardwareManifestRaw::machine_identity`; `kernel-core` runs the pure
+`machine-id-core` crate (cleanup of placeholder values, SHA-256 over a
+versioned label, RFC 4122 version/variant bits) and the serial log prints
+`machine id: <guid> (weak=.., virtual=.., ...)`. The same hardware gives the
+same id on every boot and after a reinstall (recompute only; persistence and
+the K-of-N rule are still open questions in the doc). The id is exposed
+read-only to ui-core through a single kernel-owned page mapped at
+`0xD8B0_0000` (layout in `docs/machine-id.md` section 13.1); the ui-core client
+that shows it in the USERS window is a follow-up. Verified in QEMU (q35 +
+edk2, `-smbios type=1,uuid=...`): two boots with the same UUID print the same
+id, a different UUID prints a different id, and plain QEMU (all-zero UUID)
+reports a weak, virtual id. Not done: riscv64 (always weak, no device-tree
+serial yet), NIC/disk/TPM inputs, per-service derived ids, capability-gated
+access.
 
 ## Current status (honest)
 
