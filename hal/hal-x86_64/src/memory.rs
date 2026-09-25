@@ -23,7 +23,7 @@ use hal_core::cpu::CpuFeatureFlags;
 use hal_core::error::HalError;
 use hal_core::memory::{MapPermissions, MemoryBootstrap, MemoryRegion, MemoryRegionKind, PhysAddr, VirtAddr};
 use hal_manifest::raw::{
-    FramebufferInfoRaw, HardwareManifestRaw, InterruptControllerInfoRaw, MemoryRegionRaw,
+    FramebufferInfoRaw, HardwareManifestRaw, InterruptControllerInfoRaw, MachineIdentityRaw, MemoryRegionRaw,
     PixelFormatRaw, TimerInfoRaw,
 };
 
@@ -639,6 +639,9 @@ pub struct Memory {
     /// discovered later, because the Graphics Output Protocol that knows
     /// this no longer exists by the time any of this code runs.
     framebuffer: FramebufferInfoRaw,
+    /// Raw SMBIOS identity the bootloader recorded in the handoff block
+    /// (`locate_machine_identity`), or `MachineIdentityRaw::ZERO`.
+    machine_identity: MachineIdentityRaw,
 }
 
 impl Memory {
@@ -697,6 +700,8 @@ impl Memory {
         // SAFETY: same boot-protocol contract as `locate_acpi_rsdp` just
         // above — one fixed-size record further into the same blob.
         let framebuffer = unsafe { locate_framebuffer(uefi_memory_map, &header) };
+        // SAFETY: same boot-protocol contract, one further record into the blob.
+        let machine_identity = unsafe { locate_machine_identity(uefi_memory_map, &header) };
         // SAFETY: `rsdp_phys` is either 0 (checked inside
         // acpi_dmar_present) or a value obtained per this same boot
         // protocol's guarantees.
@@ -719,6 +724,7 @@ impl Memory {
             iommu_present,
             rsdp_phys,
             framebuffer,
+            machine_identity,
         }
     }
 
@@ -743,6 +749,10 @@ impl Memory {
     /// The firmware-programmed framebuffer this crate parsed out of the
     /// handoff block at boot — `FramebufferInfoRaw::ZERO` if none. See
     /// this struct's own `framebuffer` field doc comment.
+    pub fn machine_identity(&self) -> MachineIdentityRaw {
+        self.machine_identity
+    }
+
     pub fn framebuffer(&self) -> FramebufferInfoRaw {
         self.framebuffer
     }
@@ -839,6 +849,25 @@ unsafe fn locate_framebuffer(uefi_memory_map: *const u8, header: &UefiMemoryMapH
         core::ptr::copy_nonoverlapping(uefi_memory_map.add(fb_offset as usize), bytes.as_mut_ptr(), 48);
     }
     decode_framebuffer_trailer(&bytes)
+}
+
+/// Reads the machine-identity record the bootloader appended after the
+/// (always reserved) 48-byte framebuffer record — `IDENTITY_HANDOFF_MAGIC`
+/// in hal-manifest. Raw SMBIOS bytes only; docs/machine-id.md section 3.
+///
+/// # Safety
+/// Same contract as `locate_framebuffer`: the blob is this project's
+/// bootloader block, allocated with room for this record
+/// (`HANDOFF_BUFFER_PAGES`) and zero-filled up front, so an older
+/// bootloader simply yields the magic-mismatch "no identity" answer.
+unsafe fn locate_machine_identity(uefi_memory_map: *const u8, header: &UefiMemoryMapHeader) -> MachineIdentityRaw {
+    let offset = size_of::<UefiMemoryMapHeader>() as u64 + header.map_size + 8 + 48;
+    let mut bytes = [0u8; hal_manifest::raw::MACHINE_IDENTITY_RAW_SIZE + 8];
+    // SAFETY: forwarded from this function's own safety contract.
+    unsafe {
+        core::ptr::copy_nonoverlapping(uefi_memory_map.add(offset as usize), bytes.as_mut_ptr(), bytes.len());
+    }
+    hal_manifest::identity::decode_identity_trailer(&bytes)
 }
 
 impl MemoryBootstrap for Memory {
@@ -999,6 +1028,7 @@ pub fn built_hardware_manifest(
     // process may map it is layer-4 policy, not a discovery-time
     // decision (01-HAL-Layer.md section 2).
     manifest.framebuffer = memory.framebuffer();
+    manifest.machine_identity = memory.machine_identity();
 
     // Fold IOMMU presence into the CPU feature flags too, per cpu.rs's
     // `mark_iommu_capable` doc comment on why CPUID alone cannot report

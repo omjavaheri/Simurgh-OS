@@ -27,7 +27,7 @@ use core::mem::size_of;
 use hal_core::error::HalError;
 use hal_core::memory::{MapPermissions, MemoryBootstrap, MemoryRegion, PhysAddr, VirtAddr};
 use hal_manifest::raw::{
-    FramebufferInfoRaw, HardwareManifestRaw, InterruptControllerInfoRaw, MemoryRegionRaw,
+    FramebufferInfoRaw, HardwareManifestRaw, InterruptControllerInfoRaw, MachineIdentityRaw, MemoryRegionRaw,
     PixelFormatRaw, TimerInfoRaw,
 };
 
@@ -352,6 +352,20 @@ unsafe fn locate_framebuffer(uefi_memory_map: *const u8, header: &UefiMemoryMapH
     decode_framebuffer_trailer(&bytes)
 }
 
+/// Same contract as hal-x86_64/memory.rs's `locate_machine_identity`.
+///
+/// # Safety
+/// Same contract as `locate_framebuffer` above.
+unsafe fn locate_machine_identity(uefi_memory_map: *const u8, header: &UefiMemoryMapHeader) -> MachineIdentityRaw {
+    let offset = size_of::<UefiMemoryMapHeader>() as u64 + header.map_size + 8 + 48;
+    let mut bytes = [0u8; hal_manifest::raw::MACHINE_IDENTITY_RAW_SIZE + 8];
+    // SAFETY: forwarded from this function's own safety contract.
+    unsafe {
+        core::ptr::copy_nonoverlapping(uefi_memory_map.add(offset as usize), bytes.as_mut_ptr(), bytes.len());
+    }
+    hal_manifest::identity::decode_identity_trailer(&bytes)
+}
+
 // ============================================================================
 // Page table setup — ARM64 uses a 4-level translation table walk
 // (matching this project's 4KB granule choice, the same base page size
@@ -522,6 +536,9 @@ pub struct Memory {
     /// See hal-x86_64's `Memory::framebuffer` field doc comment — same
     /// record, same handoff block, same bootloader.
     framebuffer: FramebufferInfoRaw,
+    /// Raw SMBIOS identity the bootloader recorded in the handoff block
+    /// (`locate_machine_identity`), or `MachineIdentityRaw::ZERO`.
+    machine_identity: MachineIdentityRaw,
 }
 
 impl Memory {
@@ -561,6 +578,8 @@ impl Memory {
         // SAFETY: same boot-protocol contract as `locate_acpi_rsdp` —
         // one fixed-size record further into the same blob.
         let framebuffer = unsafe { locate_framebuffer(uefi_memory_map, &header) };
+        // SAFETY: same boot-protocol contract, one further record into the blob.
+        let machine_identity = unsafe { locate_machine_identity(uefi_memory_map, &header) };
         // SAFETY: forwarded per acpi_discover's own contract.
         let acpi_result = unsafe { acpi_discover(rsdp_phys) };
 
@@ -577,10 +596,15 @@ impl Memory {
             iommu_present: acpi_result.smmu_present,
             gicd_base: acpi_result.gicd_base.unwrap_or(QEMU_VIRT_DEFAULT_GICD_BASE),
             framebuffer,
+            machine_identity,
         }
     }
 
     /// See hal-x86_64's `Memory::framebuffer` accessor.
+    pub fn machine_identity(&self) -> MachineIdentityRaw {
+        self.machine_identity
+    }
+
     pub fn framebuffer(&self) -> FramebufferInfoRaw {
         self.framebuffer
     }
@@ -768,6 +792,7 @@ pub fn built_hardware_manifest(
     // Same unconditional fold-in as hal-x86_64's own identical line:
     // discovery is always complete, policy is layer 4's business.
     manifest.framebuffer = memory.framebuffer();
+    manifest.machine_identity = memory.machine_identity();
 
     cpu.mark_iommu_capable(memory.iommu_present());
     manifest.cpu_feature_flags = cpu.feature_flags().bits();

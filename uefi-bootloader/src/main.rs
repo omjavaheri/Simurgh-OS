@@ -21,7 +21,9 @@ use core::panic::PanicInfo;
 use uefi::mem::memory_map::MemoryMap;
 use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, Mode, PixelFormat};
-use uefi::table::cfg::ACPI2_GUID;
+use uefi::table::cfg::{ACPI2_GUID, SMBIOS3_GUID, SMBIOS_GUID};
+use hal_manifest::raw::{MachineIdentityRaw, MACHINE_IDENTITY_RAW_SIZE};
+use machine_id_core::smbios;
 
 /// This bootloader's own target architecture, as an `elf-loader::machine`
 /// constant — selects which `e_machine` the embedded kernel ELF must
@@ -187,6 +189,65 @@ fn locate_acpi_rsdp() -> u64 {
 
     config_entries.unwrap_or(0)
 }
+
+// ============================================================================
+// SMBIOS — the machine identity handoff (docs/machine-id.md sections 3, 11)
+//
+// Firmware exposes the SMBIOS entry point through the UEFI configuration
+// table (SMBIOS3 preferred, SMBIOS 2.x otherwise). The structure table it
+// points at lives in firmware memory this OS may reclaim later, and the HAL
+// must never dereference firmware pointers itself, so THIS bootloader —
+// the only component that runs while firmware memory is intact — reads the
+// Type 1/2/3 fields into a `MachineIdentityRaw` and copies that record into
+// the handoff block (`SMBIOS_HANDOFF_MAGIC`). Raw bytes only: cleanup,
+// placeholder rejection and hashing happen later in `machine-id-core`.
+// ============================================================================
+
+/// Reads the SMBIOS Type 1/2/3 identity, or `MachineIdentityRaw::ZERO` when
+/// firmware exposes no usable SMBIOS (a valid, weak-id outcome — not an error).
+fn locate_smbios_identity() -> MachineIdentityRaw {
+    let entry = uefi::system::with_config_table(|entries| {
+        let e3 = entries.iter().find(|e| e.guid == SMBIOS3_GUID).map(|e| (e.address as usize, true));
+        let e2 = entries.iter().find(|e| e.guid == SMBIOS_GUID).map(|e| (e.address as usize, false));
+        e3.or(e2)
+    });
+    let Some((ep_addr, is_v3)) = entry else {
+        return MachineIdentityRaw::ZERO;
+    };
+    // SAFETY: the address comes from the firmware's own configuration
+    // table and boot services are still active, so identity-mapped firmware
+    // memory is readable; an SMBIOS entry point is at most 32 bytes, and
+    // `parse_entry_point_*` validates signature, length and checksum before
+    // any field is trusted.
+    let ep = unsafe { core::slice::from_raw_parts(ep_addr as *const u8, 32) };
+    let loc = if is_v3 { smbios::parse_entry_point_3(ep) } else { smbios::parse_entry_point_2(ep) };
+    let Some(loc) = loc else {
+        return MachineIdentityRaw::ZERO;
+    };
+    let len = loc.length.min(smbios::MAX_TABLE_BYTES) as usize;
+    if loc.address == 0 || len == 0 {
+        return MachineIdentityRaw::ZERO;
+    }
+    // SAFETY: `loc` came from a checksum-validated entry point; the length
+    // is clamped to `MAX_TABLE_BYTES`; the parser bounds-checks every
+    // offset because table contents are firmware-controlled.
+    let table = unsafe { core::slice::from_raw_parts(loc.address as usize as *const u8, len) };
+    smbios::parse_structure_table(table, loc.major, loc.minor)
+}
+
+/// Magic word introducing the machine-identity record this bootloader
+/// appends after the framebuffer record — ASCII `"SIMSMB"` + a 16-bit
+/// layout version. ADDITIVE, like `FB_HANDOFF_MAGIC`: a zero-filled or
+/// older block reads as "no identity" (HAL side: `decode_identity_trailer`).
+/// Must stay numerically equal to the HAL crates' constants of the same name.
+const SMBIOS_HANDOFF_MAGIC: u64 = 0x5349_4D53_4D42_0001;
+
+/// Byte size of the identity trailer: magic (8) + the 344-byte record.
+const SMBIOS_HANDOFF_SIZE: usize = 8 + MACHINE_IDENTITY_RAW_SIZE;
+
+// Compile-time guard that this copy of the byte contract matches the HAL side.
+const _: () = assert!(SMBIOS_HANDOFF_MAGIC == hal_manifest::identity::IDENTITY_HANDOFF_MAGIC);
+const _: () = assert!(SMBIOS_HANDOFF_SIZE == hal_manifest::identity::IDENTITY_HANDOFF_SIZE);
 // ============================================================================
 // Graphics Output Protocol — the display scanout handoff
 //
@@ -440,7 +501,7 @@ const HEADER_SIZE: usize = 16; // two u64 fields: map_size, descriptor_size
 /// kernel entry address per `load_kernel_segments`. This function does
 /// not return — it diverges into the kernel or, on an unrecoverable
 /// UEFI error, halts.
-unsafe fn exit_boot_services_and_jump(handoff_block_addr: u64,rsdp_addr: u64,framebuffer: Option<FramebufferHandoff>,entry_point: u64,) -> ! {
+unsafe fn exit_boot_services_and_jump(handoff_block_addr: u64,rsdp_addr: u64,framebuffer: Option<FramebufferHandoff>,identity: &MachineIdentityRaw,entry_point: u64,) -> ! {
     uefi::println!("________________ Stage 8: exit boot services and jump ___________________");
     // First, exploratory memory_map() call: used only to learn the
     // real descriptor layout (size, stride) so we can size our own
@@ -483,7 +544,7 @@ unsafe fn exit_boot_services_and_jump(handoff_block_addr: u64,rsdp_addr: u64,fra
     // zero-filled record is still part of the layout, and sizing the
     // check on whether a display happens to exist would make the
     // buffer-overflow guard itself machine-dependent).
-    let total_needed = HEADER_SIZE as u64 + map_bytes_needed + 8 + FB_HANDOFF_SIZE as u64;
+    let total_needed = HEADER_SIZE as u64 + map_bytes_needed + 8 + FB_HANDOFF_SIZE as u64 + SMBIOS_HANDOFF_SIZE as u64;
     if total_needed > (HANDOFF_BUFFER_PAGES * 0x1000) as u64 {
         uefi::println!("    [!!] memory map too large for fixed handoff buffer");
         uefi::println!("    [!!] Needed: {} bytes, Available: {} bytes",total_needed, HANDOFF_BUFFER_PAGES * 0x1000);
@@ -576,6 +637,20 @@ unsafe fn exit_boot_services_and_jump(handoff_block_addr: u64,rsdp_addr: u64,fra
                 fb.width, fb.height, fb.stride_pixels, fb.bits_per_pixel, fb.format, fb.base, fb.size, fb_offset);
         } else {
             uefi::println!("    [!!] framebuffer: none (no usable GOP mode) - the kernel will run headless");
+        }
+
+        // Machine-identity record, immediately after the (always
+        // reserved) 48-byte framebuffer record. Written only when SMBIOS
+        // was found; otherwise the zero-filled bytes read as "no identity".
+        if identity.source != 0 {
+            let id_offset = rsdp_offset as usize + 8 + FB_HANDOFF_SIZE;
+            let id_base = base.add(id_offset);
+            core::ptr::write_unaligned(id_base as *mut u64, SMBIOS_HANDOFF_MAGIC);
+            core::ptr::copy_nonoverlapping(identity.to_bytes().as_ptr(), id_base.add(8), MACHINE_IDENTITY_RAW_SIZE);
+            // Deliberately does not print the serials/UUID (docs/machine-id.md section 10).
+            uefi::println!("    [OK] machine identity (SMBIOS {}.{}) written at offset {}", identity.smbios_major, identity.smbios_minor, id_offset);
+        } else {
+            uefi::println!("    [!!] machine identity: no SMBIOS - the machine id will be flagged weak");
         }
     }
     uefi::println!("  [OK] Copying memory map to handoff block at {:#x}...", handoff_block_addr);
@@ -717,6 +792,17 @@ fn efi_main() -> Status {
         uefi::println!("    [!!] Continuing with limited ACPI support");
     }
     uefi::println!("");
+    // === STAGE 5a: SMBIOS machine identity ===
+    // Before the handoff block exists and before ExitBootServices, while
+    // firmware memory (the SMBIOS tables) is still intact.
+    uefi::println!("  [..] Locating SMBIOS...");
+    let identity = locate_smbios_identity();
+    if identity.source != 0 {
+        uefi::println!("    [OK] SMBIOS {}.{} identity fields read", identity.smbios_major, identity.smbios_minor);
+    } else {
+        uefi::println!("    [!!] no usable SMBIOS entry point");
+    }
+    uefi::println!("");
     // === STAGE 5b: Graphics Output Protocol ===
     //
     // Deliberately BEFORE the handoff block is allocated and long
@@ -803,7 +889,7 @@ fn efi_main() -> Status {
     // stable AllocatePages-backed buffer meant to outlive
     // ExitBootServices, per that function's own doc comment.
     unsafe {
-        exit_boot_services_and_jump(handoff_block_addr, rsdp_addr, framebuffer, entry_point);
+        exit_boot_services_and_jump(handoff_block_addr, rsdp_addr, framebuffer, &identity, entry_point);
     }
 
     // Per the `uefi` crate's `#[entry]` macro contract, returning from

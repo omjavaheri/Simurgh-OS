@@ -167,6 +167,28 @@ impl MachineIdentityRaw {
     }
 }
 
+/// Magic word introducing the identity trailer in the bootloader handoff
+/// block (ASCII `"SIMSMB"` + 16-bit layout version). Additive like the
+/// framebuffer's magic: absent/zeroed/newer -> "no identity". Must stay
+/// numerically equal to `uefi-bootloader`'s `SMBIOS_HANDOFF_MAGIC`.
+pub const IDENTITY_HANDOFF_MAGIC: u64 = 0x5349_4D53_4D42_0001;
+
+/// Byte size of the identity trailer: magic (8) + the 344-byte record.
+pub const IDENTITY_HANDOFF_SIZE: usize = 8 + MACHINE_IDENTITY_RAW_SIZE;
+
+/// Decodes the identity trailer. Wrong magic -> `MachineIdentityRaw::ZERO`.
+/// Shared by every UEFI-booted `hal-<arch>` crate (pure, host-testable).
+pub fn decode_identity_trailer(bytes: &[u8; IDENTITY_HANDOFF_SIZE]) -> MachineIdentityRaw {
+    let mut magic = [0u8; 8];
+    magic.copy_from_slice(&bytes[..8]);
+    if u64::from_le_bytes(magic) != IDENTITY_HANDOFF_MAGIC {
+        return MachineIdentityRaw::ZERO;
+    }
+    let mut rec = [0u8; MACHINE_IDENTITY_RAW_SIZE];
+    rec.copy_from_slice(&bytes[8..]);
+    MachineIdentityRaw::from_bytes(&rec)
+}
+
 // Compile-time layout guard: header(8) + uuid(16) + 5 * text(64) = 344.
 const _: () = {
     assert!(core::mem::size_of::<IdentityTextRaw>() == 64);
@@ -192,6 +214,19 @@ mod tests {
         assert_eq!(back, id);
         assert_eq!(back.board_serial.as_slice().len(), IDENTITY_TEXT_MAX);
         assert!(back.has_uuid());
+    }
+
+    #[test]
+    fn trailer_needs_the_magic() {
+        let mut id = MachineIdentityRaw::ZERO;
+        id.source = IdentitySourceRaw::Smbios as u8;
+        let mut t = [0u8; IDENTITY_HANDOFF_SIZE];
+        t[..8].copy_from_slice(&IDENTITY_HANDOFF_MAGIC.to_le_bytes());
+        t[8..].copy_from_slice(&id.to_bytes());
+        assert_eq!(decode_identity_trailer(&t), id);
+        t[0] ^= 1;
+        assert_eq!(decode_identity_trailer(&t), MachineIdentityRaw::ZERO);
+        assert_eq!(decode_identity_trailer(&[0u8; IDENTITY_HANDOFF_SIZE]), MachineIdentityRaw::ZERO);
     }
 
     #[test]

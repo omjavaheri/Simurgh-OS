@@ -41,6 +41,9 @@ uefi = { version = "0.31", default-features = false }
 # src/elf.rs, promoted to a workspace crate once kernel-arch-glue
 # needed the identical logic to load subsystem process images.
 elf-loader = { path = "../elf-loader" }
+# Raw identity record + SMBIOS parser for the machine-id handoff (docs/machine-id.md).
+hal-manifest = { path = "../hal/hal-manifest", default-features = false }
+machine-id-core = { path = "../machine-id-core" }
 
 [profile.dev]
 panic = "abort"
